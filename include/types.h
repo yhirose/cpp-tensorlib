@@ -13,12 +13,11 @@ inline void use_cpu() { device_ = device_type::cpu; }
 inline void use_gpu() { device_ = device_type::gpu; }
 inline void use_auto() { device_ = device_type::auto_; }
 
-// True when a GPU backend is compiled in AND a device is reachable at
-// runtime (Metal on macOS; CUDA driver via dlopen on Linux/Windows — on
-// WSL2 the driver lives at /usr/lib/wsl/lib/libcuda.so). No GPU backend
-// exists yet, so gpu/auto modes fall back to the reference CPU path; CI
-// runs all three modes so the fallback stays permanently tested.
-inline bool gpu_available() { return false; }
+// tl::gpu_available() — true when a GPU backend is compiled in AND a device
+// is reachable at runtime — is defined in metal.h (Metal on macOS; the CUDA
+// dlopen probe joins it in M6). Where no device exists, gpu/auto modes fall
+// back to the CPU path; CI runs all three modes so the fallback stays
+// permanently tested.
 
 // Testing/benchmark toggle: when false, evaluation ignores accelerated CPU
 // backends and runs everything through the ref:: oracle. Lets tests compare

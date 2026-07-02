@@ -30,6 +30,22 @@ bool matches_oracle(F build, float rtol = 1e-4f, float atol = 1e-5f) {
   return tl::allclose(fast, oracle, rtol, atol);
 }
 
+// Evaluate `build()` in gpu mode and forced through the ref oracle; require
+// agreement. No-op (trivially true) where no Metal device exists.
+template <typename F>
+bool matches_gpu_oracle(F build, float rtol = 1e-4f, float atol = 1e-5f) {
+  if (!tl::gpu_available()) return true;
+  auto prev = tl::device_;
+  tl::use_gpu();
+  auto fast = build().eval();
+  tl::use_cpu();
+  tl::use_accelerate_ = false;
+  auto oracle = build().eval();
+  tl::use_accelerate_ = true;
+  tl::device_ = prev;
+  return tl::allclose(fast, oracle, rtol, atol);
+}
+
 }  // namespace
 
 TEST_CASE("creation and introspection") {
@@ -243,6 +259,48 @@ TEST_CASE("accelerated backend matches the ref oracle") {
   auto g = random_array({8, 9}, 11);
   auto w = random_array({33, 9}, 12);
   CHECK(matches_oracle([&] { return w - x.transpose().dot(g) * 0.01f; }));
+}
+
+TEST_CASE("metal backend matches the ref oracle") {
+  auto a = random_array({33, 17}, 21);
+  auto b = random_array({33, 17}, 22);
+
+  CHECK(matches_gpu_oracle([&] { return a + b; }));
+  CHECK(matches_gpu_oracle([&] { return a - b; }));
+  CHECK(matches_gpu_oracle([&] { return a * b; }));
+  CHECK(matches_gpu_oracle([&] { return a / (b + 2.0f); }));
+  CHECK(matches_gpu_oracle([&] { return a.exp(); }));
+  CHECK(matches_gpu_oracle([&] { return (a + 2.0f).log(); }));
+  CHECK(matches_gpu_oracle([&] { return (a + 2.0f).sqrt(); }));
+  CHECK(matches_gpu_oracle([&] { return a.sigmoid(); }));
+  CHECK(matches_gpu_oracle([&] { return a.relu(); }));
+  CHECK(matches_gpu_oracle([&] { return (a * 3.0f) - 1.0f; }));  // fused affine
+  CHECK(matches_gpu_oracle([&] { return (a + b) * 2.0f - 1.0f; }));  // epilogue in kernel
+
+  // deep elementwise chain: one command buffer, many dispatches, one flush
+  CHECK(matches_gpu_oracle([&] {
+    auto x = a;
+    for (int i = 0; i < 8; i++) x = (x * 1.01f + b * 0.1f).relu();
+    return x;
+  }));
+
+  // mixed CPU/GPU graphs: dot runs on CPU (no Metal gemm yet) — exercises
+  // the cpu_barrier handoff in both directions
+  auto w = random_array({17, 5}, 23);
+  CHECK(matches_gpu_oracle([&] { return (a + b).dot(w); }));          // gpu → cpu
+  CHECK(matches_gpu_oracle([&] { return (a.dot(w) + 1.0f).relu(); }));  // cpu → gpu
+  CHECK(matches_gpu_oracle([&] { return ((a + b).dot(w) * 0.5f).sigmoid().sum(1); }));
+
+  // batch eval of multiple gpu roots
+  if (tl::gpu_available()) {
+    tl::use_gpu();
+    auto c = a + b;
+    auto d = a * b;
+    tl::eval(c, d);
+    tl::use_cpu();
+    CHECK(tl::allclose(c, a.clone() + b.clone(), 1e-5f, 1e-6f));
+    CHECK(tl::allclose(d, a.clone() * b.clone(), 1e-5f, 1e-6f));
+  }
 }
 
 TEST_CASE("lazy graph: build then eval") {

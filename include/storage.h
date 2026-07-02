@@ -1,26 +1,42 @@
 #pragma once
 
+#include <metal.h>
+
 #include <cstdint>
 #include <memory>
 
 namespace tl {
 
-// Flat F32 buffer shared between arrays (views share one storage). This is
-// the seam where device residency (Metal buffer, CUDA allocation) and pooled
-// recycling attach in later milestones; the CPU pointer stays the canonical
-// handle for the reference backend.
+// Flat F32 buffer shared between arrays (views share one storage). When a
+// Metal device exists every buffer is a pooled shared-mode MTLBuffer
+// (unified memory: same bytes visible to CPU and GPU); otherwise heap. CUDA
+// residency attaches here in M6.
 struct storage {
-  std::shared_ptr<float[]> buf;
-  int64_t size = 0;  // elements
+  std::shared_ptr<void> buf;   // owner: returns to the Metal pool or frees
+  float* ptr = nullptr;
+  void* native = nullptr;      // MTLBuffer handle when Metal-backed
+  int64_t size = 0;            // elements
+
+  float* data() const { return ptr; }
 
   static storage make(int64_t n) {
     storage s;
-    s.buf = std::shared_ptr<float[]>(new float[static_cast<size_t>(n)]);
     s.size = n;
+    int64_t bytes = n > 0 ? n * 4 : 4;  // MTLBuffer length must be non-zero
+    float* contents = nullptr;
+    if (void* mb = metal::alloc(bytes, &contents)) {
+      s.native = mb;
+      s.ptr = contents;
+      s.buf = std::shared_ptr<void>(
+          mb, [bytes](void* p) { metal::release(p, bytes); });
+    } else {
+      auto* p = new float[static_cast<size_t>(n > 0 ? n : 1)];
+      s.ptr = p;
+      s.buf = std::shared_ptr<void>(
+          p, [](void* q) { delete[] static_cast<float*>(q); });
+    }
     return s;
   }
-
-  float* data() const { return buf.get(); }
 };
 
 }  // namespace tl

@@ -353,11 +353,13 @@ inline bool array::contiguous() const {
 
 inline const float* array::raw() const {
   ensure_();
+  metal::cpu_barrier();  // the one choke point making mixed CPU/GPU graphs safe
   return storage_.data() + offset_;
 }
 
 inline float* array::data() {
   ensure_();
+  metal::cpu_barrier();
   if (!contiguous()) {
     throw std::logic_error("tl::data: non-contiguous view; use clone()");
   }
@@ -907,6 +909,64 @@ struct graph {
     n.evaluated = true;
   }
 
+  // Metal eligibility: manual gpu mode dispatches whenever possible; auto
+  // joins an already-running GPU pipeline but never starts one (per-class
+  // size thresholds are measured work — silarray's use_auto — and land with
+  // the bench data); cpu mode never.
+  static bool metal_mode_() {
+    if (!metal::available()) return false;
+    if (device_ == device_type::gpu) return true;
+    if (device_ == device_type::auto_) return metal::pending();
+    return false;
+  }
+
+  static metal::kop to_kop_(op_t op) {
+    switch (op) {
+      case op_t::add: return metal::kop::add;
+      case op_t::sub: return metal::kop::sub;
+      case op_t::mul: return metal::kop::mul;
+      case op_t::div: return metal::kop::div;
+      case op_t::exp_: return metal::kop::exp_;
+      case op_t::log_: return metal::kop::log_;
+      case op_t::sqrt_: return metal::kop::sqrt_;
+      case op_t::sigmoid: return metal::kop::sigmoid;
+      case op_t::relu: return metal::kop::relu;
+      default: return metal::kop::affine;
+    }
+  }
+
+  static std::optional<array> metal_binary(const node& n, const array& a,
+                                           const array& b) {
+    if (!metal_mode_() || !a.contiguous() || !b.contiguous() ||
+        a.shape() != b.shape()) {
+      return std::nullopt;
+    }
+    if (!a.storage_.native || !b.storage_.native) return std::nullopt;
+    auto out = array::empty(n.shape);
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    if (!metal::binary(to_kop_(n.op), a.storage_.native, a.offset_ * 4,
+                       b.storage_.native, b.offset_ * 4, out.storage_.native,
+                       out.offset_ * 4, out.size(), n.scale, n.offset)) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
+  static std::optional<array> metal_unary(metal::kop k, const array& a,
+                                          float scale, float offset) {
+    if (!metal_mode_() || !a.contiguous()) return std::nullopt;
+    if (!a.storage_.native) return std::nullopt;
+    auto out = array::empty(a.shape());
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    if (!metal::unary(k, a.storage_.native, a.offset_ * 4, out.storage_.native,
+                      out.offset_ * 4, out.size(), scale, offset)) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
   // One topological pass over all roots (MLX-style batch eval), then each
   // node evaluates through eval_one. Iterative DFS: recursion depth must not
   // bound graph depth.
@@ -933,6 +993,7 @@ struct graph {
       }
     }
     for (auto* n : order) eval_one(*n);
+    metal::flush();  // blocking eval: the batch is done when run() returns
   }
 
   static void eval_one(node& n) {
@@ -947,7 +1008,10 @@ struct graph {
       case op_t::mul:
       case op_t::div: {
         auto a = in(0), b = in(1);
-        if (auto o = accel::binary(n.op, a, b)) {
+        if (auto g = metal_binary(n, a, b)) {
+          r = std::move(*g);
+          epi_done = true;  // kernels apply the epilogue in the store
+        } else if (auto o = accel::binary(n.op, a, b)) {
           r = std::move(*o);
         } else if (n.op == op_t::add) {
           r = map_binary(a, b, std::plus<float>());
@@ -996,7 +1060,9 @@ struct graph {
       case op_t::affine: {
         float s = n.scale, o = n.offset;
         auto a = in(0);
-        if (auto out = accel::affine(a, s, o)) {
+        if (auto g = metal_unary(metal::kop::affine, a, s, o)) {
+          r = std::move(*g);
+        } else if (auto out = accel::affine(a, s, o)) {
           r = std::move(*out);
         } else {
           r = map_unary(a, [s, o](float x) { return x * s + o; });
@@ -1012,7 +1078,10 @@ struct graph {
       case op_t::sqrt_:
       case op_t::relu: {
         auto a = in(0);
-        if (auto o = accel::unary(n.op, a)) {
+        if (auto g = metal_unary(to_kop_(n.op), a, n.scale, n.offset)) {
+          r = std::move(*g);
+          epi_done = true;
+        } else if (auto o = accel::unary(n.op, a)) {
           r = std::move(*o);
         } else if (n.op == op_t::exp_) {
           r = map_unary(a, [](float x) { return std::exp(x); });
@@ -1025,10 +1094,17 @@ struct graph {
         }
         break;
       }
-      case op_t::sigmoid:
-        r = map_unary(in(0),
-                      [](float x) { return 1.0f / (1.0f + std::exp(-x)); });
+      case op_t::sigmoid: {
+        auto a = in(0);
+        if (auto g = metal_unary(metal::kop::sigmoid, a, n.scale, n.offset)) {
+          r = std::move(*g);
+          epi_done = true;
+        } else {
+          r = map_unary(a,
+                        [](float x) { return 1.0f / (1.0f + std::exp(-x)); });
+        }
         break;
+      }
       case op_t::softmax:
         r = ref::softmax(in(0));
         break;

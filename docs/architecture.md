@@ -24,7 +24,29 @@ keeps autograd/VJP; this library owns the graph, fusion, and execution).
  (M1, permanent)        oracle and universal fallback
 ```
 
-## Current state (M3a: Accelerate backend + dispatch seam)
+## Current state (M3b stage 1: Metal elementwise + command-buffer batching)
+
+- `objc.h` — minimal objc_msgSend bridge (header-only, no .mm files).
+- `metal.h` — device/queue/PSO context (lazy singleton), size-keyed
+  MTLBuffer pool, `#embed`'d MSL JIT-compiled on first dispatch, one
+  long-lived command buffer: dispatches accumulate, `flush()` = end +
+  commit + waitUntilCompleted at the end of every `graph::run`.
+  Non-Apple builds get inline stubs — callers have no `#ifdef`s.
+- `storage.h` — when a Metal device exists every buffer is a pooled
+  shared-mode MTLBuffer (unified memory); heap otherwise.
+- **CPU/GPU handoff**: every CPU-side read funnels through
+  `array::raw()`/`data()`, which call `metal::cpu_barrier()` (flush if
+  pending). One choke point makes arbitrarily mixed graphs safe — tested
+  gpu→cpu and cpu→gpu both ways.
+- Kernels: elementwise binary/unary/affine, all applying the graph's affine
+  epilogue in the store (`fma(op, scale, offset)`), kernel bodies shared via
+  macro (silarray edge-tile lesson). Metal gemm/softmax/reductions are
+  stage 2.
+- Dispatch order in `eval_one`: `metal (gpu mode) → accel → ref`.
+  `auto` joins a pending GPU pipeline but never starts one — measured
+  thresholds land with bench data.
+
+## Earlier state (M3a: Accelerate backend + dispatch seam)
 
 - `accel::` (in array.h; graduates to its own header with Metal) — vDSP /
   vForce / CBLAS fast paths tried from `graph::eval_one`, `ref::` as
@@ -65,7 +87,8 @@ keeps autograd/VJP; this library owns the graph, fusion, and execution).
 | M1 ✅ | Core skeleton + reference CPU implementation + tests + CI |
 | M2 ✅ | Lazy graph, topo-sort eval, build-time peephole fusion |
 | M3a ✅ | Accelerate CPU backend + dispatch seam + bench harness |
-| M3b | Metal GPU backend (`#embed` MSL) |
+| M3b-1 ✅ | Metal foundation: context, buffer pool, elementwise kernels, batching |
+| M3b-2 | Metal SGEMM ladder, softmax, reductions; auto-mode thresholds |
 | M4 | culebra integration (TensorImpl wraps tl::array; F32 unification) |
 | M5 | Own CPU backend: threadpool + BLIS-style microkernels (AVX2/AVX-512/NEON, runtime dispatch) |
 | M6 | Own CUDA backend: dlopen'd driver API, PTX `#embed`, SGEMM ladder |

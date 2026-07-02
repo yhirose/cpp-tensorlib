@@ -114,6 +114,35 @@ int main() {
         });
   }
 
+  if (tl::gpu_available()) {
+    int64_t n = 1 << 22;  // 4M — large enough to be bandwidth-bound
+    auto a = random_array({n}, 8);
+    auto b = random_array({n}, 9);
+    report(
+        "gpu add 4M", static_cast<double>(n),
+        [&] {
+          tl::use_gpu();
+          (a + b).eval();
+          tl::use_cpu();
+        },
+        [&] { (a + b).eval(); });
+    report(
+        "gpu ew-chain x8 4M (1 flush)", 8.0 * 3 * n,
+        [&] {
+          tl::use_gpu();
+          auto x = a;
+          for (int i = 0; i < 8; i++) x = (x * 1.01f + b * 0.1f).relu();
+          x.eval();
+          tl::use_cpu();
+        },
+        [&] {
+          auto x = a;
+          for (int i = 0; i < 8; i++) x = (x * 1.01f + b * 0.1f).relu();
+          x.eval();
+        });
+    std::printf("\n");
+  }
+
   // training-step composite: forward + backward-ish chain
   {
     auto x = random_array({100, 784}, 5);

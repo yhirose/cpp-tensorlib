@@ -10,7 +10,8 @@ add_library(tensorlib INTERFACE)
 target_include_directories(tensorlib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 if(APPLE)
-  target_link_libraries(tensorlib INTERFACE "-framework Accelerate")
+  target_link_libraries(tensorlib INTERFACE
+    "-framework Accelerate" "-framework Metal" "-framework Foundation")
 endif()
 
 if(TENSORLIB_CUDA)
