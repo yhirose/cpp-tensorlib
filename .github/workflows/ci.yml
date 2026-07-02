@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  # 全OSで cpu / gpu / auto の3モードを実行する。
+  # GitHub hosted runner のGPU事情:
+  #   - macos-15 (arm64): paravirtual GPU 経由で Metal が動く → 実GPUテスト
+  #   - ubuntu / windows: GPUなし → gpu/auto はCPUフォールバック経路の検証
+  test:
+    name: test / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test (cpu / gpu / auto)
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # CUDAツールチェーンのビルド検証。hosted runner にNVIDIAドライバは無いので
+  # カーネルはコンパイル・リンクのみ。テスト実行は「ドライバ不在環境での
+  # dlopenフォールバック」の検証を兼ねる（これ自体が恒久的なテスト対象）。
+  cuda-build:
+    name: cuda build+fallback / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DTENSORLIB_CUDA=ON
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test (CPU fallback — no driver on hosted runners)
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # 実CUDA GPUでの実行テストは CI では行わない方針（有料GPU runnerは
+  # Org必須+従量課金、self-hostedは管理の手間があるため断念。2026-07）。
+  # CUDAの数値回帰は NVIDIA 実機で `ctest --test-dir build` を手動実行する。
+  # 将来方針を変える場合はランナーを登録し HAS_GPU_RUNNER=true で有効化。
+  cuda-gpu:
+    if: vars.HAS_GPU_RUNNER == 'true'
+    name: cuda gpu / self-hosted
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DTENSORLIB_CUDA=ON
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test (cpu / gpu / auto on real GPU)
+        run: ctest --test-dir build -C Release --output-on-failure

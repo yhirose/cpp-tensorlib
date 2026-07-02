@@ -1,0 +1,35 @@
+cmake_minimum_required(VERSION 3.25)
+project(tensorlib LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+option(TENSORLIB_CUDA "Build the CUDA backend (needs CUDA Toolkit at build time only)" OFF)
+
+add_library(tensorlib INTERFACE)
+target_include_directories(tensorlib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+if(TENSORLIB_CUDA)
+  enable_language(CUDA)
+  # Build-size policy: SASS for the majors we ship + PTX fallback for newer
+  # (see docs/performance-notes.md once it lands). 80 alone is fine for the
+  # CI build check.
+  if(NOT CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 80)
+  endif()
+  add_library(tensorlib_cuda_kernels OBJECT kernels/smoke.cu)
+endif()
+
+enable_testing()
+
+add_executable(tensorlib_test test/test_basic.cpp test/test_array.cpp)
+target_link_libraries(tensorlib_test PRIVATE tensorlib)
+if(TENSORLIB_CUDA)
+  target_sources(tensorlib_test PRIVATE $<TARGET_OBJECTS:tensorlib_cuda_kernels>)
+  target_compile_definitions(tensorlib_test PRIVATE TENSORLIB_CUDA_ENABLED)
+endif()
+
+# The same binary runs in three device modes (silarray convention).
+add_test(NAME cpu  COMMAND tensorlib_test --cpu)
+add_test(NAME gpu  COMMAND tensorlib_test --gpu)
+add_test(NAME auto COMMAND tensorlib_test --auto)
