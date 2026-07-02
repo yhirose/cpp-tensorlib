@@ -162,6 +162,10 @@ using node_ptr = std::shared_ptr<node>;
 
 struct graph;
 
+// Evaluation hook (TL_RUNTIME_HOOKS; see storage.h). Installed alongside
+// the storage/barrier hooks by tl::install_runtime_hooks().
+inline void (*run_hook)(const std::vector<node_ptr>&) = nullptr;
+
 }  // namespace detail
 
 class array {
@@ -183,6 +187,11 @@ class array {
   int64_t size() const { return detail::num_elements(shape_); }
   bool contiguous() const;
   bool defined() const { return storage_.buf != nullptr || node_ != nullptr; }
+
+  // True when the data is materialized (no pending lazy graph). Conservative:
+  // an evaluated-but-not-yet-adopted node reads as false; any data access
+  // adopts it.
+  bool materialized() const { return storage_.buf != nullptr && !node_; }
 
   // Data access — forces evaluation. data() additionally requires a
   // contiguous array; raw() is the strided base pointer kernels consume.
@@ -351,15 +360,29 @@ inline bool array::contiguous() const {
   return strides_ == detail::contiguous_strides(shape_);
 }
 
+namespace detail {
+
+// The one choke point making mixed CPU/GPU graphs safe: every CPU-side
+// buffer access flushes pending GPU work first.
+inline void barrier_() {
+#ifdef TL_RUNTIME_HOOKS
+  if (cpu_barrier_hook) cpu_barrier_hook();
+#else
+  metal::cpu_barrier();
+#endif
+}
+
+}  // namespace detail
+
 inline const float* array::raw() const {
   ensure_();
-  metal::cpu_barrier();  // the one choke point making mixed CPU/GPU graphs safe
+  detail::barrier_();
   return storage_.data() + offset_;
 }
 
 inline float* array::data() {
   ensure_();
-  metal::cpu_barrier();
+  detail::barrier_();
   if (!contiguous()) {
     throw std::logic_error("tl::data: non-contiguous view; use clone()");
   }
@@ -1249,7 +1272,17 @@ struct graph {
 
 inline void array::ensure_() const {
   if (!node_) return;
-  if (!node_->evaluated) detail::graph::run({node_});
+  if (!node_->evaluated) {
+#ifdef TL_RUNTIME_HOOKS
+    if (!detail::run_hook) {
+      throw std::logic_error(
+          "tl: evaluation before install_runtime_hooks() (TL_RUNTIME_HOOKS)");
+    }
+    detail::run_hook({node_});
+#else
+    detail::graph::run({node_});
+#endif
+  }
   auto* self = const_cast<array*>(this);
   self->storage_ = node_->stor;
   self->strides_ = node_->strides;
@@ -1461,6 +1494,16 @@ inline array concat(const std::vector<array>& parts) {
     po += p.size();
   }
   return out;
+}
+
+// Install the execution-engine hooks (TL_RUNTIME_HOOKS builds). Call once,
+// before any evaluation, from the embedder's tensor feature loader. This is
+// the only function referencing the evaluator and device backends by name —
+// keep it out of translation units that must stay backend-free.
+inline void install_runtime_hooks() {
+  detail::storage_make_hook = &storage::make_device_;
+  detail::cpu_barrier_hook = &metal::cpu_barrier;
+  detail::run_hook = &detail::graph::run;
 }
 
 inline bool array_equal(const array& a, const array& b) {
