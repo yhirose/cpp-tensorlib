@@ -23,7 +23,9 @@
 
 #include <objc.h>
 
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -38,7 +40,8 @@ namespace metal {
 
 enum class kop {
   add, sub, mul, div, exp_, log_, sqrt_, sigmoid, relu, affine,
-  sgemm, softmax, row_sum, row_max
+  sgemm32, sgemm32x64, sgemm64x32, sgemm64, steel, steel32x64,
+  softmax, row_sum, row_max
 };
 
 #ifdef __APPLE__
@@ -87,7 +90,12 @@ struct context {
       case kop::sigmoid: return "sigmoid_";
       case kop::relu: return "relu_";
       case kop::affine: return "affine_";
-      case kop::sgemm: return "sgemm_";
+      case kop::sgemm32: return "sgemm_32_";
+      case kop::sgemm32x64: return "sgemm_32x64_";
+      case kop::sgemm64x32: return "sgemm_64x32_";
+      case kop::sgemm64: return "sgemm_64_";
+      case kop::steel: return "sgemm_steel_";
+      case kop::steel32x64: return "sgemm_steel_32x64_";
       case kop::softmax: return "softmax_";
       case kop::row_sum: return "row_sum_";
       case kop::row_max: return "row_max_";
@@ -236,6 +244,7 @@ namespace detail_ {
 
 struct gemm_params {
   uint32_t M, N, K, lda, ldb, trans_a, trans_b;
+  uint32_t a_fast, b_fast;  // float4 loader eligibility, verified host-side
   float scale, offset;
 };
 
@@ -266,7 +275,41 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b,
                  int64_t m, int64_t n, int64_t k, float scale, float offset) {
   auto& c = context::get();
   if (!c.device) return false;
-  auto pso = c.pso_(kop::sgemm);
+  // Dispatch ladder. STEEL (BN=64 bands) covers NN shapes with enough width;
+  // BM band follows silarray (M < 97 → 32×64 tiles). Transposed or narrow
+  // shapes take the simple-tile family, which reads transposed views in
+  // place. Gates are provisional pending a full census vs PyTorch-MPS.
+  bool steel = !ta && !tb && m >= 16 && n >= 48 && k >= 16;
+  kop kk_;
+  unsigned long bm, bn;
+  uint32_t fast_a, fast_b;  // STEEL reuses the a_fast slot for swizzle_log
+  unsigned long gx, gy;
+  if (steel) {
+    bool band32 = m < 97;
+    kk_ = band32 ? kop::steel32x64 : kop::steel;
+    bm = band32 ? 32 : 64;
+    bn = 64;
+    unsigned long tiles_n = (static_cast<unsigned long>(n) + bn - 1) / bn;
+    unsigned long tiles_m = (static_cast<unsigned long>(m) + bm - 1) / bm;
+    uint32_t swizzle_log = 0;  // threadgroup swizzle for L2 reuse
+    while ((tiles_n >> (swizzle_log + 1)) >= 1 && swizzle_log < 3)
+      swizzle_log++;
+    fast_a = swizzle_log;
+    fast_b = 0;
+    gx = tiles_n << swizzle_log;
+    gy = (tiles_m + ((1ul << swizzle_log) - 1)) >> swizzle_log;
+  } else {
+    kk_ = m >= 64 ? kop::sgemm64x32 : kop::sgemm32;
+    bm = m >= 64 ? 64 : 32;
+    bn = 32;
+    // float4 loader eligibility: row-major operand only (Apple GPUs handle
+    // the unaligned vector loads; transposed operands use the strided path).
+    fast_a = !ta ? 1u : 0u;
+    fast_b = !tb ? 1u : 0u;
+    gx = (static_cast<unsigned long>(n) + bn - 1) / bn;
+    gy = (static_cast<unsigned long>(m) + bm - 1) / bm;
+  }
+  auto pso = c.pso_(kk_);
   c.ensure_encoder_();
   objc::send(c.enc, "setComputePipelineState:", pso);
   detail_::set_buf_(c.enc, a, ao, 0ul);
@@ -275,12 +318,11 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b,
   detail_::gemm_params p{static_cast<uint32_t>(m),   static_cast<uint32_t>(n),
                          static_cast<uint32_t>(k),   static_cast<uint32_t>(lda),
                          static_cast<uint32_t>(ldb), ta ? 1u : 0u,
-                         tb ? 1u : 0u,               scale,
+                         tb ? 1u : 0u,               fast_a,
+                         fast_b,                     scale,
                          offset};
   objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
              static_cast<unsigned long>(sizeof(p)), 3ul);
-  unsigned long gx = (static_cast<unsigned long>(n) + 31) / 32;
-  unsigned long gy = (static_cast<unsigned long>(m) + 31) / 32;
   detail_::dispatch_grid_(c.enc, {gx, gy, 1}, {128, 1, 1});
   return true;
 }

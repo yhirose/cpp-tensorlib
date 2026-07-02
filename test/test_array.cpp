@@ -311,6 +311,9 @@ TEST_CASE("metal SGEMM / softmax / reductions match oracle") {
   struct { int64_t m, k, n; } shapes[] = {
       {32, 16, 32}, {64, 64, 64}, {33, 17, 31}, {1, 1, 1},
       {1, 128, 1}, {100, 784, 50}, {50, 50, 10}, {17, 3, 129},
+      // STEEL band (NN, n >= 48): aligned, M-edge, N-edge, corner, K-rem
+      {128, 64, 128}, {70, 32, 128}, {128, 32, 100}, {70, 30, 100},
+      {97, 33, 65}, {16, 16, 48}, {200, 129, 64},
   };
   int seed = 30;
   for (auto s : shapes) {

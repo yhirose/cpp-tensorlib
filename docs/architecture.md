@@ -24,7 +24,20 @@ keeps autograd/VJP; this library owns the graph, fusion, and execution).
  (M1, permanent)        oracle and universal fallback
 ```
 
-## Current state (M3b-2: Metal SGEMM, softmax, reductions)
+## Current state (M3b-3: STEEL SGEMM sprint)
+
+- STEEL kernels (`sgemm_steel_` 64×64, `sgemm_steel_32x64_` for M < 97)
+  ported from silarray/MLX: float2 fragment registers, precomputed loader
+  pointers, serpentine MMA, threadgroup swizzle, split edge loops
+  (interior / M-edge / N-edge / corner), affine-epilogue store shared
+  between interior and edge paths. NN operands only for now.
+- Dispatch ladder in `metal::gemm`: STEEL band (NN, m ≥ 16, n ≥ 48,
+  k ≥ 16, BM by M band) → simple-tile family (64×32 / 32×32; handles
+  transposed views in place via strided loaders + float4 fast path).
+- 2048³ sgemm: ~1300 → **~3200 GFLOP/s** over the sprint (loaded machine;
+  see performance-notes.md for the step-by-step history and census).
+
+## Earlier state (M3b-2: Metal SGEMM, softmax, reductions)
 
 - `metal_kernels.metal` adds: `sgemm_` (32×32×16 simdgroup-matrix tile,
   trans_a/trans_b in-place loaders, affine epilogue fused in the store,
@@ -104,6 +117,7 @@ keeps autograd/VJP; this library owns the graph, fusion, and execution).
 | M3a ✅ | Accelerate CPU backend + dispatch seam + bench harness |
 | M3b-1 ✅ | Metal foundation: context, buffer pool, elementwise kernels, batching |
 | M3b-2 ✅ | Metal SGEMM (tiled), softmax, last-axis reductions; full GPU MLP fwd |
+| M3b-3 ✅ | STEEL SGEMM sprint: 2048³ ~1300 → ~3200 GFLOP/s |
 | M4 | culebra integration (TensorImpl wraps tl::array; F32 unification) |
 | M4 | culebra integration (TensorImpl wraps tl::array; F32 unification) |
 | M5 | Own CPU backend: threadpool + BLIS-style microkernels (AVX2/AVX-512/NEON, runtime dispatch) |

@@ -39,25 +39,41 @@ for that band only) — do not ship a silent loss.
 
 ## Current baselines (M1 Pro, interleaved medians)
 
-| Op | Backend | Number | Note |
-|---|---|---|---|
-| sgemm 1024³ | Accelerate | ~980 GFLOP/s | AMX; strong at all sizes |
-| sgemm 2048³ | Metal (32×32×16 tile) | ~1300 GFLOP/s | **functional, not yet tuned** |
-| sgemm ≤1024³ | Metal | slower than accel-cpu | GPU wins only ≥2048 so far |
+Sprint history for Metal SGEMM at 2048³ (all measured under load avg 5–9,
+so treat as lower bounds):
 
-**Known gap (M3b-2):** the Metal SGEMM is a basic 32×32×16 tile (4
-simdgroups, FM=FN=2). M1 Pro GPU fp32 ceiling is ~4–5 TFLOP/s, so there is
-~3× headroom. The optimization pass — larger 64×64 tiles with register
-blocking, float4 vectorized loads on the non-transposed path, threadgroup
-swizzle for L2 reuse (silarray's STEEL design) — is deferred to a dedicated
-kernel-census sprint against the PyTorch-MPS gate. Do NOT hand-tune before
-running the census; the current kernel is correct and that is what M3b-2
-locked in. Elementwise/softmax/reductions are bandwidth-bound and already
-near their ceiling.
+| Step | 2048³ | 1024³ |
+|---|---|---|
+| M3b-2 basic 32×32×16 tile, scalar loads | ~1300 GFLOP/s | ~1080 |
+| + float4 fast loaders (host-gated) | ~2170 | ~1060 |
+| + STEEL port (frag registers, swizzle, split edge loops) | **~3200** | **~1700–1960** |
+
+Reference points: Accelerate (AMX) sgemm ≈ 980 GFLOP/s at 1024³ and stays
+~constant; M1 Pro GPU fp32 ceiling ≈ 4–5 TFLOP/s; MLX lands ≈ 3.5–4. The
+STEEL numbers were taken on a loaded machine — re-measure quiet before
+comparing against PyTorch-MPS for the gate.
+
+**Tile-config census (2026-07-02, loaded machine, simple-tile family):**
+32×32 ≈ 64×32 ≈ 32×64 all plateau at ~2000–2200 GFLOP/s at 2048³ — the
+bottleneck was the loader/pipeline structure, not tile size. 64×32 had the
+best small-size behavior and is the non-STEEL fallback.
+
+**Remaining SGEMM work:**
+- Transposed operands still use the simple-tile family (STEEL is NN-only
+  until SteelLoaderT is ported) — backward-pass matmuls (`xᵀ@g`, `g@Wᵀ`)
+  are the motivating shapes.
+- Function-constant specialization (fc_mn_aligned / fc_k_aligned) not yet
+  ported; runtime branches instead. silarray measured conv2d FCs equivalent,
+  but gemm may differ — measure before porting.
+- Narrow-N band (n < 48) and small shapes stay CPU-bound → auto-mode
+  thresholds are the fix, not kernel work.
 
 ## Refuted approaches — do not retry without new evidence
 
-(none yet — add entries as they are refuted, with data)
+| Approach | Verdict | Data |
+|---|---|---|
+| Naive 64×64 tile via the simple `sgemm_body_` template (full `simdgroup_matrix` locals, 16 accumulators) | **Catastrophic** | 133 GFLOP/s at 2048³ vs 2175 for 32×32 — the "16-accumulator occupancy crisis" silarray hit; STEEL's explicit float2 fragment registers are what make 16 accumulators viable |
+| Host-side alignment gating of float4 loaders (require ld%4==0, 16B base) | **Unnecessary** | silarray/MLX issue vector loads at any alignment on Apple GPUs in practice (bench shapes with ldb=50); gate removed |
 
 Inherited from silarray (Metal; re-verify before assuming they transfer to
 CUDA): spin-wait on command-buffer status (slower), split commits to overlap
