@@ -195,7 +195,7 @@ inline void dispatch_(objc::id enc, objc::id pso, const ew_params& p,
   objc::send(enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
              static_cast<unsigned long>(sizeof(p)), params_index);
   unsigned long groups = (p.n + 255ul) / 256ul;
-  using dispatch_fn = void (*)(objc::id, SEL, mtl_size, mtl_size);
+  using dispatch_fn = void (*)(objc::id, objc::sel_t, mtl_size, mtl_size);
   reinterpret_cast<dispatch_fn>(objc_msgSend)(
       enc, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"),
       mtl_size{groups, 1, 1}, mtl_size{256, 1, 1});
@@ -259,7 +259,7 @@ inline void set_buf_(objc::id enc, void* buf, int64_t off, unsigned long idx) {
 }
 
 inline void dispatch_grid_(objc::id enc, mtl_size grid, mtl_size tg) {
-  using fn = void (*)(objc::id, SEL, mtl_size, mtl_size);
+  using fn = void (*)(objc::id, objc::sel_t, mtl_size, mtl_size);
   reinterpret_cast<fn>(objc_msgSend)(
       enc, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"),
       grid, tg);
