@@ -24,27 +24,33 @@ keeps autograd/VJP; this library owns the graph, fusion, and execution).
  (M1, permanent)        oracle and universal fallback
 ```
 
-## Current state (M1)
+## Current state (M2)
 
 - `types.h` — device mode switch (`use_cpu`/`use_gpu`/`use_auto`),
   `gpu_available()`.
 - `storage.h` — shared flat F32 buffer; the seam where device residency and
   pooled recycling attach later.
 - `array.h` — `tl::array`: shapes/strides, zero-copy views (transpose,
-  reshape, slice), numpy broadcast rules, eager reference ops. `eval()` is
-  already in the API (no-op) so call sites survive the lazy switch in M2.
-
-Everything evaluates through `detail::for_each_index`, a strided index
-walker: views, broadcasts and transposed operands all reduce to strides, so
-one loop shape serves every op. It is deliberately naive — backends replace
-it on the hot paths; it stays as oracle and fallback.
+  reshape, slice), numpy broadcast rules, lazy graph + fusion + evaluation:
+  - **Graph**: ops build `detail::node`s; output shapes are computed (and
+    shape errors thrown) at build time. `tl::eval(...)` / any data access
+    runs one iterative topo-sort pass over all roots.
+  - **Fusion**: every node carries an affine epilogue
+    (`result = op(...) * scale + offset`). Scalar chains compose into the
+    producing node — including binaries, `dot` and reductions — by copying
+    it with a composed epilogue. Fusion never mutates an existing node, so
+    shared intermediates stay valid (tested).
+  - **`ref::` backend**: naive strided kernels over materialized arrays.
+    Everything reduces to strides via `detail::for_each_index`, so one loop
+    shape serves every op/view/broadcast. The oracle and fallback; real
+    backends replace it per-op in `detail::graph::eval_one`.
 
 ## Milestones
 
 | | Scope |
 |---|---|
 | M1 ✅ | Core skeleton + reference CPU implementation + tests + CI |
-| M2 | Lazy graph, topo-sort eval, build-time peephole fusion |
+| M2 ✅ | Lazy graph, topo-sort eval, build-time peephole fusion |
 | M3 | macOS backend (Accelerate + Metal, `#embed` MSL) + bench harness |
 | M4 | culebra integration (TensorImpl wraps tl::array; F32 unification) |
 | M5 | Own CPU backend: threadpool + BLIS-style microkernels (AVX2/AVX-512/NEON, runtime dispatch) |

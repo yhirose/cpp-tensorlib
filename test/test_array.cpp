@@ -183,9 +183,92 @@ TEST_CASE("edge shapes") {
   CHECK((empty + empty).size() == 0);
 }
 
-TEST_CASE("eval is a no-op contract in M1") {
-  auto a = array::ones({2, 2});
-  auto b = (a + a).eval();
-  tl::eval(a, b);
-  CHECK(b.at({0, 0}) == 2.0f);
+TEST_CASE("lazy graph: build then eval") {
+  auto a = array::from({1, 2, 3, 4}, {2, 2});
+  auto b = array::ones({2, 2});
+
+  auto c = a + b;            // lazy node
+  CHECK(c.shape() == tl::shape_t{2, 2});  // shape known before eval
+  CHECK(c.at({1, 1}) == 5.0f);            // access forces eval
+
+  // batch eval: one topological pass over multiple roots
+  auto d = a * b;
+  auto e = a - b;
+  tl::eval(d, e);
+  CHECK(d.at({0, 1}) == 2.0f);
+  CHECK(e.at({0, 0}) == 0.0f);
+
+  // shape errors surface at build time, not at eval
+  CHECK_THROWS(a + array::zeros({3, 3}));
+  CHECK_THROWS(a.dot(array::zeros({3, 3})));
+}
+
+TEST_CASE("affine fusion composes scalar chains") {
+  auto a = array::from({1, 2, 3, 4}, {2, 2});
+
+  // chain of scalar ops folds into one node: ((a*2)+1)*3 = a*6+3
+  auto c = ((a * 2.0f) + 1.0f) * 3.0f;
+  CHECK(c.at({0, 0}) == 9.0f);
+  CHECK(c.at({1, 1}) == 27.0f);
+
+  // s-a and 1/s forms
+  auto d = (10.0f - a) / 2.0f;
+  CHECK(d.at({0, 0}) == 4.5f);
+  auto r = 12.0f / a;
+  CHECK(r.at({0, 1}) == 6.0f);
+
+  // epilogue folds into a binary producer: (a+a)*2-1
+  auto e = (a + a) * 2.0f - 1.0f;
+  CHECK(e.at({1, 0}) == 11.0f);
+
+  // ... and into dot (the gemm-epilogue shape, fused at graph level)
+  auto w = array::ones({2, 2});
+  auto f = a.dot(w) * 0.5f;
+  CHECK(f.at({0, 0}) == 1.5f);
+  CHECK(f.at({1, 1}) == 3.5f);
+
+  // ... and into reductions
+  auto g = a.sum(1) * 10.0f;
+  CHECK(g.at({0}) == 30.0f);
+}
+
+TEST_CASE("fusion must not corrupt shared intermediates") {
+  auto a = array::from({1, 2, 3, 4}, {2, 2});
+
+  // t is consumed by two fused epilogues AND read directly: the composed
+  // copies must leave t's own node untouched.
+  auto t = a + a;
+  auto u = t * 2.0f;
+  auto v = t * 3.0f;
+  CHECK(u.at({0, 0}) == 4.0f);
+  CHECK(v.at({0, 0}) == 6.0f);
+  CHECK(t.at({0, 0}) == 2.0f);
+
+  // diamond: the shared node evaluates once, both consumers see it
+  auto c = a + a;
+  auto d = c * c;
+  CHECK(d.at({1, 1}) == 64.0f);
+
+  // graph rebuild on materialized results
+  auto e = (a + a).eval();
+  auto f = e + 1.0f;
+  CHECK(f.at({0, 0}) == 3.0f);
+}
+
+TEST_CASE("lazy chains through views and activations") {
+  auto a = array::from({1, 2, 3, 4, 5, 6}, {2, 3});
+
+  // view of a lazy result forces eval of the base, then stays zero-copy
+  auto t = (a * 2.0f).transpose();
+  CHECK(t.shape() == tl::shape_t{3, 2});
+  CHECK(t.at({2, 0}) == 6.0f);
+
+  // activation chain stays lazy end to end
+  auto s = (a - 3.0f).relu().sum(1);
+  CHECK(s.at({0}) == 0.0f);
+  CHECK(s.at({1}) == 6.0f);  // (1+2+3)
+
+  // softmax of a fused affine
+  auto sm = (a * 0.0f).softmax();
+  CHECK(sm.at({0, 0}) == doctest::Approx(1.0f / 3.0f));
 }
