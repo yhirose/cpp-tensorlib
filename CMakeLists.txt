@@ -9,6 +9,10 @@ option(TENSORLIB_CUDA "Build the CUDA backend (needs CUDA Toolkit at build time 
 add_library(tensorlib INTERFACE)
 target_include_directories(tensorlib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+if(APPLE)
+  target_link_libraries(tensorlib INTERFACE "-framework Accelerate")
+endif()
+
 if(TENSORLIB_CUDA)
   enable_language(CUDA)
   # Build-size policy: SASS for the majors we ship + PTX fallback for newer
@@ -28,6 +32,9 @@ if(TENSORLIB_CUDA)
   target_sources(tensorlib_test PRIVATE $<TARGET_OBJECTS:tensorlib_cuda_kernels>)
   target_compile_definitions(tensorlib_test PRIVATE TENSORLIB_CUDA_ENABLED)
 endif()
+
+add_executable(tensorlib_bench bench/bench_main.cpp)
+target_link_libraries(tensorlib_bench PRIVATE tensorlib)
 
 # The same binary runs in three device modes (silarray convention).
 add_test(NAME cpu  COMMAND tensorlib_test --cpu)

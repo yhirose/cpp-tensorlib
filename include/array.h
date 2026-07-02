@@ -18,6 +18,10 @@
 #include <storage.h>
 #include <types.h>
 
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -25,6 +29,7 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -642,6 +647,136 @@ inline array sum_to(const array& a, const shape_t& target) {
 
 }  // namespace ref
 
+// Accelerate backend (macOS) --------------------------------------------------
+//
+// First real backend: vDSP/vForce/CBLAS fast paths tried from eval_one, with
+// ref:: as the fallback for shapes they don't cover (broadcast, non-
+// contiguous except CBLAS-mappable transposes). Every function returns
+// nullopt/false when ineligible or on non-Apple builds, so eval_one carries
+// no platform conditionals. Graduates to its own header alongside the Metal
+// backend (M3b).
+
+namespace accel {
+
+inline bool enabled_() {
+#ifdef __APPLE__
+  return use_accelerate_;
+#else
+  return false;
+#endif
+}
+
+inline std::optional<array> binary(detail::node::op_t op, const array& a,
+                                   const array& b) {
+#ifdef __APPLE__
+  using op_t = detail::node::op_t;
+  if (!enabled_() || !a.contiguous() || !b.contiguous() ||
+      a.shape() != b.shape()) {
+    return std::nullopt;
+  }
+  auto n = static_cast<vDSP_Length>(a.size());
+  auto out = array::empty(a.shape());
+  if (n == 0) return out;
+  const float* pa = a.raw();
+  const float* pb = b.raw();
+  float* po = out.data();
+  switch (op) {
+    // vDSP argument-order quirk: vsub/vdiv take the subtrahend/divisor FIRST.
+    case op_t::add: vDSP_vadd(pa, 1, pb, 1, po, 1, n); break;
+    case op_t::sub: vDSP_vsub(pb, 1, pa, 1, po, 1, n); break;  // po = a - b
+    case op_t::mul: vDSP_vmul(pa, 1, pb, 1, po, 1, n); break;
+    case op_t::div: vDSP_vdiv(pb, 1, pa, 1, po, 1, n); break;  // po = a / b
+    default: return std::nullopt;
+  }
+  return out;
+#else
+  (void)op; (void)a; (void)b;
+  return std::nullopt;
+#endif
+}
+
+inline std::optional<array> unary(detail::node::op_t op, const array& a) {
+#ifdef __APPLE__
+  using op_t = detail::node::op_t;
+  if (!enabled_() || !a.contiguous()) return std::nullopt;
+  auto out = array::empty(a.shape());
+  if (a.size() == 0) return out;
+  int nn = static_cast<int>(a.size());
+  const float* pa = a.raw();
+  float* po = out.data();
+  switch (op) {
+    case op_t::exp_:  vvexpf(po, pa, &nn); break;
+    case op_t::log_:  vvlogf(po, pa, &nn); break;
+    case op_t::sqrt_: vvsqrtf(po, pa, &nn); break;
+    case op_t::relu: {
+      float lo = 0.0f;
+      vDSP_vthr(pa, 1, &lo, po, 1, static_cast<vDSP_Length>(nn));
+      break;
+    }
+    default: return std::nullopt;
+  }
+  return out;
+#else
+  (void)op; (void)a;
+  return std::nullopt;
+#endif
+}
+
+inline std::optional<array> affine(const array& a, float s, float o) {
+#ifdef __APPLE__
+  if (!enabled_() || !a.contiguous()) return std::nullopt;
+  auto out = array::empty(a.shape());
+  if (a.size() == 0) return out;
+  vDSP_vsmsa(a.raw(), 1, &s, &o, out.data(), 1,
+             static_cast<vDSP_Length>(a.size()));
+  return out;
+#else
+  (void)a; (void)s; (void)o;
+  return std::nullopt;
+#endif
+}
+
+// C = alpha * A @ B into a preallocated contiguous (m,n) array. Handles
+// operands whose layout maps onto CBLAS: row-major contiguous rows
+// (NoTrans, lda = row stride) or their transposed views (Trans) — silarray
+// lesson: reading transposed operands in place beats materializing them.
+inline bool gemm(const array& a, const array& b, array& out, float alpha) {
+#ifdef __APPLE__
+  if (!enabled_()) return false;
+  struct layout { CBLAS_TRANSPOSE trans; int ld; };
+  auto classify = [](const array& x) -> std::optional<layout> {
+    int64_t r = x.shape()[0], c = x.shape()[1];
+    int64_t s0 = x.strides()[0], s1 = x.strides()[1];
+    if (s1 == 1 && s0 >= std::max<int64_t>(c, 1)) {
+      return layout{CblasNoTrans, static_cast<int>(s0)};
+    }
+    if (s0 == 1 && s1 >= std::max<int64_t>(r, 1)) {
+      return layout{CblasTrans, static_cast<int>(s1)};
+    }
+    return std::nullopt;
+  };
+  auto la = classify(a), lb = classify(b);
+  if (!la || !lb) return false;
+  int64_t m = a.shape()[0], k = a.shape()[1], n = b.shape()[1];
+  if (m == 0 || n == 0) return true;  // out has no elements
+  if (k == 0) {
+    float* po = out.data();
+    for (int64_t i = 0; i < m * n; i++) po[i] = 0.0f;
+    return true;
+  }
+  cblas_sgemm(CblasRowMajor, la->trans, lb->trans, static_cast<int>(m),
+              static_cast<int>(n), static_cast<int>(k), alpha, a.raw(),
+              la->ld, b.raw(), lb->ld, 0.0f, out.data(),
+              static_cast<int>(n));
+  return true;
+#else
+  (void)a; (void)b; (void)out; (void)alpha;
+  return false;
+#endif
+}
+
+}  // namespace accel
+
 // Graph build + evaluation ----------------------------------------------------
 
 namespace detail {
@@ -808,17 +943,23 @@ struct graph {
       case op_t::constant:
         return;
       case op_t::add:
-        r = map_binary(in(0), in(1), std::plus<float>());
-        break;
       case op_t::sub:
-        r = map_binary(in(0), in(1), std::minus<float>());
-        break;
       case op_t::mul:
-        r = map_binary(in(0), in(1), std::multiplies<float>());
+      case op_t::div: {
+        auto a = in(0), b = in(1);
+        if (auto o = accel::binary(n.op, a, b)) {
+          r = std::move(*o);
+        } else if (n.op == op_t::add) {
+          r = map_binary(a, b, std::plus<float>());
+        } else if (n.op == op_t::sub) {
+          r = map_binary(a, b, std::minus<float>());
+        } else if (n.op == op_t::mul) {
+          r = map_binary(a, b, std::multiplies<float>());
+        } else {
+          r = map_binary(a, b, std::divides<float>());
+        }
         break;
-      case op_t::div:
-        r = map_binary(in(0), in(1), std::divides<float>());
-        break;
+      }
       case op_t::pow_:
         r = map_binary(in(0), in(1),
                        [](float x, float y) { return std::pow(x, y); });
@@ -854,7 +995,12 @@ struct graph {
         break;
       case op_t::affine: {
         float s = n.scale, o = n.offset;
-        r = map_unary(in(0), [s, o](float x) { return x * s + o; });
+        auto a = in(0);
+        if (auto out = accel::affine(a, s, o)) {
+          r = std::move(*out);
+        } else {
+          r = map_unary(a, [s, o](float x) { return x * s + o; });
+        }
         epi_done = true;
         break;
       }
@@ -862,27 +1008,51 @@ struct graph {
         r = map_unary(in(0), [](float x) { return 1.0f / x; });
         break;
       case op_t::exp_:
-        r = map_unary(in(0), [](float x) { return std::exp(x); });
-        break;
       case op_t::log_:
-        r = map_unary(in(0), [](float x) { return std::log(x); });
-        break;
       case op_t::sqrt_:
-        r = map_unary(in(0), [](float x) { return std::sqrt(x); });
+      case op_t::relu: {
+        auto a = in(0);
+        if (auto o = accel::unary(n.op, a)) {
+          r = std::move(*o);
+        } else if (n.op == op_t::exp_) {
+          r = map_unary(a, [](float x) { return std::exp(x); });
+        } else if (n.op == op_t::log_) {
+          r = map_unary(a, [](float x) { return std::log(x); });
+        } else if (n.op == op_t::sqrt_) {
+          r = map_unary(a, [](float x) { return std::sqrt(x); });
+        } else {
+          r = map_unary(a, [](float x) { return x > 0 ? x : 0.0f; });
+        }
         break;
+      }
       case op_t::sigmoid:
         r = map_unary(in(0),
                       [](float x) { return 1.0f / (1.0f + std::exp(-x)); });
         break;
-      case op_t::relu:
-        r = map_unary(in(0), [](float x) { return x > 0 ? x : 0.0f; });
-        break;
       case op_t::softmax:
         r = ref::softmax(in(0));
         break;
-      case op_t::dot:
-        r = ref::dot(in(0), in(1));
+      case op_t::dot: {
+        auto a = in(0), b = in(1);
+        array a2 = a.rank() == 1 ? a.reshape({1, a.size()}) : a;
+        array b2 = b.rank() == 1 ? b.reshape({b.size(), 1}) : b;
+        array out = array::empty({a2.shape()[0], b2.shape()[1]});
+        if (accel::gemm(a2, b2, out, n.scale)) {  // epilogue scale = alpha
+          if (n.offset != 0.0f) {
+            if (auto ofs = accel::affine(out, 1.0f, n.offset)) {
+              out = std::move(*ofs);
+            } else {
+              float o = n.offset;
+              out = map_unary(out, [o](float x) { return x + o; });
+            }
+          }
+          r = out.reshape(n.shape);
+          epi_done = true;
+        } else {
+          r = ref::dot(a, b);
+        }
         break;
+      }
       case op_t::sum_ax:
         r = ref::sum(in(0), n.axis, n.keepdims);
         break;
@@ -901,7 +1071,11 @@ struct graph {
     }
     if (!epi_done && (n.scale != 1.0f || n.offset != 0.0f)) {
       float s = n.scale, o = n.offset;
-      r = map_unary(r, [s, o](float x) { return x * s + o; });
+      if (auto out = accel::affine(r, s, o)) {
+        r = std::move(*out);
+      } else {
+        r = map_unary(r, [s, o](float x) { return x * s + o; });
+      }
     }
     store(n, r);
   }

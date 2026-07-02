@@ -2,7 +2,35 @@
 
 #include <tensorlib.h>
 
+#include <random>
+
 using tl::array;
+
+namespace {
+
+array random_array(tl::shape_t shape, unsigned seed) {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  size_t n = 1;
+  for (auto d : shape) n *= static_cast<size_t>(d);
+  std::vector<float> v(n);
+  for (auto& x : v) x = dist(rng);
+  return array::from(std::move(v), std::move(shape));
+}
+
+// Evaluate `build()` twice — accelerated and forced through the ref oracle —
+// and require the results to agree.
+template <typename F>
+bool matches_oracle(F build, float rtol = 1e-4f, float atol = 1e-5f) {
+  tl::use_accelerate_ = true;
+  auto fast = build().eval();
+  tl::use_accelerate_ = false;
+  auto oracle = build().eval();
+  tl::use_accelerate_ = true;
+  return tl::allclose(fast, oracle, rtol, atol);
+}
+
+}  // namespace
 
 TEST_CASE("creation and introspection") {
   auto a = array::zeros({2, 3});
@@ -181,6 +209,40 @@ TEST_CASE("edge shapes") {
   CHECK(empty.size() == 0);
   CHECK(empty.sum() == 0.0f);
   CHECK((empty + empty).size() == 0);
+}
+
+TEST_CASE("accelerated backend matches the ref oracle") {
+  // silarray lesson: edge shapes (1×1, single row/col, odd sizes) are where
+  // backend paths rot. Every dispatchable op class, aligned and edge.
+  auto a = random_array({33, 17}, 1);
+  auto b = random_array({17, 9}, 2);
+  auto c = random_array({33, 17}, 3);
+
+  CHECK(matches_oracle([&] { return a.dot(b); }));
+  CHECK(matches_oracle([&] { return a.dot(b) * 0.5f + 1.0f; }));  // alpha path
+  CHECK(matches_oracle([&] { return a.transpose().dot(c); }));    // CblasTrans
+  CHECK(matches_oracle([&] { return a.dot(c.transpose()); }));
+  CHECK(matches_oracle([&] { return a.transpose().dot(c).transpose().dot(b); }));
+  CHECK(matches_oracle([&] { return random_array({1, 1}, 4).dot(random_array({1, 1}, 5)); }));
+  CHECK(matches_oracle([&] { return random_array({1, 7}, 6).dot(random_array({7, 1}, 7)); }));
+  CHECK(matches_oracle([&] { return random_array({64}, 8).dot(random_array({64, 3}, 9)); }));
+
+  CHECK(matches_oracle([&] { return a + c; }));
+  CHECK(matches_oracle([&] { return a - c; }));
+  CHECK(matches_oracle([&] { return a * c; }));
+  CHECK(matches_oracle([&] { return a / (c + 2.0f); }));
+  CHECK(matches_oracle([&] { return a * 3.0f - 2.0f; }));  // fused affine
+  CHECK(matches_oracle([&] { return a.exp(); }));
+  CHECK(matches_oracle([&] { return (a + 2.0f).log(); }));
+  CHECK(matches_oracle([&] { return (a + 2.0f).sqrt(); }));
+  CHECK(matches_oracle([&] { return a.relu(); }));
+  CHECK(matches_oracle([&] { return (a + c) * 2.0f; }));  // binary + epilogue
+
+  // training-step shape: W - x^T@g*lr, the whole chain
+  auto x = random_array({8, 33}, 10);
+  auto g = random_array({8, 9}, 11);
+  auto w = random_array({33, 9}, 12);
+  CHECK(matches_oracle([&] { return w - x.transpose().dot(g) * 0.01f; }));
 }
 
 TEST_CASE("lazy graph: build then eval") {

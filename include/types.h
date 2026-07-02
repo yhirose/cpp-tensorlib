@@ -20,4 +20,9 @@ inline void use_auto() { device_ = device_type::auto_; }
 // runs all three modes so the fallback stays permanently tested.
 inline bool gpu_available() { return false; }
 
+// Testing/benchmark toggle: when false, evaluation ignores accelerated CPU
+// backends and runs everything through the ref:: oracle. Lets tests compare
+// backend results against the oracle in-process.
+inline bool use_accelerate_ = true;
+
 }  // namespace tl

@@ -24,7 +24,20 @@ keeps autograd/VJP; this library owns the graph, fusion, and execution).
  (M1, permanent)        oracle and universal fallback
 ```
 
-## Current state (M2)
+## Current state (M3a: Accelerate backend + dispatch seam)
+
+- `accel::` (in array.h; graduates to its own header with Metal) — vDSP /
+  vForce / CBLAS fast paths tried from `graph::eval_one`, `ref::` as
+  fallback. Every accel function returns nullopt/false when ineligible or on
+  non-Apple builds, so the evaluator carries no platform conditionals — this
+  is the dispatch seam Metal / CPU microkernels / CUDA plug into.
+- GEMM maps transposed views onto CblasTrans (no materialization) and takes
+  the fused epilogue scale as alpha. `tl::use_accelerate_ = false` forces
+  the oracle; tests compare both paths on every dispatchable op class
+  including edge shapes.
+- `bench/bench_main.cpp` — interleaved A/B medians (accel vs ref).
+
+## Earlier state (M2)
 
 - `types.h` — device mode switch (`use_cpu`/`use_gpu`/`use_auto`),
   `gpu_available()`.
@@ -51,7 +64,8 @@ keeps autograd/VJP; this library owns the graph, fusion, and execution).
 |---|---|
 | M1 ✅ | Core skeleton + reference CPU implementation + tests + CI |
 | M2 ✅ | Lazy graph, topo-sort eval, build-time peephole fusion |
-| M3 | macOS backend (Accelerate + Metal, `#embed` MSL) + bench harness |
+| M3a ✅ | Accelerate CPU backend + dispatch seam + bench harness |
+| M3b | Metal GPU backend (`#embed` MSL) |
 | M4 | culebra integration (TensorImpl wraps tl::array; F32 unification) |
 | M5 | Own CPU backend: threadpool + BLIS-style microkernels (AVX2/AVX-512/NEON, runtime dispatch) |
 | M6 | Own CUDA backend: dlopen'd driver API, PTX `#embed`, SGEMM ladder |
