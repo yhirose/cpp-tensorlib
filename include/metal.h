@@ -36,7 +36,10 @@ extern "C" void objc_autoreleasePoolPop(void*);
 namespace tl {
 namespace metal {
 
-enum class kop { add, sub, mul, div, exp_, log_, sqrt_, sigmoid, relu, affine };
+enum class kop {
+  add, sub, mul, div, exp_, log_, sqrt_, sigmoid, relu, affine,
+  sgemm, softmax, row_sum, row_max
+};
 
 #ifdef __APPLE__
 
@@ -84,6 +87,10 @@ struct context {
       case kop::sigmoid: return "sigmoid_";
       case kop::relu: return "relu_";
       case kop::affine: return "affine_";
+      case kop::sgemm: return "sgemm_";
+      case kop::softmax: return "softmax_";
+      case kop::row_sum: return "row_sum_";
+      case kop::row_max: return "row_max_";
     }
     return "";
   }
@@ -225,6 +232,79 @@ inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo,
   return true;
 }
 
+namespace detail_ {
+
+struct gemm_params {
+  uint32_t M, N, K, lda, ldb, trans_a, trans_b;
+  float scale, offset;
+};
+
+struct reduce_params {
+  uint32_t rows, cols;
+  float scale, offset;
+};
+
+inline void set_buf_(objc::id enc, void* buf, int64_t off, unsigned long idx) {
+  objc::send(enc, "setBuffer:offset:atIndex:", buf,
+             static_cast<unsigned long>(off), idx);
+}
+
+inline void dispatch_grid_(objc::id enc, mtl_size grid, mtl_size tg) {
+  using fn = void (*)(objc::id, SEL, mtl_size, mtl_size);
+  reinterpret_cast<fn>(objc_msgSend)(
+      enc, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"),
+      grid, tg);
+}
+
+}  // namespace detail_
+
+// C(m,n) = (A @ B) * scale + offset. lda/ldb are row strides; trans flags
+// let a transposed view be read in place. Buffers are raw MTLBuffers; byte
+// offsets fold the view offset in. Encodes without committing.
+inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b,
+                 int64_t bo, int64_t ldb, bool tb, void* out, int64_t oo,
+                 int64_t m, int64_t n, int64_t k, float scale, float offset) {
+  auto& c = context::get();
+  if (!c.device) return false;
+  auto pso = c.pso_(kop::sgemm);
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  detail_::set_buf_(c.enc, a, ao, 0ul);
+  detail_::set_buf_(c.enc, b, bo, 1ul);
+  detail_::set_buf_(c.enc, out, oo, 2ul);
+  detail_::gemm_params p{static_cast<uint32_t>(m),   static_cast<uint32_t>(n),
+                         static_cast<uint32_t>(k),   static_cast<uint32_t>(lda),
+                         static_cast<uint32_t>(ldb), ta ? 1u : 0u,
+                         tb ? 1u : 0u,               scale,
+                         offset};
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), 3ul);
+  unsigned long gx = (static_cast<unsigned long>(n) + 31) / 32;
+  unsigned long gy = (static_cast<unsigned long>(m) + 31) / 32;
+  detail_::dispatch_grid_(c.enc, {gx, gy, 1}, {128, 1, 1});
+  return true;
+}
+
+// Row-wise op over the last axis (cols): softmax writes rows×cols; row_sum/
+// row_max write one value per row (rows), with the affine epilogue.
+inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
+                   int64_t rows, int64_t cols, float scale, float offset) {
+  auto& c = context::get();
+  if (!c.device) return false;
+  auto pso = c.pso_(op);
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  detail_::set_buf_(c.enc, in, io, 0ul);
+  detail_::set_buf_(c.enc, out, oo, 1ul);
+  detail_::reduce_params p{static_cast<uint32_t>(rows),
+                           static_cast<uint32_t>(cols), scale, offset};
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), 2ul);
+  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(rows), 1, 1},
+                          {256, 1, 1});
+  return true;
+}
+
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals
 
 inline bool available() { return false; }
@@ -237,6 +317,14 @@ inline bool binary(kop, void*, int64_t, void*, int64_t, void*, int64_t,
   return false;
 }
 inline bool unary(kop, void*, int64_t, void*, int64_t, int64_t, float, float) {
+  return false;
+}
+inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
+                 void*, int64_t, int64_t, int64_t, int64_t, float, float) {
+  return false;
+}
+inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t,
+                   float, float) {
   return false;
 }
 

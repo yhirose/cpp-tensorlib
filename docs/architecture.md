@@ -24,7 +24,22 @@ keeps autograd/VJP; this library owns the graph, fusion, and execution).
  (M1, permanent)        oracle and universal fallback
 ```
 
-## Current state (M3b stage 1: Metal elementwise + command-buffer batching)
+## Current state (M3b-2: Metal SGEMM, softmax, reductions)
+
+- `metal_kernels.metal` adds: `sgemm_` (32×32×16 simdgroup-matrix tile,
+  trans_a/trans_b in-place loaders, affine epilogue fused in the store,
+  one edge-safe store path), `softmax_` (row-per-threadgroup, stable),
+  `row_sum_`/`row_max_` (last-axis reductions, epilogue applied).
+- `eval_one` dispatch: dot → `metal_gemm` (maps transposed views to
+  trans flags, same classify as accel) → accel → ref; softmax and last-axis
+  sum/max → `metal_row` → ref. Other reduction axes stay on CPU.
+- Full MLP forward (gemm→sigmoid→gemm→softmax) runs GPU end to end,
+  verified against the oracle across tile-boundary and transposed shapes.
+- **Perf status**: correct and complete, not yet tuned — see
+  performance-notes.md "Known gap". The SGEMM optimization sprint (STEEL-class
+  kernel vs the PyTorch gate) is a later dedicated pass.
+
+## Earlier state (M3b stage 1: Metal elementwise + command-buffer batching)
 
 - `objc.h` — minimal objc_msgSend bridge (header-only, no .mm files).
 - `metal.h` — device/queue/PSO context (lazy singleton), size-keyed
@@ -88,7 +103,8 @@ keeps autograd/VJP; this library owns the graph, fusion, and execution).
 | M2 ✅ | Lazy graph, topo-sort eval, build-time peephole fusion |
 | M3a ✅ | Accelerate CPU backend + dispatch seam + bench harness |
 | M3b-1 ✅ | Metal foundation: context, buffer pool, elementwise kernels, batching |
-| M3b-2 | Metal SGEMM ladder, softmax, reductions; auto-mode thresholds |
+| M3b-2 ✅ | Metal SGEMM (tiled), softmax, last-axis reductions; full GPU MLP fwd |
+| M4 | culebra integration (TensorImpl wraps tl::array; F32 unification) |
 | M4 | culebra integration (TensorImpl wraps tl::array; F32 unification) |
 | M5 | Own CPU backend: threadpool + BLIS-style microkernels (AVX2/AVX-512/NEON, runtime dispatch) |
 | M6 | Own CUDA backend: dlopen'd driver API, PTX `#embed`, SGEMM ladder |

@@ -303,6 +303,52 @@ TEST_CASE("metal backend matches the ref oracle") {
   }
 }
 
+TEST_CASE("metal SGEMM / softmax / reductions match oracle") {
+  if (!tl::gpu_available()) return;
+
+  // Tile-boundary coverage for the 32x32x16 kernel: aligned and every edge
+  // (M/N/K not multiples of 32/16), transposed operands, fused epilogue.
+  struct { int64_t m, k, n; } shapes[] = {
+      {32, 16, 32}, {64, 64, 64}, {33, 17, 31}, {1, 1, 1},
+      {1, 128, 1}, {100, 784, 50}, {50, 50, 10}, {17, 3, 129},
+  };
+  int seed = 30;
+  for (auto s : shapes) {
+    auto a = random_array({s.m, s.k}, seed++);
+    auto b = random_array({s.k, s.n}, seed++);
+    CHECK(matches_gpu_oracle([&] { return a.dot(b); }, 2e-3f, 2e-4f));
+    CHECK(matches_gpu_oracle([&] { return a.dot(b) * 0.5f + 1.0f; }, 2e-3f, 2e-4f));
+  }
+
+  // transposed operands read in place (trans_a / trans_b loaders)
+  auto p = random_array({40, 24}, 60);
+  auto q = random_array({40, 12}, 61);
+  auto rr = random_array({24, 12}, 62);
+  CHECK(matches_gpu_oracle([&] { return p.transpose().dot(q); }, 2e-3f, 2e-4f));
+  CHECK(matches_gpu_oracle([&] { return p.dot(rr.transpose().transpose()); }, 2e-3f, 2e-4f));
+  CHECK(matches_gpu_oracle([&] { return q.dot(rr.transpose()); }, 2e-3f, 2e-4f));
+
+  // softmax over the last axis, incl. wide rows (cols > threadgroup width)
+  for (int64_t cols : {1, 10, 63, 256, 1000}) {
+    auto x = random_array({7, cols}, 70 + static_cast<int>(cols));
+    CHECK(matches_gpu_oracle([&] { return x.softmax(); }));
+  }
+
+  // last-axis row reductions
+  auto m = random_array({13, 47}, 80);
+  CHECK(matches_gpu_oracle([&] { return m.sum(1); }));
+  CHECK(matches_gpu_oracle([&] { return m.sum(1, true); }));
+  CHECK(matches_gpu_oracle([&] { return m.max(1); }));
+  CHECK(matches_gpu_oracle([&] { return m.sum(1) * 2.0f; }));  // fused epilogue
+
+  // full MLP forward on GPU end to end (gemm → sigmoid → gemm → softmax)
+  auto x = random_array({100, 784}, 90);
+  auto w1 = random_array({784, 50}, 91);
+  auto w2 = random_array({50, 10}, 92);
+  CHECK(matches_gpu_oracle(
+      [&] { return x.dot(w1).sigmoid().dot(w2).softmax(); }, 2e-3f, 2e-4f));
+}
+
 TEST_CASE("lazy graph: build then eval") {
   auto a = array::from({1, 2, 3, 4}, {2, 2});
   auto b = array::ones({2, 2});

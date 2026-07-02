@@ -953,6 +953,60 @@ struct graph {
     return out;
   }
 
+  // Classify a 2-d operand's layout for the GEMM loaders: row-major
+  // contiguous rows → (trans=false, ld=row stride); its transpose →
+  // (trans=true, ld=col stride). Same test as accel::gemm. nullopt = not
+  // GEMM-mappable (needs materialization, handled by falling to ref/accel).
+  struct gemm_layout { bool trans; int64_t ld; };
+  static std::optional<gemm_layout> gemm_classify_(const array& x) {
+    int64_t r = x.shape()[0], c = x.shape()[1];
+    int64_t s0 = x.strides()[0], s1 = x.strides()[1];
+    if (s1 == 1 && s0 >= std::max<int64_t>(c, 1)) return gemm_layout{false, s0};
+    if (s0 == 1 && s1 >= std::max<int64_t>(r, 1)) return gemm_layout{true, s1};
+    return std::nullopt;
+  }
+
+  static std::optional<array> metal_gemm(const node& n, const array& a_in,
+                                         const array& b_in) {
+    if (!metal_mode_()) return std::nullopt;
+    array a = a_in.rank() == 1 ? a_in.reshape({1, a_in.size()}) : a_in;
+    array b = b_in.rank() == 1 ? b_in.reshape({b_in.size(), 1}) : b_in;
+    if (!a.storage_.native || !b.storage_.native) return std::nullopt;
+    auto la = gemm_classify_(a), lb = gemm_classify_(b);
+    if (!la || !lb) return std::nullopt;
+    int64_t m = a.shape()[0], k = a.shape()[1], nn = b.shape()[1];
+    array out = array::empty({m, nn});
+    if (!out.storage_.native) return std::nullopt;
+    if (m == 0 || nn == 0) return out.reshape(n.shape);
+    if (!metal::gemm(a.storage_.native, a.offset_ * 4, la->ld, la->trans,
+                     b.storage_.native, b.offset_ * 4, lb->ld, lb->trans,
+                     out.storage_.native, out.offset_ * 4, m, nn, k, n.scale,
+                     n.offset)) {
+      return std::nullopt;
+    }
+    return out.reshape(n.shape);
+  }
+
+  // Row op over the last axis of a contiguous input. `out_cols` is cols for
+  // softmax (rows×cols out) or 1 for reductions (rows out).
+  static std::optional<array> metal_row(metal::kop k, const array& a,
+                                        shape_t out_shape, bool reduce,
+                                        float scale, float offset) {
+    if (!metal_mode_() || !a.contiguous() || a.rank() == 0) return std::nullopt;
+    if (!a.storage_.native) return std::nullopt;
+    int64_t cols = a.shape().back();
+    int64_t rows = cols ? a.size() / cols : 0;
+    auto out = array::empty(out_shape);
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    if (!metal::row_op(k, a.storage_.native, a.offset_ * 4, out.storage_.native,
+                       out.offset_ * 4, rows, cols, scale, offset)) {
+      return std::nullopt;
+    }
+    (void)reduce;
+    return out;
+  }
+
   static std::optional<array> metal_unary(metal::kop k, const array& a,
                                           float scale, float offset) {
     if (!metal_mode_() || !a.contiguous()) return std::nullopt;
@@ -1105,11 +1159,23 @@ struct graph {
         }
         break;
       }
-      case op_t::softmax:
-        r = ref::softmax(in(0));
+      case op_t::softmax: {
+        auto a = in(0);
+        if (auto g = metal_row(metal::kop::softmax, a, a.shape(), false, 1.0f,
+                               0.0f)) {
+          r = std::move(*g);
+        } else {
+          r = ref::softmax(a);
+        }
         break;
+      }
       case op_t::dot: {
         auto a = in(0), b = in(1);
+        if (auto g = metal_gemm(n, a, b)) {
+          r = std::move(*g);
+          epi_done = true;
+          break;
+        }
         array a2 = a.rank() == 1 ? a.reshape({1, a.size()}) : a;
         array b2 = b.rank() == 1 ? b.reshape({b.size(), 1}) : b;
         array out = array::empty({a2.shape()[0], b2.shape()[1]});
@@ -1130,13 +1196,26 @@ struct graph {
         break;
       }
       case op_t::sum_ax:
-        r = ref::sum(in(0), n.axis, n.keepdims);
+      case op_t::max_ax: {
+        // GPU row reductions cover the last-axis case (softmax/argmax
+        // support shape); other axes fall to the CPU oracle. The epilogue
+        // applies in the kernel, so mark it done.
+        auto a = in(0);
+        metal::kop k =
+            n.op == op_t::sum_ax ? metal::kop::row_sum : metal::kop::row_max;
+        if (n.axis == static_cast<int>(a.rank()) - 1) {
+          if (auto g = metal_row(k, a, n.shape, true, n.scale, n.offset)) {
+            r = std::move(*g);
+            epi_done = true;
+            break;
+          }
+        }
+        r = n.op == op_t::sum_ax ? ref::sum(a, n.axis, n.keepdims)
+                                 : ref::max(a, n.axis, n.keepdims);
         break;
+      }
       case op_t::mean_ax:
         r = ref::mean(in(0), n.axis, n.keepdims);
-        break;
-      case op_t::max_ax:
-        r = ref::max(in(0), n.axis, n.keepdims);
         break;
       case op_t::argmax_ax:
         r = ref::argmax(in(0), n.axis, n.keepdims);

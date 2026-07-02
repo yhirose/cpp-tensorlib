@@ -143,6 +143,43 @@ int main() {
     std::printf("\n");
   }
 
+  if (tl::gpu_available()) {
+    std::printf("-- Metal GPU vs Accelerate CPU --\n");
+    for (int64_t n : {256, 512, 1024, 2048}) {
+      auto a = random_array({n, n}, 20);
+      auto b = random_array({n, n}, 21);
+      char name[64];
+      std::snprintf(name, sizeof(name), "gpu dot %lldx%lldx%lld",
+                    (long long)n, (long long)n, (long long)n);
+      double flops = 2.0 * n * n * n;
+      // Interleaved GPU vs CPU-accel (not vs ref — too slow at these sizes).
+      double t_gpu = median_ms([&] {
+        tl::use_gpu();
+        a.dot(b).eval();
+        tl::use_cpu();
+      });
+      double t_cpu = median_ms([&] { a.dot(b).eval(); });
+      std::printf("%-28s gpu %8.3f ms (%8.2f GFLOP/s)   accel-cpu %8.3f ms   gpu/cpu %5.2fx\n",
+                  name, t_gpu, flops / (t_gpu * 1e6), t_cpu, t_cpu / t_gpu);
+    }
+    // full MLP forward, GPU end to end
+    {
+      auto x = random_array({256, 784}, 22);
+      auto w1 = random_array({784, 256}, 23);
+      auto w2 = random_array({256, 10}, 24);
+      double t_gpu = median_ms([&] {
+        tl::use_gpu();
+        x.dot(w1).sigmoid().dot(w2).softmax().eval();
+        tl::use_cpu();
+      });
+      double t_cpu = median_ms(
+          [&] { x.dot(w1).sigmoid().dot(w2).softmax().eval(); });
+      std::printf("%-28s gpu %8.3f ms                        accel-cpu %8.3f ms   gpu/cpu %5.2fx\n",
+                  "gpu mlp fwd 256x784x256x10", t_gpu, t_cpu, t_cpu / t_gpu);
+    }
+    std::printf("\n");
+  }
+
   // training-step composite: forward + backward-ish chain
   {
     auto x = random_array({100, 784}, 5);
