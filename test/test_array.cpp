@@ -255,6 +255,102 @@ TEST_CASE("fusion must not corrupt shared intermediates") {
   CHECK(f.at({0, 0}) == 3.0f);
 }
 
+TEST_CASE("sum_to reduces broadcast dims (VJP of broadcasting)") {
+  auto a = array::from({1, 2, 3, 4, 5, 6}, {2, 3});
+
+  auto s = a.sum_to({3});  // leading dim sums away
+  CHECK(s.shape() == tl::shape_t{3});
+  CHECK(s.at({0}) == 5.0f);
+  CHECK(s.at({2}) == 9.0f);
+
+  auto k = a.sum_to({1, 3});  // size-1 dim kept
+  CHECK(k.shape() == tl::shape_t{1, 3});
+  CHECK(k.at({0, 1}) == 7.0f);
+
+  auto r = a.sum_to({2, 1});  // row sums
+  CHECK(r.at({0, 0}) == 6.0f);
+  CHECK(r.at({1, 0}) == 15.0f);
+
+  CHECK(tl::allclose(a.sum_to({2, 3}), a));  // identity
+  CHECK(a.sum_to({}).item() == 21.0f);       // total
+
+  // lazy chain and epilogue fusion compose with it
+  auto t = (a * 2.0f).sum_to({3}) * 0.5f;
+  CHECK(t.at({0}) == 5.0f);
+
+  // the grad-accumulation pattern: g broadcast up, then reduced back
+  auto row = array::from({10, 20, 30});
+  auto g = (a + row).sum_to({3});
+  CHECK(g.shape() == tl::shape_t{3});
+
+  CHECK_THROWS(a.sum_to({4}));
+  CHECK_THROWS(a.sum_to({3, 2}));
+}
+
+TEST_CASE("comparisons and where") {
+  auto x = array::from({-2, -1, 0, 1, 2});
+
+  auto m = x > 0.0f;
+  CHECK(m.at({0}) == 0.0f);
+  CHECK(m.at({3}) == 1.0f);
+  CHECK((x <= 0.0f).at({2}) == 1.0f);
+  CHECK((x == -1.0f).at({1}) == 1.0f);
+  CHECK((x != 0.0f).at({2}) == 0.0f);
+
+  // relu backward: g * (x > 0)
+  auto g = array::ones({5});
+  auto gx = g * (x > 0.0f);
+  CHECK(gx.at({1}) == 0.0f);
+  CHECK(gx.at({4}) == 1.0f);
+  CHECK(tl::allclose(gx, x.relu() > 0.0f));
+
+  // array vs array with broadcasting
+  auto a = array::from({1, 2, 3, 4}, {2, 2});
+  auto row = array::from({2, 3});
+  auto ge = a >= row;
+  CHECK(ge.at({0, 0}) == 0.0f);
+  CHECK(ge.at({1, 0}) == 1.0f);
+
+  // where with broadcast condition
+  auto w = tl::where(a > 2.0f, a, array::zeros({2, 2}));
+  CHECK(w.at({0, 0}) == 0.0f);
+  CHECK(w.at({1, 1}) == 4.0f);
+
+  // clamp pattern: where(x > hi, hi, x)
+  auto c = tl::where(x > 1.0f, array::full({}, 1.0f), x);
+  CHECK(c.at({4}) == 1.0f);
+  CHECK(c.at({0}) == -2.0f);
+}
+
+TEST_CASE("in-place add_ accumulates gradients") {
+  auto a = array::from({1, 2, 3, 4}, {2, 2});
+
+  auto g = array::zeros({2, 2});
+  g.add_(a);
+  g.add_(a);
+  CHECK(g.at({0, 0}) == 2.0f);
+  CHECK(g.at({1, 1}) == 8.0f);
+
+  // broadcasting contribution
+  g.add_(array::from({10, 20}));
+  CHECK(g.at({0, 0}) == 12.0f);
+  CHECK(g.at({1, 1}) == 28.0f);
+
+  // lazy rhs is evaluated; lazy lhs materializes first
+  auto h = (a * 0.0f);
+  h.add_(a + a);
+  CHECK(h.at({0, 1}) == 4.0f);
+
+  // accumulating through a view mutates the base storage
+  auto base = array::zeros({3, 2});
+  base.slice(1, 1).add_(array::ones({1, 2}));
+  CHECK(base.at({0, 0}) == 0.0f);
+  CHECK(base.at({1, 0}) == 1.0f);
+  CHECK(base.at({2, 1}) == 0.0f);
+
+  CHECK_THROWS(g.add_(array::zeros({3, 3})));
+}
+
 TEST_CASE("lazy chains through views and activations") {
   auto a = array::from({1, 2, 3, 4, 5, 6}, {2, 3});
 

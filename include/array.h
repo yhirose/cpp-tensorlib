@@ -131,14 +131,16 @@ struct node {
   enum class op_t {
     constant,
     add, sub, mul, div, pow_,
+    gt, lt, ge, le, eq, ne,  // masks as F32 (0/1)
     affine, recip, exp_, log_, sqrt_, sigmoid, relu,
     softmax,
+    where_,
     dot,
-    sum_ax, mean_ax, max_ax, argmax_ax,
+    sum_ax, mean_ax, max_ax, argmax_ax, sum_to_,
   };
 
   op_t op = op_t::constant;
-  shape_t shape;
+  shape_t shape;  // for sum_to this is the target shape (= the op parameter)
   std::vector<std::shared_ptr<node>> inputs;
   float scale = 1.0f, offset = 0.0f;  // fused epilogue: op(...) * scale + offset
   int axis = 0;
@@ -209,6 +211,16 @@ class array {
   array max(int axis, bool keepdims = false) const;
   array argmax(int axis, bool keepdims = false) const;
 
+  // Reduce broadcast dims back to `shape` (the VJP of broadcasting): sums
+  // over leading dims and size-1 dims. `shape` must broadcast to shape().
+  array sum_to(shape_t shape) const;
+
+  // In-place accumulate (eager): this += b, broadcasting b. Mutates the
+  // underlying storage — visible through every view sharing it, and through
+  // unevaluated graphs holding it as a constant. Intended for gradient
+  // accumulation right after eval; not for arrays still feeding lazy graphs.
+  array& add_(const array& b);
+
   // Scalar reductions (eager — they return host scalars)
   float sum() const;
   float max() const;
@@ -251,6 +263,25 @@ array operator*(float s, const array& a);
 array operator/(float s, const array& a);
 array pow(const array& a, const array& b);
 array pow(const array& a, float s);
+
+// Comparisons — F32 masks (1.0 / 0.0), broadcasting. The relu-backward
+// pattern is `g * (x > 0.0f)`.
+array operator>(const array& a, const array& b);
+array operator<(const array& a, const array& b);
+array operator>=(const array& a, const array& b);
+array operator<=(const array& a, const array& b);
+array operator==(const array& a, const array& b);
+array operator!=(const array& a, const array& b);
+array operator>(const array& a, float s);
+array operator<(const array& a, float s);
+array operator>=(const array& a, float s);
+array operator<=(const array& a, float s);
+array operator==(const array& a, float s);
+array operator!=(const array& a, float s);
+
+array where(const array& cond, const array& a, const array& b);
+
+array sum_to(const array& a, shape_t shape);
 
 array concat(const std::vector<array>& parts);  // axis 0
 
@@ -436,6 +467,24 @@ array map_binary(const array& a, const array& b, F f) {
   return out;
 }
 
+template <typename F>
+array map_ternary(const array& a, const array& b, const array& c, F f) {
+  auto shape = broadcast_shape(broadcast_shape(a.shape(), b.shape()), c.shape());
+  auto out = array::empty(shape);
+  auto* po = out.data();
+  const auto* pa = a.raw();
+  const auto* pb = b.raw();
+  const auto* pc = c.raw();
+  for_each_index(shape,
+                 {broadcast_strides(a.shape(), a.strides(), shape),
+                  broadcast_strides(b.shape(), b.strides(), shape),
+                  broadcast_strides(c.shape(), c.strides(), shape)},
+                 [&](int64_t i, const std::vector<int64_t>& off) {
+                   po[i] = f(pa[off[0]], pb[off[1]], pc[off[2]]);
+                 });
+  return out;
+}
+
 // Shared axis-reduction driver: for each input element, f(acc_slot, value).
 template <typename F>
 array reduce_axis(const array& a, int axis, bool keepdims, float init, F f) {
@@ -575,6 +624,22 @@ inline array argmax(const array& a, int axis, bool keepdims) {
   return out;
 }
 
+// The VJP of broadcasting: accumulate `a` back down to `target` (leading
+// dims and size-1 dims sum away). The accumulator strides are exactly the
+// broadcast strides of the target viewed as a's shape — sum_to is the
+// transpose of the broadcast read.
+inline array sum_to(const array& a, const shape_t& target) {
+  auto out = array::zeros(target);
+  auto acc = detail::broadcast_strides(target, out.strides(), a.shape());
+  auto* po = out.data();
+  const auto* pi = a.raw();
+  detail::for_each_index(a.shape(), {a.strides(), acc},
+                         [&](int64_t, const std::vector<int64_t>& off) {
+                           po[off[1]] += pi[off[0]];
+                         });
+  return out;
+}
+
 }  // namespace ref
 
 // Graph build + evaluation ----------------------------------------------------
@@ -635,6 +700,28 @@ struct graph {
     v.node_->scale = s;
     v.node_->offset = o;
     return v;
+  }
+
+  static array where(const array& c, const array& a, const array& b) {
+    auto n = std::make_shared<node>();
+    n->op = op_t::where_;
+    n->shape = broadcast_shape(broadcast_shape(c.shape(), a.shape()),
+                               b.shape());  // throws early
+    n->inputs = {as_node(c), as_node(a), as_node(b)};
+    return from_node(std::move(n));
+  }
+
+  static array sum_to(const array& a, shape_t target) {
+    if (broadcast_shape(target, a.shape()) != a.shape()) {
+      throw std::invalid_argument("tl::sum_to: " + shape_str(target) +
+                                  " does not broadcast to " +
+                                  shape_str(a.shape()));
+    }
+    auto n = std::make_shared<node>();
+    n->op = op_t::sum_to_;
+    n->shape = std::move(target);
+    n->inputs = {as_node(a)};
+    return from_node(std::move(n));
   }
 
   static array reduce(op_t op, const array& a, int axis, bool keepdims) {
@@ -736,6 +823,35 @@ struct graph {
         r = map_binary(in(0), in(1),
                        [](float x, float y) { return std::pow(x, y); });
         break;
+      case op_t::gt:
+        r = map_binary(in(0), in(1),
+                       [](float x, float y) { return x > y ? 1.0f : 0.0f; });
+        break;
+      case op_t::lt:
+        r = map_binary(in(0), in(1),
+                       [](float x, float y) { return x < y ? 1.0f : 0.0f; });
+        break;
+      case op_t::ge:
+        r = map_binary(in(0), in(1),
+                       [](float x, float y) { return x >= y ? 1.0f : 0.0f; });
+        break;
+      case op_t::le:
+        r = map_binary(in(0), in(1),
+                       [](float x, float y) { return x <= y ? 1.0f : 0.0f; });
+        break;
+      case op_t::eq:
+        r = map_binary(in(0), in(1),
+                       [](float x, float y) { return x == y ? 1.0f : 0.0f; });
+        break;
+      case op_t::ne:
+        r = map_binary(in(0), in(1),
+                       [](float x, float y) { return x != y ? 1.0f : 0.0f; });
+        break;
+      case op_t::where_:
+        r = map_ternary(in(0), in(1), in(2), [](float c, float x, float y) {
+          return c != 0.0f ? x : y;
+        });
+        break;
       case op_t::affine: {
         float s = n.scale, o = n.offset;
         r = map_unary(in(0), [s, o](float x) { return x * s + o; });
@@ -778,6 +894,9 @@ struct graph {
         break;
       case op_t::argmax_ax:
         r = ref::argmax(in(0), n.axis, n.keepdims);
+        break;
+      case op_t::sum_to_:
+        r = ref::sum_to(in(0), n.shape);
         break;
     }
     if (!epi_done && (n.scale != 1.0f || n.offset != 0.0f)) {
@@ -855,6 +974,60 @@ inline array operator-(float s, const array& a) {
 inline array operator/(float s, const array& a) {
   return detail::graph::affine(
       detail::graph::unary(detail::node::op_t::recip, a), s, 0.0f);
+}
+
+inline array operator>(const array& a, const array& b) {
+  return detail::graph::binary(detail::node::op_t::gt, a, b);
+}
+inline array operator<(const array& a, const array& b) {
+  return detail::graph::binary(detail::node::op_t::lt, a, b);
+}
+inline array operator>=(const array& a, const array& b) {
+  return detail::graph::binary(detail::node::op_t::ge, a, b);
+}
+inline array operator<=(const array& a, const array& b) {
+  return detail::graph::binary(detail::node::op_t::le, a, b);
+}
+inline array operator==(const array& a, const array& b) {
+  return detail::graph::binary(detail::node::op_t::eq, a, b);
+}
+inline array operator!=(const array& a, const array& b) {
+  return detail::graph::binary(detail::node::op_t::ne, a, b);
+}
+inline array operator>(const array& a, float s) { return a > array::full({}, s); }
+inline array operator<(const array& a, float s) { return a < array::full({}, s); }
+inline array operator>=(const array& a, float s) { return a >= array::full({}, s); }
+inline array operator<=(const array& a, float s) { return a <= array::full({}, s); }
+inline array operator==(const array& a, float s) { return a == array::full({}, s); }
+inline array operator!=(const array& a, float s) { return a != array::full({}, s); }
+
+inline array where(const array& cond, const array& a, const array& b) {
+  return detail::graph::where(cond, a, b);
+}
+
+inline array array::sum_to(shape_t shape) const {
+  return detail::graph::sum_to(*this, std::move(shape));
+}
+inline array sum_to(const array& a, shape_t shape) {
+  return a.sum_to(std::move(shape));
+}
+
+inline array& array::add_(const array& b) {
+  ensure_();
+  if (detail::broadcast_shape(shape_, b.shape()) != shape_) {
+    throw std::invalid_argument("tl::add_: " + detail::shape_str(b.shape()) +
+                                " does not broadcast to " +
+                                detail::shape_str(shape_));
+  }
+  const auto* pb = b.raw();
+  auto* po = storage_.data() + offset_;
+  detail::for_each_index(
+      shape_,
+      {strides_, detail::broadcast_strides(b.shape(), b.strides(), shape_)},
+      [&](int64_t, const std::vector<int64_t>& off) {
+        po[off[0]] += pb[off[1]];
+      });
+  return *this;
 }
 
 inline array array::exp() const {
