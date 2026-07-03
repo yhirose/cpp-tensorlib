@@ -197,6 +197,18 @@ Tuning targets, in likely priority: thread-local reusable pack buffers,
 skip the pool for single-block work, MR/NR + MC/KC/NC sweep, software
 prefetch, K-unroll in the microkernel.
 
+**Gate caveat (2026-07-03):** `bench/bench_cpu_gemm.cpp` links OpenBLAS
+when present (`tensorlib_bench_cpu`). But Homebrew's OpenBLAS on M1
+appears to use generic ARMV8 microkernels, not M1-tuned ones — the
+*untuned* own kernel already beats it ~1.8× at 1024³ (threads matched
+via `openblas_set_num_threads`), which is implausible against a
+properly-tuned OpenBLAS. So on a Mac, treat the OpenBLAS number as a
+loose lower-bound only; the meaningful Mac target is **% of NEON fp32
+peak** (~410 GFLOP/s on M1 Pro → own is at ~54–64%, the real headroom).
+The definitive OpenBLAS-90% gate is measured on the x86 box (M6) with a
+properly-tuned OpenBLAS. The tuning sprint should track % of NEON peak
+on the Mac and defer the OpenBLAS-90% verdict to x86.
+
 ## vs silarray (M1 Pro, 2026-07-03)
 
 Head-to-head with the predecessor across cpu/gpu/auto. Two separate

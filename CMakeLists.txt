@@ -37,6 +37,23 @@ endif()
 add_executable(tensorlib_bench bench/bench_main.cpp)
 target_link_libraries(tensorlib_bench PRIVATE tensorlib)
 
+# Own CPU GEMM bench (M5 tuning). Links OpenBLAS for the off-Apple gate when
+# present (ARM OpenBLAS = same NEON ISA); own-vs-ref only otherwise.
+add_executable(tensorlib_bench_cpu bench/bench_cpu_gemm.cpp)
+target_link_libraries(tensorlib_bench_cpu PRIVATE tensorlib)
+find_library(OPENBLAS_LIB openblas
+  PATHS /opt/homebrew/opt/openblas/lib /usr/local/opt/openblas/lib)
+if(OPENBLAS_LIB)
+  target_compile_definitions(tensorlib_bench_cpu PRIVATE BENCH_HAS_OPENBLAS)
+  target_link_libraries(tensorlib_bench_cpu PRIVATE ${OPENBLAS_LIB})
+  find_path(OPENBLAS_INC cblas.h
+    PATHS /opt/homebrew/opt/openblas/include /usr/local/opt/openblas/include)
+  if(OPENBLAS_INC)
+    target_include_directories(tensorlib_bench_cpu PRIVATE ${OPENBLAS_INC})
+  endif()
+  message(STATUS "cpu bench: OpenBLAS gate enabled (${OPENBLAS_LIB})")
+endif()
+
 # The same binary runs in three device modes (silarray convention).
 add_test(NAME cpu  COMMAND tensorlib_test --cpu)
 add_test(NAME gpu  COMMAND tensorlib_test --gpu)

@@ -51,8 +51,12 @@ loops (memory-bound), by design.
 - *Tuning pass* (the perf sprint, off-Apple gate): reusable/thread-local
   pack buffers (per-call `std::vector` alloc dominates small sizes — cpu::
   loses to the naive loop below ~256³ right now), skip pool sync for
-  single-block work, tune MR/NR and MC/KC/NC, prefetch/unroll. Target
-  OpenBLAS-90% on the ISA.
+  single-block work, tune MR/NR and MC/KC/NC, prefetch/unroll. Harness:
+  `bench/bench_cpu_gemm.cpp` (`tensorlib_bench_cpu`) — own vs ref vs
+  OpenBLAS. On the Mac, track **% of NEON fp32 peak** (~410 GFLOP/s on M1
+  Pro; own is ~54–64% now) — Homebrew OpenBLAS on M1 is a weak baseline
+  (untuned own already beats it; see performance-notes.md). The real
+  OpenBLAS-90% verdict is on the x86 box.
 - *AVX2 / AVX-512 microkernels* — write behind the same interface; validate
   and tune on the x86 WSL2 box (can't execute on ARM).
 - *Runtime CPUID dispatch* — currently the microkernel is compile-time
