@@ -14,9 +14,11 @@
 // — the compute-bound GEMM is what needs the hand-blocked kernel.
 //
 // Status: scaffolding + scalar microkernel (portable, correct on any ISA)
-// + NEON microkernel (Apple Silicon / ARM Linux, native). AVX2/AVX-512
-// microkernels are the next drop-in behind the same interface; the perf
-// tuning pass to the OpenBLAS gate is separate (see docs/roadmap.md).
+// + NEON microkernel (Apple Silicon / ARM Linux, native), NEON-tuned on
+// M1 Pro (lane-indexed FMA, K-unroll, prefetch, thread-local pack buffers,
+// MR-panel-granular parallelism — see performance-notes.md). AVX2/AVX-512
+// microkernels are the next drop-in behind the same interface, validated
+// on the x86 box (see docs/roadmap.md).
 
 #include <cstdint>
 #include <cstring>
@@ -38,10 +40,21 @@ namespace cpu {
 // use_accelerate_ false) to force the ref:: path.
 inline bool enabled_ = true;
 
-// Register-block tile and cache-block sizes. Provisional BLIS-ish defaults;
-// the tuning pass measures and sets these (docs/performance-notes.md).
+// Register-block tile and cache-block sizes. MC/KC from the 2026-07-03
+// M1 Pro sweep (KC=512 best at 1024³+; see performance-notes.md — the
+// machine was loaded, so re-confirm in a quiet census). Overridable via
+// -D for the tuning sweep (bench sweep harness).
+#ifndef TL_CPU_MC
+#define TL_CPU_MC 128
+#endif
+#ifndef TL_CPU_KC
+#define TL_CPU_KC 512
+#endif
+#ifndef TL_CPU_NC
+#define TL_CPU_NC 2048
+#endif
 constexpr int MR = 8, NR = 8;
-constexpr int64_t MC = 128, KC = 256, NC = 2048;
+constexpr int64_t MC = TL_CPU_MC, KC = TL_CPU_KC, NC = TL_CPU_NC;
 
 namespace detail {
 
@@ -73,22 +86,49 @@ inline void pack_b_panel(const float* B, int64_t bs0, int64_t bs1, int nr,
 #ifdef TL_CPU_NEON
 inline void ukernel(int64_t kc, const float* ap, const float* bp, float* c,
                     int64_t ldc, int mr, int nr) {
-  // 8×8 tile: two float32x4 accumulators per row (cols 0-3, 4-7).
+  // 8×8 tile: two float32x4 accumulators per row (cols 0-3, 4-7). A is
+  // loaded as two vectors and consumed with lane-indexed FMA — no per-
+  // element vdupq (8 dup µops/k-step in the first cut). 16 accumulators +
+  // 2 A + 2 B vectors = 20 of the 32 NEON registers.
   float32x4_t ab0[MR], ab1[MR];
   for (int i = 0; i < MR; i++) {
     ab0[i] = vdupq_n_f32(0.0f);
     ab1[i] = vdupq_n_f32(0.0f);
   }
-  for (int64_t p = 0; p < kc; p++) {
-    float32x4_t b0 = vld1q_f32(bp + p * NR);
-    float32x4_t b1 = vld1q_f32(bp + p * NR + 4);
-    const float* a = ap + p * MR;
-    for (int i = 0; i < MR; i++) {
-      float32x4_t av = vdupq_n_f32(a[i]);
-      ab0[i] = vfmaq_f32(ab0[i], av, b0);
-      ab1[i] = vfmaq_f32(ab1[i], av, b1);
-    }
+#define TL_CPU_KSTEP(p)                                        \
+  {                                                            \
+    float32x4_t b0 = vld1q_f32(bp + (p)*NR);                   \
+    float32x4_t b1 = vld1q_f32(bp + (p)*NR + 4);               \
+    float32x4_t a0 = vld1q_f32(ap + (p)*MR);                   \
+    float32x4_t a1 = vld1q_f32(ap + (p)*MR + 4);               \
+    ab0[0] = vfmaq_laneq_f32(ab0[0], b0, a0, 0);               \
+    ab1[0] = vfmaq_laneq_f32(ab1[0], b1, a0, 0);               \
+    ab0[1] = vfmaq_laneq_f32(ab0[1], b0, a0, 1);               \
+    ab1[1] = vfmaq_laneq_f32(ab1[1], b1, a0, 1);               \
+    ab0[2] = vfmaq_laneq_f32(ab0[2], b0, a0, 2);               \
+    ab1[2] = vfmaq_laneq_f32(ab1[2], b1, a0, 2);               \
+    ab0[3] = vfmaq_laneq_f32(ab0[3], b0, a0, 3);               \
+    ab1[3] = vfmaq_laneq_f32(ab1[3], b1, a0, 3);               \
+    ab0[4] = vfmaq_laneq_f32(ab0[4], b0, a1, 0);               \
+    ab1[4] = vfmaq_laneq_f32(ab1[4], b1, a1, 0);               \
+    ab0[5] = vfmaq_laneq_f32(ab0[5], b0, a1, 1);               \
+    ab1[5] = vfmaq_laneq_f32(ab1[5], b1, a1, 1);               \
+    ab0[6] = vfmaq_laneq_f32(ab0[6], b0, a1, 2);               \
+    ab1[6] = vfmaq_laneq_f32(ab1[6], b1, a1, 2);               \
+    ab0[7] = vfmaq_laneq_f32(ab0[7], b0, a1, 3);               \
+    ab1[7] = vfmaq_laneq_f32(ab1[7], b1, a1, 3);               \
   }
+  int64_t p = 0;
+  for (; p + 4 <= kc; p += 4) {
+    __builtin_prefetch(ap + (p + 16) * MR);
+    __builtin_prefetch(bp + (p + 16) * NR);
+    TL_CPU_KSTEP(p);
+    TL_CPU_KSTEP(p + 1);
+    TL_CPU_KSTEP(p + 2);
+    TL_CPU_KSTEP(p + 3);
+  }
+  for (; p < kc; p++) TL_CPU_KSTEP(p);
+#undef TL_CPU_KSTEP
   if (mr == MR && nr == NR) {
     for (int i = 0; i < MR; i++) {
       vst1q_f32(c + i * ldc, vaddq_f32(vld1q_f32(c + i * ldc), ab0[i]));
@@ -134,8 +174,16 @@ inline void sgemm(const float* A, int64_t as0, int64_t as1, const float* B,
                         sizeof(float));
   if (k == 0) return;
 
-  // Shared B pack buffer (packed once per (jc,pc), read by all threads).
-  std::vector<float> bpack(static_cast<size_t>(KC) * NC);
+  // Reusable pack buffers: thread-local so no per-call allocation (a
+  // per-call std::vector dominated small sizes in the first cut). bpack
+  // lives on the calling thread (packed once per (jc,pc), read by all);
+  // apack lives on each worker thread.
+  static thread_local std::vector<float> bpack;
+  bpack.resize(static_cast<size_t>(KC) *
+               ((std::min<int64_t>(NC, n) + NR - 1) / NR) * NR);
+  // Raw pointer for the workers: naming `bpack` inside the lambda would
+  // resolve to each worker's own (empty) thread_local instance.
+  float* bpack_p = bpack.data();
   auto& pool = thread_pool::instance();
 
   for (int64_t jc = 0; jc < n; jc += NC) {
@@ -148,34 +196,36 @@ inline void sgemm(const float* A, int64_t as0, int64_t as1, const float* B,
         int64_t j0 = jp * NR;
         int nr = static_cast<int>(std::min<int64_t>(NR, nc - j0));
         detail::pack_b_panel(B + (pc)*bs0 + (jc + j0) * bs1, bs0, bs1, nr, kc,
-                             bpack.data() + jp * KC * NR);
+                             bpack_p + jp * KC * NR);
       }
-      // Parallelize the M dimension: each task owns a disjoint block of C
-      // rows, packs its own A block, runs the macrokernel over it.
-      int64_t mblocks = (m + MC - 1) / MC;
-      pool.parallel_for(mblocks, [&](int64_t bi0, int64_t bi1) {
-        std::vector<float> apack(static_cast<size_t>(MC) * KC);
-        for (int64_t bi = bi0; bi < bi1; bi++) {
-          int64_t ic = bi * MC;
-          int64_t mc = std::min<int64_t>(MC, m - ic);
-          int64_t mpanels = (mc + MR - 1) / MR;
-          // Pack A[ic:ic+mc, pc:pc+kc] * alpha into MR-tall col-major panels.
-          for (int64_t ip = 0; ip < mpanels; ip++) {
+      // Parallelize the M dimension at MR-panel granularity (not MC-block):
+      // small m (e.g. 256 → 2 MC blocks) would otherwise use only 1-2
+      // threads. Each thread packs+computes its contiguous panel range in
+      // MC-row groups, preserving the L2 blocking.
+      int64_t mpanels = (m + MR - 1) / MR;
+      const int64_t panels_per_mc = MC / MR;
+      pool.parallel_for(mpanels, [&](int64_t ip0, int64_t ip1) {
+        static thread_local std::vector<float> apack;
+        apack.resize(static_cast<size_t>(MC) * KC);
+        for (int64_t g0 = ip0; g0 < ip1; g0 += panels_per_mc) {
+          int64_t g1 = std::min<int64_t>(g0 + panels_per_mc, ip1);
+          // Pack A[g0*MR : ..., pc:pc+kc] * alpha into MR-tall panels.
+          for (int64_t ip = g0; ip < g1; ip++) {
             int64_t i0 = ip * MR;
-            int mr = static_cast<int>(std::min<int64_t>(MR, mc - i0));
-            detail::pack_a_panel(A + (ic + i0) * as0 + pc * as1, as0, as1, mr,
-                                 kc, alpha, apack.data() + ip * MR * KC);
+            int mr = static_cast<int>(std::min<int64_t>(MR, m - i0));
+            detail::pack_a_panel(A + i0 * as0 + pc * as1, as0, as1, mr, kc,
+                                 alpha, apack.data() + (ip - g0) * MR * KC);
           }
           // Macrokernel: MR×NR microkernel over the packed panels.
           for (int64_t jp = 0; jp < npanels; jp++) {
             int64_t j0 = jp * NR;
             int nr = static_cast<int>(std::min<int64_t>(NR, nc - j0));
-            for (int64_t ip = 0; ip < mpanels; ip++) {
+            for (int64_t ip = g0; ip < g1; ip++) {
               int64_t i0 = ip * MR;
-              int mr = static_cast<int>(std::min<int64_t>(MR, mc - i0));
-              detail::ukernel(kc, apack.data() + ip * MR * KC,
-                              bpack.data() + jp * KC * NR,
-                              C + (ic + i0) * n + (jc + j0), n, mr, nr);
+              int mr = static_cast<int>(std::min<int64_t>(MR, m - i0));
+              detail::ukernel(kc, apack.data() + (ip - g0) * MR * KC,
+                              bpack_p + jp * KC * NR,
+                              C + i0 * n + (jc + j0), n, mr, nr);
             }
           }
         }

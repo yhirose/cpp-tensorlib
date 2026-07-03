@@ -195,7 +195,7 @@ small sizes — the tuning pass's first targets. The real gate (OpenBLAS
 
 Tuning targets, in likely priority: thread-local reusable pack buffers,
 skip the pool for single-block work, MR/NR + MC/KC/NC sweep, software
-prefetch, K-unroll in the microkernel.
+prefetch, K-unroll in the microkernel. → Done; see the tuning pass below.
 
 **Gate caveat (2026-07-03):** `bench/bench_cpu_gemm.cpp` links OpenBLAS
 when present (`tensorlib_bench_cpu`). But Homebrew's OpenBLAS on M1
@@ -208,6 +208,67 @@ peak** (~410 GFLOP/s on M1 Pro → own is at ~54–64%, the real headroom).
 The definitive OpenBLAS-90% gate is measured on the x86 box (M6) with a
 properly-tuned OpenBLAS. The tuning sprint should track % of NEON peak
 on the Mac and defer the OpenBLAS-90% verdict to x86.
+
+## Own CPU GEMM tuning pass (M5, M1 Pro NEON, 2026-07-03)
+
+The tuning sprint over the first cut. All changes oracle-verified (own
+== ref, full suite green). Numbers below are the **quieter census**
+(load ~4, one core taken by the `ccusage` statusline that couldn't be
+stopped — so figures sit a few % under a truly idle box, but were
+stable across runs); the sprint itself was done under heavy load
+(4–28), where every change was accepted only on interleaved same-load
+A/B.
+
+What landed, in order of impact:
+
+1. **Lane-indexed FMA microkernel** (biggest win). The first cut did 8
+   `vdupq_n_f32` broadcasts per k-step; now A is loaded as two vectors
+   and consumed with `vfmaq_laneq_f32` (16 FMA + 4 loads per k-step,
+   zero dups; 20/32 NEON regs). Plus K-unroll ×4 and
+   `__builtin_prefetch` on both panels. Peak (2048³) reached ~354
+   GFLOP/s through the dispatch path, ~365 kernel-isolated ≈ **86–89%
+   of NEON fp32 peak** (~410 GFLOP/s on M1 Pro), up from 54–64%.
+2. **Thread-local reusable pack buffers** — the per-call/per-task
+   `std::vector` allocs are gone. Trap for later: a thread_local named
+   inside the worker lambda resolves to the *worker's* instance — the
+   first attempt read each worker's empty `bpack` and crashed; the fix
+   passes the caller's pointer in.
+3. **MR-panel-granular M-parallelism** (was MC-block-granular): 256³
+   has only 2 MC blocks → 2 of 8 threads used. Threads now take
+   contiguous MR-panel ranges, grouped into MC-row chunks to keep the
+   L2 blocking.
+4. **KC 256→512** (MC=128, NC=2048 unchanged). **Confirmed in the quiet
+   census** (4 interleaved sweep rounds): KC=512 wins the compute-bound
+   regime — 512³ ~317 vs 256's ~304, 1024³ ~350 vs ~332, 2048³ ~363 vs
+   ~349 GFLOP/s — by ~1–5%. KC=256 leads only at 256³ (~231 vs ~216).
+   Since the gate is large-matmul throughput, KC=512 stands; the 256³
+   give-up is accepted.
+
+Net effect through the dispatch path (`bench_cpu_gemm`, quiet census
+vs the pre-tuning binary; medians of interleaved runs):
+
+| | before | after | vs ref |
+|---|---|---|---|
+| 128³ | 21 GF/s (0.8× ref — lost) | 65 GF/s | 2.4× |
+| 256³ | 75 GF/s | 217 GF/s | 9.0× |
+| 512³ | 131 GF/s | 310 GF/s | 12.3× |
+| 1024³ | 208 GF/s | 340 GF/s | 14× |
+| 2048³ | 246 GF/s | 348 GF/s | — |
+
+The small-size loss to the naive loop is fixed (128³ now 2.4× faster
+than ref). **8×12 kernel: measured and rejected.** With the machine
+quiet the 8×12 variant (24 FMA : 5 loads, 29/32 regs) was mixed and
+within noise — a ~4% edge only at 2048³, a ~2% *loss* at 512³, a tie at
+1024³ (KC=512, 4 interleaved rounds). Not worth its messier NR=12 edge
+handling and near-full register file; 8×8 (20/32 regs) stays and keeps
+headroom for future unroll/prefetch work. Block-size sweep harness:
+`bench/bench_cpu_sweep.cpp` — calls `cpu::sgemm` directly (compiles in
+~1s) with `-DTL_CPU_MC/KC/NC` overrides (the constants in cpu.h are
+`#ifndef`-guarded for this).
+
+Remaining for the M5 gate (needs the x86 box): AVX2/AVX-512
+microkernels, runtime CPUID dispatch, and the real OpenBLAS-90%
+measurement. The on-Mac tuning is done.
 
 ## vs silarray (M1 Pro, 2026-07-03)
 

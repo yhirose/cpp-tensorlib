@@ -47,16 +47,16 @@ shape/transpose/epilogue (own == ref oracle test); ~235 GFLOP/s at 1024³ on
 M1 Pro NEON. Elementwise/reductions stay on array.h's autovectorized flat
 loops (memory-bound), by design.
 
+**Done (NEON tuning pass, 2026-07-03):** lane-indexed-FMA microkernel
+(K-unroll ×4 + prefetch), thread-local reusable pack buffers, MR-panel-
+granular M-parallelism, KC 256→512. Quiet-census verified: **~86–89% of
+NEON fp32 peak at 2048³, ~84% at 1024³** (was 54–64%); the sub-256³ loss
+to the naive loop is fixed (128³ now 2.4× ref). KC=512 confirmed and an
+8×12 kernel measured-and-rejected (within noise). The on-Mac NEON tuning
+is complete — see performance-notes.md "tuning pass" for the census and
+the rejected 8×12.
+
 **Remaining:**
-- *Tuning pass* (the perf sprint, off-Apple gate): reusable/thread-local
-  pack buffers (per-call `std::vector` alloc dominates small sizes — cpu::
-  loses to the naive loop below ~256³ right now), skip pool sync for
-  single-block work, tune MR/NR and MC/KC/NC, prefetch/unroll. Harness:
-  `bench/bench_cpu_gemm.cpp` (`tensorlib_bench_cpu`) — own vs ref vs
-  OpenBLAS. On the Mac, track **% of NEON fp32 peak** (~410 GFLOP/s on M1
-  Pro; own is ~54–64% now) — Homebrew OpenBLAS on M1 is a weak baseline
-  (untuned own already beats it; see performance-notes.md). The real
-  OpenBLAS-90% verdict is on the x86 box.
 - *AVX2 / AVX-512 microkernels* — write behind the same interface; validate
   and tune on the x86 WSL2 box (can't execute on ARM).
 - *Runtime CPUID dispatch* — currently the microkernel is compile-time
