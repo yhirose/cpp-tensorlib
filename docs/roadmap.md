@@ -56,11 +56,25 @@ to the naive loop is fixed (128³ now 2.4× ref). KC=512 confirmed and an
 is complete — see performance-notes.md "tuning pass" for the census and
 the rejected 8×12.
 
+**Done (AVX2 + runtime dispatch scaffold, 2026-07-03):** the compile-time
+`#ifdef` microkernel pick is now a runtime function pointer (`select_ukernel`)
+— ARM fixes to NEON at compile time; x86 probes `__builtin_cpu_supports`
+and picks AVX2 (`target("avx2,fma")`) or the scalar fallback. Added an AVX2
+8×8 microkernel (`_mm256_fmadd_ps` + `_mm256_broadcast_ss`, the x86 analogue
+of the NEON lane-FMA kernel, K-unroll ×4 + prefetch), sharing the MR=8/NR=8
+packed layout. Scalar + NEON validated against a naive oracle on ARM; the
+AVX2 path cross-compiled (`-target x86_64 … -c`) and disassembly-confirmed
+to emit `vfmadd*`/`vbroadcastss` — but **not executed** (Rosetta stops at
+SSE4.2). Full suite green on native ARM.
+
 **Remaining:**
-- *AVX2 / AVX-512 microkernels* — write behind the same interface; validate
-  and tune on the x86 WSL2 box (can't execute on ARM).
-- *Runtime CPUID dispatch* — currently the microkernel is compile-time
-  selected (NEON vs scalar); x86 needs a runtime AVX2/AVX-512/scalar pick.
+- *AVX2 execution + register-tuning + the OpenBLAS-90% gate* — on the x86
+  WSL2 box: run the cross-compiled AVX2 path, confirm numerics vs `ref::`,
+  then tune the tile (6×16 vs 8×8, MC/KC/NC) and settle the gate verdict.
+- *AVX-512 microkernel* — deferred: a real AVX-512 kernel wants NR=16 (a
+  second packing layout), best written and measured on the x86 box. The
+  dispatch seam is ready for it (`select_ukernel` just needs an
+  `avx512f` branch + the wider ukernel).
 
 **Environment:** Apple Silicon is ARM64 = NEON, so the NEON microkernel is
 fully developable, natively runnable, and perf-tunable on a Mac (it is also

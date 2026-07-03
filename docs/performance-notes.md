@@ -270,6 +270,33 @@ Remaining for the M5 gate (needs the x86 box): AVX2/AVX-512
 microkernels, runtime CPUID dispatch, and the real OpenBLAS-90%
 measurement. The on-Mac tuning is done.
 
+## AVX2 + runtime dispatch scaffold (M5, 2026-07-03)
+
+Written and compile-checked on the Mac; **not executed** (Rosetta stops
+at SSE4.2 — the x86 box runs and tunes it). The compile-time `#ifdef`
+microkernel pick became a runtime function pointer: `select_ukernel()`
+returns NEON on ARM (fixed at compile time), and on x86 probes
+`__builtin_cpu_supports("avx2"/"fma")` to pick the AVX2 kernel or the
+scalar fallback. `sgemm` caches the pointer in a magic-static and calls
+through it — the indirect call is amortized over the kc-loop.
+
+The AVX2 8×8 kernel is the x86 analogue of the NEON one: NR=8 = one
+`__m256` per row → 8 accumulators (of 16 ymm), each k-step does one
+B load broadcast-multiplied by the 8 A values (`_mm256_broadcast_ss` +
+`_mm256_fmadd_ps`), K-unrolled ×4 with prefetch. It shares the MR=8/NR=8
+packing, so no second pack path. `__attribute__((target("avx2,fma")))`
+lets it live in a baseline-x86 TU and be reached only after the CPUID
+check — verified by cross-compiling (`-target x86_64-apple-macos -c`)
+and disassembling: the body emits `vfmadd213/231ps` + `vbroadcastss`,
+confirming the attribute took. Scalar + NEON kernels validated against a
+naive triple-loop oracle across full and edge (mr<8, nr<8) tiles.
+
+**Deferred to the x86 box:** executing/numerically-verifying AVX2,
+register-tuning the tile (8×8 vs a 6×16 that better fits 16 ymm), and an
+AVX-512 kernel — a real one wants NR=16 (a second packing layout), so it
+is a genuine x86-side task, not a Mac compile-check. The dispatch seam is
+ready: `select_ukernel` just needs an `avx512f` branch.
+
 ## vs silarray (M1 Pro, 2026-07-03)
 
 Head-to-head with the predecessor across cpu/gpu/auto. Two separate
