@@ -156,6 +156,34 @@ Tensor-unused-binary size check on the culebra side.
   full set produced once CUDA lands.
 - **Windows-native environment** — not set up; Windows is currently
   build-checked via CI only.
+- **MSVC support vs header-only (AVX2 on Windows)** — decided (2026-07-03).
+  header-only is a hard invariant and consumers are MSVC-majority, so the
+  tension is: MSVC has no per-function target attribute and `/arch:AVX2` is
+  TU-global, so header-only runtime-dispatched AVX2 (what GCC/Clang get via
+  `__attribute__((target)))`) cannot be replicated on MSVC. Resolution — a
+  three-tier model, dropping no one:
+  1. *Default, header-only:* GCC/Clang do runtime dispatch (already built).
+     MSVC compiles clean and runs the **scalar** kernel today — the x86 SIMD
+     path is gated on `__x86_64__`, which MSVC (`_M_X64`) doesn't define, so
+     nothing MSVC-hostile is even reached. Correct, just not accelerated.
+  2. *MSVC AVX2, opt-in, header-only preserved:* build with `/arch:AVX2` →
+     `select_ukernel` picks AVX2 at compile time (`#if defined(__AVX2__)`).
+     Caveat: `/arch:AVX2` is TU-wide, so such a binary `#UD`s on pre-AVX2
+     CPUs with no runtime fallback — fine for source-built-for-a-known-target
+     or an AVX2 baseline, not for an adaptive redistributable.
+  3. *MSVC runtime dispatch (adaptive redistributable), opt-in:* link a small
+     AVX2-only **source** file (`cpu_avx2.cpp`, not yet written) compiled
+     per-file with `/arch:AVX2`; baseline TUs stay AVX2-free; CPUID picks via
+     the existing `ukernel_fn` pointer (the TU boundary is the isolation the
+     target attribute gives on GCC/Clang). Ship **source, never a prebuilt
+     `.obj`** — an obj would need a {toolset}×{CRT: /MT,/MTd,/MD,/MDd}×{arch}
+     matrix (LNK2038 on CRT mismatch), can't cover future toolsets, and a
+     binary blob violates the zero-dep / build-from-source / auditable ethos.
+     A source file auto-matches the consumer's toolchain and stays auditable.
+  Small mechanical seams alongside this: `__builtin_prefetch` → `_mm_prefetch`
+  and `__builtin_cpu_supports` → `__cpuid`/`__cpuidex` under `_MSC_VER`. None
+  of this blocks the gates — WSL2 unblocks all x86 M5 + M6 CUDA; native-Windows
+  AVX2 is a scoped follow-up.
 
 ## Notes on effort
 
