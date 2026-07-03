@@ -118,8 +118,7 @@ keeps autograd/VJP; this library owns the graph, fusion, and execution).
 | M3b-1 ✅ | Metal foundation: context, buffer pool, elementwise kernels, batching |
 | M3b-2 ✅ | Metal SGEMM (tiled), softmax, last-axis reductions; full GPU MLP fwd |
 | M3b-3 ✅ | STEEL SGEMM sprint: 2048³ ~1300 → ~3200 GFLOP/s |
-| M4 | culebra integration (TensorImpl wraps tl::array; F32 unification) |
-| M4 | culebra integration (TensorImpl wraps tl::array; F32 unification) |
+| M4 ✅ | culebra integration (TensorImpl wraps tl::array; F32 unification); tiny-tensor per-op sprint |
 | M5 | Own CPU backend: threadpool + BLIS-style microkernels (AVX2/AVX-512/NEON, runtime dispatch) |
 | M6 | Own CUDA backend: dlopen'd driver API, PTX `#embed`, SGEMM ladder |
 | M7 | BF16 storage type; ongoing measured optimization |
