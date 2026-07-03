@@ -41,8 +41,9 @@ struct storage {
     if (void* mb = metal::alloc(bytes, &contents)) {
       s.native = mb;
       s.ptr = contents;
-      s.buf = std::shared_ptr<void>(
-          mb, [bytes](void* p) { metal::release(p, bytes); });
+      s.buf = std::shared_ptr<void>(mb, [bytes, contents](void* p) {
+        metal::release(p, bytes, contents);
+      });
     } else {
       return make_heap_(n);
     }

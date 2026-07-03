@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <initializer_list>
 #include <limits>
@@ -107,16 +108,25 @@ inline shape_t reduce_shape(const shape_t& s, int& axis, bool keepdims) {
   return out;
 }
 
+// Soft rank cap so index walkers can use stack arrays instead of per-call
+// heap vectors (the walker is called per *op*, and tiny-tensor workloads
+// live or die on per-op allocation count).
+inline constexpr size_t kMaxRank = 16;
+
 // Row-major walk over `shape`, calling f(linear_out_index, offsets...) with
 // per-source strided offsets. The oracle for every layout: views, broadcast
-// and transposed inputs all reduce to strides here.
+// and transposed inputs all reduce to strides here. Hot callers should take
+// their contiguous fast path first — this walker is the generic fallback.
 template <typename F>
 void for_each_index(const shape_t& shape,
                     const std::vector<std::vector<int64_t>>& strides, F f) {
   int64_t n = num_elements(shape);
   size_t rank = shape.size(), nsrc = strides.size();
-  std::vector<int64_t> idx(rank, 0);
-  std::vector<int64_t> off(nsrc, 0);
+  if (rank > kMaxRank || nsrc > 4) {
+    throw std::invalid_argument("tl: rank/source count over walker limits");
+  }
+  int64_t idx[kMaxRank] = {};
+  std::vector<int64_t> off(nsrc, 0);  // part of f's signature; one alloc
   for (int64_t i = 0; i < n; i++) {
     f(i, off);
     for (size_t r = rank; r-- > 0;) {
@@ -156,6 +166,7 @@ struct node {
   std::vector<int64_t> strides;
   int64_t soffset = 0;
   bool evaluated = false;
+  uint64_t visit_mark = 0;  // graph::run visited stamp (see visit_counter)
 };
 
 using node_ptr = std::shared_ptr<node>;
@@ -165,6 +176,10 @@ struct graph;
 // Evaluation hook (TL_RUNTIME_HOOKS; see storage.h). Installed alongside
 // the storage/barrier hooks by tl::install_runtime_hooks().
 inline void (*run_hook)(const std::vector<node_ptr>&) = nullptr;
+
+// Monotonic stamp for graph::run's visited marking (O(1), allocation-free;
+// nodes are single-threaded like the rest of evaluation).
+inline uint64_t visit_counter = 0;
 
 }  // namespace detail
 
@@ -253,6 +268,12 @@ class array {
   int64_t offset_ = 0;
   storage storage_;
   detail::node_ptr node_;  // set while lazy; cleared on adoption
+  // Memoized constant wrap (graph::as_node). An array's layout and storage
+  // handle never change after construction, so the wrap can never go stale;
+  // in-place data writes (add_) flow through, since the node shares the
+  // same storage. Saves the per-use node/vector allocations when the same
+  // array (a weight, an activation) feeds many ops.
+  mutable detail::node_ptr const_node_;
 
   static array make_(shape_t shape);
   void ensure_() const;  // materialize (evaluate + adopt) if lazy
@@ -455,6 +476,10 @@ inline array array::clone() const {
   auto out = make_(shape_);
   auto* po = out.storage_.data();
   const auto* pi = raw();
+  if (contiguous()) {
+    std::memcpy(po, pi, static_cast<size_t>(size()) * sizeof(float));
+    return out;
+  }
   detail::for_each_index(
       shape_, {strides_},
       [&](int64_t i, const std::vector<int64_t>& off) { po[i] = pi[off[0]]; });
@@ -474,6 +499,11 @@ array map_unary(const array& a, F f) {
   auto out = array::empty(a.shape());
   auto* po = out.data();
   const auto* pa = a.raw();
+  if (a.contiguous()) {  // flat loop: no walker, autovectorizes
+    int64_t n = out.size();
+    for (int64_t i = 0; i < n; i++) po[i] = f(pa[i]);
+    return out;
+  }
   for_each_index(a.shape(), {a.strides()},
                  [&](int64_t i, const std::vector<int64_t>& off) {
                    po[i] = f(pa[off[0]]);
@@ -483,6 +513,15 @@ array map_unary(const array& a, F f) {
 
 template <typename F>
 array map_binary(const array& a, const array& b, F f) {
+  if (a.shape() == b.shape() && a.contiguous() && b.contiguous()) {
+    auto out = array::empty(a.shape());
+    auto* po = out.data();
+    const auto* pa = a.raw();
+    const auto* pb = b.raw();
+    int64_t n = out.size();
+    for (int64_t i = 0; i < n; i++) po[i] = f(pa[i], pb[i]);
+    return out;
+  }
   auto shape = broadcast_shape(a.shape(), b.shape());
   auto out = array::empty(shape);
   auto* po = out.data();
@@ -812,12 +851,14 @@ struct graph {
   static node_ptr as_node(const array& a) {
     if (!a.defined()) throw std::logic_error("tl: undefined array");
     if (a.node_) return a.node_;
+    if (a.const_node_) return a.const_node_;
     auto n = std::make_shared<node>();
     n->shape = a.shape_;
     n->stor = a.storage_;
     n->strides = a.strides_;
     n->soffset = a.offset_;
     n->evaluated = true;
+    a.const_node_ = n;
     return n;
   }
 
@@ -829,7 +870,62 @@ struct graph {
     return a;
   }
 
+  // Eager-tiny: when the inputs are already materialized and the result is
+  // small, run the flat loop NOW and skip the node / array-shell / eval
+  // machinery entirely (~3x fewer allocations per op). Laziness is an
+  // optimization, not a semantic: values are identical, and chains that
+  // could fuse stay lazy because their intermediates aren't materialized.
+  // Backward passes and optimizer updates — all-materialized by nature —
+  // are exactly the tiny-tensor storm this targets.
+  static constexpr int64_t kEagerTiny = 4096;
+
+  static bool eager_cpu_ok_() {
+    if (device_ == device_type::gpu) return false;
+    if (metal::pending()) return false;  // never break a running pipeline
+    return true;  // cpu mode; in auto these sizes are below the threshold
+  }
+
+  static bool eager_operand_(const array& x) {
+    // An evaluated-but-not-adopted node is materialized in all but name
+    // (this is the normal state of forward values read by a backward pass);
+    // adoption here is a few pointer moves, no evaluation.
+    if (x.node_ && x.node_->evaluated) x.ensure_();
+    return x.materialized() && x.contiguous();
+  }
+
   static array binary(op_t op, const array& a, const array& b) {
+    if (a.shape() == b.shape() && num_elements(a.shape()) <= kEagerTiny &&
+        eager_operand_(a) && eager_operand_(b) && eager_cpu_ok_()) {
+      switch (op) {
+        case op_t::add: return map_binary(a, b, std::plus<float>());
+        case op_t::sub: return map_binary(a, b, std::minus<float>());
+        case op_t::mul: return map_binary(a, b, std::multiplies<float>());
+        case op_t::div: return map_binary(a, b, std::divides<float>());
+        case op_t::pow_:
+          return map_binary(a, b,
+                            [](float x, float y) { return std::pow(x, y); });
+        case op_t::gt:
+          return map_binary(
+              a, b, [](float x, float y) { return x > y ? 1.0f : 0.0f; });
+        case op_t::lt:
+          return map_binary(
+              a, b, [](float x, float y) { return x < y ? 1.0f : 0.0f; });
+        case op_t::ge:
+          return map_binary(
+              a, b, [](float x, float y) { return x >= y ? 1.0f : 0.0f; });
+        case op_t::le:
+          return map_binary(
+              a, b, [](float x, float y) { return x <= y ? 1.0f : 0.0f; });
+        case op_t::eq:
+          return map_binary(
+              a, b, [](float x, float y) { return x == y ? 1.0f : 0.0f; });
+        case op_t::ne:
+          return map_binary(
+              a, b, [](float x, float y) { return x != y ? 1.0f : 0.0f; });
+        default:
+          break;  // not an elementwise binary — fall through to lazy
+      }
+    }
     auto n = std::make_shared<node>();
     n->op = op;
     n->shape = broadcast_shape(a.shape(), b.shape());  // throws early
@@ -838,6 +934,26 @@ struct graph {
   }
 
   static array unary(op_t op, const array& a) {
+    if (num_elements(a.shape()) <= kEagerTiny && eager_operand_(a) &&
+        eager_cpu_ok_()) {
+      switch (op) {
+        case op_t::recip:
+          return map_unary(a, [](float x) { return 1.0f / x; });
+        case op_t::exp_:
+          return map_unary(a, [](float x) { return std::exp(x); });
+        case op_t::log_:
+          return map_unary(a, [](float x) { return std::log(x); });
+        case op_t::sqrt_:
+          return map_unary(a, [](float x) { return std::sqrt(x); });
+        case op_t::sigmoid:
+          return map_unary(
+              a, [](float x) { return 1.0f / (1.0f + std::exp(-x)); });
+        case op_t::relu:
+          return map_unary(a, [](float x) { return x > 0 ? x : 0.0f; });
+        default:
+          break;  // softmax etc. — fall through to lazy
+      }
+    }
     auto n = std::make_shared<node>();
     n->op = op;
     n->shape = a.shape();
@@ -855,6 +971,10 @@ struct graph {
       c->scale = a.node_->scale * s;
       c->offset = a.node_->offset * s + o;
       return from_node(std::move(c));
+    }
+    if (num_elements(a.shape()) <= kEagerTiny && eager_operand_(a) &&
+        eager_cpu_ok_()) {
+      return map_unary(a, [s, o](float x) { return x * s + o; });
     }
     auto v = unary(op_t::affine, a);
     v.node_->scale = s;
@@ -1060,19 +1180,25 @@ struct graph {
   // node evaluates through eval_one. Iterative DFS: recursion depth must not
   // bound graph depth.
   static void run(const std::vector<node_ptr>& roots) {
-    std::vector<node*> order;
-    std::unordered_set<node*> visited;
-    std::vector<std::pair<node*, size_t>> stack;
+    // Thread-local scratch: run() fires once per eval batch and tiny-graph
+    // workloads are per-op-allocation-bound. Nested evaluation cannot happen
+    // (kernels never build or evaluate graphs), so reuse is safe. Visited
+    // marking is a per-run stamp on the node — O(1), allocation-free.
+    thread_local std::vector<node*> order;
+    thread_local std::vector<std::pair<node*, size_t>> stack;
+    order.clear();
+    stack.clear();
+    const uint64_t stamp = ++visit_counter;
     for (const auto& root : roots) {
-      if (!root || root->evaluated || visited.count(root.get())) continue;
-      visited.insert(root.get());
+      if (!root || root->evaluated || root->visit_mark == stamp) continue;
+      root->visit_mark = stamp;
       stack.emplace_back(root.get(), 0);
       while (!stack.empty()) {
         auto& [n, i] = stack.back();
         if (i < n->inputs.size()) {
           node* in = n->inputs[i++].get();
-          if (!in->evaluated && !visited.count(in)) {
-            visited.insert(in);
+          if (!in->evaluated && in->visit_mark != stamp) {
+            in->visit_mark = stamp;
             stack.emplace_back(in, 0);
           }
         } else {
@@ -1085,7 +1211,145 @@ struct graph {
     metal::flush();  // blocking eval: the batch is done when run() returns
   }
 
+  // Allocation-free contiguity check on node metadata (result/constant
+  // strides vs the node's shape).
+  static bool node_contig_(const node& in) {
+    if (in.strides.size() != in.shape.size()) return false;
+    int64_t expected = 1;
+    for (size_t r = in.shape.size(); r-- > 0;) {
+      if (in.strides[r] != expected) return false;
+      expected *= in.shape[r];
+    }
+    return true;
+  }
+
+  static void store_raw_(node& n, storage&& out) {
+    n.stor = std::move(out);
+    n.strides = contiguous_strides(n.shape);
+    n.soffset = 0;
+    n.evaluated = true;
+  }
+
+  // Tiny-tensor fast path: contiguous same-shape elementwise ops evaluate
+  // as flat loops straight on the input nodes' storage — no wrap arrays, no
+  // output array shell, no walker. This is where per-op-allocation-bound
+  // workloads (microgpt-class, 16–256 element tensors) spend their time;
+  // above the cutoff the accel/metal paths win and the cost being shaved
+  // here is noise. The epilogue folds into the same loop.
+  static bool try_fast_ew_(node& n) {
+    constexpr int64_t kCutoff = 4096;
+    using op_t = node::op_t;
+    int64_t numel = num_elements(n.shape);
+    if (numel == 0 || numel > kCutoff) return false;
+    if (metal_mode_(numel, kernel_class::elementwise)) return false;
+    if (n.inputs.empty()) return false;
+    const node& a = *n.inputs[0];
+    if (a.shape != n.shape || !node_contig_(a)) return false;
+    const float* pa = a.stor.data() + a.soffset;
+    const float s = n.scale, o = n.offset;
+    const bool epi = s != 1.0f || o != 0.0f;
+
+    auto unary_loop = [&](auto f) {
+      detail::barrier_();
+      storage out = storage::make(numel);
+      float* po = out.data();
+      if (epi) {
+        for (int64_t i = 0; i < numel; i++) po[i] = f(pa[i]) * s + o;
+      } else {
+        for (int64_t i = 0; i < numel; i++) po[i] = f(pa[i]);
+      }
+      store_raw_(n, std::move(out));
+      return true;
+    };
+
+    switch (n.op) {
+      case op_t::add:
+      case op_t::sub:
+      case op_t::mul:
+      case op_t::div:
+      case op_t::pow_: {
+        const node& b = *n.inputs[1];
+        if (b.shape != n.shape || !node_contig_(b)) return false;
+        const float* pb = b.stor.data() + b.soffset;
+        auto binary_loop = [&](auto f) {
+          detail::barrier_();
+          storage out = storage::make(numel);
+          float* po = out.data();
+          if (epi) {
+            for (int64_t i = 0; i < numel; i++) po[i] = f(pa[i], pb[i]) * s + o;
+          } else {
+            for (int64_t i = 0; i < numel; i++) po[i] = f(pa[i], pb[i]);
+          }
+          store_raw_(n, std::move(out));
+          return true;
+        };
+        switch (n.op) {
+          case op_t::add: return binary_loop(std::plus<float>());
+          case op_t::sub: return binary_loop(std::minus<float>());
+          case op_t::mul: return binary_loop(std::multiplies<float>());
+          case op_t::div: return binary_loop(std::divides<float>());
+          default:
+            return binary_loop(
+                [](float x, float y) { return std::pow(x, y); });
+        }
+      }
+      case op_t::affine:
+        return unary_loop([](float x) { return x; });
+      case op_t::recip:
+        return unary_loop([](float x) { return 1.0f / x; });
+      case op_t::exp_:
+        return unary_loop([](float x) { return std::exp(x); });
+      case op_t::log_:
+        return unary_loop([](float x) { return std::log(x); });
+      case op_t::sqrt_:
+        return unary_loop([](float x) { return std::sqrt(x); });
+      case op_t::sigmoid:
+        return unary_loop(
+            [](float x) { return 1.0f / (1.0f + std::exp(-x)); });
+      case op_t::relu:
+        return unary_loop([](float x) { return x > 0 ? x : 0.0f; });
+      default:
+        return false;
+    }
+  }
+
+  // Tiny matmul fast path: strided triple loop straight on node storage.
+  // Below the cutoff the cblas/metal call overhead and the wrap/out array
+  // shells cost more than the multiply itself (microgpt-class attention/MLP
+  // matmuls are [16,16]@[16,1]). Handles rank-2 × rank-2 with arbitrary
+  // strides (transposed views included); everything else falls through.
+  static bool try_fast_dot_(node& n) {
+    constexpr int64_t kCutoff = 16384;  // M*N*K
+    const node& a = *n.inputs[0];
+    const node& b = *n.inputs[1];
+    if (a.shape.size() != 2 || b.shape.size() != 2) return false;
+    int64_t m = a.shape[0], k = a.shape[1], nn = b.shape[1];
+    if (m * nn * k > kCutoff || m * nn == 0) return false;
+    if (metal_mode_(m * nn * k, kernel_class::matmul)) return false;
+    detail::barrier_();
+    storage out = storage::make(m * nn);
+    const float* pa = a.stor.data() + a.soffset;
+    const float* pb = b.stor.data() + b.soffset;
+    float* po = out.data();
+    int64_t as0 = a.strides[0], as1 = a.strides[1];
+    int64_t bs0 = b.strides[0], bs1 = b.strides[1];
+    const float s = n.scale, o = n.offset;
+    for (int64_t i = 0; i < m; i++) {
+      for (int64_t j = 0; j < nn; j++) {
+        float acc = 0.0f;
+        for (int64_t l = 0; l < k; l++) {
+          acc += pa[i * as0 + l * as1] * pb[l * bs0 + j * bs1];
+        }
+        po[i * nn + j] = acc * s + o;
+      }
+    }
+    store_raw_(n, std::move(out));
+    return true;
+  }
+
   static void eval_one(node& n) {
+    if (n.op != node::op_t::constant && try_fast_ew_(n)) return;
+    if (n.op == node::op_t::dot && try_fast_dot_(n)) return;
     auto in = [&](size_t i) { return wrap(*n.inputs[i]); };
     array r;
     bool epi_done = false;  // epilogue already applied inside the op body
@@ -1290,16 +1554,29 @@ inline void array::ensure_() const {
       throw std::logic_error(
           "tl: evaluation before install_runtime_hooks() (TL_RUNTIME_HOOKS)");
     }
-    detail::run_hook({node_});
+    // Thread-local scratch: single-root evals fire per op in tiny-tensor
+    // workloads; an initializer-list vector per call adds up.
+    thread_local std::vector<detail::node_ptr> root;
+    root.assign(1, node_);
+    detail::run_hook(root);
+    root.clear();
 #else
-    detail::graph::run({node_});
+    thread_local std::vector<detail::node_ptr> root;
+    root.assign(1, node_);
+    detail::graph::run(root);
+    root.clear();
 #endif
   }
   auto* self = const_cast<array*>(this);
   self->storage_ = node_->stor;
   self->strides_ = node_->strides;
   self->offset_ = node_->soffset;
-  self->node_.reset();
+  // The evaluated node doubles as the constant wrap for future uses of
+  // this array as an input. Drop its input edges first: they are spent
+  // (everything is evaluated), and releasing them returns consumed
+  // intermediates' buffers to the pool as early as possible.
+  node_->inputs.clear();
+  self->const_node_ = std::move(self->node_);
 }
 
 template <typename... Ts>
@@ -1388,6 +1665,15 @@ inline array sum_to(const array& a, shape_t shape) {
 
 inline array& array::add_(const array& b) {
   ensure_();
+  // Fast path first: gradient accumulation is same-shape contiguous +=
+  // on tiny tensors, where the generic walker's setup would dominate.
+  if (shape_ == b.shape() && contiguous() && b.contiguous()) {
+    const auto* pb = b.raw();
+    auto* po = storage_.data() + offset_;
+    int64_t n = size();
+    for (int64_t i = 0; i < n; i++) po[i] += pb[i];
+    return *this;
+  }
   if (detail::broadcast_shape(shape_, b.shape()) != shape_) {
     throw std::invalid_argument("tl::add_: " + detail::shape_str(b.shape()) +
                                 " does not broadcast to " +

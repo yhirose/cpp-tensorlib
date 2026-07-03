@@ -104,6 +104,40 @@ GPU mode loses 87x on this shape (blocking flush per step × 6000; torch
 MPS hides latency with async queues and still loses 12x) — that is what
 the auto thresholds are for, not kernel work.
 
+## Tiny-tensor sprint (2026-07-02, microgpt gate)
+
+Workload: culebra microgpt (transformer, n_embd=16, 16–256 element
+tensors) measured 2.6x slower than the pre-M4 direct executor — the
+regime where per-op allocation dominates and the lazy-graph machinery is
+pure overhead. Fixes, each measured on a 256-element op microbench
+(loaded machine; ratios stable):
+
+| Change | Effect |
+|---|---|
+| Contiguous flat-loop fast paths in map_unary/map_binary/clone/add_ | add_ 1082→63 ns, clone 869→136 ns |
+| graph::run: thread-local scratch + visit-stamp marking (no hash set) | part of ~2x lazy-op win |
+| eval_one fast paths on raw node storage (elementwise + tiny dot ≤16K MNK, strided ok, epilogue folded) | dot 814→290 ns |
+| as_node memoization + evaluated-node-as-const-cache on adoption | repeat-operand allocs gone |
+| Eager-tiny in graph builders (materialized operands, ≤4096 elems, CPU-side): run flat loop, skip node/shell/eval entirely | lazy add 643→204 ns |
+| culebra: broadcast check without shape construction; strides mirror → method | wrapper allocs −2/op |
+
+End state vs the pre-M4 executor (interleaved, per-step):
+
+| Workload | old/new |
+|---|---|
+| microgpt n_embd=16 (torture corner) | 0.55 — old wins 1.8x |
+| microgpt n_embd=64 | 0.73–0.86 |
+| **microgpt n_embd=128** | **1.4–1.55 — new wins** |
+| **MNIST train (batch=10)** | **2.0 — new wins** (was 1.7 before sprint) |
+
+The remaining tiny-corner deficit is the tape+graph double bookkeeping
+(~4–5 allocations/op that a direct executor doesn't pay). Grinding it
+out needs node pooling / small-vector fields — invasive, and n_embd=16
+is a toy regime; the crossover sits between n_embd 64 and 128. Recorded
+as accepted, not refuted: revisit only if a real workload lands in it.
+Large-size and GPU numbers verified unchanged after the sprint
+(checksums identical; 2048³ within load noise of its baseline).
+
 ## auto-mode thresholds (PROVISIONAL — loaded machine)
 
 `use_gpu_`-style gate in graph::metal_mode_: never break a pending GPU

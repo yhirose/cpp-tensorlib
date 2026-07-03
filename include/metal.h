@@ -58,7 +58,9 @@ struct context {
   objc::id enc = nullptr;  // compute encoder (while pending)
   void* pool = nullptr;    // autorelease pool for the pending batch
   bool pending = false;
-  std::unordered_map<int64_t, std::vector<void*>> free_bufs;  // by byte size
+  // Free-list by byte size; contents pointers cached so a pool hit costs no
+  // objc round trip (tiny-tensor workloads allocate per op).
+  std::unordered_map<int64_t, std::vector<std::pair<void*, float*>>> free_bufs;
   std::unordered_map<int, objc::id> psos;
 
   static context& get() {
@@ -163,23 +165,23 @@ inline void flush() {
 inline void* alloc(int64_t bytes, float** contents) {
   auto& c = context::get();
   if (!c.device) return nullptr;
-  void* buf = nullptr;
   auto it = c.free_bufs.find(bytes);
   if (it != c.free_bufs.end() && !it->second.empty()) {
-    buf = it->second.back();
+    auto [buf, ptr] = it->second.back();
     it->second.pop_back();
-  } else {
-    // MTLResourceStorageModeShared = 0
-    buf = objc::send(c.device, "newBufferWithLength:options:",
-                     static_cast<unsigned long>(bytes), 0ul);
-    if (!buf) return nullptr;
+    *contents = ptr;
+    return buf;
   }
+  // MTLResourceStorageModeShared = 0
+  void* buf = objc::send(c.device, "newBufferWithLength:options:",
+                         static_cast<unsigned long>(bytes), 0ul);
+  if (!buf) return nullptr;
   *contents = static_cast<float*>(objc::send(buf, "contents"));
   return buf;
 }
 
-inline void release(void* buf, int64_t bytes) {
-  context::get().free_bufs[bytes].push_back(buf);
+inline void release(void* buf, int64_t bytes, float* contents) {
+  context::get().free_bufs[bytes].emplace_back(buf, contents);
 }
 
 namespace detail_ {
@@ -353,7 +355,7 @@ inline bool available() { return false; }
 inline bool pending() { return false; }
 inline void flush() {}
 inline void* alloc(int64_t, float**) { return nullptr; }
-inline void release(void*, int64_t) {}
+inline void release(void*, int64_t, float*) {}
 inline bool binary(kop, void*, int64_t, void*, int64_t, void*, int64_t,
                    int64_t, float, float) {
   return false;
