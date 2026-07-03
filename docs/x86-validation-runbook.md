@@ -16,9 +16,13 @@ portable and travels via git, so on the box: clone, then run these.
 
 ```sh
 sudo apt update
-sudo apt install -y build-essential g++-13 cmake pkg-config libopenblas-dev
-# g++-13 for C++23 (-std=c++2b); clang-16+ also works. libopenblas-dev is
-# the gate baseline; pkg-config resolves its include/lib paths portably.
+sudo apt install -y build-essential cmake pkg-config libopenblas-dev
+# Compiler: any g++ >= 11 or clang++ >= 13 (whatever accepts -std=c++2b) —
+# the code is C++17-level compiled under the C++23 flag, so it isn't picky;
+# Ubuntu 22.04's default g++-11 already works. CMake >= 3.20 is needed for
+# CMAKE_CXX_STANDARD 23. libopenblas-dev is the gate baseline; pkg-config
+# resolves its include/lib paths portably. Substitute clang++ for g++ in the
+# bench commands below if you prefer — both are tested (the Mac builds clang).
 ```
 
 Sanity-check the CPU actually has the ISA the kernel dispatches to:
