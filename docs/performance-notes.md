@@ -68,6 +68,53 @@ best small-size behavior and is the non-STEEL fallback.
 - Narrow-N band (n < 48) and small shapes stay CPU-bound → auto-mode
   thresholds are the fix, not kernel work.
 
+## MNIST training gate (M4 integration, 2026-07-02)
+
+Workload: culebra `benchmarks/mnist/train_bench.cul` — 784→30→10 MLP,
+batch=10, hand-coded backprop, 6000 steps/epoch. The small-shape stress
+test where per-op overhead dominates. Measured interleaved on a LOADED
+machine (load avg ~9; medians were stable across 6 rounds regardless):
+
+| Stack | warm s/epoch |
+|---|---|
+| **culebra + tensorlib (cpu, JIT)** | **0.044** |
+| PyTorch CPU (same recipe) | 0.066–0.075 |
+| culebra + pre-M4 direct cblas | 0.076 |
+| PyTorch MPS | 0.52 |
+| culebra + tensorlib (gpu) | 3.8 |
+
+**Gate: PASSED for this workload** — 1.5–1.7x faster than PyTorch CPU,
+1.7x faster than the pre-M4 implementation. All rows converge to
+accuracy=0.9079 (numerics verified across devices).
+
+**The fix that flipped it** (M4 initially measured 1.6x SLOWER than
+pre-M4): culebra's wrapper lifted `t * 2.0` and every VJP scalar to a
+rank-0 tensor and called the tensor⊙tensor path — bypassing tl's scalar
+overloads, so nothing fused and `W - d.dot(x)*lr` ran a ref:: broadcast
+loop over the weight matrix (23520 elems × 6000 steps; `sample` showed
+map_binary<multiplies> at 15x the samples of anything else). Routing
+materialized rank-0 operands through the scalar overloads restored
+affine/GEMM-epilogue fusion. Lesson: **fusion is only as good as the
+embedder's entry points — audit the wrapper's lowering, not just the
+kernels.** (Also: tl-level step microbench = 23 ms/epoch vs 44 through
+culebra; the remaining ~2x is interp/JIT + tape-node overhead, known and
+acceptable at batch=10.)
+
+GPU mode loses 87x on this shape (blocking flush per step × 6000; torch
+MPS hides latency with async queues and still loses 12x) — that is what
+the auto thresholds are for, not kernel work.
+
+## auto-mode thresholds (PROVISIONAL — loaded machine)
+
+`use_gpu_`-style gate in graph::metal_mode_: never break a pending GPU
+pipeline; otherwise start GPU only above a per-kernel-class size
+threshold (types.h auto_threshold_). Set from today's data: matmul
+5e8 (~800³; parity measured at 1024³, 2x GPU win at 2048³), elementwise
+4e6, reduction 8e6 (unmeasured, conservative). Verified both extremes:
+auto tracks gpu at 2048³ (5.4 vs cpu 11.4 ms) and tracks cpu on small
+dots (0.34 ms vs gpu's 38 ms per 100). **Re-run the census on a quiet
+machine before flipping culebra's default device to auto.**
+
 ## Refuted approaches — do not retry without new evidence
 
 | Approach | Verdict | Data |

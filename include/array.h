@@ -932,15 +932,18 @@ struct graph {
     n.evaluated = true;
   }
 
-  // Metal eligibility: manual gpu mode dispatches whenever possible; auto
-  // joins an already-running GPU pipeline but never starts one (per-class
-  // size thresholds are measured work — silarray's use_auto — and land with
-  // the bench data); cpu mode never.
-  static bool metal_mode_() {
+  // Metal eligibility: manual gpu mode dispatches whenever possible; cpu
+  // mode never. auto follows silarray's two rules: (1) never break a
+  // running GPU pipeline — a CPU op here would force a blocking flush; the
+  // choice is asymmetric because picking GPU is sticky (drags downstream
+  // ops along) while picking CPU commits nothing. (2) Otherwise start GPU
+  // only above the per-kernel-class size threshold (types.h).
+  static bool metal_mode_(int64_t n, kernel_class kc) {
     if (!metal::available()) return false;
     if (device_ == device_type::gpu) return true;
-    if (device_ == device_type::auto_) return metal::pending();
-    return false;
+    if (device_ != device_type::auto_) return false;
+    if (metal::pending()) return true;
+    return n >= auto_threshold_(kc);
   }
 
   static metal::kop to_kop_(op_t op) {
@@ -960,8 +963,8 @@ struct graph {
 
   static std::optional<array> metal_binary(const node& n, const array& a,
                                            const array& b) {
-    if (!metal_mode_() || !a.contiguous() || !b.contiguous() ||
-        a.shape() != b.shape()) {
+    if (!metal_mode_(num_elements(n.shape), kernel_class::elementwise) ||
+        !a.contiguous() || !b.contiguous() || a.shape() != b.shape()) {
       return std::nullopt;
     }
     if (!a.storage_.native || !b.storage_.native) return std::nullopt;
@@ -991,7 +994,11 @@ struct graph {
 
   static std::optional<array> metal_gemm(const node& n, const array& a_in,
                                          const array& b_in) {
-    if (!metal_mode_()) return std::nullopt;
+    int64_t k_dim = a_in.shape().back();
+    if (!metal_mode_(num_elements(n.shape) * (k_dim > 0 ? k_dim : 1),
+                     kernel_class::matmul)) {
+      return std::nullopt;
+    }
     array a = a_in.rank() == 1 ? a_in.reshape({1, a_in.size()}) : a_in;
     array b = b_in.rank() == 1 ? b_in.reshape({b_in.size(), 1}) : b_in;
     if (!a.storage_.native || !b.storage_.native) return std::nullopt;
@@ -1015,7 +1022,10 @@ struct graph {
   static std::optional<array> metal_row(metal::kop k, const array& a,
                                         shape_t out_shape, bool reduce,
                                         float scale, float offset) {
-    if (!metal_mode_() || !a.contiguous() || a.rank() == 0) return std::nullopt;
+    if (!metal_mode_(a.size(), kernel_class::reduction) || !a.contiguous() ||
+        a.rank() == 0) {
+      return std::nullopt;
+    }
     if (!a.storage_.native) return std::nullopt;
     int64_t cols = a.shape().back();
     int64_t rows = cols ? a.size() / cols : 0;
@@ -1032,7 +1042,9 @@ struct graph {
 
   static std::optional<array> metal_unary(metal::kop k, const array& a,
                                           float scale, float offset) {
-    if (!metal_mode_() || !a.contiguous()) return std::nullopt;
+    if (!metal_mode_(a.size(), kernel_class::elementwise) || !a.contiguous()) {
+      return std::nullopt;
+    }
     if (!a.storage_.native) return std::nullopt;
     auto out = array::empty(a.shape());
     if (out.size() == 0) return out;
