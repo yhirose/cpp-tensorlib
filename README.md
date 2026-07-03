@@ -4,7 +4,8 @@ cpp-tensorlib
 Cross-platform F32 tensor library — the matrix foundation for
 [culebra](https://github.com/yhirose/culebra)'s Tensor type.
 
-* Header-only C++23 — `#include <tensorlib.h>`
+* Header-only, **C++17 minimum** (builds cleanly through C++23) —
+  `#include <tensorlib.h>`
 * MLX-style **lazy evaluation**: ops build a graph; `tl::eval()` evaluates
   multiple arrays in one topological pass, with build-time peephole fusion
   (every node carries an affine epilogue, so scalar chains and
@@ -71,9 +72,14 @@ ctest --test-dir build --output-on-failure   # cpu / gpu / auto modes
 ./build/tensorlib_bench                       # micro-benchmarks
 ```
 
-Requires a C++23 compiler (`#embed` support: Clang 19+ / GCC 15+). The GPU
-backend needs macOS with Metal; elsewhere the tests exercise the CPU path
-and the GPU-mode fallback.
+Requires **C++17 or newer** — the headers use inline variables,
+`std::optional`, and structured bindings, but nothing from C++20/23, so any
+`g++ >= 11` / `clang++ >= 13` works (Apple Clang too). The bundled CMake build
+compiles the tests at C++23, but consuming the headers only needs C++17.
+Exception: the **macOS/Metal** backend `#embed`s its shader source, so
+*building on macOS* additionally needs a `#embed`-capable compiler (Clang 19+);
+non-Apple builds never reach that `#embed`. The GPU backend needs macOS with
+Metal; elsewhere the tests exercise the CPU path and the GPU-mode fallback.
 
 Documentation
 -------------

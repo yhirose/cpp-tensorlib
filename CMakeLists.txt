@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.25)
 project(tensorlib LANGUAGES CXX)
 
+# This project's own build (tests/benches) compiles at C++23. The public
+# headers, however, only require C++17 (inline variables, std::optional,
+# structured bindings — nothing from C++20/23); consumers may include them at
+# C++17+. The INTERFACE target does NOT force a standard on consumers. The one
+# C++23-ish dependency, metal.h's #embed, is macOS-only and unreached elsewhere.
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
