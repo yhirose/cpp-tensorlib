@@ -138,16 +138,38 @@ as accepted, not refuted: revisit only if a real workload lands in it.
 Large-size and GPU numbers verified unchanged after the sprint
 (checksums identical; 2048³ within load noise of its baseline).
 
-## auto-mode thresholds (PROVISIONAL — loaded machine)
+## auto-mode thresholds (M1 Pro, quiet-machine census 2026-07-03)
 
 `use_gpu_`-style gate in graph::metal_mode_: never break a pending GPU
 pipeline; otherwise start GPU only above a per-kernel-class size
-threshold (types.h auto_threshold_). Set from today's data: matmul
-5e8 (~800³; parity measured at 1024³, 2x GPU win at 2048³), elementwise
-4e6, reduction 8e6 (unmeasured, conservative). Verified both extremes:
-auto tracks gpu at 2048³ (5.4 vs cpu 11.4 ms) and tracks cpu on small
-dots (0.34 ms vs gpu's 38 ms per 100). **Re-run the census on a quiet
-machine before flipping culebra's default device to auto.**
+threshold (types.h auto_threshold_). Finalized from the crossover census
+(`misc/census.cpp`, load ~4, interleaved medians — CPU=Accelerate vs
+GPU-total=Metal single op + flush):
+
+| Class | Crossover (measured) | Threshold set | Old (provisional) |
+|---|---|---|---|
+| matmul | 1280³=2.1e9 tie, 1536³=3.6e9 GPU | **2e9** (~1260³) | 5e8 |
+| elementwise | 1M cpu / 4M GPU | **2e6** | 4e6 |
+| reduction (softmax) | 65536 tie / 262144 GPU | **2e5** | 8e6 |
+
+M1 Pro's AMX makes standalone GPU matmul only pay off past ~1300³;
+reductions flip to GPU early (CPU's per-row loop is slow). Verified auto
+tracks the faster backend at all four boundaries (mm 512³→cpu,
+1536³→gpu; ew 256K→cpu, 8M→gpu) and stays CPU-fast on MNIST training
+(auto 0.036 = cpu 0.039 s/epoch — tiny matmuls below threshold).
+
+**These are M1-Pro-specific.** They must be re-measured per Mac GPU/AMX
+balance, and a full set is needed once the CUDA backend lands (M6). The
+matmul value is the *standalone* crossover; a chained large-matmul
+pipeline amortizes the flush and would justify a lower threshold —
+unmeasured, so the conservative standalone value stands.
+
+**culebra default device:** left at `cpu` (not flipped to `auto`).
+Rationale: the thresholds are machine-specific, current culebra
+workloads (MNIST/microgpt-scale) sit below every threshold so auto would
+behave like cpu anyway, and cpu is the predictable default; users opt
+into GPU with `Tensor.use_gpu()`/`use_auto()`. Revisit if a large-tensor
+workload appears or once CUDA lands.
 
 ## Refuted approaches — do not retry without new evidence
 
