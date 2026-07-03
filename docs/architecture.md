@@ -29,7 +29,26 @@ lives in [roadmap.md](roadmap.md). This file documents how the code works
 today; performance methodology and gate results are in
 [performance-notes.md](performance-notes.md).
 
-## Current state (M4: culebra integration + tiny-tensor sprint)
+## Current state (M5 first cut: own CPU GEMM)
+
+- `cpu.h` + `cpu_threadpool.h` — BLIS-style SGEMM for platforms without
+  Accelerate: cache-blocking (MC/KC/NC) + stride-aware packing (transposed
+  views feed in place, no materialization) around a register-blocked
+  microkernel, parallelized over the M dimension by a persistent thread
+  pool. Microkernel: NEON (8×8 tile, native on Apple Silicon / ARM Linux)
+  and a portable scalar fallback; AVX2/AVX-512 are the next drop-in behind
+  the same interface. Raw-pointer API (no array.h dependency, like metal.h).
+- Dispatch (`eval_one` dot): `metal → accel::gemm → cpu::sgemm → ref::dot`.
+  `cpu::enabled_` gates it (default on; below Accelerate on Apple, primary
+  off-Apple; oracle tests force ref with it + `use_accelerate_` off).
+- **Status: correct and complete, untuned.** Matches ref across edge/
+  transposed/epilogue shapes on all modes. Scales to ~235 GFLOP/s at 1024³
+  on M1 Pro NEON (vs Accelerate's AMX ~8× faster — expected; the own kernel
+  is the *off-Apple* path). Per-call overhead (pack-buffer allocation,
+  thread-pool sync even for one block) loses to the naive loop below ~256³;
+  removing it + the OpenBLAS-90% gate + AVX are the tuning pass (roadmap).
+
+## Earlier state (M4: culebra integration + tiny-tensor sprint)
 
 - **culebra integration** (M4): `culebra::TensorImpl` is an autograd tape
   node wrapping a `tl::array`; culebra keeps VJPs, this library owns the
@@ -144,7 +163,7 @@ Status summary; scope, environment needs, and approach are in
 | M3b-2 | Metal SGEMM (tiled), softmax, last-axis reductions; GPU MLP fwd | ✅ |
 | M3b-3 | STEEL SGEMM sprint: 2048³ ~1300 → ~3200 GFLOP/s | ✅ |
 | M4 | culebra integration; tiny-tensor per-op sprint; auto thresholds | ✅ |
-| M5 | Own CPU backend: threadpool + BLIS-style microkernels (AVX2/AVX-512/NEON) | ⏳ |
+| M5 | Own CPU backend: threadpool + BLIS-style microkernels (AVX2/AVX-512/NEON) | 🔨 scaffold + NEON done; AVX + tuning pending |
 | M6 | Own CUDA backend: dlopen'd driver API, PTX `#embed`, SGEMM ladder | ⏳ |
 | M7 | BF16 storage type; ongoing measured optimization | ⏳ |
 

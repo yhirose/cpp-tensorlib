@@ -171,6 +171,32 @@ behave like cpu anyway, and cpu is the predictable default; users opt
 into GPU with `Tensor.use_gpu()`/`use_auto()`. Revisit if a large-tensor
 workload appears or once CUDA lands.
 
+## Own CPU GEMM first cut (M5, M1 Pro NEON, 2026-07-03)
+
+Correctness-first scaffolding (BLIS blocking + packing + 8×8 NEON
+microkernel + thread pool), untuned. Numbers on a loaded machine (load
+5–11), so directional only:
+
+| | own (NEON, 8 thr) | vs Accelerate (AMX) | vs ref (naive) |
+|---|---|---|---|
+| 128³ | 24 GFLOP/s | 36× slower | 0.8× (loses) |
+| 256³ | 69 GFLOP/s | 17× slower | 1.1× |
+| 512³ | 156 GFLOP/s | 8× slower | 3.6× |
+| 1024³ | 235 GFLOP/s | 8× slower | ~15× |
+
+Reading: scales correctly (compute-bound win grows with size), ~235
+GFLOP/s at 1024³ ≈ 55% of M1 Pro's NEON fp32 peak — decent for an untuned
+kernel. **Loses to Accelerate by ~8× because AMX ≫ NEON — expected; the
+own kernel is the off-Apple path, not a Mac competitor.** Loses to the
+naive loop below ~256³ because per-call overhead (a `std::vector` pack
+buffer per call/task, thread-pool sync even for one M-block) dominates
+small sizes — the tuning pass's first targets. The real gate (OpenBLAS
+90%) is measured off-Apple; deferred with the AVX kernels to the x86 box.
+
+Tuning targets, in likely priority: thread-local reusable pack buffers,
+skip the pool for single-block work, MR/NR + MC/KC/NC sweep, software
+prefetch, K-unroll in the microkernel.
+
 ## vs silarray (M1 Pro, 2026-07-03)
 
 Head-to-head with the predecessor across cpu/gpu/auto. Two separate

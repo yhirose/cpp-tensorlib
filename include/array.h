@@ -15,6 +15,7 @@
 // microkernels, CUDA) is verified against, and the permanent fallback.
 // Device dispatch slots in at detail::graph::eval_one (M3+).
 
+#include <cpu.h>
 #include <storage.h>
 #include <types.h>
 
@@ -1106,6 +1107,30 @@ struct graph {
     return out;
   }
 
+  // Add the fused dot offset to a materialized GEMM result (accel/cpu take
+  // the scale as alpha; offset is a cheap post-pass). No-op when offset==0.
+  static void apply_dot_offset_(array& out, float offset) {
+    if (offset == 0.0f) return;
+    if (auto ofs = accel::affine(out, 1.0f, offset)) {
+      out = std::move(*ofs);
+    } else {
+      out = map_unary(out, [offset](float x) { return x + offset; });
+    }
+  }
+
+  // Own CPU backend (M5): C = scale * A @ B into `out`. Handles any 2-d
+  // strided operands in place (packing is stride-aware — no materialization,
+  // more general than accel's CBLAS-mappable layouts). Gated by cpu::enabled_
+  // so oracle tests can force ref.
+  static bool cpu_gemm(const array& a, const array& b, array& out,
+                       float scale) {
+    if (!cpu::enabled_) return false;
+    int64_t m = a.shape()[0], k = a.shape()[1], nn = b.shape()[1];
+    cpu::sgemm(a.raw(), a.strides()[0], a.strides()[1], b.raw(),
+               b.strides()[0], b.strides()[1], out.data(), m, nn, k, scale);
+    return true;
+  }
+
   // Classify a 2-d operand's layout for the GEMM loaders: row-major
   // contiguous rows → (trans=false, ld=row stride); its transpose →
   // (trans=true, ld=col stride). Same test as accel::gemm. nullopt = not
@@ -1486,14 +1511,11 @@ struct graph {
         array b2 = b.rank() == 1 ? b.reshape({b.size(), 1}) : b;
         array out = array::empty({a2.shape()[0], b2.shape()[1]});
         if (accel::gemm(a2, b2, out, n.scale)) {  // epilogue scale = alpha
-          if (n.offset != 0.0f) {
-            if (auto ofs = accel::affine(out, 1.0f, n.offset)) {
-              out = std::move(*ofs);
-            } else {
-              float o = n.offset;
-              out = map_unary(out, [o](float x) { return x + o; });
-            }
-          }
+          apply_dot_offset_(out, n.offset);
+          r = out.reshape(n.shape);
+          epi_done = true;
+        } else if (cpu_gemm(a2, b2, out, n.scale)) {  // own CPU backend
+          apply_dot_offset_(out, n.offset);
           r = out.reshape(n.shape);
           epi_done = true;
         } else {

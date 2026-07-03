@@ -30,7 +30,7 @@ Design invariants that constrain everything below:
 
 ## Milestones
 
-### M5 — Own CPU backend (Linux / Windows)
+### M5 — Own CPU backend (Linux / Windows)  🔨 in progress
 
 BLIS-style GEMM: cache-blocking + packing (architecture-independent C) around
 a register-blocked SIMD microkernel per ISA (AVX2, AVX-512, NEON), selected
@@ -38,6 +38,25 @@ at runtime by CPUID. Plus a small threadpool for the M/N parallel split, and
 own SIMD elementwise/reduction kernels. Gate: ≥90% of OpenBLAS and ≥ PyTorch
 CPU on the target ISA. Escape hatch: a `-DUSE_OPENBLAS` CMake option for any
 shape band that can't meet the gate.
+
+**Done (first cut):** `cpu.h` + `cpu_threadpool.h` — the full BLIS structure
+(blocking, stride-aware packing, persistent thread pool, M-parallel), an 8×8
+NEON microkernel + a portable scalar fallback, wired into the dot dispatch
+(`metal → accel → cpu → ref`) and gated by `cpu::enabled_`. Correct on every
+shape/transpose/epilogue (own == ref oracle test); ~235 GFLOP/s at 1024³ on
+M1 Pro NEON. Elementwise/reductions stay on array.h's autovectorized flat
+loops (memory-bound), by design.
+
+**Remaining:**
+- *Tuning pass* (the perf sprint, off-Apple gate): reusable/thread-local
+  pack buffers (per-call `std::vector` alloc dominates small sizes — cpu::
+  loses to the naive loop below ~256³ right now), skip pool sync for
+  single-block work, tune MR/NR and MC/KC/NC, prefetch/unroll. Target
+  OpenBLAS-90% on the ISA.
+- *AVX2 / AVX-512 microkernels* — write behind the same interface; validate
+  and tune on the x86 WSL2 box (can't execute on ARM).
+- *Runtime CPUID dispatch* — currently the microkernel is compile-time
+  selected (NEON vs scalar); x86 needs a runtime AVX2/AVX-512/scalar pick.
 
 **Environment:** Apple Silicon is ARM64 = NEON, so the NEON microkernel is
 fully developable, natively runnable, and perf-tunable on a Mac (it is also

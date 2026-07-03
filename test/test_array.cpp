@@ -24,9 +24,28 @@ template <typename F>
 bool matches_oracle(F build, float rtol = 1e-4f, float atol = 1e-5f) {
   tl::use_accelerate_ = true;
   auto fast = build().eval();
+  // Oracle = ref::: disable both accelerated CPU backends (accel and the
+  // own-CPU GEMM), else dot would be validated against cpu:: not ref::.
   tl::use_accelerate_ = false;
+  tl::cpu::enabled_ = false;
   auto oracle = build().eval();
   tl::use_accelerate_ = true;
+  tl::cpu::enabled_ = true;
+  return tl::allclose(fast, oracle, rtol, atol);
+}
+
+// Evaluate `build()` through the own-CPU backend (accel off, cpu on) and
+// through ref (both off); require agreement. Validates cpu::sgemm — on any
+// platform, since it never touches Metal/Accelerate.
+template <typename F>
+bool cpu_matches_ref(F build, float rtol = 2e-3f, float atol = 2e-4f) {
+  tl::use_accelerate_ = false;
+  tl::cpu::enabled_ = true;
+  auto fast = build().eval();
+  tl::cpu::enabled_ = false;
+  auto oracle = build().eval();
+  tl::use_accelerate_ = true;
+  tl::cpu::enabled_ = true;
   return tl::allclose(fast, oracle, rtol, atol);
 }
 
@@ -40,8 +59,10 @@ bool matches_gpu_oracle(F build, float rtol = 1e-4f, float atol = 1e-5f) {
   auto fast = build().eval();
   tl::use_cpu();
   tl::use_accelerate_ = false;
+  tl::cpu::enabled_ = false;
   auto oracle = build().eval();
   tl::use_accelerate_ = true;
+  tl::cpu::enabled_ = true;
   tl::device_ = prev;
   return tl::allclose(fast, oracle, rtol, atol);
 }
@@ -259,6 +280,36 @@ TEST_CASE("accelerated backend matches the ref oracle") {
   auto g = random_array({8, 9}, 11);
   auto w = random_array({33, 9}, 12);
   CHECK(matches_oracle([&] { return w - x.transpose().dot(g) * 0.01f; }));
+}
+
+TEST_CASE("own CPU GEMM matches the ref oracle") {
+  // cpu::sgemm — BLIS blocking + packing + microkernel. Edge tiles (MR=8,
+  // NR=8 boundaries), single row/col, odd sizes, transposed operands
+  // (stride-aware packing, no materialization), and the fused epilogue.
+  struct { int64_t m, k, n; } shapes[] = {
+      {8, 8, 8}, {1, 1, 1}, {7, 3, 5}, {16, 16, 16}, {33, 17, 31},
+      {100, 784, 50}, {1, 128, 64}, {64, 128, 1}, {129, 7, 130},
+      {256, 256, 256}, {9, 9, 9},
+  };
+  int seed = 40;
+  for (auto s : shapes) {
+    auto a = random_array({s.m, s.k}, seed++);
+    auto b = random_array({s.k, s.n}, seed++);
+    CHECK(cpu_matches_ref([&] { return a.dot(b); }));
+    CHECK(cpu_matches_ref([&] { return a.dot(b) * 0.5f + 1.0f; }));
+  }
+  auto p = random_array({40, 24}, 70);
+  auto q = random_array({40, 12}, 71);
+  auto r = random_array({24, 12}, 72);
+  CHECK(cpu_matches_ref([&] { return p.transpose().dot(q); }));
+  CHECK(cpu_matches_ref([&] { return p.dot(r.transpose().transpose()); }));
+  CHECK(cpu_matches_ref([&] { return q.dot(r.transpose()); }));
+  // vector promotions and the training-step chain
+  CHECK(cpu_matches_ref([&] { return random_array({64}, 73).dot(random_array({64, 5}, 74)); }));
+  auto x = random_array({8, 33}, 75);
+  auto g = random_array({8, 9}, 76);
+  auto w = random_array({33, 9}, 77);
+  CHECK(cpu_matches_ref([&] { return w - x.transpose().dot(g) * 0.01f; }));
 }
 
 TEST_CASE("metal backend matches the ref oracle") {
