@@ -171,6 +171,38 @@ behave like cpu anyway, and cpu is the predictable default; users opt
 into GPU with `Tensor.use_gpu()`/`use_auto()`. Revisit if a large-tensor
 workload appears or once CUDA lands.
 
+## vs silarray (M1 Pro, 2026-07-03)
+
+Head-to-head with the predecessor across cpu/gpu/auto. Two separate
+binaries (header coexistence blocked by objc/Metal bridge collisions),
+run alternating with per-process warmup, steady-state min of 3 rounds,
+load ~3. Both use blocking eval (silarray's free `sil::eval()`, not the
+non-flushing member `.eval()`). `tl/sil` < 1 means tensorlib faster.
+
+| Workload | cpu | gpu | auto |
+|---|---|---|---|
+| SGEMM 1024³ | 1.01 | **0.76** | 0.92 |
+| SGEMM 256³ | 1.00 | 0.98 | **0.10** |
+| elementwise 4M | 0.90 | 1.04 | 0.95 |
+| softmax 1024² | **0.03** | 1.42 | **0.003** |
+| MLP fwd 256×784×256×10 | **0.38** | 1.67 | 0.55 |
+
+Reading:
+- **CPU**: tensorlib parity-to-faster. matmul parity (shared AMX). The
+  huge softmax/MLP wins are because **silarray's CPU softmax is a naive
+  correctness-only fallback** (its docs say so — silarray is GPU-focused)
+  — discount these as "sil didn't implement it," not an engineering edge.
+- **GPU**: split. tensorlib **wins matmul** (STEEL port, 1024³ 24%
+  faster); silarray **wins softmax (1.4×) and the fused MLP (1.7×)** — its
+  online-softmax and `linear_sigmoid` GPU kernels are more mature. This is
+  the motivation for the deferred "GPU fused kernels" item.
+- **auto**: tensorlib clearly better — the finalized thresholds route
+  correctly (256³→cpu 10×, softmax→gpu 300×) where silarray's auto
+  mis-picks (256³→slow GPU, softmax→slow CPU). auto quality is the payoff
+  of the measured thresholds.
+
+Caveats: single-op micro-bench, cross-process (looser than same-run).
+
 ## Refuted approaches — do not retry without new evidence
 
 | Approach | Verdict | Data |

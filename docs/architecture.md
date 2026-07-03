@@ -24,7 +24,29 @@ keeps autograd/VJP; this library owns the graph, fusion, and execution).
  (M1, permanent)        oracle and universal fallback
 ```
 
-## Current state (M3b-3: STEEL SGEMM sprint)
+Forward-looking plan (milestones, environment constraints, open decisions)
+lives in [roadmap.md](roadmap.md). This file documents how the code works
+today; performance methodology and gate results are in
+[performance-notes.md](performance-notes.md).
+
+## Current state (M4: culebra integration + tiny-tensor sprint)
+
+- **culebra integration** (M4): `culebra::TensorImpl` is an autograd tape
+  node wrapping a `tl::array`; culebra keeps VJPs, this library owns the
+  graph/fusion/execution. Vendored into culebra as a git submodule.
+  Feature-gated via `TL_RUNTIME_HOOKS`: an embedder's tensor-free binaries
+  reference no backend symbol (allocation/eval/barrier route through hooks
+  installed by `install_runtime_hooks()`).
+- **Tiny-tensor sprint**: contiguous flat-loop fast paths (map/clone/add_),
+  eager-tiny evaluation in the graph builders (materialized ≤4096-elem
+  operands skip the node/eval machinery), thread-local topo-sort scratch
+  with visit-stamp marking, memoized const-wrap, tiny-dot/tiny-ew direct
+  paths in `eval_one`, pooled MTLBuffer contents caching. Per-op overhead
+  cut 2–3×; MNIST training 2× faster than the pre-M4 executor.
+- **auto thresholds** finalized from a quiet-machine census (matmul 2e9,
+  elementwise 2e6, reduction 2e5 on M1 Pro) — see performance-notes.md.
+
+## Earlier state (M3b-3: STEEL SGEMM sprint)
 
 - STEEL kernels (`sgemm_steel_` 64×64, `sgemm_steel_32x64_` for M < 97)
   ported from silarray/MLX: float2 fragment registers, precomputed loader
@@ -110,18 +132,21 @@ keeps autograd/VJP; this library owns the graph, fusion, and execution).
 
 ## Milestones
 
-| | Scope |
-|---|---|
-| M1 ✅ | Core skeleton + reference CPU implementation + tests + CI |
-| M2 ✅ | Lazy graph, topo-sort eval, build-time peephole fusion |
-| M3a ✅ | Accelerate CPU backend + dispatch seam + bench harness |
-| M3b-1 ✅ | Metal foundation: context, buffer pool, elementwise kernels, batching |
-| M3b-2 ✅ | Metal SGEMM (tiled), softmax, last-axis reductions; full GPU MLP fwd |
-| M3b-3 ✅ | STEEL SGEMM sprint: 2048³ ~1300 → ~3200 GFLOP/s |
-| M4 ✅ | culebra integration (TensorImpl wraps tl::array; F32 unification); tiny-tensor per-op sprint |
-| M5 | Own CPU backend: threadpool + BLIS-style microkernels (AVX2/AVX-512/NEON, runtime dispatch) |
-| M6 | Own CUDA backend: dlopen'd driver API, PTX `#embed`, SGEMM ladder |
-| M7 | BF16 storage type; ongoing measured optimization |
+Status summary; scope, environment needs, and approach are in
+[roadmap.md](roadmap.md).
+
+| | Scope | Status |
+|---|---|---|
+| M1 | Core skeleton + reference CPU implementation + tests + CI | ✅ |
+| M2 | Lazy graph, topo-sort eval, build-time peephole fusion | ✅ |
+| M3a | Accelerate CPU backend + dispatch seam + bench harness | ✅ |
+| M3b-1 | Metal foundation: context, buffer pool, elementwise, batching | ✅ |
+| M3b-2 | Metal SGEMM (tiled), softmax, last-axis reductions; GPU MLP fwd | ✅ |
+| M3b-3 | STEEL SGEMM sprint: 2048³ ~1300 → ~3200 GFLOP/s | ✅ |
+| M4 | culebra integration; tiny-tensor per-op sprint; auto thresholds | ✅ |
+| M5 | Own CPU backend: threadpool + BLIS-style microkernels (AVX2/AVX-512/NEON) | ⏳ |
+| M6 | Own CUDA backend: dlopen'd driver API, PTX `#embed`, SGEMM ladder | ⏳ |
+| M7 | BF16 storage type; ongoing measured optimization | ⏳ |
 
 ## Conventions
 

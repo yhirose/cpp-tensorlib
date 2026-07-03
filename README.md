@@ -79,10 +79,12 @@ Documentation
 -------------
 
 * [docs/architecture.md](docs/architecture.md) — layer map, dispatch seam,
-  milestone plan, conventions.
+  current state, conventions.
+* [docs/roadmap.md](docs/roadmap.md) — milestone scope + status, environment
+  constraints, per-milestone approach, open decisions.
 * [docs/performance-notes.md](docs/performance-notes.md) — measurement
-  methodology, gate results, and refuted approaches (read before any
-  performance work).
+  methodology, gate results, the silarray comparison, and refuted approaches
+  (read before any performance work).
 
 License
 -------
