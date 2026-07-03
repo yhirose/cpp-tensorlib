@@ -881,7 +881,14 @@ struct graph {
 
   static bool eager_cpu_ok_() {
     if (device_ == device_type::gpu) return false;
-    if (metal::pending()) return false;  // never break a running pipeline
+    // Never break a running GPU pipeline. Via the hook under TL_RUNTIME_HOOKS
+    // so this builder path (always live in an embedder's core archive) links
+    // no Metal symbol; a null hook means no GPU backend, nothing pending.
+#ifdef TL_RUNTIME_HOOKS
+    if (detail::gpu_pending_hook && detail::gpu_pending_hook()) return false;
+#else
+    if (metal::pending()) return false;
+#endif
     return true;  // cpu mode; in auto these sizes are below the threshold
   }
 
@@ -1801,6 +1808,7 @@ inline array concat(const std::vector<array>& parts) {
 inline void install_runtime_hooks() {
   detail::storage_make_hook = &storage::make_device_;
   detail::cpu_barrier_hook = &metal::cpu_barrier;
+  detail::gpu_pending_hook = &metal::pending;
   detail::run_hook = &detail::graph::run;
 }
 

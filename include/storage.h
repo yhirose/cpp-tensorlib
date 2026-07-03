@@ -66,6 +66,11 @@ namespace detail {
 // Runtime hooks (see the storage comment). Null until installed.
 inline storage (*storage_make_hook)(int64_t) = nullptr;
 inline void (*cpu_barrier_hook)() = nullptr;
+// GPU-pipeline query for the eager-tiny decision in the graph builders.
+// Behind a hook (not a direct metal::pending() call) so those always-live
+// builders reference no Metal symbol in a no-tensor binary — null means no
+// GPU backend is installed, i.e. nothing is ever pending.
+inline bool (*gpu_pending_hook)() = nullptr;
 
 }  // namespace detail
 
