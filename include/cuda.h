@@ -249,12 +249,40 @@ struct context {
     return gemv_bf16v8_fn;
   }
 
-  // M9 fused decode attention.
-  CUfunction attn_decode_fn = nullptr;
+  // M9 fused decode attention (single-pass + split-KV two-pass).
+  CUfunction attn_decode_fn = nullptr, attn_split_fn = nullptr,
+             attn_combine_fn = nullptr;
   CUfunction attn_decode_() {
     if (!attn_decode_fn)
       d.ModuleGetFunction(&attn_decode_fn, mod, "tl_attn_decode_f32");
     return attn_decode_fn;
+  }
+  CUfunction attn_split_() {
+    if (!attn_split_fn)
+      d.ModuleGetFunction(&attn_split_fn, mod, "tl_attn_decode_split");
+    return attn_split_fn;
+  }
+  CUfunction attn_combine_() {
+    if (!attn_combine_fn)
+      d.ModuleGetFunction(&attn_combine_fn, mod, "tl_attn_combine");
+    return attn_combine_fn;
+  }
+
+  // Reusable device scratch for split-KV partials. Grown as needed, reused
+  // across attention calls (sequential on the null stream), freed at teardown.
+  CUdeviceptr attn_scratch = 0;
+  size_t attn_scratch_bytes = 0;
+  CUdeviceptr attn_scratch_(size_t bytes) {
+    if (bytes > attn_scratch_bytes) {
+      if (attn_scratch) d.MemFree(attn_scratch);  // syncs; fine (grows once)
+      if (d.MemAlloc(&attn_scratch, bytes) != 0) {
+        attn_scratch = 0;
+        attn_scratch_bytes = 0;
+        return 0;
+      }
+      attn_scratch_bytes = bytes;
+    }
+    return attn_scratch;
   }
 
   // char* pointer arithmetic to fold a byte offset into a managed pointer.
@@ -436,11 +464,48 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t heads,
   float* pk = context::off_(K, 0);
   float* pv = context::off_(V, 0);
   float* po = context::off_(out, 0);
-  unsigned uctx = static_cast<unsigned>(ctx);
-  void* args[] = {&pq, &pk, &pv, &po, &uctx, &scale};
+  unsigned uh = static_cast<unsigned>(heads), uctx = static_cast<unsigned>(ctx);
+
+  // Split ctx over gridDim.y so grid = heads×S fills the SMs (heads alone is
+  // ~32 blocks « 82 SMs). Target ~4 blocks/SM; each split needs enough keys
+  // (>=128, multiple of 4 warps) to amortize its fixed cost.
+  unsigned S = 1;
+  {
+    const long target = 328;  // ~4 * 82 SMs
+    if (uh > 0 && (long)uh < target && ctx >= 256) {
+      unsigned want = static_cast<unsigned>((target + uh - 1) / uh);
+      unsigned max_s = static_cast<unsigned>(ctx / 128);  // >=128 keys/split
+      if (want > max_s) want = max_s;
+      if (want > 1) S = want;
+    }
+  }
+  if (S == 1) {
+    void* args[] = {&pq, &pk, &pv, &po, &uctx, &scale};
+    c.pending = true;
+    return c.d.LaunchKernel(c.attn_decode_(), uh, 1, 1, 128, 1, 1, 0, nullptr,
+                            args, nullptr) == 0;
+  }
+
+  unsigned chunk = (uctx + S - 1) / S;
+  chunk = (chunk + 3u) & ~3u;  // multiple of the 4 warps
+  if (chunk == 0) chunk = 4;
+  S = (uctx + chunk - 1) / chunk;  // recompute after rounding
+  // scratch: pm[H*S] , pl[H*S] , pacc[H*S*128]
+  size_t hs = (size_t)uh * S;
+  size_t bytes = (hs * 2 + hs * 128) * sizeof(float);
+  CUdeviceptr scr = c.attn_scratch_(bytes);
+  if (!scr) return false;
+  float* pm = reinterpret_cast<float*>(scr);
+  float* pl = pm + hs;
+  float* pacc = pl + hs;
   c.pending = true;
-  return c.d.LaunchKernel(c.attn_decode_(), static_cast<unsigned>(heads), 1, 1,
-                          128, 1, 1, 0, nullptr, args, nullptr) == 0;
+  void* a1[] = {&pq, &pk, &pv, &pm, &pl, &pacc, &uctx, &chunk, &scale};
+  if (c.d.LaunchKernel(c.attn_split_(), uh, S, 1, 128, 1, 1, 0, nullptr, a1,
+                       nullptr) != 0)
+    return false;
+  void* a2[] = {&pm, &pl, &pacc, &po, &S};
+  return c.d.LaunchKernel(c.attn_combine_(), uh, 1, 1, 128, 1, 1, 0, nullptr, a2,
+                          nullptr) == 0;
 }
 
 // C(m,n) = (A @ B) * scale + offset. lda/ldb row strides; trans reads a

@@ -453,6 +453,95 @@ __global__ void tl_attn_decode_f32(const float* __restrict__ q,
   }
   out[(size_t)h * TL_AD + tid] = o / gl;
 }
+
+// Split-KV (flash-decoding): the one-block-per-head kernel above launches only
+// H=32 blocks — 3% of the 82 SMs, so it's occupancy-bound. Partition ctx over
+// gridDim.y so grid = H×S fills the SMs; each (head,split) block writes its
+// partial softmax state (m,l,acc at its local max) to scratch, and tl_attn_
+// combine merges the S partials per head. K,V are still each read exactly once.
+__global__ void tl_attn_decode_split(const float* __restrict__ q,
+                                     const float* __restrict__ K,
+                                     const float* __restrict__ V,
+                                     float* __restrict__ pm,
+                                     float* __restrict__ pl,
+                                     float* __restrict__ pacc, unsigned ctx,
+                                     unsigned chunk, float scale) {
+  const unsigned h = blockIdx.x, s = blockIdx.y, S = gridDim.y;
+  const unsigned tid = threadIdx.x;
+  const unsigned lane = tid & 31u, warp = tid >> 5;
+  const float* qh = q + (size_t)h * TL_AD;
+  const float* Kh = K + (size_t)h * ctx * TL_AD;
+  const float* Vh = V + (size_t)h * ctx * TL_AD;
+  const unsigned k0 = s * chunk;
+  const unsigned k1 = (k0 + chunk < ctx) ? (k0 + chunk) : ctx;
+
+  __shared__ float q_sh[TL_AD];
+  q_sh[tid] = qh[tid];
+  __syncthreads();
+
+  float m = -1e30f, l = 0.0f;
+  float acc[TL_ADPT] = {};
+  for (unsigned i = k0 + warp; i < k1; i += 4u) {
+    const float* Ki = Kh + (size_t)i * TL_AD;
+    float partial = 0.0f;
+#pragma unroll
+    for (int r = 0; r < TL_ADPT; r++) partial += q_sh[lane + r * 32] * Ki[lane + r * 32];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      partial += __shfl_down_sync(0xffffffffu, partial, off);
+    float sc = __shfl_sync(0xffffffffu, partial, 0) * scale;
+    float m_new = fmaxf(m, sc);
+    float corr = __expf(m - m_new);
+    float p = __expf(sc - m_new);
+    l = l * corr + p;
+    const float* Vi = Vh + (size_t)i * TL_AD;
+#pragma unroll
+    for (int r = 0; r < TL_ADPT; r++) acc[r] = acc[r] * corr + p * Vi[lane + r * 32];
+    m = m_new;
+  }
+
+  __shared__ float sm[4], sl[4], sacc[4][TL_AD];
+  if (lane == 0) {
+    sm[warp] = m;
+    sl[warp] = l;
+  }
+#pragma unroll
+  for (int r = 0; r < TL_ADPT; r++) sacc[warp][lane + r * 32] = acc[r];
+  __syncthreads();
+
+  float gm = fmaxf(fmaxf(sm[0], sm[1]), fmaxf(sm[2], sm[3]));
+  float gl = 0.0f, o = 0.0f;
+#pragma unroll
+  for (int w = 0; w < 4; w++) {
+    float e = __expf(sm[w] - gm);
+    gl += sl[w] * e;
+    o += sacc[w][tid] * e;
+  }
+  const size_t sidx = (size_t)h * S + s;
+  if (tid == 0) {
+    pm[sidx] = gm;
+    pl[sidx] = gl;
+  }
+  pacc[sidx * TL_AD + tid] = o;  // un-normalized accumulator at local max gm
+}
+
+// Merge the S per-head partials (each already at its local max) into out.
+__global__ void tl_attn_combine(const float* __restrict__ pm,
+                                const float* __restrict__ pl,
+                                const float* __restrict__ pacc,
+                                float* __restrict__ out, unsigned S) {
+  const unsigned h = blockIdx.x, tid = threadIdx.x;
+  const size_t base = (size_t)h * S;
+  float gm = -1e30f;
+  for (unsigned s = 0; s < S; s++) gm = fmaxf(gm, pm[base + s]);
+  float gl = 0.0f, o = 0.0f;
+  for (unsigned s = 0; s < S; s++) {
+    float e = __expf(pm[base + s] - gm);
+    gl += pl[base + s] * e;
+    o += pacc[(base + s) * TL_AD + tid] * e;
+  }
+  out[(size_t)h * TL_AD + tid] = o / gl;
+}
 #undef TL_AD
 #undef TL_ADPT
 
