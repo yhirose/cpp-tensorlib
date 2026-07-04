@@ -1,6 +1,10 @@
-// auto-mode crossover census: CPU (Accelerate) vs GPU-total (Metal single
-// op + flush) per kernel class. The threshold is where GPU-total first
-// beats CPU. Interleaved A/B, warmup, medians (silarray discipline).
+// auto-mode crossover census: CPU vs GPU-total (single op + flush) per kernel
+// class. The threshold is where GPU-total first beats CPU. Interleaved A/B,
+// warmup, medians (silarray discipline). Backend-agnostic: the array API routes
+// CPU to Accelerate/own-BLIS and GPU to the gpu:: facade (Metal on Apple, CUDA
+// off-Apple), so this same census produces the per-backend thresholds baked
+// into types.h. NOTE the thresholds in types.h are the M1-Pro/Metal census;
+// re-run this on each target (e.g. RTX 3090/CUDA) — the crossover differs.
 #include <tensorlib.h>
 #include <algorithm>
 #include <chrono>

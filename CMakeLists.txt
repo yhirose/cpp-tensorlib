@@ -112,6 +112,20 @@ endif()
 add_executable(tensorlib_bench bench/bench_main.cpp)
 target_link_libraries(tensorlib_bench PRIVATE tensorlib)
 
+# auto-mode CPU/GPU crossover census (misc/census.cpp). Device-agnostic array
+# API, so the gpu:: facade routes it to Metal on Apple and CUDA off-Apple —
+# tensorlib_enable_cuda below embeds the PTX so gpu_available() is true.
+add_executable(tensorlib_census misc/census.cpp)
+target_link_libraries(tensorlib_census PRIVATE tensorlib)
+
+# Both benches drive the GPU through the backend-agnostic eval seam; on a CUDA
+# build they must carry the embedded PTX + TENSORLIB_CUDA define, same as the
+# tests, or gpu_available() stays false and every GPU section silently skips.
+if(TENSORLIB_CUDA)
+  tensorlib_enable_cuda(tensorlib_bench)
+  tensorlib_enable_cuda(tensorlib_census)
+endif()
+
 # Own CPU GEMM bench (M5 tuning). Links OpenBLAS for the off-Apple gate when
 # present (ARM OpenBLAS = same NEON ISA); own-vs-ref only otherwise.
 add_executable(tensorlib_bench_cpu bench/bench_cpu_gemm.cpp)

@@ -1,6 +1,11 @@
 // Micro-benchmark harness. Measurement discipline (docs/performance-notes.md):
 // per-case medians of repeated trials; comparisons are only meaningful
 // interleaved within one run. Absolute numbers swing with clock state.
+//
+// Backend-agnostic: the "fast" CPU path is Accelerate on Apple / own BLIS
+// (cpu::sgemm) off-Apple; the GPU path is the gpu:: facade — Metal on Apple,
+// CUDA off-Apple. On a CUDA build the GPU sections exercise the CUDA backend;
+// without a GPU backend compiled in (gpu_available()==false) they self-skip.
 
 #include <tensorlib.h>
 
@@ -44,14 +49,14 @@ void report(const char* name, double flops,
             const std::function<void()>& oracle) {
   double t_fast = median_ms(fast);
   double t_ref = median_ms(oracle);
-  std::printf("%-28s accel %9.3f ms (%7.2f GFLOP/s)   ref %9.3f ms   speedup %6.1fx\n",
+  std::printf("%-28s fast %9.3f ms (%7.2f GFLOP/s)   ref %9.3f ms   speedup %6.1fx\n",
               name, t_fast, flops / (t_fast * 1e6), t_ref, t_ref / t_fast);
 }
 
 }  // namespace
 
 int main() {
-  std::printf("tensorlib bench — accel backend vs ref oracle\n\n");
+  std::printf("tensorlib bench — fast backend vs ref oracle\n\n");
 
   for (int64_t n : {64, 256, 512, 1024}) {
     auto a = random_array({n, n}, 1);
@@ -144,7 +149,7 @@ int main() {
   }
 
   if (tl::gpu_available()) {
-    std::printf("-- Metal GPU vs Accelerate CPU --\n");
+    std::printf("-- GPU vs CPU (fast backend) --\n");
     for (int64_t n : {256, 512, 1024, 2048}) {
       auto a = random_array({n, n}, 20);
       auto b = random_array({n, n}, 21);
@@ -159,7 +164,7 @@ int main() {
         tl::use_cpu();
       });
       double t_cpu = median_ms([&] { a.dot(b).eval(); });
-      std::printf("%-28s gpu %8.3f ms (%8.2f GFLOP/s)   accel-cpu %8.3f ms   gpu/cpu %5.2fx\n",
+      std::printf("%-28s gpu %8.3f ms (%8.2f GFLOP/s)   cpu %8.3f ms   gpu/cpu %5.2fx\n",
                   name, t_gpu, flops / (t_gpu * 1e6), t_cpu, t_cpu / t_gpu);
     }
     // full MLP forward, GPU end to end
@@ -174,7 +179,7 @@ int main() {
       });
       double t_cpu = median_ms(
           [&] { x.dot(w1).sigmoid().dot(w2).softmax().eval(); });
-      std::printf("%-28s gpu %8.3f ms                        accel-cpu %8.3f ms   gpu/cpu %5.2fx\n",
+      std::printf("%-28s gpu %8.3f ms                        cpu %8.3f ms   gpu/cpu %5.2fx\n",
                   "gpu mlp fwd 256x784x256x10", t_gpu, t_cpu, t_cpu / t_gpu);
     }
     std::printf("\n");
