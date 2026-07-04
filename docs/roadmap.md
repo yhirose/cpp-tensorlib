@@ -127,6 +127,29 @@ kernels. This mirrors the Metal M3b-1 foundation. (2) The SGEMM ladder tuned
 to the cuBLAS-90% gate — the performance-sensitive sprint. The x86 WSL2 box
 also validates the M5 AVX path.
 
+**Done (stage-1 kernels + cuda.h backend, validated on GPU, 2026-07-03):**
+`kernels/tensorlib_cuda.cu` (elementwise add/sub/mul/div, unary exp/log/sqrt/
+sigmoid/relu/affine, row_sum/row_max/softmax, and a correctness-first SGEMM
+with trans/ld support) compiles to PTX via nvcc 13.0 for sm_86. `include/cuda.h`
+is the metal.h analogue: a hand-declared driver API loaded by dlopen, primary-
+context + module-from-PTX loader, managed alloc/release, and binary/unary/gemm/
+row_op launchers — same signatures as metal.h so the seam is backend-agnostic,
+reusing `metal::kop`. The PTX is embedded via **bin2c** (a build-generated
+`tensorlib_cuda_ptx.inc` byte array), *not* C23 `#embed`, because the off-Apple
+compilers (g++ 11 / clang 14) predate `#embed`. `bench/check_cuda.cpp` validates
+all ops on the RTX 3090 vs CPU references (binary+affine, sigmoid, GEMM NN + NT,
+row_sum+affine, softmax — all ok). Stubs compile cleanly with no `TENSORLIB_CUDA`
+and on Apple, so non-CUDA builds are unaffected.
+
+**Remaining (stage-1 wiring, then stage-2 gate):**
+- *Build + seam integration:* the `TENSORLIB_CUDA` CMake path (nvcc → PTX →
+  bin2c → include path + `-ldl`), `storage::make_device_` trying `cuda::alloc`,
+  and array.h's eval_one routing GPU ops to CUDA off-Apple (a `gpu::` facade
+  aliasing metal on Apple / cuda elsewhere, so eval_one stays #ifdef-free), then
+  `ctest` cpu/gpu/auto exercising the real CUDA path.
+- *Stage-2 SGEMM ladder:* the correctness-first one-output-per-thread kernel →
+  shared-memory tiling / register blocking to the cuBLAS-90% gate.
+
 **Done (loader probe + memory model, 2026-07-03):** the dlopen'd-driver design
 is validated on the RTX 3090 box — a standalone probe declares the driver API
 itself (no CUDA headers), dlopens `/usr/lib/wsl/lib/libcuda.so.1`, and reaches
