@@ -379,6 +379,44 @@ __global__ void tl_gemv_bf16v8(const float* __restrict__ a,
   }
 }
 
+// ---- M8 int4-weight decode GEMV: y[n] = sum_k a[k] * dequant(Wq[n,k]) ----
+// The quantized-inference heart: weights are group-symmetric int4 in [N,K]
+// (out×in) layout so the K-axis quantization groups are contiguous (GGUF/GPTQ
+// convention). Decode is bandwidth-bound, and int4 reads ~0.625 bytes/weight
+// (0.5 packed + one f32 scale per group) vs bf16's 2 — the biggest remaining
+// decode lever. One WARP per output row n; its 32 lanes split K (each lane one
+// uint32 = 8 packed int4 per step, coalesced within the warp), dequantize in
+// registers (w = scale·(nibble-8)), MAC into an F32 accumulator, then warp-
+// shuffle-reduce. Requires K % 256 == 0 and group % 8 == 0 (transformer dims).
+__global__ void tl_gemv_q4(const float* __restrict__ a,
+                           const unsigned* __restrict__ qw,  // [N][K/8] words
+                           const float* __restrict__ scales,  // [N][K/G]
+                           float* __restrict__ y, unsigned N, unsigned K,
+                           unsigned G) {
+  const unsigned gtid = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned n = gtid >> 5;  // one warp per output row
+  const unsigned lane = threadIdx.x & 31u;
+  if (n >= N) return;
+  const unsigned* qrow = qw + (size_t)n * (K >> 3);   // 8 int4 per word
+  const float* srow = scales + (size_t)n * (K / G);
+
+  float acc = 0.0f;
+  for (unsigned base = 0; base < K; base += 256u) {  // 32 lanes × 8
+    const unsigned k0 = base + lane * 8u;
+    unsigned w = qrow[k0 >> 3];         // 8 packed int4 for k0..k0+7
+    float sc = srow[k0 / G];            // all 8 share one group (G % 8 == 0)
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      int q = (int)((w >> (j * 4)) & 0xFu) - 8;  // nibble stored as q+8
+      acc += a[k0 + j] * (sc * (float)q);
+    }
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  if (lane == 0) y[n] = acc;
+}
+
 // ---- M9 fused decode attention (flash-attention, one query row per head) ----
 // out(h,:) = softmax(scale * q(h,:) · K(h)^T) · V(h), computed in ONE pass with
 // the online-softmax recurrence so the ctx-long scores are never materialized

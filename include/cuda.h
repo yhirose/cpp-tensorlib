@@ -249,6 +249,13 @@ struct context {
     return gemv_bf16v8_fn;
   }
 
+  // M8 int4-weight decode GEMV.
+  CUfunction gemv_q4_fn = nullptr;
+  CUfunction gemv_q4_() {
+    if (!gemv_q4_fn) d.ModuleGetFunction(&gemv_q4_fn, mod, "tl_gemv_q4");
+    return gemv_q4_fn;
+  }
+
   // M9 fused decode attention (single-pass + split-KV two-pass).
   CUfunction attn_decode_fn = nullptr, attn_split_fn = nullptr,
              attn_combine_fn = nullptr;
@@ -447,6 +454,29 @@ inline bool gemv_bf16(void* a, void* B, void* y, int64_t n, int64_t k) {
                    context::off_(B, 0), context::off_(y, 0), y,
                    static_cast<unsigned>(n), static_cast<unsigned>(k),
                    v8 ? 8u : 1u);
+}
+
+// M8 int4-weight decode GEMV: y(N) = a(1,K) @ dequant(Wq[N,K]), F32 accumulate.
+// qw = packed int4 [N][K/8] words, scales = f32 [N][K/group]. One warp/output.
+// K % 256 == 0, group % 8 == 0 (host-gated).
+inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
+                    int64_t K, int64_t group) {
+  auto& c = context::get();
+  if (!c.ready || (K % 256) != 0 || (group % 8) != 0) return false;
+  c.device_read_(a);
+  c.device_read_(qw);
+  c.device_read_(scales);
+  c.device_write_(y);
+  float* pa = context::off_(a, 0);
+  float* pq = context::off_(qw, 0);
+  float* ps = context::off_(scales, 0);
+  float* py = context::off_(y, 0);
+  unsigned uN = (unsigned)N, uK = (unsigned)K, uG = (unsigned)group;
+  void* args[] = {&pa, &pq, &ps, &py, &uN, &uK, &uG};
+  unsigned grid = (unsigned)((N + 7) / 8);  // 8 warps/block, 1 output/warp
+  c.pending = true;
+  return c.d.LaunchKernel(c.gemv_q4_(), grid, 1, 1, 256, 1, 1, 0, nullptr, args,
+                          nullptr) == 0;
 }
 
 // M9 fused decode attention: out(h,:) = softmax(scale·q(h,:)·K(h)^T)·V(h) in

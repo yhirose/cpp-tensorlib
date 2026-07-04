@@ -102,6 +102,13 @@ if(TENSORLIB_CUDA)
   target_link_libraries(tensorlib_bench_attn PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_bench_attn)
 
+  # M8 int4-weight decode GEMV bench (Path-B style). Direct cuda:: API.
+  add_executable(tensorlib_bench_q4 bench/bench_q4_gemv.cpp)
+  target_include_directories(tensorlib_bench_q4 BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(tensorlib_bench_q4 PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_bench_q4)
+
   # CUDA SGEMM census (M6 stage-2 tuning). Links cuBLAS + the CUDA runtime as a
   # measurement REFERENCE only (the gate is >=90% cuBLAS) — never a library dep;
   # cuda.h still dlopen's the driver and ships zero third-party runtime deps.
