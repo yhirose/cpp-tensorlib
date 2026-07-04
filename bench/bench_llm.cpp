@@ -82,6 +82,14 @@ double time_gemm(int64_t M, int64_t N, int64_t K, unsigned seed) {
   return median_ms([&] { a.dot(b).eval(); });
 }
 
+// Same, with bf16 weights (M7): decode (M=1) hits the native bf16 GEMV on
+// CUDA; other shapes/backends widen-fallback (correct but not the fast path).
+double time_gemm_bf16(int64_t M, int64_t N, int64_t K, unsigned seed) {
+  auto a = rnd({M, K}, seed);
+  auto b = rnd({K, N}, seed + 1).to_bf16();
+  return median_ms([&] { a.dot(b).eval(); });
+}
+
 // A decoder layer's GEMMs at row count T (T=1 decode, T=seq prefill). lm_head
 // always predicts one token (last position) even during prefill.
 double bench_gemms(const char* regime, int64_t T) {
@@ -153,7 +161,36 @@ int main(int argc, char** argv) {
   std::printf(
       "\n  => decode ~%.2f ms/token  ~%.1f tok/s  (%lld layers + lm_head, F32)\n",
       per_token_ms, 1000.0 / per_token_ms, (long long)kLayers);
-  std::printf("     (F32 baseline; BF16/int4/flash-attn should move this)\n\n");
+
+  // Same decode GEMMs with bf16 weights (M7 storage dtype; attention stays
+  // F32 until M9). Halved weight traffic on the bandwidth-bound GEMV.
+  {
+    std::printf("\n-- decode, bf16 weights (T=1) --\n");
+    std::printf("  %-14s %10s %10s\n", "shape", "ms", "GB/s(bf16)");
+    struct { const char* name; int64_t N, K; bool per_layer; } ws[] = {
+        {"qkv_proj", 3 * kD, kD, true},
+        {"attn_out", kD, kD, true},
+        {"ffn_gate_up", 2 * kFfn, kD, true},
+        {"ffn_down", kD, kFfn, true},
+        {"lm_head", kVocab, kD, false},
+    };
+    double layer_bf16 = 0, lm_bf16 = 0;
+    unsigned seed = 700;
+    for (const auto& s : ws) {
+      double ms = time_gemm_bf16(1, s.N, s.K, seed += 2);
+      double gbs = static_cast<double>(s.K) * s.N * 2 / (ms * 1e6);
+      std::printf("  %-14s %10.3f %10.1f%s\n", s.name, ms, gbs,
+                  s.per_layer ? "" : "  (x1)");
+      if (s.per_layer) layer_bf16 += ms;
+      else lm_bf16 = ms;
+    }
+    double per_tok_bf16 = (layer_bf16 + attn_layer) * kLayers + lm_bf16;
+    std::printf(
+        "\n  => decode ~%.2f ms/token  ~%.1f tok/s  (bf16 weights, F32 attn)\n",
+        per_tok_bf16, 1000.0 / per_tok_bf16);
+    std::printf("     vs F32: %.2fx tokens/sec\n", per_token_ms / per_tok_bf16);
+  }
+  std::printf("     (int4 (M8) / flash-attn (M9) are the next levers)\n\n");
 
   // Prefill: compute-bound GEMM foundation.
   bench_gemms("prefill", prefill_T);

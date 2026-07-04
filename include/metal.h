@@ -349,6 +349,12 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
   return true;
 }
 
+// M7 decode GEMV (f32 / bf16 weights). No MSL kernel yet — returning false
+// sends the evaluator down the widen-to-F32 fallback; keeps the gpu:: facade
+// symmetric with CUDA (the one platform #ifdef stays the namespace alias).
+inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
+inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
+
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals
 
 inline bool available() { return false; }
@@ -371,6 +377,8 @@ inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t,
                    float, float) {
   return false;
 }
+inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
+inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
 
 #endif
 

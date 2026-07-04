@@ -588,3 +588,61 @@ TEST_CASE("lazy chains through views and activations") {
   auto sm = (a * 0.0f).softmax();
   CHECK(sm.at({0, 0}) == doctest::Approx(1.0f / 3.0f));
 }
+
+TEST_CASE("bf16 storage: round-trip, widen fallback, dot fast path") {
+  // round-trip: bf16 keeps the top 8 mantissa bits (values below are exact)
+  auto w = array::from({1.0f, -2.5f, 0.15625f, 3.0f, -0.75f, 4.0f}, {3, 2});
+  auto wb = w.to_bf16();
+  CHECK(wb.dt() == tl::dtype::bf16);
+  CHECK(wb.shape() == tl::shape_t{3, 2});
+  auto back = wb.to_f32();
+  CHECK(back.dt() == tl::dtype::f32);
+  for (int64_t i = 0; i < 3; i++)
+    for (int64_t j = 0; j < 2; j++) CHECK(back.at({i, j}) == w.at({i, j}));
+
+  // rounding: values needing more than 8 mantissa bits round to nearest-even
+  auto x = array::from({1.00390625f});  // 1 + 2^-8: exactly between bf16 steps
+  float rt = x.to_bf16().to_f32().at({0});
+  CHECK(rt == doctest::Approx(1.0f).epsilon(0.01));
+
+  // direct element access on bf16 must throw (weight-container semantics)
+  CHECK_THROWS(wb.at({0, 0}));
+
+  // decode-shaped dot: a(1,K) @ Wbf16(K,N) — fast path on CUDA, widen
+  // fallback everywhere else; both must match the f32 result within bf16
+  // weight precision (~2^-8 relative).
+  const int64_t K = 64, N = 48;
+  std::vector<float> av(K), wv(K * N);
+  unsigned s = 42;
+  auto rnd = [&] {
+    s = s * 1664525u + 1013904223u;
+    return (float)(int)(s >> 9) / (1 << 22) - 1.0f;
+  };
+  for (auto& v : av) v = rnd();
+  for (auto& v : wv) v = rnd();
+  auto a = array::from(av, {1, K});
+  auto wf = array::from(wv, {K, N});
+  auto ref = a.dot(wf);
+  auto got = a.dot(wf.to_bf16());
+  CHECK(got.shape() == ref.shape());
+  for (int64_t j = 0; j < N; j += 7) {
+    float r = ref.at({0, j}), g = got.at({0, j});
+    CHECK(g == doctest::Approx(r).epsilon(0.02));
+  }
+
+  // epilogue still applies through the bf16 path (dot result * 2 + 1)
+  auto fused = a.dot(wf.to_bf16()) * 2.0f + 1.0f;
+  float r0 = ref.at({0, 0}) * 2.0f + 1.0f;
+  CHECK(fused.at({0, 0}) == doctest::Approx(r0).epsilon(0.02));
+
+  // non-decode shape (M>1) with a bf16 operand: widen fallback, still correct
+  auto a2 = array::from({1.0f, 0.0f, 0.0f, 1.0f}, {2, 2});
+  auto w2 = array::from({1.5f, 2.5f, -3.0f, 0.5f}, {2, 2});
+  auto g2 = a2.dot(w2.to_bf16());
+  CHECK(g2.at({0, 0}) == doctest::Approx(1.5f));
+  CHECK(g2.at({1, 1}) == doctest::Approx(0.5f));
+
+  // bf16 feeding a non-dot op widens too (add)
+  auto sum = w2.to_bf16().to_f32() + w2;
+  CHECK(sum.at({0, 1}) == doctest::Approx(5.0f));
+}

@@ -224,6 +224,15 @@ class array {
   array slice(int64_t start, int64_t count) const;  // axis 0
   array clone() const;                              // contiguous copy
 
+  // Storage dtype (M7). bf16 is a weight-container storage type: create with
+  // to_bf16() (materializes, then narrows RNE); the CUDA decode GEMV consumes
+  // it natively, every other op transparently widens to an F32 copy at eval.
+  // Direct element access (data()/raw()/at()/item()) requires F32 — call
+  // to_f32() first. Compute and results are always F32.
+  tl::dtype dt() const { return storage_.dt; }
+  array to_bf16() const;  // F32 -> bf16 contiguous copy
+  array to_f32() const;   // bf16 -> F32 contiguous copy (F32: returns *this)
+
   // Elementwise (lazy)
   array exp() const;
   array log() const;
@@ -411,6 +420,9 @@ inline void host_sync_(void* native, bool for_write) {
 
 inline const float* array::raw() const {
   ensure_();
+  if (storage_.dt != tl::dtype::f32) {
+    throw std::logic_error("tl::raw: bf16 storage; use to_f32()");
+  }
   detail::barrier_();
   detail::host_sync_(storage_.native, /*for_write=*/false);
   return storage_.data() + offset_;
@@ -418,6 +430,9 @@ inline const float* array::raw() const {
 
 inline float* array::data() {
   ensure_();
+  if (storage_.dt != tl::dtype::f32) {
+    throw std::logic_error("tl::data: bf16 storage; use to_f32()");
+  }
   detail::barrier_();
   if (!contiguous()) {
     throw std::logic_error("tl::data: non-contiguous view; use clone()");
@@ -491,6 +506,21 @@ inline array array::slice(int64_t start, int64_t count) const {
 
 inline array array::clone() const {
   ensure_();
+  if (storage_.dt != tl::dtype::f32) {
+    // bf16 arrays are contiguous weight leaves (to_bf16 output); byte-copy.
+    if (!contiguous() || offset_ != 0) {
+      throw std::logic_error("tl::clone: non-contiguous bf16 view");
+    }
+    array out;
+    out.shape_ = shape_;
+    out.strides_ = strides_;
+    out.storage_ = storage::make(size(), storage_.dt);
+    detail::barrier_();
+    detail::host_sync_(storage_.native, /*for_write=*/false);
+    std::memcpy(out.storage_.data(), storage_.data(),
+                static_cast<size_t>(size()) * dtype_size(storage_.dt));
+    return out;
+  }
   auto out = make_(shape_);
   auto* po = out.storage_.data();
   const auto* pi = raw();
@@ -501,6 +531,50 @@ inline array array::clone() const {
   detail::for_each_index(
       shape_, {strides_},
       [&](int64_t i, const std::vector<int64_t>& off) { po[i] = pi[off[0]]; });
+  return out;
+}
+
+// F32 -> bf16 contiguous copy (RNE narrow). The result is a materialized
+// weight leaf; strided/transposed sources materialize through raw().
+inline array array::to_bf16() const {
+  ensure_();
+  if (storage_.dt == tl::dtype::bf16) return *this;
+  array out;
+  out.shape_ = shape_;
+  out.strides_ = detail::contiguous_strides(shape_);
+  out.storage_ = storage::make(size(), tl::dtype::bf16);
+  auto* po = reinterpret_cast<uint16_t*>(out.storage_.data());
+  const float* pi = raw();
+  if (contiguous()) {
+    const int64_t n = size();
+    for (int64_t i = 0; i < n; i++) po[i] = f32_to_bf16(pi[i]);
+  } else {
+    detail::for_each_index(shape_, {strides_},
+                           [&](int64_t i, const std::vector<int64_t>& off) {
+                             po[i] = f32_to_bf16(pi[off[0]]);
+                           });
+  }
+  return out;
+}
+
+// bf16 -> F32 contiguous copy (exact: bf16 is a truncated F32).
+inline array array::to_f32() const {
+  ensure_();
+  if (storage_.dt == tl::dtype::f32) return *this;
+  detail::barrier_();
+  detail::host_sync_(storage_.native, /*for_write=*/false);
+  array out = make_(shape_);
+  const auto* pi = reinterpret_cast<const uint16_t*>(storage_.data()) + offset_;
+  float* po = out.storage_.data();
+  if (contiguous()) {
+    const int64_t n = size();
+    for (int64_t i = 0; i < n; i++) po[i] = bf16_to_f32(pi[i]);
+  } else {
+    detail::for_each_index(shape_, {strides_},
+                           [&](int64_t i, const std::vector<int64_t>& off) {
+                             po[i] = bf16_to_f32(pi[off[0]]);
+                           });
+  }
   return out;
 }
 
@@ -914,6 +988,7 @@ struct graph {
     // An evaluated-but-not-adopted node is materialized in all but name
     // (this is the normal state of forward values read by a backward pass);
     // adoption here is a few pointer moves, no evaluation.
+    if (x.storage_.dt != tl::dtype::f32) return false;  // bf16: widen at eval
     if (x.node_ && x.node_->evaluated) x.ensure_();
     return x.materialized() && x.contiguous();
   }
@@ -1186,6 +1261,38 @@ struct graph {
     return out.reshape(n.shape);
   }
 
+  // M7 decode GEMV: a(1,K)f32 @ B(K,N) -> (1,N)f32, B either f32 or bf16
+  // weights. bf16 is the one op consuming bf16 storage natively; the f32
+  // variant matters too — the 128×128-tile gemm wastes 127 rows at M=1, the
+  // GEMV is the right kernel for decode on both dtypes (CUDA; Metal returns
+  // false). Gated to the exact decode shape — batch row 1, contiguous
+  // zero-offset operands. The kernel has no epilogue; scale/offset apply in
+  // the generic tail (identity on the plain a.dot(W) decode path).
+  static std::optional<array> gpu_gemv(const node& n, const array& a_in,
+                                       const array& b) {
+    if (b.rank() != 2) return std::nullopt;
+    const bool bf16 = b.storage_.dt == tl::dtype::bf16;
+    if (!bf16 && b.storage_.dt != tl::dtype::f32) return std::nullopt;
+    array a = a_in.rank() == 1 ? a_in.reshape({1, a_in.size()}) : a_in;
+    if (a.storage_.dt != tl::dtype::f32 || a.rank() != 2 || a.shape()[0] != 1)
+      return std::nullopt;
+    int64_t k = a.shape()[1], nn = b.shape()[1];
+    if (!gpu_mode_(nn * (k > 0 ? k : 1), kernel_class::matmul))
+      return std::nullopt;
+    if (!a.contiguous() || a.offset_ != 0 || !b.contiguous() || b.offset_ != 0)
+      return std::nullopt;
+    if (!a.storage_.native || !b.storage_.native) return std::nullopt;
+    array out = array::empty({int64_t{1}, nn});
+    if (!out.storage_.native) return std::nullopt;
+    if (nn == 0) return out.reshape(n.shape);
+    bool ok = bf16 ? gpu::gemv_bf16(a.storage_.native, b.storage_.native,
+                                    out.storage_.native, nn, k)
+                   : gpu::gemv_f32(a.storage_.native, b.storage_.native,
+                                   out.storage_.native, nn, k);
+    if (!ok) return std::nullopt;
+    return out.reshape(n.shape);
+  }
+
   // Row op over the last axis of a contiguous input. `out_cols` is cols for
   // softmax (rows×cols out) or 1 for reductions (rows out).
   static std::optional<array> gpu_row(gpu::kop k, const array& a,
@@ -1293,6 +1400,7 @@ struct graph {
     if (gpu_mode_(numel, kernel_class::elementwise)) return false;
     if (n.inputs.empty()) return false;
     const node& a = *n.inputs[0];
+    if (a.stor.dt != tl::dtype::f32) return false;  // bf16 widens in eval_one
     if (a.shape != n.shape || !node_contig_(a)) return false;
     const float* pa = a.stor.data() + a.soffset;
     const float s = n.scale, o = n.offset;
@@ -1371,6 +1479,8 @@ struct graph {
     constexpr int64_t kCutoff = 16384;  // M*N*K
     const node& a = *n.inputs[0];
     const node& b = *n.inputs[1];
+    if (a.stor.dt != tl::dtype::f32 || b.stor.dt != tl::dtype::f32)
+      return false;  // bf16 operands take the eval_one dot path
     if (a.shape.size() != 2 || b.shape.size() != 2) return false;
     int64_t m = a.shape[0], k = a.shape[1], nn = b.shape[1];
     if (m * nn * k > kCutoff || m * nn == 0) return false;
@@ -1399,7 +1509,14 @@ struct graph {
   static void eval_one(node& n) {
     if (n.op != node::op_t::constant && try_fast_ew_(n)) return;
     if (n.op == node::op_t::dot && try_fast_dot_(n)) return;
-    auto in = [&](size_t i) { return wrap(*n.inputs[i]); };
+    // Input funnel. bf16 inputs widen to an F32 copy here — the universal
+    // fallback that keeps every backend kernel F32-only; the sole native bf16
+    // consumer (decode GEMV) intercepts in the dot case before this runs.
+    auto in = [&](size_t i) {
+      array x = wrap(*n.inputs[i]);
+      if (x.storage_.dt != tl::dtype::f32) x = x.to_f32();
+      return x;
+    };
     array r;
     bool epi_done = false;  // epilogue already applied inside the op body
     switch (n.op) {
@@ -1518,6 +1635,12 @@ struct graph {
         break;
       }
       case op_t::dot: {
+        // Decode GEMV fast path first (M=1; f32 or bf16 weights), on the
+        // un-widened inputs.
+        if (auto g = gpu_gemv(n, wrap(*n.inputs[0]), wrap(*n.inputs[1]))) {
+          r = std::move(*g);
+          break;  // kernel is epilogue-free; generic tail applies scale/offset
+        }
         auto a = in(0), b = in(1);
         if (auto g = gpu_gemm(n, a, b)) {
           r = std::move(*g);
@@ -1845,7 +1968,9 @@ inline array concat(const std::vector<array>& parts) {
 // the only function referencing the evaluator and device backends by name —
 // keep it out of translation units that must stay backend-free.
 inline void install_runtime_hooks() {
-  detail::storage_make_hook = &storage::make_device_;
+  // The hook seam is F32-only (bf16 bypasses it in storage::make); wrap the
+  // now-defaulted-dtype allocator to keep the hook signature unchanged.
+  detail::storage_make_hook = [](int64_t n) { return storage::make_device_(n); };
   detail::cpu_barrier_hook = &gpu::cpu_barrier;
   detail::host_sync_hook = &gpu::sync_to_host;
   detail::gpu_pending_hook = &gpu::pending;

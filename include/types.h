@@ -1,11 +1,34 @@
 #pragma once
 
-// Device selection. v1 computes in F32 only (BF16 lands later as a storage
-// type); dtype is therefore not part of the public type system.
+// Device selection and storage dtype. Compute is F32 everywhere; bf16 (M7) is
+// a STORAGE type only — 16-bit in memory, widened to F32 on load. In slice A1
+// a bf16 array is a weight container: the CUDA decode GEMV consumes it
+// natively; every other op widens it to an F32 copy first (correct on all
+// backends, no kernel changes). Activations, results and scalars stay F32.
 
 #include <cstdint>
+#include <cstring>
 
 namespace tl {
+
+enum class dtype : uint8_t { f32, bf16 };
+
+inline int64_t dtype_size(dtype dt) { return dt == dtype::bf16 ? 2 : 4; }
+
+// Scalar converters (host side). bf16 = top 16 bits of the F32 pattern;
+// narrow rounds to nearest-even (the same rounding the CUDA path uses).
+inline uint16_t f32_to_bf16(float f) {
+  uint32_t x;
+  std::memcpy(&x, &f, 4);
+  x += 0x7fffu + ((x >> 16) & 1u);
+  return static_cast<uint16_t>(x >> 16);
+}
+inline float bf16_to_f32(uint16_t h) {
+  uint32_t x = static_cast<uint32_t>(h) << 16;
+  float f;
+  std::memcpy(&f, &x, 4);
+  return f;
+}
 
 enum class device_type { cpu, gpu, auto_ };
 
