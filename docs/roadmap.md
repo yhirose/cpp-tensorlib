@@ -156,10 +156,35 @@ the driver-absent CI fallback). Non-CUDA build unchanged (3 tests green). The
 old `kernels/smoke.cu` build-check is removed — the real kernel → PTX compile
 now serves that role.
 
-**Remaining — stage-2 SGEMM ladder (the perf sprint):** the correctness-first
-one-output-per-thread kernel → shared-memory tiling / register blocking to the
-cuBLAS-90% + beat-PyTorch gate. This is the STEEL-discipline sprint (per-shape
-census, interleaved A/B); measure on the RTX 3090, recording the WSL2 side.
+**Done (stage-2 memory-model pivot, 2026-07-03):** standing up the SGEMM census
+exposed that the managed-memory model (below) collapses compute-bound GEMM ~88×
+on WSL2 (`ConcurrentManagedAccess=0` → no page migration; prefetch/advise both
+"invalid device ordinal"). Since no kernel tuning matters on managed memory and
+PyTorch uses device memory, the backend moved to the pre-authorized **explicit
+device-buffer model**: a persistent host/device **mirror** per allocation (host
+malloc + `cuMemAlloc` device buffer; dirty state keyed by the device pointer in
+cuda.h so views sharing a storage share one entry), lazy H2D before a kernel
+reads a host-dirty buffer, D2H before the CPU reads a device-dirty one
+(`array::raw()/data()` → `gpu::sync_to_host`). Metal stays a strict no-op
+(genuinely unified). storage.h is unchanged; the seam addition is two lines in
+array.h. ctest cpu/gpu/auto + the cuda_ukernel oracle validate the coherence.
+See performance-notes.md "Own CUDA GEMM stage-2" and [[cuda-wsl2-managed-memory-cliff]].
+
+**Done (stage-2 SGEMM ladder, first pass, 2026-07-03):** `tl_sgemm_rb` — a
+128×128×8 blocktile / 64×32 warp-tile / 8×8-microtile kernel (float4 global
+loads, register-staged double buffer, conflict-free warp-broadcast smem reads),
+dispatched as the fast path for NN-contiguous K%8/N%4/16B-aligned shapes;
+everything else keeps the correctness-first `tl_sgemm`. Ladder (interleaved
+own/cuBLAS): naive ~0.09 → register-block 0.68/0.75 → +warp-tile 0.71/0.80 →
++double-buffer **0.72–0.84 (2048³) / 0.79–0.83 (4096³)**. Correct throughout
+(max rel ≤ 6e-5). **Gate not yet met:** own ≈ 80% of cuBLAS, ≈ 75% of PyTorch-
+FP32 (which bundles a faster cuBLAS 12.8). BK=16 measured-and-rejected.
+
+**Remaining — close the gate (80%→90%+):** larger block tiles (128×256 for more
+C-reuse; needs register/spill care), split-K for the mid-size wave-quantization
+tail, finer scheduling; then the per-shape CUTLASS escape hatch if a band still
+misses. Also: SteelLoaderT-equivalent for transposed operands (backward matmuls
+use the naive `tl_sgemm` today). All measured on the RTX 3090, WSL2 side noted.
 
 **Done (loader probe + memory model, 2026-07-03):** the dlopen'd-driver design
 is validated on the RTX 3090 box — a standalone probe declares the driver API
@@ -167,13 +192,14 @@ itself (no CUDA headers), dlopens `/usr/lib/wsl/lib/libcuda.so.1`, and reaches
 the device (`cuInit` → driver API 13.1, RTX 3090 sm_86, 82 SMs) with **no CUDA
 Toolkit installed**. So the host side needs only libdl; nvcc is a build-time-
 only prereq for the kernel PTX (`cuda-toolkit-13-0`, matching the 13.1 driver).
-**Memory model decided: CUDA managed memory** (`cuMemAllocManaged`) — one
-allocation visible to host and device, so `storage.native == storage.contents`
-and the existing unified-memory seam (built for Apple) is reused unchanged; the
-driver migrates pages on demand. Chosen for minimal churn + correctness-first,
-mirroring Metal. The explicit device-buffer + H2D/D2H alternative is deferred to
-the stage-2 gate *iff* managed-memory page migration proves a bottleneck
-(prefetch hints `cuMemPrefetchAsync` are the first lever before that).
+**Memory model (SUPERSEDED at the stage-2 gate — see the memory-model pivot
+above): originally CUDA managed memory** (`cuMemAllocManaged`) — one allocation
+visible to host and device, reusing the Apple unified-memory seam, the driver
+migrating pages on demand. Chosen for minimal churn + correctness-first. The
+explicit device-buffer + H2D/D2H alternative was deferred *iff* managed-memory
+page migration proved a bottleneck (prefetch the first lever). It did — on WSL2
+`ConcurrentManagedAccess=0` means pages never migrate and prefetch is
+unavailable, so the device-buffer mirror replaced managed at stage 2.
 
 ### M7 — BF16 storage type
 

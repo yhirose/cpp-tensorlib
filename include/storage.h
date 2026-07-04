@@ -66,6 +66,10 @@ namespace detail {
 // Runtime hooks (see the storage comment). Null until installed.
 inline storage (*storage_make_hook)(int64_t) = nullptr;
 inline void (*cpu_barrier_hook)() = nullptr;
+// Host↔device coherence (CUDA device-mirror). Called with (native, for_write)
+// before a CPU read/write of a managed buffer to pull the device copy back
+// (D2H) and, on write, invalidate it. Null / no-op on unified backends (Metal).
+inline void (*host_sync_hook)(void*, bool) = nullptr;
 // GPU-pipeline query for the eager-tiny decision in the graph builders.
 // Behind a hook (not a direct gpu::pending() call) so those always-live
 // builders reference no Metal symbol in a no-tensor binary — null means no

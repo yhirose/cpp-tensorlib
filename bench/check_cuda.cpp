@@ -50,7 +50,7 @@ int main() {
       ref[i] = (ca[i] + cb[i]) * 2.0f + 1.0f;
     }
     bool launched = tl::cuda::binary(kop::add, a, 0, b, 0, o, 0, n, 2.0f, 1.0f);
-    flush();
+    sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < n; i++)
       if (std::fabs(co[i] - ref[i]) > 1e-4f) match = false;
@@ -73,7 +73,7 @@ int main() {
       ref[i] = 1.0f / (1.0f + std::exp(-ca[i]));
     }
     bool launched = tl::cuda::unary(kop::sigmoid, a, 0, o, 0, n, 1.0f, 0.0f);
-    flush();
+    sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < n; i++)
       if (std::fabs(co[i] - ref[i]) > 1e-4f) match = false;
@@ -101,7 +101,7 @@ int main() {
         ref[i * n + j] = s * 0.5f;
       }
     bool launched = gemm(a, 0, k, false, b, 0, n, false, o, 0, m, n, k, 0.5f, 0);
-    flush();
+    sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < m * n; i++)
       if (std::fabs(co[i] - ref[i]) > 1e-3f * (1 + std::fabs(ref[i])))
@@ -132,7 +132,7 @@ int main() {
       }
     // trans_b=true, ldb=k (the col stride of the logical k×n = row stride of bt)
     bool launched = gemm(a, 0, k, false, b, 0, k, true, o, 0, m, n, k, 1.0f, 0);
-    flush();
+    sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < m * n; i++)
       if (std::fabs(co[i] - ref[i]) > 1e-3f * (1 + std::fabs(ref[i])))
@@ -160,7 +160,7 @@ int main() {
       ref[r] = s * 0.25f + 3.0f;
     }
     bool launched = tl::cuda::row_op(kop::row_sum, in, 0, o, 0, rows, cols, 0.25f, 3.0f);
-    flush();
+    sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t r = 0; r < rows; r++)
       if (std::fabs(co[r] - ref[r]) > 1e-2f) match = false;
@@ -188,7 +188,7 @@ int main() {
         ref[r * cols + c] = std::exp(ci[r * cols + c] - mx) / sum;
     }
     bool launched = tl::cuda::row_op(kop::softmax, in, 0, o, 0, rows, cols, 1.0f, 0.0f);
-    flush();
+    sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < rows * cols; i++)
       if (std::fabs(co[i] - ref[i]) > 1e-4f) match = false;

@@ -74,6 +74,39 @@ if(TENSORLIB_CUDA)
   target_link_libraries(tensorlib_check_cuda PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_check_cuda)
   add_test(NAME cuda_ukernel COMMAND tensorlib_check_cuda)
+
+  # CUDA SGEMM census (M6 stage-2 tuning). Links cuBLAS + the CUDA runtime as a
+  # measurement REFERENCE only (the gate is >=90% cuBLAS) — never a library dep;
+  # cuda.h still dlopen's the driver and ships zero third-party runtime deps.
+  # Not a ctest (it's a perf bench, and cuBLAS may be absent on CI). Only built
+  # when the CUDA Toolkit's cuBLAS is found.
+  find_library(CUBLAS_LIB cublas
+    PATHS ${CMAKE_CUDA_COMPILER_LIBRARY_ROOT}/lib64
+          ${CMAKE_CUDA_COMPILER_LIBRARY_ROOT}/targets/x86_64-linux/lib
+          /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu)
+  find_library(CUDART_LIB cudart
+    PATHS ${CMAKE_CUDA_COMPILER_LIBRARY_ROOT}/lib64
+          ${CMAKE_CUDA_COMPILER_LIBRARY_ROOT}/targets/x86_64-linux/lib
+          /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu)
+  find_path(CUDA_TK_INC cublas_v2.h
+    PATHS ${CMAKE_CUDA_COMPILER_LIBRARY_ROOT}/include
+          ${CMAKE_CUDA_COMPILER_LIBRARY_ROOT}/targets/x86_64-linux/include
+          /usr/local/cuda/include)
+  if(CUBLAS_LIB AND CUDART_LIB AND CUDA_TK_INC)
+    add_executable(tensorlib_bench_cuda bench/bench_cuda_gemm.cpp)
+    target_link_libraries(tensorlib_bench_cuda PRIVATE tensorlib
+      ${CUBLAS_LIB} ${CUDART_LIB})
+    # The project include MUST come before the CUDA Toolkit include: the bench's
+    # #include "cuda.h" means the project header, but the CUDA TK ships its own
+    # cuda.h (the driver API) — BEFORE prepends so ours wins the quote-include.
+    target_include_directories(tensorlib_bench_cuda BEFORE PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(tensorlib_bench_cuda PRIVATE ${CUDA_TK_INC})
+    tensorlib_enable_cuda(tensorlib_bench_cuda)
+    message(STATUS "cuda bench: cuBLAS gate enabled (${CUBLAS_LIB})")
+  else()
+    message(STATUS "cuda bench: cuBLAS not found — SGEMM gate bench skipped")
+  endif()
 endif()
 
 add_executable(tensorlib_bench bench/bench_main.cpp)

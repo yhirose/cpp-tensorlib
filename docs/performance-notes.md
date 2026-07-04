@@ -352,6 +352,84 @@ over-parallelizing small GEMMs on the P/E+HT topology where OpenBLAS caps
 threads. See the deferred "problem-size-aware thread count" item in
 roadmap.md — best measured on native Linux, not this WSL2 box.
 
+## Own CUDA GEMM stage-2 (M6, RTX 3090 / WSL2, 2026-07-03)
+
+The SGEMM tuning sprint over the correctness-first one-output-per-thread
+kernel. Bench: `bench/bench_cuda_gemm.cpp` links cuBLAS + the CUDA runtime as a
+**measurement reference only** (like OpenBLAS on the CPU side — never a library
+dependency; cuda.h still dlopen's the driver). Timing is CUDA events on the null
+stream, R launches per batch, median of interleaved own-vs-cuBLAS rounds. All
+numbers are **device-side event timing on the RTX 3090 under WSL2** — WSL2 adds
+submission latency, but events measure device-side, so the own/cuBLAS ratio is
+WSL2-insensitive (wall-clock would not be).
+
+### The finding that reframed the sprint: managed memory was the first blocker
+
+The stage-1 backend used `cuMemAllocManaged` (chosen to reuse the Apple unified-
+memory seam). Standing up the census immediately exposed an **~88× cliff** —
+same cuBLAS SGEMM at 2048³, only the allocator differs:
+
+| allocation | cuBLAS 2048³ |
+|---|---|
+| `cudaMalloc` (device) | **~22,900 GFLOP/s** |
+| `cudaMallocManaged` (managed) | **~260 GFLOP/s** |
+
+Root cause: **`cudaDevAttrConcurrentManagedAccess = 0` on WSL2** — the GPU
+cannot fault-migrate managed pages, so it reads them over PCIe every access (the
+~260 GF/s ≈ PCIe-bound). No managed escape exists on this box: `cuMemPrefetchAsync`
+and every `cudaMemAdvise` variant return *"invalid device ordinal"*, and a
+device-only-initialized managed buffer (host never touches it) still runs 256
+GF/s — migration is fundamentally off, not a first-touch issue. So the roadmap's
+"first lever" (prefetch hints) is a dead end here. Because PyTorch uses
+`cudaMalloc` device memory, *beating PyTorch requires device memory too* — no
+kernel tuning matters on managed memory. This triggered the roadmap's pre-
+authorized **device-buffer pivot**: the CUDA backend now keeps a persistent
+host/device **mirror** per allocation (host malloc + `cuMemAlloc` device buffer,
+dirty state keyed by the device pointer in cuda.h, so views sharing a storage
+share one entry), with lazy H2D before a kernel reads a host-dirty buffer and
+D2H before the CPU reads a device-dirty one (`array::raw()/data()` →
+`gpu::sync_to_host`). Metal stays a strict no-op (genuinely unified). This
+replaced managed everywhere; the array oracle + ctest cpu/gpu/auto validate the
+coherence end-to-end. Recorded in [[cuda-wsl2-managed-memory-cliff]].
+
+### SGEMM kernel ladder (interleaved own/cuBLAS, device memory)
+
+With operands on device memory, the naive kernel is the bottleneck. The tuned
+`tl_sgemm_rb` fast path (NN, contiguous, K%8==0, N%4==0, 16B-aligned; everything
+else — transpose/strides/odd shapes — falls to the correctness-first `tl_sgemm`):
+
+| step | 2048³ own/cuB | 4096³ own/cuB |
+|---|---|---|
+| naive one-output-per-thread (device mem) | ~0.09 | ~0.09 |
+| 128×128×8 register block, 8×8 microtile, float4 loads | 0.68 | 0.75 |
+| + warp-tiling (64×32 warp tile, WNITER=2) — conflict-free smem reads | 0.71 | 0.80 |
+| **+ register-staged double buffer (current)** | **0.72–0.84** | **0.79–0.83** |
+
+The warp-tiled thread→output map makes every As/Bs fragment read a broadcast
+within a warp, removing the 4-way bank conflict the plain `tid/16,tid%16` map
+hits (its stride-8 B reads serialize). `ptxas`: 127 regs, no spills, 16KB smem
+(double-buffered) → 2 blocks/SM (33% occupancy, register-limited by the 64
+accumulators — normal for GEMM). Absolute: ~18,500–19,400 GF/s at 4096³ (cuBLAS
+~23,400). Correct throughout — max rel err vs cuBLAS ≤ 6e-5 at 2048³, exact at
+4096³; full ctest green including the fast path (check_cuda's 64×48×40 NN case).
+
+**Gate status: not yet met.** Own ≈ **80% of cuBLAS**, and PyTorch-FP32 (TF32
+disabled; it bundles cuBLAS 12.8 and measured ~25,900 GF/s at 4096³, *faster*
+than the linked cuBLAS 13.1 ~23,400) is the tougher bar at ~0.75. The remaining
+levers to close 80%→90%+ (in likely order): larger block tiles (128×256 for more
+C-reuse per load — needs register/spill management), split-K for the mid-size
+wave-quantization tail (2048³ is only ~2 waves at 128² tiles — the ratio dips vs
+4096³'s ~6 waves), and finer instruction scheduling. Per the roadmap escape
+hatch, a per-shape-band CUTLASS instance is the fallback if a band can't reach
+the gate after that.
+
+**Refuted (do not retry without new evidence):**
+
+| Approach | Verdict | Data |
+|---|---|---|
+| BK 8→16 (BK=16 slab, 2×float4 loads) | **Rejected** | Helps 1024³ (0.62→0.70) but *regresses* the gate sizes: 2048³ 0.72→0.62, 4096³ 0.83→0.73. The 32KB smem + 130 regs hurt where large-matmul throughput matters. |
+| Register double-buffer *before* warp-tiling | **No effect** | On the conflict-bound (pre-warptile) kernel, hiding global latency did nothing (2048³ 0.68→0.67) — the kernel was smem-bound, not latency-bound. Double buffering only paid off *after* warp-tiling made the smem reads conflict-free. |
+
 ## vs silarray (M1 Pro, 2026-07-03)
 
 Head-to-head with the predecessor across cpu/gpu/auto. Two separate

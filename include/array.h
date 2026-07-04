@@ -394,11 +394,25 @@ inline void barrier_() {
 #endif
 }
 
+// Pull a storage's device copy back to host before a CPU access (D2H if the
+// device holds the live version), and on a write mark the device copy stale so
+// the next GPU op re-uploads. No-op on unified backends (Metal) and for heap
+// storages (native==null). Pairs with barrier_(): flush first (kernels done),
+// then reconcile this specific buffer.
+inline void host_sync_(void* native, bool for_write) {
+#ifdef TL_RUNTIME_HOOKS
+  if (host_sync_hook) host_sync_hook(native, for_write);
+#else
+  gpu::sync_to_host(native, for_write);
+#endif
+}
+
 }  // namespace detail
 
 inline const float* array::raw() const {
   ensure_();
   detail::barrier_();
+  detail::host_sync_(storage_.native, /*for_write=*/false);
   return storage_.data() + offset_;
 }
 
@@ -408,6 +422,9 @@ inline float* array::data() {
   if (!contiguous()) {
     throw std::logic_error("tl::data: non-contiguous view; use clone()");
   }
+  // Mutable handle: conservatively treat as a potential host write, so the
+  // device mirror is invalidated (correctness over a rare redundant re-upload).
+  detail::host_sync_(storage_.native, /*for_write=*/true);
   return storage_.data() + offset_;
 }
 
@@ -1830,6 +1847,7 @@ inline array concat(const std::vector<array>& parts) {
 inline void install_runtime_hooks() {
   detail::storage_make_hook = &storage::make_device_;
   detail::cpu_barrier_hook = &gpu::cpu_barrier;
+  detail::host_sync_hook = &gpu::sync_to_host;
   detail::gpu_pending_hook = &gpu::pending;
   detail::run_hook = &detail::graph::run;
 }

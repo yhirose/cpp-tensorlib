@@ -380,6 +380,12 @@ inline void cpu_barrier() {
   if (pending()) flush();
 }
 
+// Host↔device coherence hook (see cuda.h). Metal is genuinely unified memory —
+// the CPU and GPU see the same MTLBuffer bytes — so there is nothing to copy;
+// cpu_barrier (the flush) is the only synchronization needed. A no-op here keeps
+// the eval seam backend-agnostic (the CUDA device-mirror does the real work).
+inline void sync_to_host(void*, bool) {}
+
 }  // namespace metal
 
 // tl::gpu_available() and the tl::gpu facade (metal on Apple, cuda elsewhere)
