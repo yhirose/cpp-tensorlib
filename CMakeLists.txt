@@ -95,6 +95,13 @@ if(TENSORLIB_CUDA)
   target_link_libraries(tensorlib_bench_bf16 PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_bench_bf16)
 
+  # M9 fused decode-attention bench (Path-B style). Direct cuda:: API.
+  add_executable(tensorlib_bench_attn bench/bench_attn_decode.cpp)
+  target_include_directories(tensorlib_bench_attn BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(tensorlib_bench_attn PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_bench_attn)
+
   # CUDA SGEMM census (M6 stage-2 tuning). Links cuBLAS + the CUDA runtime as a
   # measurement REFERENCE only (the gate is >=90% cuBLAS) — never a library dep;
   # cuda.h still dlopen's the driver and ships zero third-party runtime deps.

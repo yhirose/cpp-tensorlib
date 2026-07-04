@@ -249,6 +249,14 @@ struct context {
     return gemv_bf16v8_fn;
   }
 
+  // M9 fused decode attention.
+  CUfunction attn_decode_fn = nullptr;
+  CUfunction attn_decode_() {
+    if (!attn_decode_fn)
+      d.ModuleGetFunction(&attn_decode_fn, mod, "tl_attn_decode_f32");
+    return attn_decode_fn;
+  }
+
   // char* pointer arithmetic to fold a byte offset into a managed pointer.
   static float* off_(void* base, int64_t byte_off) {
     return reinterpret_cast<float*>(static_cast<char*>(base) + byte_off);
@@ -411,6 +419,28 @@ inline bool gemv_bf16(void* a, void* B, void* y, int64_t n, int64_t k) {
                    context::off_(B, 0), context::off_(y, 0), y,
                    static_cast<unsigned>(n), static_cast<unsigned>(k),
                    v8 ? 8u : 1u);
+}
+
+// M9 fused decode attention: out(h,:) = softmax(scale·q(h,:)·K(h)^T)·V(h) in
+// one pass. q [heads,D], K/V [heads,ctx,D], out [heads,D], contiguous, D==128.
+// One block per head. No epilogue (attention is its own op).
+inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t heads,
+                        int64_t ctx, int64_t D, float scale) {
+  auto& c = context::get();
+  if (!c.ready || D != 128) return false;
+  c.device_read_(q);
+  c.device_read_(K);
+  c.device_read_(V);
+  c.device_write_(out);
+  float* pq = context::off_(q, 0);
+  float* pk = context::off_(K, 0);
+  float* pv = context::off_(V, 0);
+  float* po = context::off_(out, 0);
+  unsigned uctx = static_cast<unsigned>(ctx);
+  void* args[] = {&pq, &pk, &pv, &po, &uctx, &scale};
+  c.pending = true;
+  return c.d.LaunchKernel(c.attn_decode_(), static_cast<unsigned>(heads), 1, 1,
+                          128, 1, 1, 0, nullptr, args, nullptr) == 0;
 }
 
 // C(m,n) = (A @ B) * scale + offset. lda/ldb row strides; trans reads a

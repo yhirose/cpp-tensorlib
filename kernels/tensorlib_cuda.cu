@@ -379,4 +379,81 @@ __global__ void tl_gemv_bf16v8(const float* __restrict__ a,
   }
 }
 
+// ---- M9 fused decode attention (flash-attention, one query row per head) ----
+// out(h,:) = softmax(scale * q(h,:) · K(h)^T) · V(h), computed in ONE pass with
+// the online-softmax recurrence so the ctx-long scores are never materialized
+// and K,V are each read exactly once (the decode floor is KV bandwidth). This
+// replaces the array path's 3 launches × 2 materializations × (heads×layers)
+// — which is launch/materialize-bound, not compute-bound — for the regime that
+// dominates decode-token time.
+//
+// One block per head, blockDim = head_dim = 128 (4 warps). Each warp owns keys
+// i = warp, warp+4, ...; its 32 lanes cooperatively reduce the D=128 score
+// (coalesced K/V row reads, warp-shuffle reduction, no block sync in the loop),
+// keeping per-warp (m,l,acc) running state. A final shared-memory step merges
+// the 4 warps' partial softmax states (flash-attention rescale-by-exp(m_w-m)).
+#define TL_AD 128    // head dim
+#define TL_ADPT 4    // TL_AD / 32 = dims per lane
+__global__ void tl_attn_decode_f32(const float* __restrict__ q,
+                                   const float* __restrict__ K,
+                                   const float* __restrict__ V,
+                                   float* __restrict__ out, unsigned ctx,
+                                   float scale) {
+  const unsigned h = blockIdx.x;
+  const unsigned tid = threadIdx.x;  // 0..127
+  const unsigned lane = tid & 31u, warp = tid >> 5;  // 4 warps of 32
+  const float* qh = q + (size_t)h * TL_AD;
+  const float* Kh = K + (size_t)h * ctx * TL_AD;
+  const float* Vh = V + (size_t)h * ctx * TL_AD;
+
+  __shared__ float q_sh[TL_AD];
+  q_sh[tid] = qh[tid];
+  __syncthreads();
+
+  float m = -1e30f, l = 0.0f;
+  float acc[TL_ADPT] = {};  // lane holds dims d = lane, lane+32, lane+64, +96
+
+  for (unsigned i = warp; i < ctx; i += 4u) {
+    const float* Ki = Kh + (size_t)i * TL_AD;
+    float partial = 0.0f;
+#pragma unroll
+    for (int r = 0; r < TL_ADPT; r++) partial += q_sh[lane + r * 32] * Ki[lane + r * 32];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      partial += __shfl_down_sync(0xffffffffu, partial, off);
+    float s = __shfl_sync(0xffffffffu, partial, 0) * scale;  // lane0 has the sum
+
+    float m_new = fmaxf(m, s);
+    float corr = __expf(m - m_new);
+    float p = __expf(s - m_new);
+    l = l * corr + p;
+    const float* Vi = Vh + (size_t)i * TL_AD;
+#pragma unroll
+    for (int r = 0; r < TL_ADPT; r++) acc[r] = acc[r] * corr + p * Vi[lane + r * 32];
+    m = m_new;
+  }
+
+  // merge the 4 warps' partial softmax states through shared memory
+  __shared__ float sm[4], sl[4], sacc[4][TL_AD];
+  if (lane == 0) {
+    sm[warp] = m;
+    sl[warp] = l;
+  }
+#pragma unroll
+  for (int r = 0; r < TL_ADPT; r++) sacc[warp][lane + r * 32] = acc[r];
+  __syncthreads();
+
+  float gm = fmaxf(fmaxf(sm[0], sm[1]), fmaxf(sm[2], sm[3]));
+  float gl = 0.0f, o = 0.0f;
+#pragma unroll
+  for (int w = 0; w < 4; w++) {
+    float e = __expf(sm[w] - gm);
+    gl += sl[w] * e;
+    o += sacc[w][tid] * e;
+  }
+  out[(size_t)h * TL_AD + tid] = o / gl;
+}
+#undef TL_AD
+#undef TL_ADPT
+
 }  // extern "C"
