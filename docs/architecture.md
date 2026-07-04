@@ -163,9 +163,16 @@ Status summary; scope, environment needs, and approach are in
 | M3b-2 | Metal SGEMM (tiled), softmax, last-axis reductions; GPU MLP fwd | ✅ |
 | M3b-3 | STEEL SGEMM sprint: 2048³ ~1300 → ~3200 GFLOP/s | ✅ |
 | M4 | culebra integration; tiny-tensor per-op sprint; auto thresholds | ✅ |
-| M5 | Own CPU backend: threadpool + BLIS-style microkernels (AVX2/AVX-512/NEON) | 🔨 scaffold + NEON done; AVX + tuning pending |
-| M6 | Own CUDA backend: dlopen'd driver API, PTX `#embed`, SGEMM ladder | ⏳ |
-| M7 | BF16 storage type; ongoing measured optimization | ⏳ |
+| M5 | Own CPU backend: threadpool + BLIS-style microkernels (AVX2/AVX-512/NEON) | 🔨 NEON + AVX2 done (OpenBLAS gate met); AVX-512 deferred (needs hw) |
+| M6 | Own CUDA backend: dlopen'd driver API, PTX `#embed`, SGEMM + split-K | 🔨 correct; ~0.82 of cuBLAS (prefill foundation — see roadmap "Target scope") |
+| M7 | BF16/FP16 storage **and compute** (LoRA/QLoRA fine-tuning path) | ⏳ |
+| M8 | Quantized (int4/int8) dequant-fused matmul (local-LLM inference) | ⏳ |
+| M9 | Fused attention (flash-attn style) + KV cache | ⏳ |
+
+Milestones are now driven by the **target scope** (consumer local-LLM
+inference/fine-tuning on 1–few consumer GPUs — RTX 5090 / A6000); see
+`roadmap.md`. The CUDA bar is tokens/sec vs llama.cpp/exllamav2, not cuBLAS
+GFLOP/s — full rationale in `performance-notes.md`.
 
 ## Conventions
 

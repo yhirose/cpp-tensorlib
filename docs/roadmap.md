@@ -12,9 +12,13 @@ plan — it travels with the repo, so any checkout on any machine has it.
 M1–M4 are done: reference backend, lazy graph + fusion, the Accelerate and
 Metal (STEEL SGEMM) backends behind a single dispatch seam, culebra
 integration, and a tiny-tensor per-op sprint. The macOS backend is complete
-and competitive (see the silarray comparison in performance-notes.md). What
-remains is the non-Apple backends (M5 CPU, M6 CUDA), BF16 (M7), and a tail of
-deferred perf/CI/API work.
+and competitive (see the silarray comparison in performance-notes.md). The
+non-Apple backends have landed their F32 foundation (M5 CPU met the OpenBLAS
+gate; M6 CUDA has a correct, split-K SGEMM at ~0.82 of cuBLAS). What remains is
+reoriented by the target scope below: BF16/FP16 **compute** (M7), quantized
+dequant-matmul (M8), and fused attention + KV cache (M9) — the kernels that
+actually make the target workloads fast — plus a tail of deferred perf/CI/API
+work.
 
 Design invariants that constrain everything below:
 
@@ -26,7 +30,37 @@ Design invariants that constrain everything below:
   A new backend is a new set of `*_mode_()` guards + kernels, nothing else.
 - **The reference `ref::` backend is permanent** — correctness oracle and the
   fallback for any unsupported shape/target.
-- **F32 only** (BF16 as a storage type in M7); no F64.
+- **F32 is the compute baseline**; BF16/FP16 storage *and* compute arrive in M7,
+  and int4/int8 as a *storage+dequant* type in M8 (compute stays F32/BF16-accum,
+  no F64). Widening the dtype surface is now in scope — see below.
+
+## Target scope & the bar
+
+The project targets **consumer/prosumer local AI**: running and fine-tuning
+neural nets — Local LLM inference (chat/decode) and LoRA/QLoRA fine-tuning — on
+**one to a few consumer GPUs** (RTX 5090 = Blackwell sm_120; A6000 = Ampere
+sm_86). Large-scale multi-node LLM *training* is explicitly **out of scope**.
+
+This scope resets the performance bar, and it is not "beat cuBLAS at 4096³":
+
+- **The relevant competitor is llama.cpp / exllamav2 / ggml / MLC-LLM, not
+  PyTorch+cuBLAS.** Those are the SOTA local runtimes, and they are hand-written
+  with **no cuBLAS on the hot paths** — proof that own-kernels is the *right*
+  approach here, not a compromise. The operative metric is **tokens/sec on a
+  real quantized model**, not GFLOP/s vs cuBLAS.
+- **Interactive decode (the dominant cost) is memory-bandwidth-bound**
+  GEMV / dequant-matmul (batch≈1, each weight streamed once), where cuBLAS has
+  **no moat** — a hand kernel that saturates VRAM bandwidth matches or beats it.
+  Attention is flash-attention-style fused work cuBLAS doesn't even do. Only
+  **prefill / larger batch** is compute-bound dense GEMM (the regime where the
+  hand SGEMM tops ~0.90 of cuBLAS — see M6), and it is a one-time, minority cost
+  for interactive use.
+- Therefore the M6 **cuBLAS-90%-on-square gate is consciously de-prioritized**
+  (measured, reached ~0.82 with split-K, kept as the prefill foundation — not
+  chased with a CUTLASS escape hatch the scope doesn't need). The high-leverage
+  work is the dtype/quant/attention kernels (M7–M9), all hand-written-friendly
+  and cuBLAS-irrelevant. Full analysis (the decode=bandwidth-bound regime split,
+  the silarray/llama.cpp precedent) is in performance-notes.md.
 
 ## Milestones
 
@@ -211,9 +245,21 @@ SIMT kernel structurally trails cuBLAS (which uses tensor-core-adjacent
 `ldmatrix`/mma paths even for its FP32 SGEMM on Ampere). Options: (a) the
 pre-authorized **per-shape CUTLASS escape hatch** for the large band; (b) accept
 ~0.82 and document the band as a known gap; (c) further micro-scheduling with
-uncertain payoff. This is an open decision (see Open decisions). Also unchanged:
-SteelLoaderT-equivalent for transposed operands (backward matmuls use the naive
-`tl_sgemm` today). All measured on the RTX 3090, WSL2 side noted.
+uncertain payoff.
+
+**Resolved (2026-07-04): option (b) — accept ~0.82, no CUTLASS.** Per the target
+scope, large-square compute-bound GEMM is *prefill only* (a minority, one-time
+cost); the dominant local-LLM cost is bandwidth-bound decode where cuBLAS has no
+moat. So the ~0.82 split-K SGEMM is kept as the **prefill/compute-bound
+foundation** and the cuBLAS-90% chase is dropped. The escape hatch stays
+*pre-authorized but unused* — if a real workload ever proves prefill-GEMM-bound,
+reopen it (with the binary-size feature-flag design: CUTLASS confined to the
+build-time kernel `.cu`, `-DTENSORLIB_CUDA_CUTLASS` off by default, so
+non-matmul builds carry zero CUTLASS bytes). Reaching ~0.90 by hand is also
+possible (Boehm hits ~0.93 on sm_86 via a full tile autotune + fragment-register
+pipeline + swizzled cp.async) but is deferred as lower-leverage than M7–M9.
+Also unchanged: SteelLoaderT-equivalent for transposed operands (backward
+matmuls use the naive `tl_sgemm` today). All measured on the RTX 3090, WSL2 noted.
 
 **Done (loader probe + memory model, 2026-07-03):** the dlopen'd-driver design
 is validated on the RTX 3090 box — a standalone probe declares the driver API
@@ -230,14 +276,46 @@ page migration proved a bottleneck (prefetch the first lever). It did — on WSL
 `ConcurrentManagedAccess=0` means pages never migrate and prefetch is
 unavailable, so the device-buffer mirror replaced managed at stage 2.
 
-### M7 — BF16 storage type
+### M7 — BF16 / FP16 storage **and compute**
 
-BF16 as a *storage* type (memory is BF16, load widens to F32, store narrows),
-so the conversion is a bit-shift confined to load/store and the compute path
-and kernels stay F32 — no dtype × ISA × kernel explosion. Halves bandwidth on
-memory-bound ops. Pairs with a language-level dtype surface in culebra. A BF16
-*compute* path (Tensor Core / bf16 SIMD) is a later, demand-driven step and is
-where reconsidering CUTLASS/library kernels would make sense.
+BF16/FP16 as a *storage* type first (memory is 16-bit, load widens to F32, store
+narrows — a bit-shift confined to load/store, compute stays F32, no dtype × ISA ×
+kernel explosion). Halves bandwidth on memory-bound ops — directly the decode
+lever. Pairs with a language-level dtype surface in culebra.
+
+**The compute path is now in scope (was "later, demand-driven" — the scope
+demands it).** LoRA/QLoRA fine-tuning trains in BF16/FP16 with F32 accumulation,
+and a 16-bit compute GEMM halves weight bandwidth for decode too. So M7 adds a
+BF16/FP16 GEMM with F32-accumulate: on CUDA the `tl_sgemm_rb` register-blocked
+kernel generalizes (16-bit smem tiles, F32 accumulators — the microtile/warp
+structure is unchanged); on Ampere+ a Tensor-Core (`mma.sync` bf16→f32) path is
+the fast option and, unlike the FP32 SGEMM, here Tensor Cores are the *native*
+datapath so the hand kernel is on equal footing with cuBLAS. FP8 (sm_120 /
+Blackwell) is a forward-looking extension of the same seam.
+
+### M8 — Quantized (int4/int8) dequant-fused matmul
+
+The heart of consumer local-LLM inference: 4-bit/8-bit weights (VRAM fit +
+bandwidth) with a **fused dequantize-and-matmul** kernel — read packed int4/int8
++ per-group scales, widen to BF16/F32 in registers, accumulate. This is a
+*storage+dequant* dtype (activations stay BF16/F32; only weights are quantized),
+so it rides the M7 dtype surface and the existing GEMM/GEMV structure with a
+widen-on-load epilogue. Decode is GEMV-shaped and bandwidth-bound, so the win is
+reading 4× fewer weight bytes — a regime cuBLAS doesn't serve and where
+llama.cpp/exllamav2 hand-write. GGUF-style group quantization (Q4_K etc.) is the
+reference format to stay interop-friendly. Gate: **tokens/sec within reach of
+llama.cpp/exllamav2** on the same quantized model + GPU (not GFLOP/s vs cuBLAS).
+
+### M9 — Fused attention + KV cache
+
+Flash-attention-style fused attention (tiled QKᵀ → online softmax → ·V, never
+materializing the S×S scores), causal masking, and a **KV cache** (append per
+decode step, GQA/MQA head sharing). cuBLAS does not do attention at all, so this
+is squarely own-kernel territory (FlashAttention is itself hand-written CUDA).
+Promotes the deferred "GPU fused kernels" item. Decode attention is KV-cache-
+bandwidth-bound; prefill attention is compute-bound and long-context-sensitive.
+This is what turns the M6/M7/M8 GEMM kernels into an actual runnable LLM
+(alongside the model layer — RoPE, norm, MLP — built in culebra or an app layer).
 
 ## Deferred / conditional work
 
@@ -246,7 +324,7 @@ Tracked so it isn't re-discovered. Each is gated on a trigger, not scheduled.
 | Item | Trigger to act |
 |---|---|
 | **SteelLoaderT** — transposed-operand STEEL for backward matmuls (`xᵀ@g`, `g@Wᵀ`) | a real GPU workload whose backward is transpose-bound (census-driven) |
-| **GPU fused kernels** — `linear_sigmoid`, online-softmax (silarray has these; tensorlib's GPU softmax/MLP trail silarray) | a GPU training/inference workload that is fusion-bound |
+| **GPU fused kernels** — `linear_sigmoid`, online-softmax (silarray has these; tensorlib's GPU softmax/MLP trail silarray) | **promoted → M9** (fused attention is the flagship case); general fused-epilogue kernels ride the same seam |
 | **Tiny-tensor corner** (n_embd≈16) — node pooling / small-vector fields | a real workload that lives in the ~16-element regime (documented as accepted, not a bug) |
 | **View-crossing fusion** — eager view eval breaks fusion across reshape/transpose | a transformer workload where this shows up in a census |
 | **Problem-size-aware CPU thread count** — pool statically uses all `hardware_concurrency()` threads; over-parallelizes mid-size GEMM (512³/1024³ < OpenBLAS on hybrid P/E+HT), where OpenBLAS caps threads | a native-Linux x86 measurement session (WSL2 hides P/E topology); or a workload bound by mid-size CPU GEMM |
@@ -265,6 +343,17 @@ Tensor-unused-binary size check on the culebra side.
 
 ## Open decisions
 
+- **CUDA performance bar — RESOLVED (2026-07-04).** The bar is **tokens/sec vs
+  llama.cpp/exllamav2 on a real quantized model**, not cuBLAS-90% on square GEMM.
+  Rationale: the target scope (consumer local-LLM inference/fine-tuning) is
+  decode-dominated = bandwidth-bound, where cuBLAS has no moat and hand-written
+  is SOTA. The M6 cuBLAS gate is kept only as the prefill/compute-bound
+  foundation (~0.82, split-K). Full regime analysis in performance-notes.md.
+- **CUTLASS escape hatch — RESOLVED (2026-07-04): pre-authorized but unused.**
+  Not needed for the scope (see M6 Resolved). If ever reopened, it is confined
+  to the build-time kernel `.cu` behind `-DTENSORLIB_CUDA_CUTLASS` (off by
+  default) so non-matmul / non-opted-in binaries carry zero CUTLASS bytes and
+  the header-only consumer surface is preserved.
 - **culebra default device** — stays `cpu` for now; revisit per the deferred
   table. Rationale in performance-notes.md.
 - **auto thresholds are M1-Pro-specific** — must be re-measured per Mac and a

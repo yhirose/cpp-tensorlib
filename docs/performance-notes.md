@@ -6,18 +6,56 @@ path must carry the measurement that set it.
 
 ## Performance gates
 
-The reference target is **PyTorch/libtorch** on the same hardware (silarray
-benched against MLX; this project is cross-platform, so PyTorch is the bar).
+The reference target is **PyTorch/libtorch** on the same hardware for the raw
+GEMM foundation (silarray benched against MLX; this project is cross-platform, so
+PyTorch is the portable BLAS-level bar).
 
-| Backend | Gate |
+| Backend | Foundation gate (raw GEMM) |
 |---|---|
 | macOS (Accelerate + Metal) | ≥ silarray (which is ≈ MLX) and ≥ PyTorch MPS |
 | Own CPU GEMM | ≥ 90% of OpenBLAS single/multi-thread, ≥ PyTorch CPU |
-| Own CUDA GEMM | ≥ 90% of cuBLAS FP32, ≥ PyTorch CUDA |
+| Own CUDA GEMM | ≥ 90% of cuBLAS FP32 — **scoped: prefill/compute-bound only** |
 
 Where a gate cannot be met on a shape band after honest effort, record the
 band and the data here, then consider the escape hatch (OpenBLAS / CUTLASS
 for that band only) — do not ship a silent loss.
+
+**The CUDA GEMM gate is scoped, not absolute (2026-07-04).** The target scope is
+consumer local-LLM inference/fine-tuning (roadmap.md "Target scope"), which is
+decode-dominated and therefore *bandwidth-bound*, not compute-bound-GEMM-bound.
+So the operative CUDA bar is **tokens/sec vs llama.cpp/exllamav2 on a real
+quantized model**, and the cuBLAS-90%-on-square gate applies only to the
+minority prefill/large-batch band — where it is **consciously accepted at ~0.82**
+(split-K), not chased. See "CUDA GEMM regime analysis" below.
+
+## CUDA GEMM regime analysis — why the cuBLAS gate is de-prioritized (2026-07-04)
+
+The decision chain that reset the CUDA bar, recorded so it isn't relitigated:
+
+- **cuBLAS's moat is SASS, and it only matters in one regime.** Hand-written FP32
+  SIMT SGEMM tops ~0.90–0.93 of cuBLAS on sm_86 (Boehm's public kernel is the
+  existence proof; ours is ~0.82 with split-K and untuned tiles). The last
+  ~7–18% is register-bank/instruction scheduling that ptxas won't reach from
+  CUDA C++ — cuBLAS's ~15-year SASS tuning. This gap is real but lives **only in
+  large compute-bound dense GEMM**.
+- **The target workload rarely hits that regime.** Local-LLM interactive
+  **decode** (the dominant cost) is batch≈1 GEMV / dequant-GEMV — each weight
+  streamed once, FLOP-intensity ~2 → **100% VRAM-bandwidth-bound**. cuBLAS has
+  **no advantage** on bandwidth-bound work; a hand kernel that saturates memory
+  ties or beats it. **Attention** is flash-attention-style fused work cuBLAS
+  doesn't do. Only **prefill / larger batch** is compute-bound GEMM — a one-time,
+  minority cost for interactive use.
+- **The SOTA precedent confirms it.** llama.cpp / exllamav2 / ggml / MLC-LLM are
+  the dominant local runtimes and hand-write their CUDA/Metal kernels with **no
+  cuBLAS on the hot paths**. Own-kernels is the *correct* approach for this scope,
+  not a compromise. And silarray's own data (bench/README) is the same shape:
+  it *tied* PyTorch-MPS on large square (0.96–1.0×) but *won 1.8×* on the
+  DL/small-batch shape (32×4096×768) — the win was never in the big-square regime.
+- **Conclusion.** Keep the ~0.82 split-K SGEMM as the prefill foundation; do not
+  spend the CUTLASS escape hatch or a SASS-level sprint on the square gate. The
+  high-leverage CUDA work is the dtype/quant/attention kernels (roadmap M7–M9),
+  all bandwidth- or fusion-bound, all hand-written-friendly, all cuBLAS-irrelevant.
+  Benchmark them as **tokens/sec vs llama.cpp/exllamav2**, not GFLOP/s vs cuBLAS.
 
 ## Measurement discipline (inherited from silarray, verified there)
 
