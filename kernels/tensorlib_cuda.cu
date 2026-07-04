@@ -152,6 +152,14 @@ __global__ void tl_sgemm(const float* A, const float* B, float* C, unsigned m,
 // no transpose, lda==k, ldb==n, K%8==0, N%4==0, all base offsets folded in and
 // 16B-aligned. M and N block edges are predicated (zero-filled loads, guarded
 // stores), so arbitrary M and any N%4==0 are correct.
+//
+// Split-K (ladder ②): gridDim.z = S partitions the K axis so S× more blocks
+// fill the SMs at mid sizes (1024³/2048³ underfill 82 SMs with 128² tiles).
+// blockIdx.z picks the split; ksplit is the per-split K chunk (a multiple of
+// TL_BK, so slab boundaries stay aligned). When S>1 each split atomicAdds its
+// partial into a pre-zeroed C (scale/offset must be identity — the host gates
+// on that); when S==1 (ksplit>=k) the epilogue is the normal fused store, so
+// the non-split path is bit-identical to before.
 #define TL_BM 128
 #define TL_BN 128
 #define TL_BK 8
@@ -164,13 +172,18 @@ __global__ void tl_sgemm(const float* A, const float* B, float* C, unsigned m,
 __global__ void tl_sgemm_rb(const float* __restrict__ A,
                             const float* __restrict__ B, float* __restrict__ C,
                             unsigned m, unsigned n, unsigned k, float scale,
-                            float offset) {
+                            float offset, unsigned ksplit) {
   __shared__ float As[2][TL_BK][TL_BM];  // double-buffered, transposed
   __shared__ float Bs[2][TL_BK][TL_BN];
 
   const unsigned blockRow = blockIdx.y * TL_BM;
   const unsigned blockCol = blockIdx.x * TL_BN;
   const unsigned tid = threadIdx.x;  // 0..255
+
+  // split-K K-range for this z-slice (multiple of TL_BK; identity when S==1)
+  const unsigned k0 = blockIdx.z * ksplit;
+  if (k0 >= k) return;
+  const unsigned k1 = (k0 + ksplit < k) ? (k0 + ksplit) : k;
 
   // warp placement in the block: 8 warps as 2 rows × 4 cols of 64×32 tiles
   const unsigned warp = tid / 32;
@@ -211,12 +224,12 @@ __global__ void tl_sgemm_rb(const float* __restrict__ A,
     *reinterpret_cast<float4*>(&Bs[buf][bRow][bColx4]) = ldgB;
   };
 
-  load_regs(0);
+  load_regs(k0);
   store_smem(0);
   __syncthreads();
   int buf = 0;
-  for (unsigned kt = 0; kt < k; kt += TL_BK) {
-    bool has_next = kt + TL_BK < k;
+  for (unsigned kt = k0; kt < k1; kt += TL_BK) {
+    bool has_next = kt + TL_BK < k1;
     if (has_next) load_regs(kt + TL_BK);  // prefetch next slab into registers
 #pragma unroll
     for (unsigned kk = 0; kk < TL_BK; kk++) {
@@ -242,7 +255,11 @@ __global__ void tl_sgemm_rb(const float* __restrict__ A,
     buf ^= 1;
   }
 
-  // --- epilogue: scale/offset + guarded store (mirror the load map) ---
+  // --- epilogue: guarded store (mirror the load map) ---
+  // S==1: fused affine store. S>1: atomicAdd the raw partial into a pre-zeroed
+  // C (scale/offset are identity on this path, gated host-side). gridDim.z is
+  // uniform across the block, so the branch never diverges.
+  const bool split = gridDim.z > 1;
 #pragma unroll
   for (unsigned i = 0; i < TL_TM; i++) {
     unsigned gRow = blockRow + warpRow * TL_WM + threadRowInWarp * TL_TM + i;
@@ -254,7 +271,12 @@ __global__ void tl_sgemm_rb(const float* __restrict__ A,
         unsigned j = wn * TL_TNSUB + js;
         unsigned gCol = blockCol + warpCol * TL_WN + wn * (TL_WN / TL_WNI) +
                         threadColInWarp * TL_TNSUB + js;
-        if (gCol < n) C[(size_t)gRow * n + gCol] = acc[i][j] * scale + offset;
+        if (gCol >= n) continue;
+        size_t idx = (size_t)gRow * n + gCol;
+        if (split)
+          atomicAdd(&C[idx], acc[i][j]);
+        else
+          C[idx] = acc[i][j] * scale + offset;
       }
     }
   }

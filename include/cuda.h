@@ -77,11 +77,13 @@ struct driver {
   CUresult (*MemFree)(CUdeviceptr) = nullptr;
   CUresult (*MemcpyHtoD)(CUdeviceptr, const void*, size_t) = nullptr;
   CUresult (*MemcpyDtoH)(void*, CUdeviceptr, size_t) = nullptr;
+  CUresult (*MemsetD8)(CUdeviceptr, unsigned char, size_t) = nullptr;
 
   bool ok() const {
     return Init && DeviceGet && DevicePrimaryCtxRetain && CtxSetCurrent &&
            CtxSynchronize && ModuleLoadData && ModuleGetFunction &&
-           LaunchKernel && MemAlloc && MemFree && MemcpyHtoD && MemcpyDtoH;
+           LaunchKernel && MemAlloc && MemFree && MemcpyHtoD && MemcpyDtoH &&
+           MemsetD8;
   }
 };
 
@@ -196,6 +198,10 @@ struct context {
         (CUresult(*)(void*, CUdeviceptr, size_t))S("cuMemcpyDtoH_v2");
     if (!d.MemcpyDtoH)
       d.MemcpyDtoH = (CUresult(*)(void*, CUdeviceptr, size_t))S("cuMemcpyDtoH");
+    d.MemsetD8 =
+        (CUresult(*)(CUdeviceptr, unsigned char, size_t))S("cuMemsetD8_v2");
+    if (!d.MemsetD8)
+      d.MemsetD8 = (CUresult(*)(CUdeviceptr, unsigned char, size_t))S("cuMemsetD8");
     if (!d.ok()) return;
 
     if (d.Init(0) != 0) return;
@@ -353,11 +359,42 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
   bool aligned = (ao % 16 == 0) && (bo % 16 == 0) && (oo % 16 == 0);
   if (!ta && !tb && lda == k && ldb == n && k % 8 == 0 && n % 4 == 0 &&
       aligned && m > 0 && n > 0 && k > 0) {
+    unsigned gx = (un + 127) / 128, gy = (um + 127) / 128;
+
     if (CUfunction f = c.sgemm_rb_()) {
-      void* rb[] = {&pa, &pb, &po, &um, &un, &uk, &scale, &offset};
-      unsigned gx = (un + 127) / 128, gy = (um + 127) / 128;
+      // Split-K (ladder ②): when the 128² tiling underfills the 82 SMs (base
+      // blocks < ~3 waves of 82×2 slots), partition K into S z-slices so S× more
+      // blocks run concurrently. Split-K partitions K (not replicates it), so
+      // A/B global traffic is unchanged — the only cost is C written S× via
+      // atomicAdd into a pre-zeroed buffer, so it applies only when scale/offset
+      // are identity (plain GEMM; the host gates on that). The census (RTX 3090)
+      // shows S=2 is the robust optimum for the underfilled sizes (1024³
+      // 0.63→0.75, 2048³ 0.74→0.76); S≥4 regresses as C-atomic traffic + short-K
+      // per-block overhead overtake the occupancy gain, and 4096³ (6 waves) wants
+      // S=1. So auto uses S=2 for base<512 with K≥512 (each half ≥256, enough to
+      // amortize the smem pipeline). TL_SPLITK forces S for the census.
+      unsigned S = 1, ksplit = uk;
+      if (scale == 1.0f && offset == 0.0f) {
+        long base = (long)gx * gy;
+        long want = -1;
+        if (const char* e = std::getenv("TL_SPLITK"))
+          want = std::atol(e);
+        else if (base < 512 && uk >= 512)
+          want = 2;
+        if (want > 1) {
+          unsigned chunk = (uk + (unsigned)want - 1) / (unsigned)want;
+          chunk = (chunk + 7u) & ~7u;  // multiple of TL_BK=8
+          if (chunk == 0) chunk = 8;
+          unsigned s = (uk + chunk - 1) / chunk;
+          if (s > 1) { S = s; ksplit = chunk; }
+        }
+      }
+
+      void* rb[] = {&pa, &pb, &po, &um, &un, &uk, &scale, &offset, &ksplit};
+      if (S > 1) c.d.MemsetD8(reinterpret_cast<CUdeviceptr>(po), 0,
+                              (size_t)m * n * 4);  // zero C for atomicAdd
       c.pending = true;
-      return c.d.LaunchKernel(f, gx, gy, 1, 256, 1, 1, 0, nullptr, rb,
+      return c.d.LaunchKernel(f, gx, gy, S, 256, 1, 1, 0, nullptr, rb,
                               nullptr) == 0;
     }
   }

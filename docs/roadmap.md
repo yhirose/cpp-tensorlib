@@ -180,11 +180,40 @@ own/cuBLAS): naive ~0.09 → register-block 0.68/0.75 → +warp-tile 0.71/0.80 �
 (max rel ≤ 6e-5). **Gate not yet met:** own ≈ 80% of cuBLAS, ≈ 75% of PyTorch-
 FP32 (which bundles a faster cuBLAS 12.8). BK=16 measured-and-rejected.
 
-**Remaining — close the gate (80%→90%+):** larger block tiles (128×256 for more
-C-reuse; needs register/spill care), split-K for the mid-size wave-quantization
-tail, finer scheduling; then the per-shape CUTLASS escape hatch if a band still
-misses. Also: SteelLoaderT-equivalent for transposed operands (backward matmuls
-use the naive `tl_sgemm` today). All measured on the RTX 3090, WSL2 side noted.
+**Done (stage-2 ladder ① rejected + ② split-K landed, 2026-07-04):** the
+128×256 large-tile rung (①) was built (`tl_sgemm_rb2`, 8×16 microtile) and
+**rejected** — 128 accumulators → 203 regs → 1 block/SM (16.7% occ vs rb's 33%),
+losing at every size *including* 4096³ (0.81→0.75, where wave-quant is a
+non-issue), so the arithmetic-intensity gain is dwarfed by the occupancy loss;
+big spatial tiles are ceiling-capped at rb on sm_86 (see the refuted table). The
+census reframed the deficit as small-size *fill* (own/cuB rising with size), so
+**split-K (②) landed**: a single `ksplit`/`blockIdx.z` addition to `tl_sgemm_rb`
+partitions K into S z-slices (S× more blocks), atomicAdd'ing partials into a
+zeroed C (identity scale/offset only). S=2 is the measured optimum — 1024³
+0.63→0.75, 2048³ 0.74→0.76; 4096³ stays S=1 (6 waves already, split is pure
+overhead). Auto: S=2 for base<512 blocks & K≥512. Post: 1024³ ~0.72–0.82, 2048³
+0.76, 4096³ 0.82–0.83. Still 127 regs / 2 blocks/SM; ctest cpu/gpu/auto green.
+
+**Done (stage-2 ladder ③ cp.async rejected, 2026-07-04):** the Ampere `cp.async`
+staged pipeline (`tl_sgemm_cp`, 3/4-stage) was built and **rejected** — it loses
+at 4096³ (0.83→0.73) and 2048³ because the transposed-A smem layout the fragment
+read needs can't be filled by an efficient 16-byte cp.async (cp.async can't
+transpose), forcing 4×4-byte scatter (the slow granularity) + an extra barrier.
+Efficient cp.async here needs `ldmatrix` (tensor-core-only). See the refuted
+table. The register-staged `tl_sgemm_rb` load path stands.
+
+**Remaining — the efficiency ceiling (~0.82 at 4096³) is the open gate.** All
+three documented rungs are now spent: ① 128×256 large tile (rejected, occupancy
+cliff), ② split-K (**landed**, fixed the small-size fill deficit), ③ cp.async
+(rejected, transpose mismatch). The remaining ~8–18% to the cuBLAS-90% / beat-
+PyTorch gate is per-SM kernel efficiency at large sizes, where the hand-written
+SIMT kernel structurally trails cuBLAS (which uses tensor-core-adjacent
+`ldmatrix`/mma paths even for its FP32 SGEMM on Ampere). Options: (a) the
+pre-authorized **per-shape CUTLASS escape hatch** for the large band; (b) accept
+~0.82 and document the band as a known gap; (c) further micro-scheduling with
+uncertain payoff. This is an open decision (see Open decisions). Also unchanged:
+SteelLoaderT-equivalent for transposed operands (backward matmuls use the naive
+`tl_sgemm` today). All measured on the RTX 3090, WSL2 side noted.
 
 **Done (loader probe + memory model, 2026-07-03):** the dlopen'd-driver design
 is validated on the RTX 3090 box — a standalone probe declares the driver API

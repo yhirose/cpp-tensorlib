@@ -423,12 +423,53 @@ wave-quantization tail (2048³ is only ~2 waves at 128² tiles — the ratio dip
 hatch, a per-shape-band CUTLASS instance is the fallback if a band can't reach
 the gate after that.
 
+### Split-K census (ladder ②, 2026-07-04)
+
+The census signature — own/cuB rising monotonically with size (1024³ 0.63,
+2048³ 0.74, 4096³ 0.82) — is the classic occupancy/wave-quantization tell: 128²
+tiles make ceil(m/128)·ceil(n/128) blocks, and the RTX 3090's 82 SMs hold 2
+blocks each = 164 concurrent. So 1024³ = 64 blocks fills only ~39% of the SMs
+(0.39 wave), 2048³ = 256 blocks = 1.56 waves (half-empty tail), 4096³ = 1024
+blocks = 6.24 waves (tail negligible → the 0.82 there is pure kernel efficiency,
+not a fill problem). Split-K partitions the K axis into S z-slices (gridDim.z=S)
+so S× more blocks run at once; crucially it *partitions* K rather than
+replicating it, so A/B global traffic is unchanged — the only added cost is C
+written S× via `atomicAdd` into a pre-zeroed buffer (hence gated to identity
+scale/offset; fused-affine GEMM keeps the single-slice store). Forced-S census
+(interleaved own/cuB, maxrel ≤1.2e-4 — fp32 atomic-order noise, acceptable):
+
+| size | S=1 | S=2 | S=4 | S=8 |
+|---|---|---|---|---|
+| 1024³ | 0.63 | **0.75** | 0.75 | 0.73 |
+| 2048³ | 0.74 | **0.76** | 0.76 | 0.68 |
+| 4096³ | **0.82** | 0.82 | 0.79 | 0.75 |
+
+**S=2 is the robust optimum** for the underfilled mid sizes (1024³ +19%, 2048³
++3%). S≥4 regresses: the S× C-atomic traffic + the shorter per-block K (fixed
+smem-pipeline fill/drain amortized over fewer slabs) overtake the occupancy gain;
+by S=8 both mid sizes drop below their S=1. 4096³ is already 6 waves so any split
+is pure overhead → S=1 (and S=1 keeps C exact, maxrel 0.0). Kernel change is a
+single `ksplit` param + `blockIdx.z` K-range + a `gridDim.z>1 ? atomicAdd : store`
+epilogue on the *same* `tl_sgemm_rb` body (no copy-paste divergence; still 127
+regs / 2 blocks/SM). Auto policy: S=2 when base<512 blocks and K≥512 (each half
+≥256 K, enough to amortize the pipeline), else S=1; `TL_SPLITK` forces S for the
+census. Post-split state: 1024³ ~0.72–0.82, 2048³ 0.76, 4096³ 0.82–0.83.
+
+**Gate still open** at 2048³/4096³ (~0.76/0.82). Split-K fixed the small-size
+*fill* deficit but the per-SM *efficiency* ceiling (~0.82, visible at 4096³ where
+fill is a non-issue) is untouched — that is the remaining ~10-18% and needs the
+kernel-efficiency lever (ladder ③: Ampere `cp.async` staged pipeline — removes
+the register-staged global loads, frees registers, enables >2-stage overlap),
+then the per-band CUTLASS escape hatch if it still misses.
+
 **Refuted (do not retry without new evidence):**
 
 | Approach | Verdict | Data |
 |---|---|---|
 | BK 8→16 (BK=16 slab, 2×float4 loads) | **Rejected** | Helps 1024³ (0.62→0.70) but *regresses* the gate sizes: 2048³ 0.72→0.62, 4096³ 0.83→0.73. The 32KB smem + 130 regs hurt where large-matmul throughput matters. |
 | Register double-buffer *before* warp-tiling | **No effect** | On the conflict-bound (pre-warptile) kernel, hiding global latency did nothing (2048³ 0.68→0.67) — the kernel was smem-bound, not latency-bound. Double buffering only paid off *after* warp-tiling made the smem reads conflict-free. |
+| **128×256 large tile (ladder ①)** — 256-thread block, 8×16 microtile, WNITER=4 (`tl_sgemm_rb2`), +33% arithmetic intensity (64→85) | **Rejected** | Loses at *every* size (interleaved own/cuB): 1024³ 0.69→0.41, 2048³ 0.75→0.68, 4096³ 0.81→0.75. 128 accumulators/thread → 203 regs (no spills) but **1 block/SM = 16.7% occupancy** (rb keeps 2 blocks/SM = 33%). It loses even at 4096³ (6 waves, machine full, wave-quant irrelevant), so the arithmetic-intensity gain (−25% DRAM traffic) is dwarfed by the occupancy/latency-hiding loss — same class as the BK=16 rejection. 1024³ collapses because 128×256 halves the block count (64→32) so only ~39% of the 82 SMs get work. Big spatial tiles are ceiling-capped at rb on sm_86 for this kernel: any 128×256 variant is ≥1 block/SM. Pivoted to split-K (below) for the small-size deficit that census confirms is the real problem. |
+| **cp.async staged pipeline (ladder ③)** — Ampere `cp.async` global→shared, 3/4-stage smem pipeline (`tl_sgemm_cp`), replacing the register-staged loads | **Rejected** | Loses where it was meant to win: 4096³ 0.83→0.72–0.74, 2048³ 0.75–0.80→0.62–0.69 (interleaved vs rb S=1); ties at 1024³. Correct throughout (maxrel = rb, 4096³ exact). Root cause is a **structural mismatch**: A must land *transposed* in smem (As[k][m]) for the regM fragment read to stay a contiguous float4, but cp.async copies a contiguous global chunk to a contiguous smem chunk — it can't transpose. So A is forced to 4×**4-byte** cp.async scatter (one per k of the thread's float4), and 4-byte cp.async is the inefficient granularity (16-byte `.cg` is the fast path); that penalty + the extra `__syncthreads` (2/slab vs rb's 1) sink it. 4 stages don't rescue it (4096³ still 0.73). Efficient cp.async for transposed-A SIMT needs `ldmatrix` (tensor-core-only) — out of scope for the FP32 SIMT kernel. rb's float4-ldg-then-scatter stays the load path; regs dropped 127→107 with cp.async but occupancy stayed 2 blocks/SM (64 accumulators, not loads, are the register floor), so even the freed registers bought nothing. |
 
 ## vs silarray (M1 Pro, 2026-07-03)
 
