@@ -75,6 +75,16 @@ if(TENSORLIB_CUDA)
   tensorlib_enable_cuda(tensorlib_check_cuda)
   add_test(NAME cuda_ukernel COMMAND tensorlib_check_cuda)
 
+  # Real-MNIST convergence gate — asserts the GPU op stack (hand-rolled backprop)
+  # drives a 784-256-10 ReLU MLP to a real test-accuracy target. Skips-as-pass
+  # with no GPU (CI) or no data (offline); fetches MNIST once via curl into the
+  # build dir. A few seconds on-device.
+  add_executable(tensorlib_check_mnist bench/check_mnist.cpp)
+  target_link_libraries(tensorlib_check_mnist PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_check_mnist)
+  add_test(NAME mnist_converge COMMAND tensorlib_check_mnist
+           ${CMAKE_BINARY_DIR}/mnist-data)
+
   # CUDA SGEMM census (M6 stage-2 tuning). Links cuBLAS + the CUDA runtime as a
   # measurement REFERENCE only (the gate is >=90% cuBLAS) — never a library dep;
   # cuda.h still dlopen's the driver and ships zero third-party runtime deps.

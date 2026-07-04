@@ -3,3 +3,6 @@ build-*/
 .DS_Store
 .cache/
 compile_commands.json
+
+# Downloaded MNIST cache for the convergence gate (bench/check_mnist.cpp)
+mnist-data/
