@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.20)
 project(tensorlib LANGUAGES CXX)
 
 # This project's own build (tests/benches) compiles at C++23. The public
