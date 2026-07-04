@@ -118,12 +118,18 @@ target_link_libraries(tensorlib_bench PRIVATE tensorlib)
 add_executable(tensorlib_census misc/census.cpp)
 target_link_libraries(tensorlib_census PRIVATE tensorlib)
 
-# Both benches drive the GPU through the backend-agnostic eval seam; on a CUDA
+# Local-LLM shape bench — the dev harness for M7-M9 (decode/prefill GEMM +
+# attention at real decoder-layer shapes). Same backend-agnostic array API.
+add_executable(tensorlib_bench_llm bench/bench_llm.cpp)
+target_link_libraries(tensorlib_bench_llm PRIVATE tensorlib)
+
+# These benches drive the GPU through the backend-agnostic eval seam; on a CUDA
 # build they must carry the embedded PTX + TENSORLIB_CUDA define, same as the
 # tests, or gpu_available() stays false and every GPU section silently skips.
 if(TENSORLIB_CUDA)
   tensorlib_enable_cuda(tensorlib_bench)
   tensorlib_enable_cuda(tensorlib_census)
+  tensorlib_enable_cuda(tensorlib_bench_llm)
 endif()
 
 # Own CPU GEMM bench (M5 tuning). Links OpenBLAS for the off-Apple gate when
