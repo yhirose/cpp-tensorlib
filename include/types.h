@@ -35,27 +35,45 @@ enum class kernel_class {
   matmul,       // gemm — n = M*N*K
 };
 
-// auto_-mode size thresholds: the measured CPU (Accelerate) vs GPU-total
-// (Metal single op + flush) standalone crossover per family — the size
-// where GPU-total first beats CPU. Census 2026-07-03 on M1 Pro (load ~4,
-// interleaved medians; misc/census.cpp):
-//   matmul      1024^3=1.07e9 tie, 1280^3=2.1e9 tie, 1536^3=3.6e9 GPU wins
-//               → crossover ~2e9 (~1260^3). AMX is strong; standalone GPU
-//               matmul only pays off past here. Pipelined training amortizes
-//               the flush, so the effective threshold could be lower — this
-//               is the conservative standalone value.
-//   elementwise 1M cpu wins (0.15 vs 0.25 ms), 4M GPU wins (0.55 vs 0.91)
-//               → crossover ~2e6.
-//   reduction   softmax 256x256=65536 tie, 1024x256=262144 GPU wins clearly
-//               (0.26 vs 0.87 ms) → crossover ~2e5. GPU wins reductions
-//               early (CPU's per-row loop is slow); set slightly above the
-//               softmax crossover for the lighter row_sum/row_max.
+// auto_-mode size thresholds: the measured CPU vs GPU-total (single op +
+// flush) standalone crossover per family — the size where GPU-total first
+// beats CPU. The GPU backend is fixed at build time by the gpu:: facade
+// (CUDA off-Apple when TENSORLIB_CUDA, else Metal on Apple), so the crossover
+// is a compile-time property too and the thresholds branch on the same macro.
+// These are the conservative standalone values; pipelined graphs amortize the
+// flush, so the effective crossover is lower. Re-measure per target with
+// misc/census.cpp.
 inline int64_t auto_threshold_(kernel_class kc) {
+#if defined(TENSORLIB_CUDA)
+  // RTX 3090 (sm_86) census 2026-07-04, misc/census.cpp. No AMX rival on the
+  // CPU side (own BLIS), so the GPU wins far earlier than on Apple's Metal:
+  //   matmul      64^3=2.6e5 already GPU (0.038 vs cpu 0.152 ms) — crossover
+  //               is at/below the smallest measured size; below trivial matmul
+  //               that CPU handles cheaply anyway.
+  //   elementwise 256K tie (0.374 vs 0.377), 1M GPU (0.438 vs 0.575) → ~5e5.
+  //   reduction   softmax 16K already GPU (0.034 vs 0.044); CPU's per-row loop
+  //               is slow, GPU wins from the smallest measured size.
+  switch (kc) {
+    case kernel_class::matmul: return 200'000;          // ~58^3; GPU by 64^3
+    case kernel_class::elementwise: return 500'000;     // tie ~256K, GPU by 1M
+    case kernel_class::reduction: return 16'000;        // GPU from ~16K
+  }
+#else
+  // Metal / M1 Pro census 2026-07-03 (load ~4, interleaved medians):
+  //   matmul      1024^3=1.07e9 tie, 1280^3=2.1e9 tie, 1536^3=3.6e9 GPU wins
+  //               → crossover ~2e9 (~1260^3). AMX is strong; standalone GPU
+  //               matmul only pays off past here.
+  //   elementwise 1M cpu wins (0.15 vs 0.25 ms), 4M GPU wins (0.55 vs 0.91)
+  //               → crossover ~2e6.
+  //   reduction   softmax 256x256=65536 tie, 1024x256=262144 GPU wins clearly
+  //               (0.26 vs 0.87 ms) → crossover ~2e5. Set slightly above the
+  //               softmax crossover for the lighter row_sum/row_max.
   switch (kc) {
     case kernel_class::matmul: return 2'000'000'000;    // ~1260^3
     case kernel_class::elementwise: return 2'000'000;   // 2M elements
     case kernel_class::reduction: return 200'000;       // ~2e5 elements
   }
+#endif
   return 1'000'000'000'000;  // unreachable
 }
 
