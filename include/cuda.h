@@ -234,7 +234,7 @@ struct context {
   }
 
   // M7 decode GEMV (f32 and bf16-weight variants), cached like sgemm_rb.
-  CUfunction gemv_f32_fn = nullptr, gemv_bf16_fn = nullptr;
+  CUfunction gemv_f32_fn = nullptr, gemv_bf16_fn = nullptr, gemv_bf16v8_fn = nullptr;
   CUfunction gemv_f32_() {
     if (!gemv_f32_fn) d.ModuleGetFunction(&gemv_f32_fn, mod, "tl_gemv_f32");
     return gemv_f32_fn;
@@ -242,6 +242,11 @@ struct context {
   CUfunction gemv_bf16_() {
     if (!gemv_bf16_fn) d.ModuleGetFunction(&gemv_bf16_fn, mod, "tl_gemv_bf16");
     return gemv_bf16_fn;
+  }
+  CUfunction gemv_bf16v8_() {
+    if (!gemv_bf16v8_fn)
+      d.ModuleGetFunction(&gemv_bf16v8_fn, mod, "tl_gemv_bf16v8");
+    return gemv_bf16v8_fn;
   }
 
   // char* pointer arithmetic to fold a byte offset into a managed pointer.
@@ -357,9 +362,11 @@ inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo, int64_t n,
 // partition K over gridDim.y, atomicAdd into a pre-zeroed y, so the kernel stays
 // bandwidth-bound rather than occupancy-bound. gridDim.y==1 stores directly.
 inline bool gemv_run_(CUfunction f, float* pa, float* pB, float* py,
-                      void* y_native, unsigned un, unsigned uk) {
+                      void* y_native, unsigned un, unsigned uk,
+                      unsigned vcols = 1) {
   auto& c = context::get();
-  unsigned bx = (un + 255) / 256;
+  unsigned per = 256u * vcols;  // output columns covered by one block
+  unsigned bx = (un + per - 1) / per;
   if (bx == 0) bx = 1;
   unsigned gy = 1, ksplit = uk;
   const long target = 164;  // ~2 blocks per SM on the 82-SM RTX 3090
@@ -397,9 +404,13 @@ inline bool gemv_bf16(void* a, void* B, void* y, int64_t n, int64_t k) {
   c.device_read_(a);
   c.device_read_(B);  // B reinterpreted as __nv_bfloat16* in-kernel
   c.device_write_(y);
-  return gemv_run_(c.gemv_bf16_(), context::off_(a, 0), context::off_(B, 0),
-                   context::off_(y, 0), y, static_cast<unsigned>(n),
-                   static_cast<unsigned>(k));
+  // Vectorized 8-cols/thread path when n%8==0 (all transformer dims) — 16-byte
+  // bf16 loads close the bandwidth gap to f32; scalar fallback otherwise.
+  bool v8 = (n % 8) == 0;
+  return gemv_run_(v8 ? c.gemv_bf16v8_() : c.gemv_bf16_(), context::off_(a, 0),
+                   context::off_(B, 0), context::off_(y, 0), y,
+                   static_cast<unsigned>(n), static_cast<unsigned>(k),
+                   v8 ? 8u : 1u);
 }
 
 // C(m,n) = (A @ B) * scale + offset. lda/ldb row strides; trans reads a

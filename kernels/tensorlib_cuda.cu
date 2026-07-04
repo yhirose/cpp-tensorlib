@@ -338,5 +338,45 @@ __global__ void tl_gemv_bf16(const float* __restrict__ a,
   else
     y[col] = acc;
 }
+// Vectorized bf16 GEMV: 8 columns/thread via one 16-byte (uint4 = 8×bf16) load,
+// so each thread issues f32-width memory transactions instead of scalar 2-byte
+// loads — closes the bandwidth gap to the f32 kernel. Requires n % 8 == 0 (all
+// transformer dims are; the host gates on it and falls back to the scalar kernel
+// otherwise), which also guarantees the 16-byte alignment of every row's load.
+__global__ void tl_gemv_bf16v8(const float* __restrict__ a,
+                               const __nv_bfloat16* __restrict__ B,
+                               float* __restrict__ y, unsigned n, unsigned k,
+                               unsigned ksplit) {
+  unsigned col = (blockIdx.x * blockDim.x + threadIdx.x) * 8u;
+  if (col >= n) return;
+  unsigned k0 = blockIdx.y * ksplit;
+  if (k0 >= k) return;
+  unsigned k1 = (k0 + ksplit < k) ? (k0 + ksplit) : k;
+  float acc[8] = {};
+  for (unsigned kk = k0; kk < k1; kk++) {
+    float av = a[kk];
+    uint4 raw = *reinterpret_cast<const uint4*>(&B[(size_t)kk * n + col]);
+    float2 f0 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.x));
+    float2 f1 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.y));
+    float2 f2 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.z));
+    float2 f3 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.w));
+    acc[0] += av * f0.x;
+    acc[1] += av * f0.y;
+    acc[2] += av * f1.x;
+    acc[3] += av * f1.y;
+    acc[4] += av * f2.x;
+    acc[5] += av * f2.y;
+    acc[6] += av * f3.x;
+    acc[7] += av * f3.y;
+  }
+  bool split = gridDim.y > 1;
+#pragma unroll
+  for (int j = 0; j < 8; j++) {
+    if (split)
+      atomicAdd(&y[col + j], acc[j]);
+    else
+      y[col + j] = acc[j];
+  }
+}
 
 }  // extern "C"
