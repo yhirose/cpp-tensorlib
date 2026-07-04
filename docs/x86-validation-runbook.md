@@ -61,8 +61,12 @@ NEON).
 
 ```sh
 g++ -std=c++2b -O2 -I include bench/check_cpu_ukernel.cpp -o check_uk -pthread
-./check_uk        # expect: scalar: ok / avx2: ok / ALL OK
+./check_uk        # expect: scalar / avx2-8x8 / avx2-6x16: ok / ALL OK
 ```
+
+Done 2026-07-03 on the i7-12700KF: all three ok. See performance-notes.md
+"x86 census" for the full result; the notes below are the record of how it
+was reached (kept as the procedure for the next box / AVX-512).
 
 `-pthread` is required on Linux (the thread pool uses `std::thread`). If
 `avx2: ok` does not print, confirm the CPU has AVX2+FMA (step 0) — the harness
@@ -107,10 +111,11 @@ done
 for i in 1 2 3 4; do for kc in 256 384 512 768; do ./sw_$kc; done; done
 ```
 
-Also worth an A/B on this µarch: the current **8×8** AVX2 tile vs a **6×16**
-(6 rows × 2 ymm cols = 12 accumulators of 16 — often the better AVX2 register
-blocking; needs a NR=16 pack variant). The 8×8 was chosen to share the NEON
-packing, not because it is x86-optimal.
+A/B settled 2026-07-03: **6×16 beat 8×8** by +18% single-core (91% vs 77% of
+AVX2 peak) and is now the x86 default; 8×8 is kept behind `-DTL_CPU_AVX2_8X8`.
+The 6×16 kernel added the NR=16 pack variant (via `ukernel_desc`), which the
+AVX-512 kernel will reuse. KC=512 re-confirmed. On a **new** µarch, re-run this
+A/B and the KC sweep — the cache hierarchy and register pressure differ.
 
 ## 5. Measurement discipline (from performance-notes.md)
 

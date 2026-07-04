@@ -67,14 +67,25 @@ AVX2 path cross-compiled (`-target x86_64 … -c`) and disassembly-confirmed
 to emit `vfmadd*`/`vbroadcastss` — but **not executed** (Rosetta stops at
 SSE4.2). Full suite green on native ARM.
 
+**Done (AVX2 execution + 6×16 tuning + gate, 2026-07-03):** first real run on
+the i7-12700KF WSL2 box (see performance-notes.md "x86 census" + the runbook).
+AVX2 numerically verified vs the naive oracle and the full suite. Tuned the
+tile **8×8 → 6×16** (12 ymm accumulators): single-core **~91% of AVX2 peak**
+(was ~77%), matching NEON; **own ≈ 106% of OpenBLAS at 2048³ — gate MET**. Each
+kernel now packs to its own tile via `ukernel_desc` (the anticipated second
+packing layout; AVX-512 reuses NR=16). KC=512 re-confirmed for x86; 8×8 kept
+behind `-DTL_CPU_AVX2_8X8` for A/B.
+
 **Remaining:**
-- *AVX2 execution + register-tuning + the OpenBLAS-90% gate* — on the x86
-  WSL2 box: run the cross-compiled AVX2 path, confirm numerics vs `ref::`,
-  then tune the tile (6×16 vs 8×8, MC/KC/NC) and settle the gate verdict.
-- *AVX-512 microkernel* — deferred: a real AVX-512 kernel wants NR=16 (a
-  second packing layout), best written and measured on the x86 box. The
-  dispatch seam is ready for it (`select_ukernel` just needs an
-  `avx512f` branch + the wider ukernel).
+- *AVX-512 microkernel* — deferred: a real AVX-512 kernel wants NR=16 — now a
+  ready-made layout (the 6×16 AVX2 kernel packs NR=16), so `select_ukernel`
+  needs only an `avx512f` branch + the wider ukernel. This box has no AVX-512;
+  needs a Sapphire/Ice Lake / Zen4 box.
+- *Problem-size-aware thread count* — see the deferred table: the pool statically
+  splits M across all 20 threads, over-parallelizing mid-size GEMM (512³/1024³
+  lose to OpenBLAS, which caps threads for small problems). Single-core is 91%
+  of peak, so this is a thread-policy gap, not a kernel one. Best measured on
+  native Linux (WSL2 hides the P/E topology the heuristic needs).
 
 **Environment:** Apple Silicon is ARM64 = NEON, so the NEON microkernel is
 fully developable, natively runnable, and perf-tunable on a Mac (it is also
@@ -135,6 +146,7 @@ Tracked so it isn't re-discovered. Each is gated on a trigger, not scheduled.
 | **GPU fused kernels** — `linear_sigmoid`, online-softmax (silarray has these; tensorlib's GPU softmax/MLP trail silarray) | a GPU training/inference workload that is fusion-bound |
 | **Tiny-tensor corner** (n_embd≈16) — node pooling / small-vector fields | a real workload that lives in the ~16-element regime (documented as accepted, not a bug) |
 | **View-crossing fusion** — eager view eval breaks fusion across reshape/transpose | a transformer workload where this shows up in a census |
+| **Problem-size-aware CPU thread count** — pool statically uses all `hardware_concurrency()` threads; over-parallelizes mid-size GEMM (512³/1024³ < OpenBLAS on hybrid P/E+HT), where OpenBLAS caps threads | a native-Linux x86 measurement session (WSL2 hides P/E topology); or a workload bound by mid-size CPU GEMM |
 | **culebra default → `auto`** — currently `cpu` | large-tensor workloads appear, or after CUDA lands and thresholds are re-measured |
 | **`reshape` on non-contiguous**, **other-axis slice/concat** | a workload / language feature that needs it (tensorlib can already materialize) |
 

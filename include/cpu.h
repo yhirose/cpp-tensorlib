@@ -17,11 +17,14 @@
 // Status: scaffolding + scalar microkernel (portable, correct on any ISA);
 // NEON microkernel (Apple Silicon / ARM Linux, native), NEON-tuned on M1 Pro
 // (lane-indexed FMA, K-unroll, prefetch, thread-local pack buffers, MR-panel-
-// granular parallelism — see performance-notes.md); AVX2 microkernel (x86,
-// compile-checked on Apple via cross-target, register-tuned + OpenBLAS-gated
-// on the x86 box — it can't execute under Rosetta). All three share the
-// MR=8/NR=8 packed layout and are picked at runtime. AVX-512 (wants NR=16)
-// is deferred to the x86 box; see docs/roadmap.md.
+// granular parallelism — see performance-notes.md); AVX2 microkernel (x86),
+// executed and tuned on the i7-12700KF box (2026-07-03): the 6×16 tile (12
+// ymm accumulators) reaches ~91% of single-P-core AVX2 peak and ~106% of
+// OpenBLAS at 2048³, beating the original 8×8 (kept, `-DTL_CPU_AVX2_8X8`, for
+// A/B). Each kernel packs to its OWN tile — 8×8 for scalar/NEON, 6×16 for
+// AVX2 — carried in the ukernel_desc the driver reads (no longer one shared
+// layout). AVX-512 (also NR=16) reuses the 6×16 pack layout and is deferred;
+// see docs/roadmap.md and docs/performance-notes.md.
 
 #include <cstdint>
 #include <cstring>
@@ -66,24 +69,26 @@ constexpr int64_t MC = TL_CPU_MC, KC = TL_CPU_KC, NC = TL_CPU_NC;
 
 namespace detail {
 
-// Pack an MR-tall, kc-wide panel of A (with arbitrary strides, alpha folded
-// in) into column-major micropanels: ap[p*MR + i] = alpha * A[i*as0 + p*as1].
-// Rows past `mr` are zero-padded so the microkernel always runs full MR×NR.
+// Pack an mrt-tall, kc-wide panel of A (with arbitrary strides, alpha folded
+// in) into column-major micropanels: ap[p*mrt + i] = alpha * A[i*as0 + p*as1].
+// `mrt` is the selected kernel's tile MR (8 for scalar/NEON, 6 for AVX2 6×16);
+// rows past `mr` are zero-padded to mrt so the microkernel runs a full tile.
 inline void pack_a_panel(const float* A, int64_t as0, int64_t as1, int mr,
-                         int64_t kc, float alpha, float* ap) {
+                         int mrt, int64_t kc, float alpha, float* ap) {
   for (int64_t p = 0; p < kc; p++) {
-    for (int i = 0; i < mr; i++) ap[p * MR + i] = alpha * A[i * as0 + p * as1];
-    for (int i = mr; i < MR; i++) ap[p * MR + i] = 0.0f;
+    for (int i = 0; i < mr; i++) ap[p * mrt + i] = alpha * A[i * as0 + p * as1];
+    for (int i = mr; i < mrt; i++) ap[p * mrt + i] = 0.0f;
   }
 }
 
-// Pack a kc-tall, NR-wide panel of B into row-major micropanels:
-// bp[p*NR + j] = B[p*bs0 + j*bs1]. Cols past `nr` are zero-padded.
+// Pack a kc-tall, nrt-wide panel of B into row-major micropanels:
+// bp[p*nrt + j] = B[p*bs0 + j*bs1]. `nrt` is the kernel's tile NR (8 or 16);
+// cols past `nr` are zero-padded to nrt.
 inline void pack_b_panel(const float* B, int64_t bs0, int64_t bs1, int nr,
-                         int64_t kc, float* bp) {
+                         int nrt, int64_t kc, float* bp) {
   for (int64_t p = 0; p < kc; p++) {
-    for (int j = 0; j < nr; j++) bp[p * NR + j] = B[p * bs0 + j * bs1];
-    for (int j = nr; j < NR; j++) bp[p * NR + j] = 0.0f;
+    for (int j = 0; j < nr; j++) bp[p * nrt + j] = B[p * bs0 + j * bs1];
+    for (int j = nr; j < nrt; j++) bp[p * nrt + j] = 0.0f;
   }
 }
 
@@ -99,6 +104,17 @@ inline void pack_b_panel(const float* B, int64_t bs0, int64_t bs1, int nr,
 // baseline-x86 TU and be reached only after a CPUID check.
 using ukernel_fn = void (*)(int64_t, const float*, const float*, float*,
                             int64_t, int, int);
+
+// A microkernel plus the register-block tile it packs to. The tile is a
+// property of the kernel — 8×8 for scalar/NEON, 6×16 for the AVX2 kernel (6
+// rows × 2 ymm = 12 accumulators, the canonical Haswell+ blocking) — so the
+// driver reads mr/nr here to size the packed panels. This is the "second
+// packing layout" the roadmap anticipated; the deferred AVX-512 kernel reuses
+// the NR=16 layout. select_ukernel picks one descriptor once per process.
+struct ukernel_desc {
+  ukernel_fn fn;
+  int mr, nr;
+};
 
 inline void ukernel_scalar(int64_t kc, const float* ap, const float* bp,
                            float* c, int64_t ldc, int mr, int nr) {
@@ -228,20 +244,97 @@ __attribute__((target("avx2,fma"))) inline void ukernel_avx2(
       for (int j = 0; j < nr; j++) c[i * ldc + j] += tmp[i][j];
   }
 }
+
+// AVX2 6×16: 6 rows × 2 ymm columns = 12 accumulators, the canonical Haswell+
+// register blocking (BLIS/OpenBLAS haswell use it). Per k-step: two B loads
+// (16 floats) each FMA'd against a broadcast of the 6 A values → 12 FMA on 12
+// accumulators, using 12 + 2(B) + 1(broadcast) = 15 of the 16 ymm registers.
+// The 8×8 kernel above uses only 8 accumulators (half the file), so it reloads
+// B relative to compute; 6×16 raises in-register reuse — the reason it is the
+// standard AVX2 GEMM tile. Packs to MR=6/NR=16 (a distinct layout from the
+// 8×8 kernels; the driver picks it via the descriptor). K-unrolled ×4 with
+// prefetch, mirroring the 8×8 kernel. `target("avx2,fma")` + CPUID-guarded.
+__attribute__((target("avx2,fma"))) inline void ukernel_avx2_6x16(
+    int64_t kc, const float* ap, const float* bp, float* c, int64_t ldc,
+    int mr, int nr) {
+  constexpr int KMR = 6, KNR = 16;
+  __m256 ab0[KMR], ab1[KMR];
+  for (int i = 0; i < KMR; i++) {
+    ab0[i] = _mm256_setzero_ps();
+    ab1[i] = _mm256_setzero_ps();
+  }
+#define TL_CPU_KSTEP(p)                                            \
+  {                                                                \
+    __m256 b0 = _mm256_loadu_ps(bp + (p)*KNR);                     \
+    __m256 b1 = _mm256_loadu_ps(bp + (p)*KNR + 8);                 \
+    const float* a = ap + (p)*KMR;                                 \
+    __m256 av;                                                     \
+    av = _mm256_broadcast_ss(a + 0);                               \
+    ab0[0] = _mm256_fmadd_ps(av, b0, ab0[0]);                      \
+    ab1[0] = _mm256_fmadd_ps(av, b1, ab1[0]);                      \
+    av = _mm256_broadcast_ss(a + 1);                               \
+    ab0[1] = _mm256_fmadd_ps(av, b0, ab0[1]);                      \
+    ab1[1] = _mm256_fmadd_ps(av, b1, ab1[1]);                      \
+    av = _mm256_broadcast_ss(a + 2);                               \
+    ab0[2] = _mm256_fmadd_ps(av, b0, ab0[2]);                      \
+    ab1[2] = _mm256_fmadd_ps(av, b1, ab1[2]);                      \
+    av = _mm256_broadcast_ss(a + 3);                               \
+    ab0[3] = _mm256_fmadd_ps(av, b0, ab0[3]);                      \
+    ab1[3] = _mm256_fmadd_ps(av, b1, ab1[3]);                      \
+    av = _mm256_broadcast_ss(a + 4);                               \
+    ab0[4] = _mm256_fmadd_ps(av, b0, ab0[4]);                      \
+    ab1[4] = _mm256_fmadd_ps(av, b1, ab1[4]);                      \
+    av = _mm256_broadcast_ss(a + 5);                               \
+    ab0[5] = _mm256_fmadd_ps(av, b0, ab0[5]);                      \
+    ab1[5] = _mm256_fmadd_ps(av, b1, ab1[5]);                      \
+  }
+  int64_t p = 0;
+  for (; p + 4 <= kc; p += 4) {
+    __builtin_prefetch(ap + (p + 16) * KMR);
+    __builtin_prefetch(bp + (p + 16) * KNR);
+    TL_CPU_KSTEP(p);
+    TL_CPU_KSTEP(p + 1);
+    TL_CPU_KSTEP(p + 2);
+    TL_CPU_KSTEP(p + 3);
+  }
+  for (; p < kc; p++) TL_CPU_KSTEP(p);
+#undef TL_CPU_KSTEP
+  if (mr == KMR && nr == KNR) {
+    for (int i = 0; i < KMR; i++) {
+      _mm256_storeu_ps(c + i * ldc,
+                       _mm256_add_ps(_mm256_loadu_ps(c + i * ldc), ab0[i]));
+      _mm256_storeu_ps(c + i * ldc + 8,
+                       _mm256_add_ps(_mm256_loadu_ps(c + i * ldc + 8), ab1[i]));
+    }
+  } else {
+    float tmp[KMR][KNR];
+    for (int i = 0; i < KMR; i++) {
+      _mm256_storeu_ps(tmp[i], ab0[i]);
+      _mm256_storeu_ps(tmp[i] + 8, ab1[i]);
+    }
+    for (int i = 0; i < mr; i++)
+      for (int j = 0; j < nr; j++) c[i * ldc + j] += tmp[i][j];
+  }
+}
 #endif  // TL_CPU_X86
 
 // Pick the microkernel once, by ISA then (on x86) by CPUID. On ARM the choice
 // is fixed at compile time (NEON always present); on x86 AVX2 needs a runtime
 // probe because a generic build must still run on pre-AVX2 CPUs.
-inline ukernel_fn select_ukernel() {
+inline ukernel_desc select_ukernel() {
 #if defined(TL_CPU_NEON)
-  return &ukernel_neon;
+  return {&ukernel_neon, MR, NR};
 #elif defined(TL_CPU_X86)
-  if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))
-    return &ukernel_avx2;
-  return &ukernel_scalar;
+  if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+#ifdef TL_CPU_AVX2_8X8
+    return {&ukernel_avx2, MR, NR};  // A/B: the original 8×8 tile
 #else
-  return &ukernel_scalar;
+    return {&ukernel_avx2_6x16, 6, 16};  // default: 6×16 register blocking
+#endif
+  }
+  return {&ukernel_scalar, MR, NR};
+#else
+  return {&ukernel_scalar, MR, NR};
 #endif
 }
 
@@ -259,8 +352,11 @@ inline void sgemm(const float* A, int64_t as0, int64_t as1, const float* B,
   if (k == 0) return;
 
   // Microkernel chosen once per process (magic-static init is thread-safe);
-  // the indirect call is amortized over the kc-loop's hundreds of FMAs.
-  static const detail::ukernel_fn ukernel = detail::select_ukernel();
+  // the indirect call is amortized over the kc-loop's hundreds of FMAs. The
+  // descriptor carries the register-block tile (mr/nr) the packers must match.
+  static const detail::ukernel_desc ukr = detail::select_ukernel();
+  const detail::ukernel_fn ukernel = ukr.fn;
+  const int mrt = ukr.mr, nrt = ukr.nr;
 
   // Reusable pack buffers: thread-local so no per-call allocation (a
   // per-call std::vector dominated small sizes in the first cut). bpack
@@ -268,7 +364,7 @@ inline void sgemm(const float* A, int64_t as0, int64_t as1, const float* B,
   // apack lives on each worker thread.
   static thread_local std::vector<float> bpack;
   bpack.resize(static_cast<size_t>(KC) *
-               ((std::min<int64_t>(NC, n) + NR - 1) / NR) * NR);
+               ((std::min<int64_t>(NC, n) + nrt - 1) / nrt) * nrt);
   // Raw pointer for the workers: naming `bpack` inside the lambda would
   // resolve to each worker's own (empty) thread_local instance.
   float* bpack_p = bpack.data();
@@ -278,41 +374,41 @@ inline void sgemm(const float* A, int64_t as0, int64_t as1, const float* B,
     int64_t nc = std::min<int64_t>(NC, n - jc);
     for (int64_t pc = 0; pc < k; pc += KC) {
       int64_t kc = std::min<int64_t>(KC, k - pc);
-      // Pack B[pc:pc+kc, jc:jc+nc] into NR-wide row-major micropanels.
-      int64_t npanels = (nc + NR - 1) / NR;
+      // Pack B[pc:pc+kc, jc:jc+nc] into nrt-wide row-major micropanels.
+      int64_t npanels = (nc + nrt - 1) / nrt;
       for (int64_t jp = 0; jp < npanels; jp++) {
-        int64_t j0 = jp * NR;
-        int nr = static_cast<int>(std::min<int64_t>(NR, nc - j0));
-        detail::pack_b_panel(B + (pc)*bs0 + (jc + j0) * bs1, bs0, bs1, nr, kc,
-                             bpack_p + jp * KC * NR);
+        int64_t j0 = jp * nrt;
+        int nr = static_cast<int>(std::min<int64_t>(nrt, nc - j0));
+        detail::pack_b_panel(B + (pc)*bs0 + (jc + j0) * bs1, bs0, bs1, nr, nrt,
+                             kc, bpack_p + jp * KC * nrt);
       }
-      // Parallelize the M dimension at MR-panel granularity (not MC-block):
+      // Parallelize the M dimension at mrt-panel granularity (not MC-block):
       // small m (e.g. 256 → 2 MC blocks) would otherwise use only 1-2
       // threads. Each thread packs+computes its contiguous panel range in
       // MC-row groups, preserving the L2 blocking.
-      int64_t mpanels = (m + MR - 1) / MR;
-      const int64_t panels_per_mc = MC / MR;
+      int64_t mpanels = (m + mrt - 1) / mrt;
+      const int64_t panels_per_mc = MC / mrt;
       pool.parallel_for(mpanels, [&](int64_t ip0, int64_t ip1) {
         static thread_local std::vector<float> apack;
-        apack.resize(static_cast<size_t>(MC) * KC);
+        apack.resize(static_cast<size_t>(panels_per_mc) * mrt * KC);
         for (int64_t g0 = ip0; g0 < ip1; g0 += panels_per_mc) {
           int64_t g1 = std::min<int64_t>(g0 + panels_per_mc, ip1);
-          // Pack A[g0*MR : ..., pc:pc+kc] * alpha into MR-tall panels.
+          // Pack A[g0*mrt : ..., pc:pc+kc] * alpha into mrt-tall panels.
           for (int64_t ip = g0; ip < g1; ip++) {
-            int64_t i0 = ip * MR;
-            int mr = static_cast<int>(std::min<int64_t>(MR, m - i0));
-            detail::pack_a_panel(A + i0 * as0 + pc * as1, as0, as1, mr, kc,
-                                 alpha, apack.data() + (ip - g0) * MR * KC);
+            int64_t i0 = ip * mrt;
+            int mr = static_cast<int>(std::min<int64_t>(mrt, m - i0));
+            detail::pack_a_panel(A + i0 * as0 + pc * as1, as0, as1, mr, mrt, kc,
+                                 alpha, apack.data() + (ip - g0) * mrt * KC);
           }
-          // Macrokernel: MR×NR microkernel over the packed panels.
+          // Macrokernel: mrt×nrt microkernel over the packed panels.
           for (int64_t jp = 0; jp < npanels; jp++) {
-            int64_t j0 = jp * NR;
-            int nr = static_cast<int>(std::min<int64_t>(NR, nc - j0));
+            int64_t j0 = jp * nrt;
+            int nr = static_cast<int>(std::min<int64_t>(nrt, nc - j0));
             for (int64_t ip = g0; ip < g1; ip++) {
-              int64_t i0 = ip * MR;
-              int mr = static_cast<int>(std::min<int64_t>(MR, m - i0));
-              ukernel(kc, apack.data() + (ip - g0) * MR * KC,
-                      bpack_p + jp * KC * NR, C + i0 * n + (jc + j0), n, mr,
+              int64_t i0 = ip * mrt;
+              int mr = static_cast<int>(std::min<int64_t>(mrt, m - i0));
+              ukernel(kc, apack.data() + (ip - g0) * mrt * KC,
+                      bpack_p + jp * KC * nrt, C + i0 * n + (jc + j0), n, mr,
                       nr);
             }
           }

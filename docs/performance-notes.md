@@ -297,6 +297,61 @@ AVX-512 kernel — a real one wants NR=16 (a second packing layout), so it
 is a genuine x86-side task, not a Mac compile-check. The dispatch seam is
 ready: `select_ukernel` just needs an `avx512f` branch.
 
+## Own CPU GEMM x86 census (M5, i7-12700KF, 2026-07-03)
+
+First real execution of the AVX2 path (per docs/x86-validation-runbook.md).
+Box: 12th-gen i7-12700KF (Alder Lake, 8 P-core + 4 E-core = 20 logical),
+Ubuntu 22.04 under **WSL2**, g++ 11.4, OpenBLAS 0.3.20. AVX2+FMA present,
+no AVX-512.
+
+**AVX2 first-run correctness:** `check_cpu_ukernel` — scalar, avx2-8×8, and
+the new avx2-6×16 all match the naive oracle across full + edge tiles; the
+full array suite (cpu/gpu/auto) is green with the descriptor-driven driver.
+This is the first time the AVX2 kernel has executed anywhere (Rosetta stopped
+at SSE4.2 on the Mac).
+
+**8×8 → 6×16 register blocking (the tuning win).** The original 8×8 tile uses
+only 8 of 16 ymm registers as accumulators; a 6×16 tile (6 rows × 2 ymm = 12
+accumulators, the canonical Haswell+ blocking, BLIS/OpenBLAS haswell) raises
+in-register reuse. Each kernel now packs to its own tile via `ukernel_desc`
+(the "second packing layout" the roadmap anticipated; AVX-512 will reuse the
+NR=16 layout). Single-core (`taskset -c 0`, interleaved ×3, quiet), GFLOP/s:
+
+| size | 6×16 | 8×8 | 6×16 gain |
+|---|---|---|---|
+| 512³ | 131–142 | 114–119 | +17% |
+| 1024³ | **140–148** | 116–122 | +18–20% |
+| 2048³ | 128–138 | 110–118 | +15% |
+
+Single-P-core AVX2 peak ≈ 4.9 GHz × 2 FMA × 8 fp32 × 2 ≈ **157 GFLOP/s**, so
+6×16 at ~143–148 (1024³) is **~91% of single-core peak** — matches/exceeds
+the NEON kernel's 86–89%. The 8×8 sat at ~77%. 6×16 is now the x86 default;
+8×8 is kept behind `-DTL_CPU_AVX2_8X8` for A/B.
+
+**KC re-sweep on 6×16 (single-core, interleaved ×3):** KC=512 is best/tied at
+every size (1024³: 147/141/148; 2048³: 137/136/138); KC=256/384 slightly
+lower, 768 ~= 512 at large N but down at 1024³. **KC=512 confirmed for x86**,
+same as NEON — kept. MC=128/NC=2048 kept (not exhaustively re-swept; KC is the
+dominant cache-blocking param and it held).
+
+**OpenBLAS-90% gate.** Full machine, threads matched (`openblas_set_num_threads`
+= pool size), the stable compute-bound point is **2048³: own (6×16) ≈ 106% of
+OpenBLAS** (~810–890 vs ~20–23 ms), interleaved — **gate MET**. 8×8 was
+~95–103% there. Confined to 8 logical CPUs, own(6×16) 2048³ throughput
+(~712 GF/s median) beat own(8×8) (~609) by ~17%, mirroring single-core.
+
+**Caveats (WSL2, recorded per methodology).** (1) WSL2 flattens the hybrid
+topology — `lscpu` shows 10×2 with no MAXMHZ, so P/E cores can't be told apart
+and `taskset` can't pin to P-cores; the Windows host scheduler places threads.
+(2) `std::thread::hardware_concurrency()` ignores the taskset affinity mask
+(always reports 20), so the pool always spawns 20 threads. (3) Mid-size
+multi-thread (512³/1024³) is noisy and often < OpenBLAS — but single-core
+1024³ is 91% of peak, so this is **not** a kernel deficit. It is the thread
+pool statically splitting M across all 20 threads regardless of problem size,
+over-parallelizing small GEMMs on the P/E+HT topology where OpenBLAS caps
+threads. See the deferred "problem-size-aware thread count" item in
+roadmap.md — best measured on native Linux, not this WSL2 box.
+
 ## vs silarray (M1 Pro, 2026-07-03)
 
 Head-to-head with the predecessor across cpu/gpu/auto. Two separate

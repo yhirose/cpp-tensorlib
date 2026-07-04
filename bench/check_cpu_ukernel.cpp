@@ -21,23 +21,26 @@
 using namespace tl::cpu;
 using namespace tl::cpu::detail;
 
-static bool test_uk(ukernel_fn uk, const char* name) {
+// Each kernel packs to its own tile (mrt×nrt) — 8×8 for scalar/NEON/AVX2-8×8,
+// 6×16 for AVX2-6×16 — so the harness takes the tile and lays panels out with
+// that stride, exactly as cpu::sgemm's driver does per descriptor.
+static bool test_uk(ukernel_fn uk, int mrt, int nrt, const char* name) {
   std::mt19937 g(123);
   std::uniform_real_distribution<float> d(-1, 1);
   for (int kc : {1, 3, 7, 16, 100}) {
-    for (int mr = 1; mr <= MR; mr++) {
-      for (int nr = 1; nr <= NR; nr++) {
+    for (int mr = 1; mr <= mrt; mr++) {
+      for (int nr = 1; nr <= nrt; nr++) {
         // Packed panels are zero-padded past mr/nr, as the packers guarantee.
-        std::vector<float> ap(kc * MR, 0), bp(kc * NR, 0);
+        std::vector<float> ap(kc * mrt, 0), bp(kc * nrt, 0);
         for (int p = 0; p < kc; p++) {
-          for (int i = 0; i < mr; i++) ap[p * MR + i] = d(g);
-          for (int j = 0; j < nr; j++) bp[p * NR + j] = d(g);
+          for (int i = 0; i < mr; i++) ap[p * mrt + i] = d(g);
+          for (int j = 0; j < nr; j++) bp[p * nrt + j] = d(g);
         }
         std::vector<float> c(mr * nr, 0), ref(mr * nr, 0);
         for (int i = 0; i < mr; i++)
           for (int j = 0; j < nr; j++) {
             float s = 0;
-            for (int p = 0; p < kc; p++) s += ap[p * MR + i] * bp[p * NR + j];
+            for (int p = 0; p < kc; p++) s += ap[p * mrt + i] * bp[p * nrt + j];
             ref[i * nr + j] = s;
           }
         // ldc = nr: the kernel writes only the valid mr×nr corner.
@@ -55,12 +58,13 @@ static bool test_uk(ukernel_fn uk, const char* name) {
 }
 
 int main() {
-  bool ok = test_uk(&ukernel_scalar, "scalar");
+  bool ok = test_uk(&ukernel_scalar, MR, NR, "scalar");
 #ifdef TL_CPU_NEON
-  ok &= test_uk(&ukernel_neon, "neon");
+  ok &= test_uk(&ukernel_neon, MR, NR, "neon");
 #endif
 #ifdef TL_CPU_X86
-  ok &= test_uk(&ukernel_avx2, "avx2");
+  ok &= test_uk(&ukernel_avx2, MR, NR, "avx2-8x8");
+  ok &= test_uk(&ukernel_avx2_6x16, 6, 16, "avx2-6x16");
 #endif
   std::printf(ok ? "ALL OK\n" : "FAILED\n");
   return ok ? 0 : 1;
