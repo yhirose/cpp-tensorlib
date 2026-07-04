@@ -127,6 +127,20 @@ kernels. This mirrors the Metal M3b-1 foundation. (2) The SGEMM ladder tuned
 to the cuBLAS-90% gate — the performance-sensitive sprint. The x86 WSL2 box
 also validates the M5 AVX path.
 
+**Done (loader probe + memory model, 2026-07-03):** the dlopen'd-driver design
+is validated on the RTX 3090 box — a standalone probe declares the driver API
+itself (no CUDA headers), dlopens `/usr/lib/wsl/lib/libcuda.so.1`, and reaches
+the device (`cuInit` → driver API 13.1, RTX 3090 sm_86, 82 SMs) with **no CUDA
+Toolkit installed**. So the host side needs only libdl; nvcc is a build-time-
+only prereq for the kernel PTX (`cuda-toolkit-13-0`, matching the 13.1 driver).
+**Memory model decided: CUDA managed memory** (`cuMemAllocManaged`) — one
+allocation visible to host and device, so `storage.native == storage.contents`
+and the existing unified-memory seam (built for Apple) is reused unchanged; the
+driver migrates pages on demand. Chosen for minimal churn + correctness-first,
+mirroring Metal. The explicit device-buffer + H2D/D2H alternative is deferred to
+the stage-2 gate *iff* managed-memory page migration proves a bottleneck
+(prefetch hints `cuMemPrefetchAsync` are the first lever before that).
+
 ### M7 — BF16 storage type
 
 BF16 as a *storage* type (memory is BF16, load widens to F32, store narrows),
