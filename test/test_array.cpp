@@ -646,3 +646,49 @@ TEST_CASE("bf16 storage: round-trip, widen fallback, dot fast path") {
   auto sum = w2.to_bf16().to_f32() + w2;
   CHECK(sum.at({0, 1}) == doctest::Approx(5.0f));
 }
+
+TEST_CASE("fused decode attention matches an explicit softmax(qKt)V") {
+  // Small, D=128 (the kernel's supported head dim); 2 heads, ctx=5.
+  const int64_t H = 2, D = 128, C = 5;
+  auto mk = [](tl::shape_t s, unsigned seed) {
+    size_t n = 1;
+    for (auto d : s) n *= (size_t)d;
+    std::vector<float> v(n);
+    unsigned st = seed;
+    for (auto& x : v) {
+      st = st * 1664525u + 1013904223u;
+      x = (float)(int)(st >> 9) / (1 << 22) - 1.0f;
+    }
+    return tl::array::from(std::move(v), std::move(s));
+  };
+  auto q = mk({H, D}, 1), K = mk({H, C, D}, 2), V = mk({H, C, D}, 3);
+  float scale = 1.0f / std::sqrt((float)D);
+
+  auto got = tl::array::attn_decode(q, K, V, scale);
+  CHECK(got.shape() == tl::shape_t{H, D});
+
+  // Independent expected value: softmax over ctx of scale*q·K[j], then ·V.
+  for (int64_t h = 0; h < H; h++) {
+    std::vector<float> s(C);
+    float mx = -1e30f;
+    for (int64_t j = 0; j < C; j++) {
+      float acc = 0;
+      for (int64_t d = 0; d < D; d++)
+        acc += q.at({h, d}) * K.at({h, j, d});
+      s[j] = acc * scale;
+      mx = std::max(mx, s[j]);
+    }
+    float sum = 0;
+    for (int64_t j = 0; j < C; j++) { s[j] = std::exp(s[j] - mx); sum += s[j]; }
+    for (int64_t d : {0, 37, 127}) {
+      float e = 0;
+      for (int64_t j = 0; j < C; j++) e += s[j] * V.at({h, j, d});
+      e /= sum;
+      CHECK(got.at({h, d}) == doctest::Approx(e).epsilon(1e-4));
+    }
+  }
+
+  // shape validation: q must be [H,D] rank-2, K/V rank-3 and equal
+  CHECK_THROWS(tl::array::attn_decode(K, K, V, scale));       // q rank 3
+  CHECK_THROWS(tl::array::attn_decode(q, K, q.reshape({H, D}), scale));  // V rank 2
+}

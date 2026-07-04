@@ -117,21 +117,32 @@ double bench_gemms(const char* regime, int64_t T) {
   return layer_ms;  // GEMM ms per layer (attention added by caller for decode)
 }
 
-// Representative single-head attention at decode: q[1,hdim] vs a ctx-long KV
-// cache. scores = q·Kᵀ, softmax, ·V. The M9 flash-attn kernel replaces this
-// three-op composite; measured here so its target is on record. Returned ms is
-// for all heads of one layer (single-head median × kHeads, MHA).
-double bench_decode_attention(int64_t ctx) {
-  auto q = rnd({1, kHdim}, 300);
-  auto k = rnd({ctx, kHdim}, 301);
-  auto v = rnd({ctx, kHdim}, 302);
-  auto kt = k.transpose();  // 2D reverse-axes → [hdim, ctx], zero-copy view
-  double ms = median_ms([&] { q.dot(kt).softmax().dot(v).eval(); });
-  double per_layer = ms * kHeads;
-  std::printf("-- decode attention (ctx=%lld, per head) --\n", (long long)ctx);
-  std::printf("  %-14s %10.3f ms/head   %10.3f ms/layer (x%lld heads)\n",
-              "qk·softmax·v", ms, per_layer, (long long)kHeads);
-  return per_layer;
+// Decode attention for one layer (all kHeads). Two ways:
+//  unfused — the 3-op composite (q·Kᵀ, softmax, ·V) per head × kHeads;
+//  fused   — the single M9 attn_decode op over [kHeads, ctx, kHdim].
+// Returns {unfused_ms, fused_ms} per layer.
+std::pair<double, double> bench_decode_attention(int64_t ctx) {
+  // unfused: representative single head, × kHeads (mirrors the old estimate).
+  auto q1 = rnd({1, kHdim}, 300);
+  auto k1 = rnd({ctx, kHdim}, 301);
+  auto v1 = rnd({ctx, kHdim}, 302);
+  auto kt = k1.transpose();
+  double unfused = median_ms([&] { q1.dot(kt).softmax().dot(v1).eval(); }) * kHeads;
+
+  // fused: one op over all heads.
+  auto q = rnd({kHeads, kHdim}, 310);
+  auto k = rnd({kHeads, ctx, kHdim}, 311);
+  auto v = rnd({kHeads, ctx, kHdim}, 312);
+  float scale = 1.0f / std::sqrt((float)kHdim);
+  double fused =
+      median_ms([&] { tl::array::attn_decode(q, k, v, scale).eval(); });
+
+  std::printf("-- decode attention (ctx=%lld) --\n", (long long)ctx);
+  std::printf("  %-16s %10.3f ms/layer (unfused, 3-op × %lld heads)\n",
+              "qk·softmax·v", unfused, (long long)kHeads);
+  std::printf("  %-16s %10.3f ms/layer (fused attn_decode)   %.1fx\n",
+              "attn_decode", fused, unfused / fused);
+  return {unfused, fused};
 }
 
 }  // namespace
@@ -155,12 +166,18 @@ int main(int argc, char** argv) {
 
   // Decode: the money regime. Per-layer GEMM + attention → whole-model t/s.
   double decode_layer = bench_gemms("decode", 1);
-  double attn_layer = bench_decode_attention(ctx);
+  auto [attn_unfused, attn_fused] = bench_decode_attention(ctx);
   double lm_head_ms = time_gemm(1, kVocab, kD, 500);
-  double per_token_ms = (decode_layer + attn_layer) * kLayers + lm_head_ms;
+  double per_token_unfused =
+      (decode_layer + attn_unfused) * kLayers + lm_head_ms;
+  double per_token_ms = (decode_layer + attn_fused) * kLayers + lm_head_ms;
   std::printf(
-      "\n  => decode ~%.2f ms/token  ~%.1f tok/s  (%lld layers + lm_head, F32)\n",
-      per_token_ms, 1000.0 / per_token_ms, (long long)kLayers);
+      "\n  => decode ~%.2f ms/token  ~%.1f tok/s  (F32, fused attn)\n",
+      per_token_ms, 1000.0 / per_token_ms);
+  std::printf(
+      "     unfused attn would be ~%.2f ms/token (~%.1f tok/s) — fusion %.2fx\n",
+      per_token_unfused, 1000.0 / per_token_unfused,
+      per_token_unfused / per_token_ms);
 
   // Same decode GEMMs with bf16 weights (M7 storage dtype; attention stays
   // F32 until M9). Halved weight traffic on the bandwidth-bound GEMV.
@@ -184,13 +201,13 @@ int main(int argc, char** argv) {
       if (s.per_layer) layer_bf16 += ms;
       else lm_bf16 = ms;
     }
-    double per_tok_bf16 = (layer_bf16 + attn_layer) * kLayers + lm_bf16;
+    double per_tok_bf16 = (layer_bf16 + attn_fused) * kLayers + lm_bf16;
     std::printf(
-        "\n  => decode ~%.2f ms/token  ~%.1f tok/s  (bf16 weights, F32 attn)\n",
+        "\n  => decode ~%.2f ms/token  ~%.1f tok/s  (bf16 weights + fused attn)\n",
         per_tok_bf16, 1000.0 / per_tok_bf16);
     std::printf("     vs F32: %.2fx tokens/sec\n", per_token_ms / per_tok_bf16);
   }
-  std::printf("     (int4 (M8) / flash-attn (M9) are the next levers)\n\n");
+  std::printf("     (int4 dequant-matmul (M8) is the next lever)\n\n");
 
   // Prefill: compute-bound GEMM foundation.
   bench_gemms("prefill", prefill_T);

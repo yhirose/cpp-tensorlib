@@ -152,6 +152,7 @@ struct node {
     softmax,
     where_,
     dot,
+    attn_dec,  // fused decode attention: softmax(arg0 · q·Kᵀ)·V
     sum_ax, mean_ax, max_ax, argmax_ax, sum_to_,
   };
 
@@ -159,6 +160,7 @@ struct node {
   shape_t shape;  // for sum_to this is the target shape (= the op parameter)
   std::vector<std::shared_ptr<node>> inputs;
   float scale = 1.0f, offset = 0.0f;  // fused epilogue: op(...) * scale + offset
+  float arg0 = 0.0f;  // op-specific scalar (attn_dec: softmax scale)
   int axis = 0;
   bool keepdims = false;
 
@@ -243,6 +245,12 @@ class array {
 
   // Linear algebra: (M,K)@(K,N); 1-d operands promote numpy-style. (lazy)
   array dot(const array& b) const;
+
+  // Fused decode attention (M9): out(h,:) = softmax(scale · q(h,:)·K(h)ᵀ)·V(h),
+  // one query row per head. q [H,D], K/V [H,ctx,D], out [H,D]. On CUDA with
+  // D==128 this is the fused flash-attention kernel; otherwise a CPU reference.
+  static array attn_decode(const array& q, const array& K, const array& V,
+                           float scale);
 
   // Axis reductions (lazy); argmax yields indices as F32
   array sum(int axis, bool keepdims = false) const;
@@ -1135,6 +1143,25 @@ struct graph {
     return from_node(std::move(n));
   }
 
+  static array attn_decode(const array& q, const array& K, const array& V,
+                           float scale) {
+    const auto& sq = q.shape();
+    const auto& sk = K.shape();
+    const auto& sv = V.shape();
+    if (sq.size() != 2 || sk.size() != 3 || sv.size() != 3 || sk != sv ||
+        sq[0] != sk[0] || sq[1] != sk[2]) {
+      throw std::invalid_argument(
+          "tl::attn_decode: expect q[H,D], K/V[H,ctx,D] (matching) — got q " +
+          shape_str(sq) + ", K " + shape_str(sk) + ", V " + shape_str(sv));
+    }
+    auto n = std::make_shared<node>();
+    n->op = op_t::attn_dec;
+    n->shape = sq;  // [H, D]
+    n->arg0 = scale;
+    n->inputs = {as_node(q), as_node(K), as_node(V)};
+    return from_node(std::move(n));
+  }
+
   // Materialized view of an evaluated node, for kernel consumption.
   static array wrap(const node& n) {
     array a;
@@ -1291,6 +1318,63 @@ struct graph {
                                    out.storage_.native, nn, k);
     if (!ok) return std::nullopt;
     return out.reshape(n.shape);
+  }
+
+  // M9 fused decode attention on the GPU. q[H,D], K/V[H,ctx,D] contiguous,
+  // D==128. Returns nullopt (→ CPU ref) when the kernel declines.
+  static std::optional<array> gpu_attn_(const node& n, const array& q,
+                                        const array& K, const array& V) {
+    int64_t H = q.shape()[0], D = q.shape()[1], ctx = K.shape()[1];
+    if (!gpu_mode_(H * ctx * D, kernel_class::matmul)) return std::nullopt;
+    if (!q.contiguous() || q.offset_ != 0 || !K.contiguous() ||
+        K.offset_ != 0 || !V.contiguous() || V.offset_ != 0)
+      return std::nullopt;
+    if (!q.storage_.native || !K.storage_.native || !V.storage_.native)
+      return std::nullopt;
+    array out = array::empty({H, D});
+    if (!out.storage_.native) return std::nullopt;
+    if (!gpu::attn_decode(q.storage_.native, K.storage_.native,
+                          V.storage_.native, out.storage_.native, H, ctx, D,
+                          n.arg0)) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
+  // CPU reference decode attention (fallback / non-GPU builds).
+  static array ref_attn_(const array& q, const array& K, const array& V,
+                         float scale) {
+    int64_t H = q.shape()[0], D = q.shape()[1], ctx = K.shape()[1];
+    array out = array::empty({H, D});
+    const float* pq = q.raw();
+    const float* pk = K.raw();
+    const float* pv = V.raw();
+    float* po = out.data();
+    std::vector<float> s(ctx);
+    for (int64_t h = 0; h < H; h++) {
+      const float* qh = pq + h * D;
+      const float* Kh = pk + h * ctx * D;
+      const float* Vh = pv + h * ctx * D;
+      float mx = -std::numeric_limits<float>::infinity();
+      for (int64_t j = 0; j < ctx; j++) {
+        float acc = 0;
+        for (int64_t d = 0; d < D; d++) acc += qh[d] * Kh[j * D + d];
+        s[j] = acc * scale;
+        mx = std::max(mx, s[j]);
+      }
+      float sum = 0;
+      for (int64_t j = 0; j < ctx; j++) {
+        s[j] = std::exp(s[j] - mx);
+        sum += s[j];
+      }
+      float* oh = po + h * D;
+      for (int64_t d = 0; d < D; d++) {
+        float acc = 0;
+        for (int64_t j = 0; j < ctx; j++) acc += s[j] * Vh[j * D + d];
+        oh[d] = acc / sum;
+      }
+    }
+    return out;
   }
 
   // Row op over the last axis of a contiguous input. `out_cols` is cols for
@@ -1663,6 +1747,15 @@ struct graph {
         }
         break;
       }
+      case op_t::attn_dec: {
+        if (auto g = gpu_attn_(n, wrap(*n.inputs[0]), wrap(*n.inputs[1]),
+                               wrap(*n.inputs[2]))) {
+          r = std::move(*g);
+        } else {
+          r = ref_attn_(in(0), in(1), in(2), n.arg0);
+        }
+        break;
+      }
       case op_t::sum_ax:
       case op_t::max_ax: {
         // GPU row reductions cover the last-axis case (softmax/argmax
@@ -1881,6 +1974,11 @@ inline array array::softmax() const {
 
 inline array array::dot(const array& b) const {
   return detail::graph::dot(*this, b);
+}
+
+inline array array::attn_decode(const array& q, const array& K, const array& V,
+                                float scale) {
+  return detail::graph::attn_decode(q, K, V, scale);
 }
 
 inline array array::sum(int axis, bool keepdims) const {
