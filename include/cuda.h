@@ -233,6 +233,17 @@ struct context {
     return sgemm_rb_fn;
   }
 
+  // M7 decode GEMV (f32 and bf16-weight variants), cached like sgemm_rb.
+  CUfunction gemv_f32_fn = nullptr, gemv_bf16_fn = nullptr;
+  CUfunction gemv_f32_() {
+    if (!gemv_f32_fn) d.ModuleGetFunction(&gemv_f32_fn, mod, "tl_gemv_f32");
+    return gemv_f32_fn;
+  }
+  CUfunction gemv_bf16_() {
+    if (!gemv_bf16_fn) d.ModuleGetFunction(&gemv_bf16_fn, mod, "tl_gemv_bf16");
+    return gemv_bf16_fn;
+  }
+
   // char* pointer arithmetic to fold a byte offset into a managed pointer.
   static float* off_(void* base, int64_t byte_off) {
     return reinterpret_cast<float*>(static_cast<char*>(base) + byte_off);
@@ -334,6 +345,61 @@ inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo, int64_t n,
   unsigned un = static_cast<unsigned>(n);
   void* args[] = {&pa, &po, &un, &scale, &offset};
   return c.launch1d_(c.fn_(op), un, args);
+}
+
+// M7 decode GEMV: y(n) = a(1,k) @ B(k,n), F32 accumulate. B is either f32 or
+// bf16 weights (bf16 halves the dominant K×N weight traffic — the decode
+// bandwidth lever). Buffers are opaque device pointers; the kernel interprets
+// B's dtype. Offset 0 (contiguous weight/activation operands). Separate from
+// gemm() so the M=1 path skips the 128×128 tile that wastes 127 rows.
+//
+// Split-K when the N/256 column-blocks alone underfill the SMs (small-N layers):
+// partition K over gridDim.y, atomicAdd into a pre-zeroed y, so the kernel stays
+// bandwidth-bound rather than occupancy-bound. gridDim.y==1 stores directly.
+inline bool gemv_run_(CUfunction f, float* pa, float* pB, float* py,
+                      void* y_native, unsigned un, unsigned uk) {
+  auto& c = context::get();
+  unsigned bx = (un + 255) / 256;
+  if (bx == 0) bx = 1;
+  unsigned gy = 1, ksplit = uk;
+  const long target = 164;  // ~2 blocks per SM on the 82-SM RTX 3090
+  if (static_cast<long>(bx) < target && uk >= 512) {
+    unsigned g = static_cast<unsigned>((target + bx - 1) / bx);
+    unsigned chunk = (uk + g - 1) / g;
+    chunk = (chunk + 31u) & ~31u;
+    if (chunk == 0) chunk = 32;
+    unsigned s = (uk + chunk - 1) / chunk;
+    if (s > 1) {
+      gy = s;
+      ksplit = chunk;
+    }
+  }
+  if (gy > 1)
+    c.d.MemsetD8(reinterpret_cast<CUdeviceptr>(y_native), 0, (size_t)un * 4);
+  void* args[] = {&pa, &pB, &py, &un, &uk, &ksplit};
+  c.pending = true;
+  return c.d.LaunchKernel(f, bx, gy, 1, 256, 1, 1, 0, nullptr, args, nullptr) ==
+         0;
+}
+inline bool gemv_f32(void* a, void* B, void* y, int64_t n, int64_t k) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(a);
+  c.device_read_(B);
+  c.device_write_(y);
+  return gemv_run_(c.gemv_f32_(), context::off_(a, 0), context::off_(B, 0),
+                   context::off_(y, 0), y, static_cast<unsigned>(n),
+                   static_cast<unsigned>(k));
+}
+inline bool gemv_bf16(void* a, void* B, void* y, int64_t n, int64_t k) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(a);
+  c.device_read_(B);  // B reinterpreted as __nv_bfloat16* in-kernel
+  c.device_write_(y);
+  return gemv_run_(c.gemv_bf16_(), context::off_(a, 0), context::off_(B, 0),
+                   context::off_(y, 0), y, static_cast<unsigned>(n),
+                   static_cast<unsigned>(k));
 }
 
 // C(m,n) = (A @ B) * scale + offset. lda/ldb row strides; trans reads a

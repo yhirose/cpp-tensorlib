@@ -85,6 +85,16 @@ if(TENSORLIB_CUDA)
   add_test(NAME mnist_converge COMMAND tensorlib_check_mnist
            ${CMAKE_BINARY_DIR}/mnist-data)
 
+  # M7 bf16-weight decode GEMV bench (Path B). Direct cuda:: API, no cudart —
+  # times bf16 vs f32 weight storage on the memory-bound decode GEMV. Needs the
+  # project cuda.h before the CUDA TK's driver header (same BEFORE-include idiom
+  # as bench_cuda_gemm).
+  add_executable(tensorlib_bench_bf16 bench/bench_bf16_gemv.cpp)
+  target_include_directories(tensorlib_bench_bf16 BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(tensorlib_bench_bf16 PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_bench_bf16)
+
   # CUDA SGEMM census (M6 stage-2 tuning). Links cuBLAS + the CUDA runtime as a
   # measurement REFERENCE only (the gate is >=90% cuBLAS) — never a library dep;
   # cuda.h still dlopen's the driver and ships zero third-party runtime deps.

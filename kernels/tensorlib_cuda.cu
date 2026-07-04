@@ -17,6 +17,8 @@
 // Correctness-first (M6 stage 1). The SGEMM here is a one-output-per-thread
 // tiled loop — the tuned cuBLAS-90% ladder is the stage-2 sprint (roadmap M6).
 
+#include <cuda_bf16.h>  // __nv_bfloat16 + __bfloat162float (M7 storage widen)
+
 extern "C" {
 
 // ---- elementwise binary: out = (a OP b) * scale + offset ----
@@ -290,5 +292,51 @@ __global__ void tl_sgemm_rb(const float* __restrict__ A,
 #undef TL_TM
 #undef TL_TN
 #undef TL_TNSUB
+
+// ---- M7 decode GEMV: y[n] = sum_k a[k] * B[k,n], F32 accumulate ----
+// The decode regime is batch~1, so the matmul is a GEMV and MEMORY-BANDWIDTH-
+// bound: the K×N weight B dominates traffic. One thread per output column;
+// consecutive threads read consecutive columns B[k*n+col], so the B reads
+// coalesce. a[k] is a warp-uniform broadcast. The f32 and bf16 variants are
+// structurally identical — only B's dtype (and thus its byte traffic) differs,
+// so their timing ratio isolates the storage-width win. bf16 widens on load
+// with no precision loss beyond bf16's 8-bit mantissa; the accumulator is F32.
+//
+// Split-K over blockIdx.y: small-N layers (N/256 blocks) can't fill the SMs and
+// would go occupancy-bound instead of bandwidth-bound, hiding the bf16 win. Each
+// z-slice sums its K-range and atomicAdds into a pre-zeroed y (host memsets when
+// gridDim.y>1); gridDim.y==1 stores directly and is bit-identical to no split.
+__global__ void tl_gemv_f32(const float* __restrict__ a,
+                            const float* __restrict__ B, float* __restrict__ y,
+                            unsigned n, unsigned k, unsigned ksplit) {
+  unsigned col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col >= n) return;
+  unsigned k0 = blockIdx.y * ksplit;
+  if (k0 >= k) return;
+  unsigned k1 = (k0 + ksplit < k) ? (k0 + ksplit) : k;
+  float acc = 0.0f;
+  for (unsigned kk = k0; kk < k1; kk++) acc += a[kk] * B[(size_t)kk * n + col];
+  if (gridDim.y > 1)
+    atomicAdd(&y[col], acc);
+  else
+    y[col] = acc;
+}
+__global__ void tl_gemv_bf16(const float* __restrict__ a,
+                             const __nv_bfloat16* __restrict__ B,
+                             float* __restrict__ y, unsigned n, unsigned k,
+                             unsigned ksplit) {
+  unsigned col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (col >= n) return;
+  unsigned k0 = blockIdx.y * ksplit;
+  if (k0 >= k) return;
+  unsigned k1 = (k0 + ksplit < k) ? (k0 + ksplit) : k;
+  float acc = 0.0f;
+  for (unsigned kk = k0; kk < k1; kk++)
+    acc += a[kk] * __bfloat162float(B[(size_t)kk * n + col]);
+  if (gridDim.y > 1)
+    atomicAdd(&y[col], acc);
+  else
+    y[col] = acc;
+}
 
 }  // extern "C"
