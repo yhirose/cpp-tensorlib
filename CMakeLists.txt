@@ -20,14 +20,42 @@ if(APPLE)
 endif()
 
 if(TENSORLIB_CUDA)
+  # The CUDA backend does NOT link CUDA — the driver is dlopen'd (cuda.h) and
+  # kernels run as PTX JIT'd by the driver. So nvcc is used only to compile
+  # kernels/tensorlib_cuda.cu to PTX, which bin2c turns into a byte array the
+  # header #includes (off-Apple compilers predate C23 #embed). enable_language
+  # locates nvcc (CMAKE_CUDA_COMPILER); nothing links against libcudart.
   enable_language(CUDA)
-  # Build-size policy: SASS for the majors we ship + PTX fallback for newer
-  # (see docs/performance-notes.md once it lands). 80 alone is fine for the
-  # CI build check.
-  if(NOT CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 80)
+  # PTX virtual arch: compute_80 PTX JITs onto any sm_80+ device (the RTX 3090
+  # is sm_86), so one PTX blob is portable across recent GPUs.
+  if(NOT TENSORLIB_CUDA_PTX_ARCH)
+    set(TENSORLIB_CUDA_PTX_ARCH sm_80)
   endif()
-  add_library(tensorlib_cuda_kernels OBJECT kernels/smoke.cu)
+  set(TL_CUDA_PTX ${CMAKE_BINARY_DIR}/tensorlib_cuda.ptx)
+  set(TL_CUDA_INC ${CMAKE_BINARY_DIR}/tensorlib_cuda_ptx.inc)
+  add_custom_command(
+    OUTPUT ${TL_CUDA_PTX}
+    COMMAND ${CMAKE_CUDA_COMPILER} -arch=${TENSORLIB_CUDA_PTX_ARCH} -ptx
+            ${CMAKE_CURRENT_SOURCE_DIR}/kernels/tensorlib_cuda.cu -o ${TL_CUDA_PTX}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/tensorlib_cuda.cu
+    COMMENT "nvcc: tensorlib_cuda.cu -> PTX (${TENSORLIB_CUDA_PTX_ARCH})"
+    VERBATIM)
+  add_custom_command(
+    OUTPUT ${TL_CUDA_INC}
+    COMMAND ${CMAKE_COMMAND} -DINPUT=${TL_CUDA_PTX} -DOUTPUT=${TL_CUDA_INC}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/bin2c.cmake
+    DEPENDS ${TL_CUDA_PTX}
+    COMMENT "bin2c: PTX -> tensorlib_cuda_ptx.inc"
+    VERBATIM)
+  add_custom_target(tensorlib_cuda_ptx DEPENDS ${TL_CUDA_INC})
+  # Everything a CUDA-enabled consumer target needs: the generated .inc on the
+  # include path, the TENSORLIB_CUDA switch, and libdl for dlopen.
+  function(tensorlib_enable_cuda tgt)
+    add_dependencies(${tgt} tensorlib_cuda_ptx)
+    target_include_directories(${tgt} PRIVATE ${CMAKE_BINARY_DIR})
+    target_compile_definitions(${tgt} PRIVATE TENSORLIB_CUDA)
+    target_link_libraries(${tgt} PRIVATE ${CMAKE_DL_LIBS})
+  endfunction()
 endif()
 
 enable_testing()
@@ -35,8 +63,17 @@ enable_testing()
 add_executable(tensorlib_test test/test_basic.cpp test/test_array.cpp)
 target_link_libraries(tensorlib_test PRIVATE tensorlib)
 if(TENSORLIB_CUDA)
-  target_sources(tensorlib_test PRIVATE $<TARGET_OBJECTS:tensorlib_cuda_kernels>)
-  target_compile_definitions(tensorlib_test PRIVATE TENSORLIB_CUDA_ENABLED)
+  # The test suite's gpu/auto modes now exercise the real CUDA backend (the
+  # gpu:: facade routes to cuda off-Apple), falling back to CPU with no device.
+  tensorlib_enable_cuda(tensorlib_test)
+
+  # Kernel-level CUDA oracle (like check_cpu_ukernel for the CPU backend):
+  # every op vs a CPU reference, direct on the cuda:: API. Only built/run when
+  # CUDA is enabled.
+  add_executable(tensorlib_check_cuda bench/check_cuda.cpp)
+  target_link_libraries(tensorlib_check_cuda PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_check_cuda)
+  add_test(NAME cuda_ukernel COMMAND tensorlib_check_cuda)
 endif()
 
 add_executable(tensorlib_bench bench/bench_main.cpp)

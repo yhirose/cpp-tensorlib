@@ -382,6 +382,8 @@ inline void cpu_barrier() {
 
 }  // namespace metal
 
-inline bool gpu_available() { return metal::available(); }
+// tl::gpu_available() and the tl::gpu facade (metal on Apple, cuda elsewhere)
+// are defined in cuda.h, which includes this header — so the choice of GPU
+// backend lives in one place and array.h's eval seam stays #ifdef-free.
 
 }  // namespace tl

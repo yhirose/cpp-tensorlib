@@ -1,6 +1,6 @@
 #pragma once
 
-#include <metal.h>
+#include <cuda.h>
 
 #include <cstdint>
 #include <memory>
@@ -38,11 +38,11 @@ struct storage {
     s.size = n;
     int64_t bytes = n > 0 ? n * 4 : 4;  // MTLBuffer length must be non-zero
     float* contents = nullptr;
-    if (void* mb = metal::alloc(bytes, &contents)) {
+    if (void* mb = gpu::alloc(bytes, &contents)) {
       s.native = mb;
       s.ptr = contents;
       s.buf = std::shared_ptr<void>(mb, [bytes, contents](void* p) {
-        metal::release(p, bytes, contents);
+        gpu::release(p, bytes, contents);
       });
     } else {
       return make_heap_(n);
@@ -67,7 +67,7 @@ namespace detail {
 inline storage (*storage_make_hook)(int64_t) = nullptr;
 inline void (*cpu_barrier_hook)() = nullptr;
 // GPU-pipeline query for the eager-tiny decision in the graph builders.
-// Behind a hook (not a direct metal::pending() call) so those always-live
+// Behind a hook (not a direct gpu::pending() call) so those always-live
 // builders reference no Metal symbol in a no-tensor binary — null means no
 // GPU backend is installed, i.e. nothing is ever pending.
 inline bool (*gpu_pending_hook)() = nullptr;

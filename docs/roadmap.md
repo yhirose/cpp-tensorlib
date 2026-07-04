@@ -141,14 +141,25 @@ all ops on the RTX 3090 vs CPU references (binary+affine, sigmoid, GEMM NN + NT,
 row_sum+affine, softmax — all ok). Stubs compile cleanly with no `TENSORLIB_CUDA`
 and on Apple, so non-CUDA builds are unaffected.
 
-**Remaining (stage-1 wiring, then stage-2 gate):**
-- *Build + seam integration:* the `TENSORLIB_CUDA` CMake path (nvcc → PTX →
-  bin2c → include path + `-ldl`), `storage::make_device_` trying `cuda::alloc`,
-  and array.h's eval_one routing GPU ops to CUDA off-Apple (a `gpu::` facade
-  aliasing metal on Apple / cuda elsewhere, so eval_one stays #ifdef-free), then
-  `ctest` cpu/gpu/auto exercising the real CUDA path.
-- *Stage-2 SGEMM ladder:* the correctness-first one-output-per-thread kernel →
-  shared-memory tiling / register blocking to the cuBLAS-90% gate.
+**Done (stage-1 build + seam integration, 2026-07-03):** the `TENSORLIB_CUDA`
+CMake path compiles the kernels to PTX (nvcc), bin2c's them to a byte-array
+`.inc` on the include path, defines `TENSORLIB_CUDA`, and links `libdl` — no
+CUDA runtime link (`cmake/bin2c.cmake` is the portable, xxd-free converter).
+The eval seam is now a **`gpu::` facade** (in cuda.h: `namespace gpu = cuda`
+off-Apple, `= metal` on Apple / non-CUDA builds), so array.h renamed its
+`metal_*` helpers to `gpu_*` and its `metal::` calls to `gpu::` — one alias is
+the only platform `#ifdef`. `storage::make_device_` uses `gpu::alloc`, so CUDA
+managed memory flows in with no extra branch. **`ctest` cpu/gpu/auto + a
+`cuda_ukernel` oracle all pass with the real CUDA backend on the RTX 3090**
+(gpu/auto route to CUDA; `cuda_ukernel` skips-as-pass with no device, matching
+the driver-absent CI fallback). Non-CUDA build unchanged (3 tests green). The
+old `kernels/smoke.cu` build-check is removed — the real kernel → PTX compile
+now serves that role.
+
+**Remaining — stage-2 SGEMM ladder (the perf sprint):** the correctness-first
+one-output-per-thread kernel → shared-memory tiling / register blocking to the
+cuBLAS-90% + beat-PyTorch gate. This is the STEEL-discipline sprint (per-shape
+census, interleaved A/B); measure on the RTX 3090, recording the WSL2 side.
 
 **Done (loader probe + memory model, 2026-07-03):** the dlopen'd-driver design
 is validated on the RTX 3090 box — a standalone probe declares the driver API

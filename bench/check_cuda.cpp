@@ -24,8 +24,11 @@ static void check(bool ok, const char* what) {
 
 int main() {
   if (!available()) {
-    std::printf("cuda::available() == false (no device?)\n");
-    return 1;
+    // No driver/device — the valid CPU-fallback state (e.g. CI hosted runners
+    // build with TENSORLIB_CUDA but have no GPU). Skip, don't fail: the driver-
+    // absent fallback is itself a permanent test target (see .github/ci.yml).
+    std::printf("no CUDA device — skipping (CPU-fallback build is valid)\n");
+    return 0;
   }
   std::printf("cuda backend available\n");
   std::mt19937 g(7);

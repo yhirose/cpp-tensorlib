@@ -390,7 +390,7 @@ inline void barrier_() {
 #ifdef TL_RUNTIME_HOOKS
   if (cpu_barrier_hook) cpu_barrier_hook();
 #else
-  metal::cpu_barrier();
+  gpu::cpu_barrier();
 #endif
 }
 
@@ -888,7 +888,7 @@ struct graph {
 #ifdef TL_RUNTIME_HOOKS
     if (detail::gpu_pending_hook && detail::gpu_pending_hook()) return false;
 #else
-    if (metal::pending()) return false;
+    if (gpu::pending()) return false;
 #endif
     return true;  // cpu mode; in auto these sizes are below the threshold
   }
@@ -1066,32 +1066,32 @@ struct graph {
   // choice is asymmetric because picking GPU is sticky (drags downstream
   // ops along) while picking CPU commits nothing. (2) Otherwise start GPU
   // only above the per-kernel-class size threshold (types.h).
-  static bool metal_mode_(int64_t n, kernel_class kc) {
-    if (!metal::available()) return false;
+  static bool gpu_mode_(int64_t n, kernel_class kc) {
+    if (!gpu::available()) return false;
     if (device_ == device_type::gpu) return true;
     if (device_ != device_type::auto_) return false;
-    if (metal::pending()) return true;
+    if (gpu::pending()) return true;
     return n >= auto_threshold_(kc);
   }
 
-  static metal::kop to_kop_(op_t op) {
+  static gpu::kop to_kop_(op_t op) {
     switch (op) {
-      case op_t::add: return metal::kop::add;
-      case op_t::sub: return metal::kop::sub;
-      case op_t::mul: return metal::kop::mul;
-      case op_t::div: return metal::kop::div;
-      case op_t::exp_: return metal::kop::exp_;
-      case op_t::log_: return metal::kop::log_;
-      case op_t::sqrt_: return metal::kop::sqrt_;
-      case op_t::sigmoid: return metal::kop::sigmoid;
-      case op_t::relu: return metal::kop::relu;
-      default: return metal::kop::affine;
+      case op_t::add: return gpu::kop::add;
+      case op_t::sub: return gpu::kop::sub;
+      case op_t::mul: return gpu::kop::mul;
+      case op_t::div: return gpu::kop::div;
+      case op_t::exp_: return gpu::kop::exp_;
+      case op_t::log_: return gpu::kop::log_;
+      case op_t::sqrt_: return gpu::kop::sqrt_;
+      case op_t::sigmoid: return gpu::kop::sigmoid;
+      case op_t::relu: return gpu::kop::relu;
+      default: return gpu::kop::affine;
     }
   }
 
-  static std::optional<array> metal_binary(const node& n, const array& a,
+  static std::optional<array> gpu_binary(const node& n, const array& a,
                                            const array& b) {
-    if (!metal_mode_(num_elements(n.shape), kernel_class::elementwise) ||
+    if (!gpu_mode_(num_elements(n.shape), kernel_class::elementwise) ||
         !a.contiguous() || !b.contiguous() || a.shape() != b.shape()) {
       return std::nullopt;
     }
@@ -1099,7 +1099,7 @@ struct graph {
     auto out = array::empty(n.shape);
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
-    if (!metal::binary(to_kop_(n.op), a.storage_.native, a.offset_ * 4,
+    if (!gpu::binary(to_kop_(n.op), a.storage_.native, a.offset_ * 4,
                        b.storage_.native, b.offset_ * 4, out.storage_.native,
                        out.offset_ * 4, out.size(), n.scale, n.offset)) {
       return std::nullopt;
@@ -1144,10 +1144,10 @@ struct graph {
     return std::nullopt;
   }
 
-  static std::optional<array> metal_gemm(const node& n, const array& a_in,
+  static std::optional<array> gpu_gemm(const node& n, const array& a_in,
                                          const array& b_in) {
     int64_t k_dim = a_in.shape().back();
-    if (!metal_mode_(num_elements(n.shape) * (k_dim > 0 ? k_dim : 1),
+    if (!gpu_mode_(num_elements(n.shape) * (k_dim > 0 ? k_dim : 1),
                      kernel_class::matmul)) {
       return std::nullopt;
     }
@@ -1160,7 +1160,7 @@ struct graph {
     array out = array::empty({m, nn});
     if (!out.storage_.native) return std::nullopt;
     if (m == 0 || nn == 0) return out.reshape(n.shape);
-    if (!metal::gemm(a.storage_.native, a.offset_ * 4, la->ld, la->trans,
+    if (!gpu::gemm(a.storage_.native, a.offset_ * 4, la->ld, la->trans,
                      b.storage_.native, b.offset_ * 4, lb->ld, lb->trans,
                      out.storage_.native, out.offset_ * 4, m, nn, k, n.scale,
                      n.offset)) {
@@ -1171,10 +1171,10 @@ struct graph {
 
   // Row op over the last axis of a contiguous input. `out_cols` is cols for
   // softmax (rows×cols out) or 1 for reductions (rows out).
-  static std::optional<array> metal_row(metal::kop k, const array& a,
+  static std::optional<array> gpu_row(gpu::kop k, const array& a,
                                         shape_t out_shape, bool reduce,
                                         float scale, float offset) {
-    if (!metal_mode_(a.size(), kernel_class::reduction) || !a.contiguous() ||
+    if (!gpu_mode_(a.size(), kernel_class::reduction) || !a.contiguous() ||
         a.rank() == 0) {
       return std::nullopt;
     }
@@ -1184,7 +1184,7 @@ struct graph {
     auto out = array::empty(out_shape);
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
-    if (!metal::row_op(k, a.storage_.native, a.offset_ * 4, out.storage_.native,
+    if (!gpu::row_op(k, a.storage_.native, a.offset_ * 4, out.storage_.native,
                        out.offset_ * 4, rows, cols, scale, offset)) {
       return std::nullopt;
     }
@@ -1192,16 +1192,16 @@ struct graph {
     return out;
   }
 
-  static std::optional<array> metal_unary(metal::kop k, const array& a,
+  static std::optional<array> gpu_unary(gpu::kop k, const array& a,
                                           float scale, float offset) {
-    if (!metal_mode_(a.size(), kernel_class::elementwise) || !a.contiguous()) {
+    if (!gpu_mode_(a.size(), kernel_class::elementwise) || !a.contiguous()) {
       return std::nullopt;
     }
     if (!a.storage_.native) return std::nullopt;
     auto out = array::empty(a.shape());
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
-    if (!metal::unary(k, a.storage_.native, a.offset_ * 4, out.storage_.native,
+    if (!gpu::unary(k, a.storage_.native, a.offset_ * 4, out.storage_.native,
                       out.offset_ * 4, out.size(), scale, offset)) {
       return std::nullopt;
     }
@@ -1240,7 +1240,7 @@ struct graph {
       }
     }
     for (auto* n : order) eval_one(*n);
-    metal::flush();  // blocking eval: the batch is done when run() returns
+    gpu::flush();  // blocking eval: the batch is done when run() returns
   }
 
   // Allocation-free contiguity check on node metadata (result/constant
@@ -1273,7 +1273,7 @@ struct graph {
     using op_t = node::op_t;
     int64_t numel = num_elements(n.shape);
     if (numel == 0 || numel > kCutoff) return false;
-    if (metal_mode_(numel, kernel_class::elementwise)) return false;
+    if (gpu_mode_(numel, kernel_class::elementwise)) return false;
     if (n.inputs.empty()) return false;
     const node& a = *n.inputs[0];
     if (a.shape != n.shape || !node_contig_(a)) return false;
@@ -1357,7 +1357,7 @@ struct graph {
     if (a.shape.size() != 2 || b.shape.size() != 2) return false;
     int64_t m = a.shape[0], k = a.shape[1], nn = b.shape[1];
     if (m * nn * k > kCutoff || m * nn == 0) return false;
-    if (metal_mode_(m * nn * k, kernel_class::matmul)) return false;
+    if (gpu_mode_(m * nn * k, kernel_class::matmul)) return false;
     detail::barrier_();
     storage out = storage::make(m * nn);
     const float* pa = a.stor.data() + a.soffset;
@@ -1393,7 +1393,7 @@ struct graph {
       case op_t::mul:
       case op_t::div: {
         auto a = in(0), b = in(1);
-        if (auto g = metal_binary(n, a, b)) {
+        if (auto g = gpu_binary(n, a, b)) {
           r = std::move(*g);
           epi_done = true;  // kernels apply the epilogue in the store
         } else if (auto o = accel::binary(n.op, a, b)) {
@@ -1445,7 +1445,7 @@ struct graph {
       case op_t::affine: {
         float s = n.scale, o = n.offset;
         auto a = in(0);
-        if (auto g = metal_unary(metal::kop::affine, a, s, o)) {
+        if (auto g = gpu_unary(gpu::kop::affine, a, s, o)) {
           r = std::move(*g);
         } else if (auto out = accel::affine(a, s, o)) {
           r = std::move(*out);
@@ -1463,7 +1463,7 @@ struct graph {
       case op_t::sqrt_:
       case op_t::relu: {
         auto a = in(0);
-        if (auto g = metal_unary(to_kop_(n.op), a, n.scale, n.offset)) {
+        if (auto g = gpu_unary(to_kop_(n.op), a, n.scale, n.offset)) {
           r = std::move(*g);
           epi_done = true;
         } else if (auto o = accel::unary(n.op, a)) {
@@ -1481,7 +1481,7 @@ struct graph {
       }
       case op_t::sigmoid: {
         auto a = in(0);
-        if (auto g = metal_unary(metal::kop::sigmoid, a, n.scale, n.offset)) {
+        if (auto g = gpu_unary(gpu::kop::sigmoid, a, n.scale, n.offset)) {
           r = std::move(*g);
           epi_done = true;
         } else {
@@ -1492,7 +1492,7 @@ struct graph {
       }
       case op_t::softmax: {
         auto a = in(0);
-        if (auto g = metal_row(metal::kop::softmax, a, a.shape(), false, 1.0f,
+        if (auto g = gpu_row(gpu::kop::softmax, a, a.shape(), false, 1.0f,
                                0.0f)) {
           r = std::move(*g);
         } else {
@@ -1502,7 +1502,7 @@ struct graph {
       }
       case op_t::dot: {
         auto a = in(0), b = in(1);
-        if (auto g = metal_gemm(n, a, b)) {
+        if (auto g = gpu_gemm(n, a, b)) {
           r = std::move(*g);
           epi_done = true;
           break;
@@ -1529,10 +1529,10 @@ struct graph {
         // support shape); other axes fall to the CPU oracle. The epilogue
         // applies in the kernel, so mark it done.
         auto a = in(0);
-        metal::kop k =
-            n.op == op_t::sum_ax ? metal::kop::row_sum : metal::kop::row_max;
+        gpu::kop k =
+            n.op == op_t::sum_ax ? gpu::kop::row_sum : gpu::kop::row_max;
         if (n.axis == static_cast<int>(a.rank()) - 1) {
-          if (auto g = metal_row(k, a, n.shape, true, n.scale, n.offset)) {
+          if (auto g = gpu_row(k, a, n.shape, true, n.scale, n.offset)) {
             r = std::move(*g);
             epi_done = true;
             break;
@@ -1829,8 +1829,8 @@ inline array concat(const std::vector<array>& parts) {
 // keep it out of translation units that must stay backend-free.
 inline void install_runtime_hooks() {
   detail::storage_make_hook = &storage::make_device_;
-  detail::cpu_barrier_hook = &metal::cpu_barrier;
-  detail::gpu_pending_hook = &metal::pending;
+  detail::cpu_barrier_hook = &gpu::cpu_barrier;
+  detail::gpu_pending_hook = &gpu::pending;
   detail::run_hook = &detail::graph::run;
 }
 
