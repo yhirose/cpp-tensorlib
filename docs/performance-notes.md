@@ -550,8 +550,17 @@ packed + 4/32 scale) vs bf16's 2.0. **1.79× vs bf16** (layer sum 0.436 vs 0.78
 ms). *Not yet bandwidth-bound* (best ~565/936 GB/s): the global-a kernel re-reads
 the activation from L2 per output warp; shared-a staging (`tl_gemv_q4s`, gated to
 K·4 ≤ 24 KB — larger K collapses occupancy) helps but the strided a_sh reads
-bank-conflict. Headroom to ~3× (the byte-ratio ideal): conflict-free staging +
-vectorized qweight loads. Not yet an array op.
+bank-conflict. Not yet an array op.
+
+*Refuted (2026-07-04): interleaved (exllama-style) repack for conflict-free
+reads.* Assigning lane l the stride-32 keys k = base+l+m·32 (packed one word/lane)
+makes both the a and qweight reads coalesced/conflict-free — but measured
+**slower**, not faster: shared-a 488 vs the conflicted 565 GB/s, global-a 438 vs
+shared 565. So the bank conflict was *not* the binding constraint (a's L2 re-read
+per output warp, which shared-a addresses, dominates; the interleaved layout also
+reads 8 scales/word vs 1). Reverted. Reaching bandwidth-bound needs a different
+lever (cut a-traffic further / dp4a int8 path), found by profiling, not the
+obvious coalescing fix — a reminder to measure before assuming.
 
 **Progression pattern (all three kernels).** Each landed correct-but-un-tuned,
 then a second pass to bandwidth-bound: bf16 1.62→1.84×, attention 4→19×, int4
