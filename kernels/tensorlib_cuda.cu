@@ -388,34 +388,56 @@ __global__ void tl_gemv_bf16v8(const float* __restrict__ a,
 // uint32 = 8 packed int4 per step, coalesced within the warp), dequantize in
 // registers (w = scale·(nibble-8)), MAC into an F32 accumulator, then warp-
 // shuffle-reduce. Requires K % 256 == 0 and group % 8 == 0 (transformer dims).
+// Per-warp int4 dot over a lane's K-slice, into acc (macro so both the global-a
+// and shared-a kernels share the body — a template can't live in extern "C").
+#define TL_Q4_DOT(AEXPR)                                                    \
+  float acc = 0.0f;                                                         \
+  for (unsigned base = 0; base < K; base += 256u) {                         \
+    const unsigned k0 = base + lane * 8u;                                   \
+    unsigned w = qrow[k0 >> 3];                                             \
+    float sc = srow[k0 / G];                                                \
+    _Pragma("unroll") for (int j = 0; j < 8; j++) {                         \
+      int q = (int)((w >> (j * 4)) & 0xFu) - 8;                             \
+      acc += (AEXPR) * (sc * (float)q);                                     \
+    }                                                                       \
+  }                                                                         \
+  _Pragma("unroll") for (int off = 16; off > 0; off >>= 1) acc +=           \
+      __shfl_down_sync(0xffffffffu, acc, off);
+
+// Global-a variant (general; the activation is L2/read-only-cache resident).
 __global__ void tl_gemv_q4(const float* __restrict__ a,
-                           const unsigned* __restrict__ qw,  // [N][K/8] words
+                           const unsigned* __restrict__ qw,   // [N][K/8] words
                            const float* __restrict__ scales,  // [N][K/G]
                            float* __restrict__ y, unsigned N, unsigned K,
                            unsigned G) {
-  const unsigned gtid = blockIdx.x * blockDim.x + threadIdx.x;
-  const unsigned n = gtid >> 5;  // one warp per output row
+  const unsigned n = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const unsigned lane = threadIdx.x & 31u;
   if (n >= N) return;
-  const unsigned* qrow = qw + (size_t)n * (K >> 3);   // 8 int4 per word
+  const unsigned* qrow = qw + (size_t)n * (K >> 3);
   const float* srow = scales + (size_t)n * (K / G);
-
-  float acc = 0.0f;
-  for (unsigned base = 0; base < K; base += 256u) {  // 32 lanes × 8
-    const unsigned k0 = base + lane * 8u;
-    unsigned w = qrow[k0 >> 3];         // 8 packed int4 for k0..k0+7
-    float sc = srow[k0 / G];            // all 8 share one group (G % 8 == 0)
-#pragma unroll
-    for (int j = 0; j < 8; j++) {
-      int q = (int)((w >> (j * 4)) & 0xFu) - 8;  // nibble stored as q+8
-      acc += a[k0 + j] * (sc * (float)q);
-    }
-  }
-#pragma unroll
-  for (int off = 16; off > 0; off >>= 1)
-    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  TL_Q4_DOT(a[k0 + j])
   if (lane == 0) y[n] = acc;
 }
+
+// Shared-a variant: stage a[K] once per block so the block's output warps reuse
+// it (small K only — large K's shared footprint collapses occupancy; host gates).
+__global__ void tl_gemv_q4s(const float* __restrict__ a,
+                            const unsigned* __restrict__ qw,
+                            const float* __restrict__ scales,
+                            float* __restrict__ y, unsigned N, unsigned K,
+                            unsigned G) {
+  extern __shared__ float a_sh[];
+  for (unsigned i = threadIdx.x; i < K; i += blockDim.x) a_sh[i] = a[i];
+  __syncthreads();
+  const unsigned n = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const unsigned lane = threadIdx.x & 31u;
+  if (n >= N) return;
+  const unsigned* qrow = qw + (size_t)n * (K >> 3);
+  const float* srow = scales + (size_t)n * (K / G);
+  TL_Q4_DOT(a_sh[k0 + j])
+  if (lane == 0) y[n] = acc;
+}
+#undef TL_Q4_DOT
 
 // ---- M9 fused decode attention (flash-attention, one query row per head) ----
 // out(h,:) = softmax(scale * q(h,:) · K(h)^T) · V(h), computed in ONE pass with

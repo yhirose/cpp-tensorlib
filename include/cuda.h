@@ -249,11 +249,15 @@ struct context {
     return gemv_bf16v8_fn;
   }
 
-  // M8 int4-weight decode GEMV.
-  CUfunction gemv_q4_fn = nullptr;
+  // M8 int4-weight decode GEMV (global-a + shared-a variants).
+  CUfunction gemv_q4_fn = nullptr, gemv_q4s_fn = nullptr;
   CUfunction gemv_q4_() {
     if (!gemv_q4_fn) d.ModuleGetFunction(&gemv_q4_fn, mod, "tl_gemv_q4");
     return gemv_q4_fn;
+  }
+  CUfunction gemv_q4s_() {
+    if (!gemv_q4s_fn) d.ModuleGetFunction(&gemv_q4s_fn, mod, "tl_gemv_q4s");
+    return gemv_q4s_fn;
   }
 
   // M9 fused decode attention (single-pass + split-KV two-pass).
@@ -474,7 +478,15 @@ inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
   unsigned uN = (unsigned)N, uK = (unsigned)K, uG = (unsigned)group;
   void* args[] = {&pa, &pq, &ps, &py, &uN, &uK, &uG};
   unsigned grid = (unsigned)((N + 7) / 8);  // 8 warps/block, 1 output/warp
+  // Stage a[K] in shared when it's small enough to keep occupancy up; above
+  // ~24KB the shared footprint collapses to ~1 block/SM, so use the global-a
+  // kernel (activation stays L2-resident) instead.
   c.pending = true;
+  if (K * 4 <= 24576) {
+    unsigned shared = (unsigned)(K * 4);
+    return c.d.LaunchKernel(c.gemv_q4s_(), grid, 1, 1, 256, 1, 1, shared,
+                            nullptr, args, nullptr) == 0;
+  }
   return c.d.LaunchKernel(c.gemv_q4_(), grid, 1, 1, 256, 1, 1, 0, nullptr, args,
                           nullptr) == 0;
 }
