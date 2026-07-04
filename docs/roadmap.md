@@ -14,11 +14,15 @@ Metal (STEEL SGEMM) backends behind a single dispatch seam, culebra
 integration, and a tiny-tensor per-op sprint. The macOS backend is complete
 and competitive (see the silarray comparison in performance-notes.md). The
 non-Apple backends have landed their F32 foundation (M5 CPU met the OpenBLAS
-gate; M6 CUDA has a correct, split-K SGEMM at ~0.82 of cuBLAS). What remains is
-reoriented by the target scope below: BF16/FP16 **compute** (M7), quantized
-dequant-matmul (M8), and fused attention + KV cache (M9) — the kernels that
-actually make the target workloads fast — plus a tail of deferred perf/CI/API
-work.
+gate; M6 CUDA has a correct, split-K SGEMM at ~0.82 of cuBLAS).
+
+The decode path (the target-scope money regime) is now built out (2026-07-04):
+**M7** bf16 storage + decode GEMV, and **M9** fused decode attention, are done
+and integrated end to end — CUDA decode went **3.5 → 41.2 tok/s** on llama-7B
+shapes (RTX 3090). **M8** int4 dequant GEMV has a correct kernel (1.79× vs bf16)
+but is not yet array-integrated or bandwidth-bound. What remains: M8's tuning +
+integration, M7's bf16 **compute** GEMM (fine-tuning / prefill, Tensor Core),
+M9's KV cache / GQA / causal-mask, and a tail of deferred perf/CI/API work.
 
 Design invariants that constrain everything below:
 
@@ -276,12 +280,25 @@ page migration proved a bottleneck (prefetch the first lever). It did — on WSL
 `ConcurrentManagedAccess=0` means pages never migrate and prefetch is
 unavailable, so the device-buffer mirror replaced managed at stage 2.
 
-### M7 — BF16 / FP16 storage **and compute**
+### M7 — BF16 / FP16 storage **and compute**  🔨 storage done; compute deferred
 
 BF16/FP16 as a *storage* type first (memory is 16-bit, load widens to F32, store
 narrows — a bit-shift confined to load/store, compute stays F32, no dtype × ISA ×
 kernel explosion). Halves bandwidth on memory-bound ops — directly the decode
 lever. Pairs with a language-level dtype surface in culebra.
+
+**Done (storage + decode GEMV, 2026-07-04):** `types.h` `dtype{f32,bf16}` +
+RNE converters; `storage`/`array` carry a dtype (byte-sized alloc). bf16 is a
+weight-container type (`to_bf16()`/`to_f32()`) — consumed natively by the CUDA
+decode GEMV, widened to F32 for every other op in `eval_one`'s input funnel
+(ref/cpu/accel/Metal untouched). Two levers landed together: routing M=1 dots to
+a GEMV kernel (`tl_gemv_f32`/`tl_gemv_bf16v8`, the 128² tile wastes 127 rows at
+M=1) — F32 decode 3.5 → 12.2 tok/s — and bf16 weights (~1.84× on the
+bandwidth-bound GEMV) → 14.8 tok/s. Census in performance-notes.md.
+
+**Remaining:** bf16 **compute** GEMM with F32-accumulate — the fine-tuning /
+prefill path, and the Tensor-Core option below. Deferred as lower-leverage than
+M8/M9 for decode; scheduled when the fine-tuning workload is exercised.
 
 **The compute path is now in scope (was "later, demand-driven" — the scope
 demands it).** LoRA/QLoRA fine-tuning trains in BF16/FP16 with F32 accumulation,
@@ -293,7 +310,17 @@ the fast option and, unlike the FP32 SGEMM, here Tensor Cores are the *native*
 datapath so the hand kernel is on equal footing with cuBLAS. FP8 (sm_120 /
 Blackwell) is a forward-looking extension of the same seam.
 
-### M8 — Quantized (int4/int8) dequant-fused matmul
+### M8 — Quantized (int4/int8) dequant-fused matmul  🔨 kernel done; integration + tuning remain
+
+**Done (int4 GEMV kernel, 2026-07-04):** `tl_gemv_q4`/`tl_gemv_q4s` — group-
+symmetric int4 weights in [N,K] layout (groups along K contiguous, GGUF/GPTQ
+convention), one warp per output, dequant in registers (scale·(nibble−8)), F32
+accumulate. Correct vs a host dequant reference (maxrel ~1e-5); ~0.625 bytes/
+weight vs bf16's 2.0 → **1.79× vs bf16** on the decode GEMV. shared-a staging
+gated by K (large-K collapses occupancy → global-a fallback). **Remaining:** not
+yet bandwidth-bound (best ~565/936 GB/s — bank-conflict-free staging + vectorized
+qweight loads are the headroom), and not yet an array op (needs a quantized-
+weight storage form the eval seam can route). See performance-notes.md.
 
 The heart of consumer local-LLM inference: 4-bit/8-bit weights (VRAM fit +
 bandwidth) with a **fused dequantize-and-matmul** kernel — read packed int4/int8
@@ -306,7 +333,18 @@ llama.cpp/exllamav2 hand-write. GGUF-style group quantization (Q4_K etc.) is the
 reference format to stay interop-friendly. Gate: **tokens/sec within reach of
 llama.cpp/exllamav2** on the same quantized model + GPU (not GFLOP/s vs cuBLAS).
 
-### M9 — Fused attention + KV cache
+### M9 — Fused attention + KV cache  🔨 fused decode attention done; KV cache / GQA / mask remain
+
+**Done (fused decode attention, 2026-07-04):** `array::attn_decode(q,K,V,scale)`
+(op_t::attn_dec) → `tl_attn_decode_*`. Flash-attention online-softmax in one pass
+(the ctx-long scores never touch memory), one block per head with warp-shuffle
+score reduction, split-KV across `gridDim.y` + a combine pass so grid = H×S fills
+the SMs. KV-bandwidth-bound (~844 GB/s, ~19× the unfused 3-op array path);
+numerically exact (maxrel ~1e-7); CPU reference fallback. Integrated end to end:
+decode 12.2 → 26.1 tok/s (F32), 41.2 with bf16 weights. **Remaining:** the KV
+cache itself (append per decode step), GQA/MQA head sharing, causal masking, and
+prefill (compute-bound, long-context) attention. head_dim is currently fixed at
+128 (host-gated). See performance-notes.md.
 
 Flash-attention-style fused attention (tiled QKᵀ → online softmax → ·V, never
 materializing the S×S scores), causal masking, and a **KV cache** (append per

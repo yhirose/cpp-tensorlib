@@ -509,6 +509,55 @@ then the per-band CUTLASS escape hatch if it still misses.
 | **128×256 large tile (ladder ①)** — 256-thread block, 8×16 microtile, WNITER=4 (`tl_sgemm_rb2`), +33% arithmetic intensity (64→85) | **Rejected** | Loses at *every* size (interleaved own/cuB): 1024³ 0.69→0.41, 2048³ 0.75→0.68, 4096³ 0.81→0.75. 128 accumulators/thread → 203 regs (no spills) but **1 block/SM = 16.7% occupancy** (rb keeps 2 blocks/SM = 33%). It loses even at 4096³ (6 waves, machine full, wave-quant irrelevant), so the arithmetic-intensity gain (−25% DRAM traffic) is dwarfed by the occupancy/latency-hiding loss — same class as the BK=16 rejection. 1024³ collapses because 128×256 halves the block count (64→32) so only ~39% of the 82 SMs get work. Big spatial tiles are ceiling-capped at rb on sm_86 for this kernel: any 128×256 variant is ≥1 block/SM. Pivoted to split-K (below) for the small-size deficit that census confirms is the real problem. |
 | **cp.async staged pipeline (ladder ③)** — Ampere `cp.async` global→shared, 3/4-stage smem pipeline (`tl_sgemm_cp`), replacing the register-staged loads | **Rejected** | Loses where it was meant to win: 4096³ 0.83→0.72–0.74, 2048³ 0.75–0.80→0.62–0.69 (interleaved vs rb S=1); ties at 1024³. Correct throughout (maxrel = rb, 4096³ exact). Root cause is a **structural mismatch**: A must land *transposed* in smem (As[k][m]) for the regM fragment read to stay a contiguous float4, but cp.async copies a contiguous global chunk to a contiguous smem chunk — it can't transpose. So A is forced to 4×**4-byte** cp.async scatter (one per k of the thread's float4), and 4-byte cp.async is the inefficient granularity (16-byte `.cg` is the fast path); that penalty + the extra `__syncthreads` (2/slab vs rb's 1) sink it. 4 stages don't rescue it (4096³ still 0.73). Efficient cp.async for transposed-A SIMT needs `ldmatrix` (tensor-core-only) — out of scope for the FP32 SIMT kernel. rb's float4-ldg-then-scatter stays the load path; regs dropped 127→107 with cp.async but occupancy stayed 2 blocks/SM (64 accumulators, not loads, are the register floor), so even the freed registers bought nothing. |
 
+## M7–M9 decode kernels (RTX 3090 / WSL2, 2026-07-04)
+
+The consumer-local-LLM decode path (batch≈1, bandwidth-bound). Metric is
+tokens/sec on llama-7B decoder shapes (d=4096, ffn=11008, 32 heads × head_dim
+128, 32 layers, vocab 32000), measured via `bench_llm`; kernel-level numbers via
+the direct `bench_bf16_gemv` / `bench_attn_decode` / `bench_q4_gemv` benches
+(cuda:: API, cuda::flush + steady_clock, no cudart). RTX 3090 memory-bandwidth
+peak ≈ 936 GB/s — the ceiling that matters here, not GFLOP/s.
+
+**Whole-decode tok/s arc (F32 baseline → M7+M9):**
+
+| stage | tok/s | lever |
+|---|---|---|
+| tile-GEMM (session start) | 3.5 | M=1 dot ran the 128² tile → 127/128 rows wasted |
+| + GEMV dispatch (F32) | 12.2 | route M=1 dots (incl. attention's) to `tl_gemv_f32` |
+| + bf16 weights | 14.8 | `tl_gemv_bf16v8`, halved weight bytes |
+| + fused attention (F32) | 26.1 | `attn_decode` — attention was 72% of token time |
+| + bf16 weights + fused attn | **41.2** | both |
+
+**bf16 decode GEMV** (`bench_bf16_gemv`, layer weight shapes): f32 kernels run
+at 850–935 GB/s (≈ peak — bandwidth-bound). Scalar 2-byte bf16 loads under-use
+that (layer sum 1.62× vs f32); `tl_gemv_bf16v8` (8 cols/thread, one 16-byte uint4
+load, `n%8==0`) closes it to **1.84×** (ffn_gate_up/lm_head at the 2× ceiling,
+~890 GB/s). Small-N shapes (N=4096) lag — split-K atomic + launch overhead is a
+bigger fraction of their tiny work.
+
+**Fused decode attention** (`bench_attn_decode`, H=32, ctx=2048): the unfused
+3-op array path (q·Kᵀ, softmax, ·V, per head × layer ≈ 1024×) is
+launch/materialize-bound, ~48 ms/model. `tl_attn_decode_f32` (one block/head,
+online softmax) → 11.7 ms (4×) but only ~180 GB/s: grid = H = 32 blocks fills 3%
+of the 82 SMs, occupancy-bound. **Split-KV** (partition ctx over `gridDim.y`,
+partial states → combine pass) → **2.54 ms, 844 GB/s (~19×)**, bandwidth-bound.
+Numerically exact throughout (maxrel ~1e-7). Array-integrated at 0.110 ms/layer
+(13.5× the unfused path).
+
+**int4 dequant GEMV** (`bench_q4_gemv`, group=32 symmetric int4, [N,K] layout):
+correct vs a host dequant reference (maxrel ~1e-5), 0.625 bytes/weight (0.5
+packed + 4/32 scale) vs bf16's 2.0. **1.79× vs bf16** (layer sum 0.436 vs 0.78
+ms). *Not yet bandwidth-bound* (best ~565/936 GB/s): the global-a kernel re-reads
+the activation from L2 per output warp; shared-a staging (`tl_gemv_q4s`, gated to
+K·4 ≤ 24 KB — larger K collapses occupancy) helps but the strided a_sh reads
+bank-conflict. Headroom to ~3× (the byte-ratio ideal): conflict-free staging +
+vectorized qweight loads. Not yet an array op.
+
+**Progression pattern (all three kernels).** Each landed correct-but-un-tuned,
+then a second pass to bandwidth-bound: bf16 1.62→1.84×, attention 4→19×, int4
+1.24→1.79× (mid-tune). Occupancy (blocks vs 82 SMs) was the recurring first
+bottleneck — split-K/split-KV the recurring fix.
+
 ## vs silarray (M1 Pro, 2026-07-03)
 
 Head-to-head with the predecessor across cpu/gpu/auto. Two separate

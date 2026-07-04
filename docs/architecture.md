@@ -29,6 +29,35 @@ lives in [roadmap.md](roadmap.md). This file documents how the code works
 today; performance methodology and gate results are in
 [performance-notes.md](performance-notes.md).
 
+## Current state (M7–M9: dtype surface + decode kernels)
+
+The consumer-local-LLM decode path (batch≈1) is the focus (see roadmap "Target
+scope"). Decode is memory-bandwidth-bound, so the levers are cutting weight
+bytes (bf16/int4 storage) and fusing attention — not F32 GFLOP/s.
+
+- **Storage dtype (M7).** `types.h` has `dtype{f32,bf16}` + RNE converters;
+  `storage`/`array` carry a dtype and byte-sized allocation. bf16 is a
+  *weight-container* type: `array::to_bf16()`/`to_f32()`; the CUDA decode GEMV
+  consumes bf16 natively, and every other op transparently widens bf16 inputs to
+  an F32 copy in `eval_one`'s input funnel — so ref/cpu/accel/Metal kernels stay
+  F32-only, zero changes. Compute and results are always F32.
+- **Decode GEMV (M7).** `tl_gemv_f32` / `tl_gemv_bf16v8` (8 cols/thread, 16-byte
+  loads, split-K for small N). `eval_one`'s dot case routes M=1 to the GEMV
+  (the 128×128 tile wastes 127 rows at M=1) — this alone tripled the F32 decode
+  baseline; bf16 weights add ~1.84× on the bandwidth-bound GEMV.
+- **Fused attention (M9).** `array::attn_decode(q,K,V,scale)` (op_t::attn_dec)
+  → `tl_attn_decode_*`: flash-attention online-softmax in one pass (scores never
+  materialized), split-KV across `gridDim.y` to fill the SMs (KV-bandwidth-bound,
+  ~844 GB/s). CPU reference fallback; Metal returns false (widen/CPU path).
+- **int4 GEMV (M8, kernel only).** `tl_gemv_q4` / `tl_gemv_q4s`: group-symmetric
+  int4 weights in [N,K] layout (GGUF/GPTQ convention), one warp/output, dequant
+  in registers, F32 accumulate. Correct; 1.79× vs bf16 (not yet array-integrated
+  or bandwidth-bound).
+- **Result (RTX 3090, llama-7B decode shapes):** 3.5 → 41.2 tok/s over the
+  M7+M9 work (F32 12.2, +fused-attn 26.1, +bf16 weights 41.2). Full census in
+  performance-notes.md. Dev harness: `bench_llm` (shapes + tok/s), plus direct
+  kernel benches `bench_bf16_gemv` / `bench_attn_decode` / `bench_q4_gemv`.
+
 ## Current state (M5 first cut: own CPU GEMM)
 
 - `cpu.h` + `cpu_threadpool.h` — BLIS-style SGEMM for platforms without
@@ -165,9 +194,9 @@ Status summary; scope, environment needs, and approach are in
 | M4 | culebra integration; tiny-tensor per-op sprint; auto thresholds | ✅ |
 | M5 | Own CPU backend: threadpool + BLIS-style microkernels (AVX2/AVX-512/NEON) | 🔨 NEON + AVX2 done (OpenBLAS gate met); AVX-512 deferred (needs hw) |
 | M6 | Own CUDA backend: dlopen'd driver API, PTX `#embed`, SGEMM + split-K | 🔨 correct; ~0.82 of cuBLAS (prefill foundation — see roadmap "Target scope") |
-| M7 | BF16/FP16 storage **and compute** (LoRA/QLoRA fine-tuning path) | ⏳ |
-| M8 | Quantized (int4/int8) dequant-fused matmul (local-LLM inference) | ⏳ |
-| M9 | Fused attention (flash-attn style) + KV cache | ⏳ |
+| M7 | BF16/FP16 **storage** + decode GEMV dispatch | 🔨 storage dtype + bf16 GEMV done & integrated; bf16 **compute** GEMM (fine-tuning) deferred |
+| M8 | Quantized (int4/int8) dequant-fused matmul (local-LLM inference) | 🔨 int4 GEMV kernel correct (1.79× vs bf16); array integration + bandwidth-bound tuning remain |
+| M9 | Fused attention (flash-attn style) + KV cache | 🔨 fused decode attention done & integrated (split-KV, ~19×); KV cache / GQA / causal mask remain |
 
 Milestones are now driven by the **target scope** (consumer local-LLM
 inference/fine-tuning on 1–few consumer GPUs — RTX 5090 / A6000); see
