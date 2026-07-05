@@ -526,7 +526,8 @@ peak ≈ 936 GB/s — the ceiling that matters here, not GFLOP/s.
 | + GEMV dispatch (F32) | 12.2 | route M=1 dots (incl. attention's) to `tl_gemv_f32` |
 | + bf16 weights | 14.8 | `tl_gemv_bf16v8`, halved weight bytes |
 | + fused attention (F32) | 26.1 | `attn_decode` — attention was 72% of token time |
-| + bf16 weights + fused attn | **41.2** | both |
+| + bf16 weights + fused attn | 42.5 | both |
+| + int4 weights + fused attn | **61.7** | `dtype::q4` GEMV (M8) |
 
 **bf16 decode GEMV** (`bench_bf16_gemv`, layer weight shapes): f32 kernels run
 at 850–935 GB/s (≈ peak — bandwidth-bound). Scalar 2-byte bf16 loads under-use
@@ -550,7 +551,20 @@ packed + 4/32 scale) vs bf16's 2.0. **1.79× vs bf16** (layer sum 0.436 vs 0.78
 ms). *Not yet bandwidth-bound* (best ~565/936 GB/s): the global-a kernel re-reads
 the activation from L2 per output warp; shared-a staging (`tl_gemv_q4s`, gated to
 K·4 ≤ 24 KB — larger K collapses occupancy) helps but the strided a_sh reads
-bank-conflict. Not yet an array op.
+bank-conflict. Integrated as `dtype::q4` (storage-dtype path; `a.dot(Wq)` rides
+the bf16 widen-fallback seam) → **decode 61.7 tok/s** (vs bf16 42.5).
+
+*Measurement note.* The direct benches (`bench_q4_gemv` etc.) flush each batch
+and are authoritative. `bench_llm` uses array `eval()` and, on WSL2, its
+per-op medians **degrade once the run gets long** (the f32/bf16/attn numbers are
+clean at the M9 bench length but adding an int4 section pushed later
+measurements 5–10× slow — a sustained-load/submission-latency artifact, NOT a
+regression: reverting the int4 section restores f32 26.2 / bf16 42.4 / attn
+0.110 ms exactly). So int4's tok/s is measured in isolation, and `bench_llm`
+stays at the shorter f32+bf16+attn scope. A **CUDA buffer pool** (recycle vs
+cuMemFree, size-keyed; Metal already pools) landed alongside — it did *not* fix
+this bench artifact (so the artifact isn't allocator fragmentation) but sped the
+real-MNIST training gate 7.8 → 5.8 s (training churns activations every step).
 
 *Refuted (2026-07-04): interleaved (exllama-style) repack for conflict-free
 reads.* Assigning lane l the stride-32 keys k = base+l+m·32 (packed one word/lane)

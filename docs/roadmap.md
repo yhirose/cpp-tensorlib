@@ -310,17 +310,22 @@ the fast option and, unlike the FP32 SGEMM, here Tensor Cores are the *native*
 datapath so the hand kernel is on equal footing with cuBLAS. FP8 (sm_120 /
 Blackwell) is a forward-looking extension of the same seam.
 
-### M8 — Quantized (int4/int8) dequant-fused matmul  🔨 kernel done; integration + tuning remain
+### M8 — Quantized (int4/int8) dequant-fused matmul  🔨 int4 done & integrated; tuning + int8/GGUF remain
 
-**Done (int4 GEMV kernel, 2026-07-04):** `tl_gemv_q4`/`tl_gemv_q4s` — group-
-symmetric int4 weights in [N,K] layout (groups along K contiguous, GGUF/GPTQ
-convention), one warp per output, dequant in registers (scale·(nibble−8)), F32
-accumulate. Correct vs a host dequant reference (maxrel ~1e-5); ~0.625 bytes/
-weight vs bf16's 2.0 → **1.79× vs bf16** on the decode GEMV. shared-a staging
-gated by K (large-K collapses occupancy → global-a fallback). **Remaining:** not
-yet bandwidth-bound (best ~565/936 GB/s — bank-conflict-free staging + vectorized
-qweight loads are the headroom), and not yet an array op (needs a quantized-
-weight storage form the eval seam can route). See performance-notes.md.
+**Done (int4 GEMV kernel + integration, 2026-07-04):** `tl_gemv_q4`/`tl_gemv_q4s`
+— group-symmetric int4 weights in [N,K] layout (groups along K contiguous,
+GGUF/GPTQ convention), one warp per output, dequant in registers
+(scale·(nibble−8)), F32 accumulate. Correct vs a host dequant reference (maxrel
+~1e-5); ~0.625 bytes/weight vs bf16's 2.0 → **1.79× vs bf16** on the decode GEMV.
+Integrated as `dtype::q4` (chose the storage-dtype path B over a separate
+q4_matrix type — see performance-notes.md): one buffer = packed [N,K] int4 +
+appended scales, logical shape stays [K,N] so `a.dot(Wq)` type-checks like f32
+and rides the bf16 widen-fallback seam. `array::to_q4()`/`to_f32()`. **Decode
+61.7 tok/s** (vs bf16 42.5). Also landed a **CUDA buffer pool** (recycle vs
+cuMemFree; real-MNIST gate 7.8→5.8 s). **Remaining:** not yet bandwidth-bound
+(best ~565/936 GB/s — the interleaved-repack fix was measured *worse*, see
+refuted note; needs a profiled lever), int8, and GGUF-format interop. See
+performance-notes.md.
 
 The heart of consumer local-LLM inference: 4-bit/8-bit weights (VRAM fit +
 bandwidth) with a **fused dequantize-and-matmul** kernel — read packed int4/int8

@@ -49,14 +49,20 @@ bytes (bf16/int4 storage) and fusing attention — not F32 GFLOP/s.
   → `tl_attn_decode_*`: flash-attention online-softmax in one pass (scores never
   materialized), split-KV across `gridDim.y` to fill the SMs (KV-bandwidth-bound,
   ~844 GB/s). CPU reference fallback; Metal returns false (widen/CPU path).
-- **int4 GEMV (M8, kernel only).** `tl_gemv_q4` / `tl_gemv_q4s`: group-symmetric
-  int4 weights in [N,K] layout (GGUF/GPTQ convention), one warp/output, dequant
-  in registers, F32 accumulate. Correct; 1.79× vs bf16 (not yet array-integrated
-  or bandwidth-bound).
-- **Result (RTX 3090, llama-7B decode shapes):** 3.5 → 41.2 tok/s over the
-  M7+M9 work (F32 12.2, +fused-attn 26.1, +bf16 weights 41.2). Full census in
-  performance-notes.md. Dev harness: `bench_llm` (shapes + tok/s), plus direct
-  kernel benches `bench_bf16_gemv` / `bench_attn_decode` / `bench_q4_gemv`.
+- **int4 storage dtype (M8).** `dtype::q4`: group-symmetric int4 weights, one
+  buffer holding packed [N,K] int4 + appended f32 scales, logical shape [K,N] so
+  `a.dot(Wq)` type-checks like f32 and rides the bf16 widen-fallback seam (decode
+  → `tl_gemv_q4`, else dequant to F32). `array::to_q4()`/`to_f32()`. Correct;
+  1.79× vs bf16 on the GEMV (not yet bandwidth-bound).
+- **CUDA buffer pool.** `gpu::alloc`/`release` recycle device buffers via a
+  size-keyed free list (like Metal's), so alloc/free-heavy workloads (training)
+  don't fragment the driver allocator (real-MNIST gate 7.8 → 5.8 s).
+- **Result (RTX 3090, llama-7B decode shapes):** 3.5 → 61.7 tok/s over M7+M9+M8
+  (F32 12.2, +fused-attn 26.1, +bf16 42.5, +int4 61.7). Full census in
+  performance-notes.md. Dev harness: `bench_llm` (f32/bf16 + attn; kept short so
+  WSL2 timing stays clean), plus direct kernel benches `bench_bf16_gemv` /
+  `bench_attn_decode` / `bench_q4_gemv` (each flushes — the authoritative
+  per-kernel numbers).
 
 ## Current state (M5 first cut: own CPU GEMM)
 
@@ -195,7 +201,7 @@ Status summary; scope, environment needs, and approach are in
 | M5 | Own CPU backend: threadpool + BLIS-style microkernels (AVX2/AVX-512/NEON) | 🔨 NEON + AVX2 done (OpenBLAS gate met); AVX-512 deferred (needs hw) |
 | M6 | Own CUDA backend: dlopen'd driver API, PTX `#embed`, SGEMM + split-K | 🔨 correct; ~0.82 of cuBLAS (prefill foundation — see roadmap "Target scope") |
 | M7 | BF16/FP16 **storage** + decode GEMV dispatch | 🔨 storage dtype + bf16 GEMV done & integrated; bf16 **compute** GEMM (fine-tuning) deferred |
-| M8 | Quantized (int4/int8) dequant-fused matmul (local-LLM inference) | 🔨 int4 GEMV kernel correct (1.79× vs bf16); array integration + bandwidth-bound tuning remain |
+| M8 | Quantized (int4/int8) dequant-fused matmul (local-LLM inference) | 🔨 int4 GEMV done & integrated as a storage dtype (decode 61.7 tok/s); bandwidth-bound tuning + int8/GGUF-format remain |
 | M9 | Fused attention (flash-attn style) + KV cache | 🔨 fused decode attention done & integrated (split-KV, ~19×); KV cache / GQA / causal mask remain |
 
 Milestones are now driven by the **target scope** (consumer local-LLM
