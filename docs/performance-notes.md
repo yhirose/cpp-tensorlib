@@ -582,11 +582,21 @@ touching one then reads over PCIe (~7× slower), at full clock. This is the
 documented WSL2 "shared GPU memory" / sysmem-fallback behavior (see roadmap
 sources). It is **WSL2-only**: native Linux/Windows OOM instead of silently
 spilling. Mitigations: the Windows-side driver setting *Prefer No Sysmem
-Fallback*, and keeping the committed footprint under the budget (real inference —
-weights loaded once, quantized — fits; only this bench's transient churn of
-diverse multi-hundred-MB sources crosses it). So int4's tok/s is measured in
-isolation and `bench_llm` stays at the shorter f32+bf16+attn scope; the direct
-flush-based benches (`bench_q4_gemv` etc.) are authoritative.
+Fallback*, and keeping the committed footprint under the budget.
+
+**Real workloads are unaffected (measured), so there is nothing to fix there.**
+The trigger is allocation *activity* — many *distinct* large allocations in
+sequence — not resident level (a single 1 GB alloc, or 3.5 GB held via the pool,
+never triggers it). Real inference loads its weights *once* (low churn, high
+resident is fine — same as llama.cpp running a 4 GB model on WSL2). Real training
+churns activations but at *repeated* shapes, so the footprint stays bounded: a
+500-step train-churn loop is **flat** (4.3 ms with the pool, 5.4 ms without —
+neither degrades, memory pinned at ~1.8 GB). Only diverse-shape churn — this
+bench allocating ~15 distinct multi-hundred-MB sources — climbs the high-water
+past the budget. So int4's tok/s is measured in isolation and `bench_llm` stays
+at the shorter f32+bf16+attn scope; the direct flush-based benches
+(`bench_q4_gemv` etc.) are authoritative. The pool is a pure win for real
+training regardless (20% faster here, avoiding cuMemFree's sync).
 
 The **CUDA buffer pool** (recycle vs cuMemFree, size-keyed, exact match; Metal
 already pools) is kept regardless — it does not fix the WSL2 cliff (that's not
