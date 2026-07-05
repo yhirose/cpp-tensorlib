@@ -67,6 +67,29 @@ struct storage {
         p, [](void* q) { delete[] static_cast<unsigned char*>(q); });
     return s;
   }
+
+  // Explicit-byte allocation (q4, whose bytes aren't elems×width). `elems` is
+  // the logical element count; `bytes` the physical buffer size. Device-
+  // preferred with heap fallback, like make_device_.
+  static storage make_bytes_(int64_t elems, int64_t bytes, dtype dt) {
+    storage s;
+    s.size = elems;
+    s.dt = dt;
+    int64_t nb = bytes > 0 ? bytes : 4;
+    float* contents = nullptr;
+    if (void* mb = gpu::alloc(nb, &contents)) {
+      s.native = mb;
+      s.ptr = contents;
+      s.buf = std::shared_ptr<void>(
+          mb, [nb, contents](void* p) { gpu::release(p, nb, contents); });
+    } else {
+      auto* p = new unsigned char[static_cast<size_t>(nb)];
+      s.ptr = reinterpret_cast<float*>(p);
+      s.buf = std::shared_ptr<void>(
+          p, [](void* q) { delete[] static_cast<unsigned char*>(q); });
+    }
+    return s;
+  }
 };
 
 namespace detail {

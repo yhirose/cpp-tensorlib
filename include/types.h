@@ -11,9 +11,22 @@
 
 namespace tl {
 
-enum class dtype : uint8_t { f32, bf16 };
+// f32/bf16 are plain storage widths. q4 (M8) is group-symmetric int4 *weight*
+// storage: physically [N,K] (out×in) packed 2 nibbles/byte with per-group f32
+// scales appended in the same buffer — the logical array shape stays [K,N] so
+// `a.dot(Wq)` type-checks like f32; the decode GEMV reads it natively and every
+// other op dequantizes to F32 (to_f32) via the same widen-fallback seam as bf16.
+enum class dtype : uint8_t { f32, bf16, q4 };
 
+// Byte width for the plain widths (q4 is variable — use q4_bytes()).
 inline int64_t dtype_size(dtype dt) { return dt == dtype::bf16 ? 2 : 4; }
+
+// q4 layout: fixed group size, one buffer = [packed int4 [N][K/2] | scales
+// f32 [N][K/kQ4Group]]. K must be a multiple of 256 (kernel) and kQ4Group.
+inline constexpr int64_t kQ4Group = 32;
+inline int64_t q4_bytes(int64_t N, int64_t K) {
+  return N * K / 2 + N * (K / kQ4Group) * 4;
+}
 
 // Scalar converters (host side). bf16 = top 16 bits of the F32 pattern;
 // narrow rounds to nearest-even (the same rounding the CUDA path uses).

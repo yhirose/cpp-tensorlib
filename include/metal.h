@@ -358,6 +358,9 @@ inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
                         float) {
   return false;
 }
+inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
+  return false;
+}
 
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals
 
@@ -385,6 +388,9 @@ inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
                         float) {
+  return false;
+}
+inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
   return false;
 }
 

@@ -692,3 +692,52 @@ TEST_CASE("fused decode attention matches an explicit softmax(qKt)V") {
   CHECK_THROWS(tl::array::attn_decode(K, K, V, scale));       // q rank 3
   CHECK_THROWS(tl::array::attn_decode(q, K, q.reshape({H, D}), scale));  // V rank 2
 }
+
+TEST_CASE("q4 weight storage: decode dot + widen fallback vs dequant oracle") {
+  // W [K,N], K a multiple of 256; a [1,K]. int4 quant error on random data is
+  // large (a small weight in a big-maxabs group rounds coarsely), so the right
+  // oracle is a.dot(dequant(Wq)) — this isolates the GEMV/packing from quant
+  // error. The GPU kernel and the CPU widen-fallback must both match it.
+  const int64_t K = 256, N = 48;
+  std::vector<float> av(K), wv(K * N);
+  unsigned st = 5;
+  auto rnd = [&] {
+    st = st * 1664525u + 1013904223u;
+    return (float)(int)(st >> 9) / (1 << 22) - 1.0f;
+  };
+  for (auto& v : av) v = rnd();
+  for (auto& v : wv) v = rnd();
+  auto a = tl::array::from(av, {1, K});
+  auto w = tl::array::from(wv, {K, N});
+  auto wq = w.to_q4();
+  CHECK(wq.dt() == tl::dtype::q4);
+  CHECK(wq.shape() == tl::shape_t{K, N});  // logical shape preserved
+
+  auto deq = wq.to_f32();  // exactly what every path multiplies against
+  CHECK(deq.dt() == tl::dtype::f32);
+  CHECK(deq.shape() == tl::shape_t{K, N});
+  auto ref = a.dot(deq);   // oracle: dot against the dequantized weights
+  auto got = a.dot(wq);    // GPU decode GEMV, or widen-fallback on CPU
+  CHECK(got.shape() == ref.shape());
+  for (int64_t j = 0; j < N; j += 5) {
+    CHECK(got.at({0, j}) == doctest::Approx(ref.at({0, j})).epsilon(1e-3));
+  }
+
+  // dequant stays within int4's step of the original (per element)
+  double maxerr = 0;
+  for (int64_t k = 0; k < K; k++)
+    for (int64_t j = 0; j < N; j++)
+      maxerr = std::max(maxerr, (double)std::fabs(deq.at({k, j}) - w.at({k, j})));
+  CHECK(maxerr < 0.2);  // symmetric int4, scale = maxabs/7
+
+  // direct element access on q4 throws (weight-container semantics)
+  CHECK_THROWS(wq.at({0, 0}));
+
+  // non-decode shape (M=2) widens q4 -> f32; matches the same dequant oracle
+  auto a2v = std::vector<float>(2 * K);
+  for (auto& v : a2v) v = rnd();
+  auto a2 = tl::array::from(a2v, {2, K});
+  auto ref2 = a2.dot(deq);
+  auto got2 = a2.dot(wq);
+  CHECK(got2.at({1, 3}) == doctest::Approx(ref2.at({1, 3})).epsilon(1e-3));
+}

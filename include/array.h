@@ -233,7 +233,11 @@ class array {
   // to_f32() first. Compute and results are always F32.
   tl::dtype dt() const { return storage_.dt; }
   array to_bf16() const;  // F32 -> bf16 contiguous copy
-  array to_f32() const;   // bf16 -> F32 contiguous copy (F32: returns *this)
+  array to_f32() const;   // bf16/q4 -> F32 contiguous copy (F32: returns *this)
+  // F32 [K,N] weight -> group-symmetric int4 (M8). Logical shape stays [K,N];
+  // storage is packed [N,K] int4 + per-group scales. The decode GEMV consumes
+  // it natively; other ops dequantize via to_f32(). K % 256 == 0 required.
+  array to_q4() const;
 
   // Elementwise (lazy)
   array exp() const;
@@ -565,12 +569,31 @@ inline array array::to_bf16() const {
   return out;
 }
 
-// bf16 -> F32 contiguous copy (exact: bf16 is a truncated F32).
+// bf16/q4 -> F32 contiguous copy.
 inline array array::to_f32() const {
   ensure_();
   if (storage_.dt == tl::dtype::f32) return *this;
   detail::barrier_();
   detail::host_sync_(storage_.native, /*for_write=*/false);
+  if (storage_.dt == tl::dtype::q4) {
+    // Dequantize the packed [N,K] int4 + scales back to logical [K,N] F32.
+    const int64_t K = shape_[0], N = shape_[1], G = tl::kQ4Group;
+    array out = make_(shape_);  // [K, N]
+    const auto* base = reinterpret_cast<const uint8_t*>(storage_.data());
+    const uint8_t* qw = base;                       // [N][K/2]
+    const float* sc = reinterpret_cast<const float*>(base + N * K / 2);
+    float* po = out.storage_.data();
+    for (int64_t nn = 0; nn < N; nn++) {
+      const uint8_t* qrow = qw + nn * (K / 2);
+      const float* srow = sc + nn * (K / G);
+      for (int64_t k = 0; k < K; k++) {
+        uint8_t byte = qrow[k / 2];
+        int nib = (k & 1) ? (byte >> 4) : (byte & 0xF);
+        po[k * N + nn] = srow[k / G] * (float)(nib - 8);
+      }
+    }
+    return out;
+  }
   array out = make_(shape_);
   const auto* pi = reinterpret_cast<const uint16_t*>(storage_.data()) + offset_;
   float* po = out.storage_.data();
@@ -582,6 +605,50 @@ inline array array::to_f32() const {
                            [&](int64_t i, const std::vector<int64_t>& off) {
                              po[i] = bf16_to_f32(pi[off[0]]);
                            });
+  }
+  return out;
+}
+
+// F32 [K,N] -> group-symmetric int4 weight. Packs the transpose [N,K]: 2
+// nibbles/byte contiguous in k (word[n][k/8] slot k%8), scales per group of 32
+// appended. Matches the tl_gemv_q4 kernel's layout.
+inline array array::to_q4() const {
+  ensure_();
+  if (storage_.dt == tl::dtype::q4) return *this;
+  if (rank() != 2) throw std::logic_error("tl::to_q4: expect [K,N]");
+  const int64_t K = shape_[0], N = shape_[1], G = tl::kQ4Group;
+  if (K % 256 != 0 || K % G != 0)
+    throw std::logic_error("tl::to_q4: K must be a multiple of 256");
+  const float* pi = raw();  // [K,N], strided ok
+  int64_t s0 = strides_[0], s1 = strides_[1];
+  array out;
+  out.shape_ = shape_;  // logical [K,N]
+  out.strides_ = detail::contiguous_strides(shape_);
+  out.storage_ = storage::make_bytes_(N * K, tl::q4_bytes(N, K), tl::dtype::q4);
+  auto* base = reinterpret_cast<uint8_t*>(out.storage_.data());
+  std::memset(base, 0, static_cast<size_t>(tl::q4_bytes(N, K)));
+  uint8_t* qw = base;
+  float* sc = reinterpret_cast<float*>(base + N * K / 2);
+  for (int64_t nn = 0; nn < N; nn++) {
+    uint8_t* qrow = qw + nn * (K / 2);
+    float* srow = sc + nn * (K / G);
+    for (int64_t g = 0; g < K / G; g++) {
+      float maxabs = 1e-8f;
+      for (int64_t j = 0; j < G; j++) {
+        int64_t k = g * G + j;
+        maxabs = std::max(maxabs, std::fabs(pi[k * s0 + nn * s1]));
+      }
+      float scale = maxabs / 7.0f;
+      srow[g] = scale;
+      for (int64_t j = 0; j < G; j++) {
+        int64_t k = g * G + j;
+        int q = (int)std::lround(pi[k * s0 + nn * s1] / scale);
+        q = std::max(-8, std::min(7, q));
+        uint8_t& byte = qrow[k / 2];
+        unsigned nib = (unsigned)(q + 8);
+        byte = (k & 1) ? ((byte & 0x0F) | (nib << 4)) : ((byte & 0xF0) | nib);
+      }
+    }
   }
   return out;
 }
@@ -1320,6 +1387,33 @@ struct graph {
     return out.reshape(n.shape);
   }
 
+  // M8 int4-weight decode GEMV: a(1,K)f32 @ Wq(K,N)q4 -> (1,N)f32. Wq's logical
+  // shape is [K,N]; its storage is packed [N,K] int4 + appended scales, so the
+  // scales pointer is native + N·K/2 bytes (one buffer). Gated to the decode
+  // shape; non-decode / non-GPU dequantizes to F32 via the input funnel.
+  static std::optional<array> gpu_gemv_q4(const node& n, const array& a_in,
+                                          const array& Wq) {
+    if (Wq.storage_.dt != tl::dtype::q4 || Wq.rank() != 2) return std::nullopt;
+    array a = a_in.rank() == 1 ? a_in.reshape({1, a_in.size()}) : a_in;
+    if (a.storage_.dt != tl::dtype::f32 || a.rank() != 2 || a.shape()[0] != 1)
+      return std::nullopt;
+    int64_t K = Wq.shape()[0], N = Wq.shape()[1];  // logical [K,N]
+    if (!gpu_mode_(N * (K > 0 ? K : 1), kernel_class::matmul))
+      return std::nullopt;
+    if (!a.contiguous() || a.offset_ != 0 || Wq.offset_ != 0) return std::nullopt;
+    if (!a.storage_.native || !Wq.storage_.native) return std::nullopt;
+    array out = array::empty({int64_t{1}, N});
+    if (!out.storage_.native) return std::nullopt;
+    if (N == 0) return out.reshape(n.shape);
+    void* scales = reinterpret_cast<void*>(
+        reinterpret_cast<char*>(Wq.storage_.native) + N * K / 2);
+    if (!gpu::gemv_q4(a.storage_.native, Wq.storage_.native, scales,
+                      out.storage_.native, N, K, tl::kQ4Group)) {
+      return std::nullopt;
+    }
+    return out.reshape(n.shape);
+  }
+
   // M9 fused decode attention on the GPU. q[H,D], K/V[H,ctx,D] contiguous,
   // D==128. Returns nullopt (→ CPU ref) when the kernel declines.
   static std::optional<array> gpu_attn_(const node& n, const array& q,
@@ -1719,11 +1813,15 @@ struct graph {
         break;
       }
       case op_t::dot: {
-        // Decode GEMV fast path first (M=1; f32 or bf16 weights), on the
+        // Decode GEMV fast path first (M=1; f32/bf16/q4 weights), on the
         // un-widened inputs.
         if (auto g = gpu_gemv(n, wrap(*n.inputs[0]), wrap(*n.inputs[1]))) {
           r = std::move(*g);
           break;  // kernel is epilogue-free; generic tail applies scale/offset
+        }
+        if (auto g = gpu_gemv_q4(n, wrap(*n.inputs[0]), wrap(*n.inputs[1]))) {
+          r = std::move(*g);
+          break;
         }
         auto a = in(0), b = in(1);
         if (auto g = gpu_gemm(n, a, b)) {
