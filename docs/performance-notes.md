@@ -554,17 +554,46 @@ K·4 ≤ 24 KB — larger K collapses occupancy) helps but the strided a_sh read
 bank-conflict. Integrated as `dtype::q4` (storage-dtype path; `a.dot(Wq)` rides
 the bf16 widen-fallback seam) → **decode 61.7 tok/s** (vs bf16 42.5).
 
-*Measurement note.* The direct benches (`bench_q4_gemv` etc.) flush each batch
-and are authoritative. `bench_llm` uses array `eval()` and, on WSL2, its
-per-op medians **degrade once the run gets long** (the f32/bf16/attn numbers are
-clean at the M9 bench length but adding an int4 section pushed later
-measurements 5–10× slow — a sustained-load/submission-latency artifact, NOT a
-regression: reverting the int4 section restores f32 26.2 / bf16 42.4 / attn
-0.110 ms exactly). So int4's tok/s is measured in isolation, and `bench_llm`
-stays at the shorter f32+bf16+attn scope. A **CUDA buffer pool** (recycle vs
-cuMemFree, size-keyed; Metal already pools) landed alongside — it did *not* fix
-this bench artifact (so the artifact isn't allocator fragmentation) but sped the
-real-MNIST training gate 7.8 → 5.8 s (training churns activations every step).
+### WSL2 sysmem-fallback cliff — root cause of the long-run bench slowdown (2026-07-04)
+
+`bench_llm` (array `eval()`) is clean at the M9 length but, once an int4 section
+makes the run longer, later measurements go **5–10× slow and stay slow**. Ran it
+to ground with a fixed small "probe" op timed as unrelated large shapes are
+processed:
+
+- **Not** op-count/thermal/clock: the same op repeated 300× never degrades, and
+  during a degraded 400× probe the SM clock is pinned at **1710 MHz with throttle
+  reasons 0x0** — full clock, no throttle. The slow op is compute-idle-bound.
+- **Not** the buffer pool: reproduces identically with pooling disabled (always
+  cuMemFree). **Not** allocation fragmentation, **not** current memory level
+  (degrades at 2.3 GB used / 24 GB; a single 1 GB alloc+free never triggers it),
+  **not** the concurrent working set (freeing each weight before the next still
+  degrades). pow2 size-binning (more reuse, memory capped at 2.4 GB) did **not**
+  fix it either.
+- **It is cumulative and persistent:** degrades only after ~a dozen distinct
+  large allocations (lm_head *first* is clean; lm_head *last* degrades), and once
+  triggered it never recovers (400 iterations flat at 0.63 ms vs 0.088 ms clean).
+
+Diagnosis: **WSL2/WDDM sysmem fallback.** WDDM reclaims cuMemFree lazily, so the
+process's committed high-water climbs monotonically; once it crosses the WDDM
+working-set budget (~2 GB effective here, far below the 24 GB VRAM), WDDM evicts
+device buffers to system memory, and evicted buffers stay there — every kernel
+touching one then reads over PCIe (~7× slower), at full clock. This is the
+documented WSL2 "shared GPU memory" / sysmem-fallback behavior (see roadmap
+sources). It is **WSL2-only**: native Linux/Windows OOM instead of silently
+spilling. Mitigations: the Windows-side driver setting *Prefer No Sysmem
+Fallback*, and keeping the committed footprint under the budget (real inference —
+weights loaded once, quantized — fits; only this bench's transient churn of
+diverse multi-hundred-MB sources crosses it). So int4's tok/s is measured in
+isolation and `bench_llm` stays at the shorter f32+bf16+attn scope; the direct
+flush-based benches (`bench_q4_gemv` etc.) are authoritative.
+
+The **CUDA buffer pool** (recycle vs cuMemFree, size-keyed, exact match; Metal
+already pools) is kept regardless — it does not fix the WSL2 cliff (that's not
+allocator-driven) but avoids cuMemFree's synchronization on *every* backend
+(cuMemFree stalls the CPU-runs-ahead pipeline — the reason PyTorch/TF cache);
+real-MNIST training gate 7.8 → 5.8 s. It helps steady-state workloads (repeated
+shapes reuse exactly); for WSL2 a bounded/released pool would be safer, deferred.
 
 *Refuted (2026-07-04): interleaved (exllama-style) repack for conflict-free
 reads.* Assigning lane l the stride-32 keys k = base+l+m·32 (packed one word/lane)
