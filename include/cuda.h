@@ -44,6 +44,8 @@ using kop = tl::metal::kop;
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace tl {
 namespace cuda {
@@ -139,6 +141,13 @@ struct context {
     loc where = HOST;
   };
   std::unordered_map<CUdeviceptr, mirror> mirrors;
+
+  // Size-keyed free list (like Metal's MTLBuffer pool). Released buffers are
+  // recycled, not cuMemFree'd — repeated large alloc/free otherwise fragments
+  // the driver allocator (decode benches, training that churns activations).
+  // Buffers persist until the (leaked) context tears down. Keyed by exact byte
+  // size; the workloads that churn reuse identical shapes.
+  std::unordered_map<size_t, std::vector<std::pair<CUdeviceptr, float*>>> pool;
 
   mirror* mirror_(void* native) {
     auto it = mirrors.find(reinterpret_cast<CUdeviceptr>(native));
@@ -331,11 +340,19 @@ inline void* alloc(int64_t bytes, float** contents) {
   if (!c.ready) return nullptr;
   size_t nb = bytes > 0 ? (size_t)bytes : 4;
   CUdeviceptr dev = 0;
-  if (c.d.MemAlloc(&dev, nb) != 0) return nullptr;
-  float* host = static_cast<float*>(std::malloc(nb));
-  if (!host) {
-    c.d.MemFree(dev);
-    return nullptr;
+  float* host = nullptr;
+  auto it = c.pool.find(nb);  // reuse a recycled buffer of this exact size
+  if (it != c.pool.end() && !it->second.empty()) {
+    dev = it->second.back().first;
+    host = it->second.back().second;
+    it->second.pop_back();
+  } else {
+    if (c.d.MemAlloc(&dev, nb) != 0) return nullptr;
+    host = static_cast<float*>(std::malloc(nb));
+    if (!host) {
+      c.d.MemFree(dev);
+      return nullptr;
+    }
   }
   c.mirrors[dev] = context::mirror{host, dev, nb, context::HOST};
   if (contents) *contents = host;
@@ -347,11 +364,12 @@ inline void release(void* buf, int64_t, float*) {
   if (!c.ready || !buf) return;
   CUdeviceptr dev = reinterpret_cast<CUdeviceptr>(buf);
   auto it = c.mirrors.find(dev);
-  if (it != c.mirrors.end()) {
-    std::free(it->second.host);
-    c.mirrors.erase(it);
+  if (it == c.mirrors.end()) {
+    c.d.MemFree(dev);  // untracked (shouldn't happen); free outright
+    return;
   }
-  c.d.MemFree(dev);
+  c.pool[it->second.bytes].push_back({dev, it->second.host});  // recycle
+  c.mirrors.erase(it);
 }
 
 // Reconcile a buffer for a CPU access: flush pending kernels, then D2H if the
