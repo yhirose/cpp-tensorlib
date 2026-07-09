@@ -1427,9 +1427,11 @@ struct graph {
       return std::nullopt;
     array out = array::empty({H, D});
     if (!out.storage_.native) return std::nullopt;
+    // Array path has no persistent cache: K/V are [H,ctx,D], so n_kv_heads==H
+    // (no GQA) and kv_max==ctx (kv_stride==ctx*D degenerates to whole-buffer).
     if (!gpu::attn_decode(q.storage_.native, K.storage_.native,
-                          V.storage_.native, out.storage_.native, H, ctx, D,
-                          n.arg0)) {
+                          V.storage_.native, out.storage_.native, H, H, ctx, ctx,
+                          D, n.arg0)) {
       return std::nullopt;
     }
     return out;

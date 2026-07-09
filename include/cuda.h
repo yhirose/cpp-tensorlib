@@ -288,6 +288,13 @@ struct context {
     return attn_combine_fn;
   }
 
+  // M9 KV cache append (scatter one token's k,v into the persistent cache).
+  CUfunction kv_append_fn = nullptr;
+  CUfunction kv_append_() {
+    if (!kv_append_fn) d.ModuleGetFunction(&kv_append_fn, mod, "tl_kv_append");
+    return kv_append_fn;
+  }
+
   // Reusable device scratch for split-KV partials. Grown as needed, reused
   // across attention calls (sequential on the null stream), freed at teardown.
   CUdeviceptr attn_scratch = 0;
@@ -509,13 +516,16 @@ inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
                           nullptr) == 0;
 }
 
-// M9 fused decode attention: out(h,:) = softmax(scale·q(h,:)·K(h)^T)·V(h) in
-// one pass. q [heads,D], K/V [heads,ctx,D], out [heads,D], contiguous, D==128.
-// One block per head. No epilogue (attention is its own op).
-inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t heads,
-                        int64_t ctx, int64_t D, float scale) {
+// M9 fused decode attention: out(h,:) = softmax(scale·q(h,:)·K(kv,:)^T)·V(kv) in
+// one pass. q [n_q_heads,D], out [n_q_heads,D]; K/V are a [n_kv_heads,kv_max,D]
+// cache read over its valid prefix [0,ctx) (kv_max==ctx is the no-cache case).
+// GQA: q head h reads kv head h/(n_q_heads/n_kv_heads). Contiguous, D==128.
+inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
+                        int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
+                        int64_t D, float scale) {
   auto& c = context::get();
   if (!c.ready || D != 128) return false;
+  if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
   c.device_read_(q);
   c.device_read_(K);
   c.device_read_(V);
@@ -524,7 +534,9 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t heads,
   float* pk = context::off_(K, 0);
   float* pv = context::off_(V, 0);
   float* po = context::off_(out, 0);
-  unsigned uh = static_cast<unsigned>(heads), uctx = static_cast<unsigned>(ctx);
+  unsigned uh = static_cast<unsigned>(n_q_heads), uctx = static_cast<unsigned>(ctx);
+  unsigned kv_stride = static_cast<unsigned>(kv_max * D);
+  unsigned group = static_cast<unsigned>(n_q_heads / n_kv_heads);
 
   // Split ctx over gridDim.y so grid = heads×S fills the SMs (heads alone is
   // ~32 blocks « 82 SMs). Target ~4 blocks/SM; each split needs enough keys
@@ -540,7 +552,7 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t heads,
     }
   }
   if (S == 1) {
-    void* args[] = {&pq, &pk, &pv, &po, &uctx, &scale};
+    void* args[] = {&pq, &pk, &pv, &po, &uctx, &kv_stride, &group, &scale};
     c.pending = true;
     return c.d.LaunchKernel(c.attn_decode_(), uh, 1, 1, 128, 1, 1, 0, nullptr,
                             args, nullptr) == 0;
@@ -559,7 +571,9 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t heads,
   float* pl = pm + hs;
   float* pacc = pl + hs;
   c.pending = true;
-  void* a1[] = {&pq, &pk, &pv, &pm, &pl, &pacc, &uctx, &chunk, &scale};
+  void* a1[] = {&pq,     &pk,        &pv,    &pm,    &pl,
+                &pacc,   &uctx,      &kv_stride, &group, &chunk,
+                &scale};
   if (c.d.LaunchKernel(c.attn_split_(), uh, S, 1, 128, 1, 1, 0, nullptr, a1,
                        nullptr) != 0)
     return false;
@@ -567,6 +581,67 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t heads,
   return c.d.LaunchKernel(c.attn_combine_(), uh, 1, 1, 128, 1, 1, 0, nullptr, a2,
                           nullptr) == 0;
 }
+
+// M9 KV cache append: scatter one decode step's k,v (each [n_kv_heads,D] device
+// buffers) into the cache (K,V each [n_kv_heads,kv_max,D]) at row `pos`.
+inline bool kv_append(void* Kc, void* Vc, void* k_new, void* v_new, int64_t pos,
+                      int64_t kv_max, int64_t n_kv_heads, int64_t D) {
+  auto& c = context::get();
+  if (!c.ready || D != 128) return false;
+  c.device_read_(k_new);
+  c.device_read_(v_new);
+  c.device_write_(Kc);
+  c.device_write_(Vc);
+  float* pKc = context::off_(Kc, 0);
+  float* pVc = context::off_(Vc, 0);
+  float* pk = context::off_(k_new, 0);
+  float* pv = context::off_(v_new, 0);
+  unsigned upos = static_cast<unsigned>(pos);
+  unsigned kv_stride = static_cast<unsigned>(kv_max * D);
+  void* args[] = {&pKc, &pVc, &pk, &pv, &upos, &kv_stride};
+  c.pending = true;
+  return c.d.LaunchKernel(c.kv_append_(), static_cast<unsigned>(n_kv_heads), 1, 1,
+                          static_cast<unsigned>(D), 1, 1, 0, nullptr, args,
+                          nullptr) == 0;
+}
+
+// Persistent, device-resident KV cache (roadmap M9, A-surface): K,V buffers
+// [n_kv_heads, max_ctx, D] plus a running position. It lives OUTSIDE the lazy
+// graph — decode is inference-only and stateful, which the immutable node model
+// doesn't fit. append() writes one token and advances; attn() runs GQA-aware
+// fused decode attention over the cached prefix [0,pos).
+struct kv_cache {
+  void* K = nullptr;  // native device-buffer handles (see alloc())
+  void* V = nullptr;
+  int64_t n_kv_heads = 0, max_ctx = 0, D = 0, pos = 0;
+
+  bool init(int64_t kv_heads, int64_t maxctx, int64_t d) {
+    n_kv_heads = kv_heads;
+    max_ctx = maxctx;
+    D = d;
+    pos = 0;
+    K = alloc(n_kv_heads * max_ctx * D * 4, nullptr);
+    V = alloc(n_kv_heads * max_ctx * D * 4, nullptr);
+    return K && V;
+  }
+  // k_new/v_new: [n_kv_heads, D] device buffers (this step's projected k,v).
+  bool append(void* k_new, void* v_new) {
+    if (pos >= max_ctx) return false;
+    if (!kv_append(K, V, k_new, v_new, pos, max_ctx, n_kv_heads, D)) return false;
+    pos++;
+    return true;
+  }
+  // q/out: [n_q_heads, D] device buffers. Attends over the cached prefix.
+  bool attn(void* q, void* out, int64_t n_q_heads, float scale) {
+    return attn_decode(q, K, V, out, n_q_heads, n_kv_heads, pos, max_ctx, D,
+                       scale);
+  }
+  void destroy() {
+    if (K) release(K, 0, nullptr);
+    if (V) release(V, 0, nullptr);
+    K = V = nullptr;
+  }
+};
 
 // C(m,n) = (A @ B) * scale + offset. lda/ldb row strides; trans reads a
 // transposed view in place. One output per thread (16×16 blocks).

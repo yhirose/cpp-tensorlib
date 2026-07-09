@@ -458,13 +458,17 @@ __global__ void tl_attn_decode_f32(const float* __restrict__ q,
                                    const float* __restrict__ K,
                                    const float* __restrict__ V,
                                    float* __restrict__ out, unsigned ctx,
+                                   unsigned kv_stride, unsigned group,
                                    float scale) {
-  const unsigned h = blockIdx.x;
+  const unsigned h = blockIdx.x;                // query head
+  const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
   const unsigned tid = threadIdx.x;  // 0..127
   const unsigned lane = tid & 31u, warp = tid >> 5;  // 4 warps of 32
   const float* qh = q + (size_t)h * TL_AD;
-  const float* Kh = K + (size_t)h * ctx * TL_AD;
-  const float* Vh = V + (size_t)h * ctx * TL_AD;
+  // K,V are [H_kv, max_ctx, D]; kv_stride = max_ctx*D lets a persistent cache be
+  // read as its valid prefix [0,ctx) (kv_stride==ctx*TL_AD is the no-cache case).
+  const float* Kh = K + (size_t)kv_h * kv_stride;
+  const float* Vh = V + (size_t)kv_h * kv_stride;
 
   __shared__ float q_sh[TL_AD];
   q_sh[tid] = qh[tid];
@@ -525,13 +529,15 @@ __global__ void tl_attn_decode_split(const float* __restrict__ q,
                                      float* __restrict__ pm,
                                      float* __restrict__ pl,
                                      float* __restrict__ pacc, unsigned ctx,
+                                     unsigned kv_stride, unsigned group,
                                      unsigned chunk, float scale) {
   const unsigned h = blockIdx.x, s = blockIdx.y, S = gridDim.y;
+  const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
   const unsigned tid = threadIdx.x;
   const unsigned lane = tid & 31u, warp = tid >> 5;
   const float* qh = q + (size_t)h * TL_AD;
-  const float* Kh = K + (size_t)h * ctx * TL_AD;
-  const float* Vh = V + (size_t)h * ctx * TL_AD;
+  const float* Kh = K + (size_t)kv_h * kv_stride;
+  const float* Vh = V + (size_t)kv_h * kv_stride;
   const unsigned k0 = s * chunk;
   const unsigned k1 = (k0 + chunk < ctx) ? (k0 + chunk) : ctx;
 
@@ -601,6 +607,22 @@ __global__ void tl_attn_combine(const float* __restrict__ pm,
     o += pacc[(base + s) * TL_AD + tid] * e;
   }
   out[(size_t)h * TL_AD + tid] = o / gl;
+}
+
+// Append one decode step's k,v (each [H_kv, D] contiguous) into the persistent
+// cache at row `pos`. The cache is [H_kv, max_ctx, D], so head h's slot for the
+// new token starts at h*kv_stride + pos*D (kv_stride = max_ctx*D). Heads are
+// non-contiguous in the cache, so this is a scatter, not a plain copy.
+// grid.x = H_kv, blockDim = D.
+__global__ void tl_kv_append(float* __restrict__ Kc, float* __restrict__ Vc,
+                             const float* __restrict__ k_new,
+                             const float* __restrict__ v_new, unsigned pos,
+                             unsigned kv_stride) {
+  const unsigned h = blockIdx.x, d = threadIdx.x;
+  const size_t dst = (size_t)h * kv_stride + (size_t)pos * TL_AD + d;
+  const size_t src = (size_t)h * TL_AD + d;
+  Kc[dst] = k_new[src];
+  Vc[dst] = v_new[src];
 }
 #undef TL_AD
 #undef TL_ADPT

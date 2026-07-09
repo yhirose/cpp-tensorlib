@@ -545,6 +545,28 @@ partial states → combine pass) → **2.54 ms, 844 GB/s (~19×)**, bandwidth-bo
 Numerically exact throughout (maxrel ~1e-7). Array-integrated at 0.110 ms/layer
 (13.5× the unfused path).
 
+**KV cache + GQA/MQA** (`bench_attn_decode`, 2026-07-08): decode-side, kernel +
+direct-bench first (STEEL). The persistent cache is a `cuda::kv_cache` object (K,V
+`[n_kv_heads, max_ctx, D]` device buffers + `pos`), *outside* the lazy graph —
+decode is stateful/inference-only, a poor fit for the immutable node model. The
+linchpin kernel change is a **`kv_stride`** param (head stride = `max_ctx*D`,
+distinct from the valid length `ctx`), so `tl_attn_decode_split` reads a persistent
+max_ctx allocation as its prefix `[0,pos)`; `kv_stride==ctx*D` degenerates to the
+pre-cache whole-buffer path exactly (the array `attn_decode` still uses it — MHA
+numbers above unchanged, re-verified maxrel ~1e-7). A **`group`** param
+(`n_q_heads/n_kv_heads`) adds GQA/MQA: query head `h` reads kv head `h/group`.
+`tl_kv_append` scatters one token's k,v `[n_kv_heads,D]` into the cache at `pos`.
+Verified by growing the cache token-by-token to 2048 and comparing a from-scratch
+CPU reference (prefix + GQA mapping) at 11 checkpoints across the split-KV boundary
+(ctx≥256) and its chunk rounding — **maxrel 1.6e-7**. GQA (32 q / 8 kv, group 4) at
+ctx=2048 runs at **0.044 ms/layer vs MHA's 0.081** (~1.85× faster wall-time) and 4×
+less KV cache VRAM. The reported "unique KV GB/s" (383) understates real efficiency:
+with group=4, four q-head blocks each stream the *same* kv head, so physical DRAM
+traffic sits between the unique (HKV) and redundant (HQ) bounds, partly served by
+L2 — the next tuning lever is a per-group block that reads each kv head once (not
+once per q head in the group). Causal masking + prefill (compute-bound, multi-query
+— a distinct kernel) are the deferred next step, not decode-path work.
+
 **int4 dequant GEMV** (`bench_q4_gemv`, group=32 symmetric int4, [N,K] layout):
 correct vs a host dequant reference (maxrel ~1e-5), 0.625 bytes/weight (0.5
 packed + 4/32 scale) vs bf16's 2.0. **1.79× vs bf16** (layer sum 0.436 vs 0.78

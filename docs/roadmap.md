@@ -338,7 +338,7 @@ llama.cpp/exllamav2 hand-write. GGUF-style group quantization (Q4_K etc.) is the
 reference format to stay interop-friendly. Gate: **tokens/sec within reach of
 llama.cpp/exllamav2** on the same quantized model + GPU (not GFLOP/s vs cuBLAS).
 
-### M9 — Fused attention + KV cache  🔨 fused decode attention done; KV cache / GQA / mask remain
+### M9 — Fused attention + KV cache  🔨 decode attention + KV cache + GQA done; causal mask / prefill remain
 
 **Done (fused decode attention, 2026-07-04):** `array::attn_decode(q,K,V,scale)`
 (op_t::attn_dec) → `tl_attn_decode_*`. Flash-attention online-softmax in one pass
@@ -346,10 +346,29 @@ llama.cpp/exllamav2** on the same quantized model + GPU (not GFLOP/s vs cuBLAS).
 score reduction, split-KV across `gridDim.y` + a combine pass so grid = H×S fills
 the SMs. KV-bandwidth-bound (~844 GB/s, ~19× the unfused 3-op array path);
 numerically exact (maxrel ~1e-7); CPU reference fallback. Integrated end to end:
-decode 12.2 → 26.1 tok/s (F32), 41.2 with bf16 weights. **Remaining:** the KV
-cache itself (append per decode step), GQA/MQA head sharing, causal masking, and
-prefill (compute-bound, long-context) attention. head_dim is currently fixed at
-128 (host-gated). See performance-notes.md.
+decode 12.2 → 26.1 tok/s (F32), 41.2 with bf16 weights.
+
+**Done (KV cache + GQA/MQA, 2026-07-08):** decode-side, kernel + direct-bench
+proven (STEEL). A persistent device-resident **`cuda::kv_cache`** object (K,V
+buffers `[n_kv_heads, max_ctx, D]` + running `pos`) lives *outside* the lazy graph
+— decode is inference-only and stateful, which the immutable node model doesn't
+fit (chosen A-surface; B = first-class array node was rejected as high-friction).
+Two surgical kernel changes: (1) attention gains a **`kv_stride`** param (head
+stride = `max_ctx*D`, distinct from the valid length `ctx`) so it reads a
+persistent cache as its prefix `[0,pos)` — `kv_stride==ctx*D` degenerates to the
+old whole-buffer path (the array `attn_decode` still rides that, unchanged); (2) a
+**`group`** param (`n_q_heads/n_kv_heads`) maps each query head to its shared kv
+head for **GQA/MQA** (`group==1` = MHA). Plus `tl_kv_append` — a scatter that
+writes one token's projected k,v `[n_kv_heads,D]` into the cache at `pos`.
+Verified in `bench_attn_decode` by growing the cache one token at a time to 2048
+and checking a from-scratch CPU reference (prefix + GQA mapping) at 11 checkpoints
+straddling the split-KV boundary — **maxrel 1.6e-7**. GQA (32 q / 8 kv) at
+ctx=2048 is ~1.85× faster wall-time than MHA (0.044 vs 0.081 ms/layer) and 4× less
+KV cache VRAM. **Remaining:** causal masking + prefill (compute-bound,
+long-context, multi-query — a distinct kernel) as the next step; a per-group
+shared-kv-head block (read each kv head once, not once per q head in the group) is
+the GQA tuning lever. head_dim is still fixed at 128 (host-gated). See
+performance-notes.md.
 
 Flash-attention-style fused attention (tiled QKᵀ → online softmax → ·V, never
 materializing the S×S scores), causal masking, and a **KV cache** (append per
