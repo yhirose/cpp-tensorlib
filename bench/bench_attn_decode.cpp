@@ -246,5 +246,158 @@ int main() {
     release(q, 0, nullptr);
     release(o, 0, nullptr);
   }
+
+  // ---- Causal prefill: process a T-token prompt at once (query p attends keys
+  // 0..p), fill the cache, then verify a decode step continues from pos=T. ----
+  {
+    const int64_t HQ = 32, HKV = 8, D = 128, MAXC = 2048, T = 512;
+    const int64_t group = HQ / HKV;
+    const float scale = 1.0f / std::sqrt((float)D);
+    std::printf(
+        "\ncausal prefill — %lld q / %lld kv heads, T=%lld, max_ctx=%lld\n",
+        (long long)HQ, (long long)HKV, (long long)T, (long long)MAXC);
+
+    float *hks = nullptr, *hvs = nullptr, *hqp = nullptr, *hop = nullptr;
+    void* ks = alloc(HKV * T * D * 4, &hks);  // prompt k,v [HKV,T,D]
+    void* vs = alloc(HKV * T * D * 4, &hvs);
+    void* qp = alloc(HQ * T * D * 4, &hqp);  // prompt queries [HQ,T,D]
+    void* op = alloc(HQ * T * D * 4, &hop);
+
+    uint32_t st = 424242u;
+    auto rnd = [&] {
+      st ^= st << 13;
+      st ^= st >> 17;
+      st ^= st << 5;
+      return (int32_t)st * (1.0f / 2147483648.0f);
+    };
+    for (int64_t i = 0; i < HKV * T * D; i++) {
+      hks[i] = rnd();
+      hvs[i] = rnd();
+    }
+    for (int64_t i = 0; i < HQ * T * D; i++) hqp[i] = rnd();
+
+    kv_cache cache;
+    if (!cache.init(HKV, MAXC, D)) {
+      std::printf("  cache init failed\n");
+      return 1;
+    }
+    cache.prefill(qp, ks, vs, op, T, HQ, scale);
+    flush();
+    sync_to_host(op, false);
+
+    // CPU causal reference: out[qh,p,:] = softmax over keys 0..p of q·kᵀ · v.
+    double maxrel = 0;
+    std::vector<float> scores(T);
+    for (int64_t qh = 0; qh < HQ; qh++) {
+      int64_t kvh = qh / group;
+      const float* Kh = hks + kvh * T * D;
+      const float* Vh = hvs + kvh * T * D;
+      for (int64_t p = 0; p < T; p++) {
+        const float* qhp = hqp + (qh * T + p) * D;
+        float mx = -1e30f;
+        for (int64_t j = 0; j <= p; j++) {
+          float s = 0;
+          for (int64_t d = 0; d < D; d++) s += qhp[d] * Kh[j * D + d];
+          scores[j] = s * scale;
+          mx = std::max(mx, scores[j]);
+        }
+        float sum = 0;
+        for (int64_t j = 0; j <= p; j++) {
+          scores[j] = std::exp(scores[j] - mx);
+          sum += scores[j];
+        }
+        for (int64_t d = 0; d < D; d++) {
+          float acc = 0;
+          for (int64_t j = 0; j <= p; j++) acc += scores[j] * Vh[j * D + d];
+          float ref = acc / sum;
+          float got = hop[(qh * T + p) * D + d];
+          maxrel = std::max<double>(
+              maxrel, std::fabs(got - ref) / (1.0 + std::fabs(ref)));
+        }
+      }
+    }
+    std::printf("  prefill T=%lld — maxrel %.1e %s (cache pos now %lld)\n",
+                (long long)T, maxrel, maxrel < 1e-4 ? "OK" : "FAIL",
+                (long long)cache.pos);
+
+    // Decode continues: append one token at pos=T, attend over 0..T. Verifies
+    // the prefill→decode handoff (prefill-filled rows + the appended row).
+    float *hkn = nullptr, *hvn = nullptr, *hq1 = nullptr, *ho1 = nullptr;
+    void* kn = alloc(HKV * D * 4, &hkn);
+    void* vn = alloc(HKV * D * 4, &hvn);
+    void* q1 = alloc(HQ * D * 4, &hq1);
+    void* o1 = alloc(HQ * D * 4, &ho1);
+    for (int64_t i = 0; i < HKV * D; i++) {
+      hkn[i] = rnd();
+      hvn[i] = rnd();
+    }
+    for (int64_t i = 0; i < HQ * D; i++) hq1[i] = rnd();
+    sync_to_host(kn, true);
+    sync_to_host(vn, true);
+    sync_to_host(q1, true);
+    cache.append(kn, vn);
+    cache.attn(q1, o1, HQ, scale);
+    flush();
+    sync_to_host(o1, false);
+
+    double drel = 0;
+    std::vector<float> sc(T + 1);
+    for (int64_t qh = 0; qh < HQ; qh++) {
+      int64_t kvh = qh / group;
+      const float* Kh = hks + kvh * T * D;
+      const float* Vh = hvs + kvh * T * D;
+      const float* q1p = hq1 + qh * D;
+      float mx = -1e30f;
+      for (int64_t j = 0; j <= T; j++) {  // keys 0..T (T from prefill + 1 new)
+        const float* kj = (j < T) ? Kh + j * D : hkn + kvh * D;
+        float s = 0;
+        for (int64_t d = 0; d < D; d++) s += q1p[d] * kj[d];
+        sc[j] = s * scale;
+        mx = std::max(mx, sc[j]);
+      }
+      float sum = 0;
+      for (int64_t j = 0; j <= T; j++) {
+        sc[j] = std::exp(sc[j] - mx);
+        sum += sc[j];
+      }
+      for (int64_t d = 0; d < D; d++) {
+        float acc = 0;
+        for (int64_t j = 0; j <= T; j++) {
+          const float* vj = (j < T) ? Vh + j * D : hvn + kvh * D;
+          acc += sc[j] * vj[d];
+        }
+        float ref = acc / sum;
+        float got = ho1[qh * D + d];
+        drel = std::max<double>(drel,
+                                std::fabs(got - ref) / (1.0 + std::fabs(ref)));
+      }
+    }
+    std::printf("  decode step at pos=%lld — maxrel %.1e %s\n",
+                (long long)cache.pos - 1, drel, drel < 1e-4 ? "OK" : "FAIL");
+
+    // Prefill timing.
+    std::vector<double> ms;
+    for (int r = 0; r < ROUNDS; r++) {
+      auto t0 = clk::now();
+      for (int i = 0; i < R; i++)
+        attn_prefill(qp, cache.K, cache.V, op, HQ, HKV, T, MAXC, D, scale);
+      flush();
+      ms.push_back(
+          std::chrono::duration<double, std::milli>(clk::now() - t0).count() / R);
+    }
+    double pf_ms = median(ms);
+    std::printf("  prefill attn: %.4f ms for T=%lld (%.1f Ktok/s)\n", pf_ms,
+                (long long)T, T / pf_ms);
+
+    cache.destroy();
+    release(ks, 0, nullptr);
+    release(vs, 0, nullptr);
+    release(qp, 0, nullptr);
+    release(op, 0, nullptr);
+    release(kn, 0, nullptr);
+    release(vn, 0, nullptr);
+    release(q1, 0, nullptr);
+    release(o1, 0, nullptr);
+  }
   return 0;
 }

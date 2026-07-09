@@ -624,6 +624,90 @@ __global__ void tl_kv_append(float* __restrict__ Kc, float* __restrict__ Vc,
   Kc[dst] = k_new[src];
   Vc[dst] = v_new[src];
 }
+
+// Bulk-fill the cache from a prefill's k,v (each [H_kv, T, D] contiguous) into
+// the cache [H_kv, max_ctx, D] rows [0,T). The two differ only in the row
+// stride (T vs max_ctx), so this is a strided copy. grid = (H_kv, T), block = D.
+__global__ void tl_kv_fill(float* __restrict__ Kc, float* __restrict__ Vc,
+                           const float* __restrict__ K,
+                           const float* __restrict__ V, unsigned T,
+                           unsigned kv_stride) {
+  const unsigned h = blockIdx.x, p = blockIdx.y, d = threadIdx.x;
+  const size_t dst = (size_t)h * kv_stride + (size_t)p * TL_AD + d;
+  const size_t src = ((size_t)h * T + p) * TL_AD + d;
+  Kc[dst] = K[src];
+  Vc[dst] = V[src];
+}
+
+// Causal prefill attention: process all T query positions of a prompt at once.
+// Query at position p attends to keys 0..p (the causal mask). q,out are
+// [H_q, T, D]; K,V are the [H_kv, kv_max, D] cache read over [0,p] via kv_stride.
+// Reuses the decode online-softmax (no T×T scores materialized), one block per
+// (head, query pos) so the grid = H_q×T fills the SMs (no split-KV needed). This
+// is the correctness-first baseline — each query re-streams its keys from DRAM
+// (O(T²) traffic); a query×key tiled flash-attention is the deferred tuning pass.
+// grid = (H_q, T), blockDim = 128 = head_dim (4 warps).
+__global__ void tl_attn_prefill_f32(const float* __restrict__ q,
+                                    const float* __restrict__ K,
+                                    const float* __restrict__ V,
+                                    float* __restrict__ out, unsigned T,
+                                    unsigned kv_stride, unsigned group,
+                                    float scale) {
+  const unsigned h = blockIdx.x;                // query head
+  const unsigned p = blockIdx.y;                // query pos, attends keys 0..p
+  const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
+  const unsigned tid = threadIdx.x;
+  const unsigned lane = tid & 31u, warp = tid >> 5;
+  const float* qh = q + ((size_t)h * T + p) * TL_AD;  // q is [H_q, T, D]
+  const float* Kh = K + (size_t)kv_h * kv_stride;
+  const float* Vh = V + (size_t)kv_h * kv_stride;
+
+  __shared__ float q_sh[TL_AD];
+  q_sh[tid] = qh[tid];
+  __syncthreads();
+
+  float m = -1e30f, l = 0.0f;
+  float acc[TL_ADPT] = {};
+  for (unsigned i = warp; i <= p; i += 4u) {  // causal: keys 0..p only
+    const float* Ki = Kh + (size_t)i * TL_AD;
+    float partial = 0.0f;
+#pragma unroll
+    for (int r = 0; r < TL_ADPT; r++) partial += q_sh[lane + r * 32] * Ki[lane + r * 32];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      partial += __shfl_down_sync(0xffffffffu, partial, off);
+    float s = __shfl_sync(0xffffffffu, partial, 0) * scale;
+    float m_new = fmaxf(m, s);
+    float corr = __expf(m - m_new);
+    float pp = __expf(s - m_new);
+    l = l * corr + pp;
+    const float* Vi = Vh + (size_t)i * TL_AD;
+#pragma unroll
+    for (int r = 0; r < TL_ADPT; r++) acc[r] = acc[r] * corr + pp * Vi[lane + r * 32];
+    m = m_new;
+  }
+
+  // merge the 4 warps' partial softmax states (empty warps carry m=-1e30,l=0 →
+  // contribute exp(-inf)=0, correct for the short causal prefixes at small p)
+  __shared__ float sm[4], sl[4], sacc[4][TL_AD];
+  if (lane == 0) {
+    sm[warp] = m;
+    sl[warp] = l;
+  }
+#pragma unroll
+  for (int r = 0; r < TL_ADPT; r++) sacc[warp][lane + r * 32] = acc[r];
+  __syncthreads();
+
+  float gm = fmaxf(fmaxf(sm[0], sm[1]), fmaxf(sm[2], sm[3]));
+  float gl = 0.0f, o = 0.0f;
+#pragma unroll
+  for (int w = 0; w < 4; w++) {
+    float e = __expf(sm[w] - gm);
+    gl += sl[w] * e;
+    o += sacc[w][tid] * e;
+  }
+  out[((size_t)h * T + p) * TL_AD + tid] = o / gl;
+}
 #undef TL_AD
 #undef TL_ADPT
 

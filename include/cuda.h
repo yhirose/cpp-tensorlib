@@ -295,6 +295,18 @@ struct context {
     return kv_append_fn;
   }
 
+  // M9 prefill: bulk cache fill + causal prefill attention.
+  CUfunction kv_fill_fn = nullptr, attn_prefill_fn = nullptr;
+  CUfunction kv_fill_() {
+    if (!kv_fill_fn) d.ModuleGetFunction(&kv_fill_fn, mod, "tl_kv_fill");
+    return kv_fill_fn;
+  }
+  CUfunction attn_prefill_() {
+    if (!attn_prefill_fn)
+      d.ModuleGetFunction(&attn_prefill_fn, mod, "tl_attn_prefill_f32");
+    return attn_prefill_fn;
+  }
+
   // Reusable device scratch for split-KV partials. Grown as needed, reused
   // across attention calls (sequential on the null stream), freed at teardown.
   CUdeviceptr attn_scratch = 0;
@@ -605,6 +617,57 @@ inline bool kv_append(void* Kc, void* Vc, void* k_new, void* v_new, int64_t pos,
                           nullptr) == 0;
 }
 
+// M9 prefill: bulk-copy a prompt's k,v (each [n_kv_heads,T,D] device buffers)
+// into the cache (K,V each [n_kv_heads,kv_max,D]) rows [0,T). grid=(n_kv_heads,T).
+inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
+                    int64_t kv_max, int64_t n_kv_heads, int64_t D) {
+  auto& c = context::get();
+  if (!c.ready || D != 128) return false;
+  c.device_read_(K);
+  c.device_read_(V);
+  c.device_write_(Kc);
+  c.device_write_(Vc);
+  float* pKc = context::off_(Kc, 0);
+  float* pVc = context::off_(Vc, 0);
+  float* pk = context::off_(K, 0);
+  float* pv = context::off_(V, 0);
+  unsigned uT = static_cast<unsigned>(T);
+  unsigned kv_stride = static_cast<unsigned>(kv_max * D);
+  void* args[] = {&pKc, &pVc, &pk, &pv, &uT, &kv_stride};
+  c.pending = true;
+  return c.d.LaunchKernel(c.kv_fill_(), static_cast<unsigned>(n_kv_heads),
+                          static_cast<unsigned>(T), 1, static_cast<unsigned>(D),
+                          1, 1, 0, nullptr, args, nullptr) == 0;
+}
+
+// M9 causal prefill attention: q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D]
+// cache read over [0,T). Query p attends keys 0..p. GQA via group. D==128.
+// One block per (head, query pos); grid=(n_q_heads,T) (T <= 65535 gridDim.y).
+inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads,
+                         int64_t n_kv_heads, int64_t T, int64_t kv_max, int64_t D,
+                         float scale) {
+  auto& c = context::get();
+  if (!c.ready || D != 128) return false;
+  if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
+  if (T <= 0 || T > 65535) return false;  // gridDim.y limit (chunk beyond)
+  c.device_read_(q);
+  c.device_read_(K);
+  c.device_read_(V);
+  c.device_write_(out);
+  float* pq = context::off_(q, 0);
+  float* pk = context::off_(K, 0);
+  float* pv = context::off_(V, 0);
+  float* po = context::off_(out, 0);
+  unsigned uT = static_cast<unsigned>(T);
+  unsigned kv_stride = static_cast<unsigned>(kv_max * D);
+  unsigned group = static_cast<unsigned>(n_q_heads / n_kv_heads);
+  void* args[] = {&pq, &pk, &pv, &po, &uT, &kv_stride, &group, &scale};
+  c.pending = true;
+  return c.d.LaunchKernel(c.attn_prefill_(), static_cast<unsigned>(n_q_heads), uT,
+                          1, static_cast<unsigned>(D), 1, 1, 0, nullptr, args,
+                          nullptr) == 0;
+}
+
 // Persistent, device-resident KV cache (roadmap M9, A-surface): K,V buffers
 // [n_kv_heads, max_ctx, D] plus a running position. It lives OUTSIDE the lazy
 // graph — decode is inference-only and stateful, which the immutable node model
@@ -635,6 +698,17 @@ struct kv_cache {
   bool attn(void* q, void* out, int64_t n_q_heads, float scale) {
     return attn_decode(q, K, V, out, n_q_heads, n_kv_heads, pos, max_ctx, D,
                        scale);
+  }
+  // Prefill a T-token prompt: bulk-fill the cache from k_src/v_src
+  // ([n_kv_heads,T,D]) and run causal attention (q/out [n_q_heads,T,D]). Leaves
+  // pos=T so decode continues from there. Overwrites the cache from row 0.
+  bool prefill(void* q, void* k_src, void* v_src, void* out, int64_t T,
+               int64_t n_q_heads, float scale) {
+    if (T <= 0 || T > max_ctx) return false;
+    if (!kv_fill(K, V, k_src, v_src, T, max_ctx, n_kv_heads, D)) return false;
+    pos = T;
+    return attn_prefill(q, K, V, out, n_q_heads, n_kv_heads, T, max_ctx, D,
+                        scale);
   }
   void destroy() {
     if (K) release(K, 0, nullptr);

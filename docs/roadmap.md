@@ -338,7 +338,7 @@ llama.cpp/exllamav2 hand-write. GGUF-style group quantization (Q4_K etc.) is the
 reference format to stay interop-friendly. Gate: **tokens/sec within reach of
 llama.cpp/exllamav2** on the same quantized model + GPU (not GFLOP/s vs cuBLAS).
 
-### M9 — Fused attention + KV cache  🔨 decode attention + KV cache + GQA done; causal mask / prefill remain
+### M9 — Fused attention + KV cache  🔨 decode + KV cache + GQA + causal prefill done (baseline); prefill tiling + array/culebra surface remain
 
 **Done (fused decode attention, 2026-07-04):** `array::attn_decode(q,K,V,scale)`
 (op_t::attn_dec) → `tl_attn_decode_*`. Flash-attention online-softmax in one pass
@@ -364,11 +364,29 @@ Verified in `bench_attn_decode` by growing the cache one token at a time to 2048
 and checking a from-scratch CPU reference (prefix + GQA mapping) at 11 checkpoints
 straddling the split-KV boundary — **maxrel 1.6e-7**. GQA (32 q / 8 kv) at
 ctx=2048 is ~1.85× faster wall-time than MHA (0.044 vs 0.081 ms/layer) and 4× less
-KV cache VRAM. **Remaining:** causal masking + prefill (compute-bound,
-long-context, multi-query — a distinct kernel) as the next step; a per-group
-shared-kv-head block (read each kv head once, not once per q head in the group) is
-the GQA tuning lever. head_dim is still fixed at 128 (host-gated). See
-performance-notes.md.
+KV cache VRAM.
+
+**Done (causal prefill + cache fill, 2026-07-08):** the prompt-processing regime,
+kernel + direct-bench (STEEL), correctness-first baseline. `tl_attn_prefill_f32`
+processes all T query positions at once: query `p` attends keys `0..p` (**causal
+masking**), one block per (head, query pos) so grid = H_q×T fills the SMs (no
+split-KV needed). It **reuses the decode online-softmax verbatim** — only the key
+loop cap (`i<=p`) and the query-row index differ — so no T×T scores are ever
+materialized. `tl_kv_fill` bulk-copies a prompt's k,v `[H_kv,T,D]` into the cache
+`[0,T)`; `kv_cache::prefill(q,k,v,out,T,...)` chains fill → causal attend and
+leaves `pos=T` so decode continues. Verified against a from-scratch causal CPU
+reference (T=512): **prefill maxrel 1.6e-7**, and a follow-on decode step at
+pos=512 (prefill-filled rows + one appended token) **maxrel 8.5e-8** — the
+prefill→decode handoff is exact. Baseline throughput ~335 Ktok/s (T=512, one
+layer's attention). **This is deliberately un-tiled** — each query re-streams its
+keys from DRAM (O(T²) traffic), so it's bandwidth-bound, not compute-optimal.
+**Remaining:** a query×key **tiled flash-attention** prefill (shared-mem K/V
+reuse across a query block) is the tuning pass, gated on prefill proving a
+bottleneck (scope: prefill is a minority one-time cost); T>65535 needs gridDim.y
+chunking; the array/culebra surface for the whole cache (currently a `cuda::`
+object only); a per-group shared-kv-head block is the GQA tuning lever; a bf16 KV
+cache (~2× the attention floor) is the next decode lever. head_dim is still fixed
+at 128 (host-gated). See performance-notes.md.
 
 Flash-attention-style fused attention (tiled QKᵀ → online softmax → ·V, never
 materializing the S×S scores), causal masking, and a **KV cache** (append per

@@ -564,8 +564,24 @@ less KV cache VRAM. The reported "unique KV GB/s" (383) understates real efficie
 with group=4, four q-head blocks each stream the *same* kv head, so physical DRAM
 traffic sits between the unique (HKV) and redundant (HQ) bounds, partly served by
 L2 — the next tuning lever is a per-group block that reads each kv head once (not
-once per q head in the group). Causal masking + prefill (compute-bound, multi-query
-— a distinct kernel) are the deferred next step, not decode-path work.
+once per q head in the group).
+
+**Causal prefill** (`bench_attn_decode`, 2026-07-08): the prompt regime, baseline
+kernel + direct-bench. `tl_attn_prefill_f32` processes all T query positions at
+once — query `p` attends keys `0..p` (**causal mask** = loop cap `i<=p`), one block
+per (head, query pos) so grid = H_q×T fills the SMs with no split-KV. It reuses the
+decode online-softmax verbatim (only the loop cap + query-row index change), so no
+T×T scores are materialized. `tl_kv_fill` bulk-copies a prompt's k,v `[H_kv,T,D]`
+into the cache `[0,T)`; `kv_cache::prefill` chains fill → attend and sets `pos=T`.
+Verified vs a from-scratch causal CPU reference (T=512): **prefill maxrel 1.6e-7**,
+and a follow-on decode step at pos=512 **maxrel 8.5e-8** (the prefill→decode
+handoff — prefill-filled rows + one appended token — is exact). ~335 Ktok/s (T=512,
+one layer). **Deliberately un-tiled**: each query re-streams its keys from DRAM
+(O(T²) traffic → bandwidth-bound, not compute-optimal). The tuning pass is a
+query×key tiled flash-attention (shared-mem K/V reuse across a query block), gated
+on prefill proving a bottleneck — per scope, prefill is a minority one-time cost,
+so the correct baseline is the right stopping point for now. T>65535 needs
+gridDim.y chunking.
 
 **int4 dequant GEMV** (`bench_q4_gemv`, group=32 symmetric int4, [N,K] layout):
 correct vs a host dequant reference (maxrel ~1e-5), 0.625 bytes/weight (0.5
