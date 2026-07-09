@@ -338,7 +338,7 @@ llama.cpp/exllamav2 hand-write. GGUF-style group quantization (Q4_K etc.) is the
 reference format to stay interop-friendly. Gate: **tokens/sec within reach of
 llama.cpp/exllamav2** on the same quantized model + GPU (not GFLOP/s vs cuBLAS).
 
-### M9 — Fused attention + KV cache  🔨 decode + KV cache + GQA + causal prefill done (baseline); prefill tiling + array/culebra surface remain
+### M9 — Fused attention + KV cache  🔨 decode + KV cache + GQA + causal prefill + block-wiring done; cache↔array bridge in the decode loop + GGUF/tokenizer + prefill tiling remain
 
 **Done (fused decode attention, 2026-07-04):** `array::attn_decode(q,K,V,scale)`
 (op_t::attn_dec) → `tl_attn_decode_*`. Flash-attention online-softmax in one pass
@@ -387,6 +387,26 @@ chunking; the array/culebra surface for the whole cache (currently a `cuda::`
 object only); a per-group shared-kv-head block is the GQA tuning lever; a bf16 KV
 cache (~2× the attention floor) is the next decode lever. head_dim is still fixed
 at 128 (host-gated). See performance-notes.md.
+
+**Done (model building-block ops + verified decoder block, 2026-07-09):** the
+"turn kernels into a runnable LLM" wiring, at the **pure array-op surface** (so it
+rides the tuned kernels and is autograd-ready for the fine-tuning path). The one
+genuinely new op is **RoPE** (`array::rope(x,pos,base)` → `op_t::rope` →
+`tl_rope`, half-split / GPT-NeoX-HF convention, GPU kernel + CPU ref; x is
+`[H,D]` decode / `[H,T,D]` prefill, per-row position `pos+(row%T)`). **RMSNorm,
+SiLU, SwiGLU are pure compositions** of existing ops (`rmsnorm = x·rsqrt(mean(x²)
++eps)·w`; `silu = x·σ(x)`; `swiglu = silu(gate)·up`) — no new kernels, correct by
+construction. A full **llama decoder block** (RMSNorm → qkv proj → RoPE(q,k) →
+append → attn_decode → out proj → residual → RMSNorm → SwiGLU MLP → residual) is
+assembled from these + `dot` + `attn_decode` and verified vs a from-scratch CPU
+reference in `bench/check_llm_block.cpp` (ctest `llm_block`, backend-agnostic):
+**decoder-block maxrel 1.8e-7** on GPU, all six unit+block checks green on both
+CUDA and CPU builds. **Remaining to an actual chat:** the block test uses the pure
+MHA `array::attn_decode` for attention — wiring the persistent `cuda::kv_cache`
+(GQA + causal prefill) into a multi-layer decode *loop* needs the array↔native
+bridge (a public `array::native()` + a cached-attention entry, or a small app
+layer); then GGUF weight loading + a BPE tokenizer + sampling (mechanical bulk —
+Fable-appropriate). VJPs for RoPE (training) are deferred.
 
 Flash-attention-style fused attention (tiled QKᵀ → online softmax → ·V, never
 materializing the S×S scores), causal masking, and a **KV cache** (append per

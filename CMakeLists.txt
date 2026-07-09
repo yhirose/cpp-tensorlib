@@ -163,6 +163,13 @@ target_link_libraries(tensorlib_bench_llm PRIVATE tensorlib)
 add_executable(tensorlib_bench_mlp bench/bench_mlp_train.cpp)
 target_link_libraries(tensorlib_bench_mlp PRIVATE tensorlib)
 
+# M9 model-surface check: RoPE op + RMSNorm/SiLU/SwiGLU compositions + a full
+# llama decoder block, all via the array API, verified vs a from-scratch CPU
+# reference. Backend-agnostic; gates correctness of the transformer wiring.
+add_executable(tensorlib_check_llm_block bench/check_llm_block.cpp)
+target_link_libraries(tensorlib_check_llm_block PRIVATE tensorlib)
+add_test(NAME llm_block COMMAND tensorlib_check_llm_block)
+
 # These benches drive the GPU through the backend-agnostic eval seam; on a CUDA
 # build they must carry the embedded PTX + TENSORLIB_CUDA define, same as the
 # tests, or gpu_available() stays false and every GPU section silently skips.
@@ -171,6 +178,7 @@ if(TENSORLIB_CUDA)
   tensorlib_enable_cuda(tensorlib_census)
   tensorlib_enable_cuda(tensorlib_bench_llm)
   tensorlib_enable_cuda(tensorlib_bench_mlp)
+  tensorlib_enable_cuda(tensorlib_check_llm_block)
 endif()
 
 # Own CPU GEMM bench (M5 tuning). Links OpenBLAS for the off-Apple gate when

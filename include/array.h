@@ -153,6 +153,7 @@ struct node {
     where_,
     dot,
     attn_dec,  // fused decode attention: softmax(arg0 · q·Kᵀ)·V
+    rope,      // rotary position embedding (arg0=base, axis=position offset)
     sum_ax, mean_ax, max_ax, argmax_ax, sum_to_,
   };
 
@@ -255,6 +256,15 @@ class array {
   // D==128 this is the fused flash-attention kernel; otherwise a CPU reference.
   static array attn_decode(const array& q, const array& K, const array& V,
                            float scale);
+
+  // Transformer building blocks (M9 model surface). RoPE is a fused op (needs
+  // cos/sin); RMSNorm/SiLU/SwiGLU are pure compositions of existing ops (so they
+  // ride the tuned kernels and are autograd-ready when VJPs land). RoPE input is
+  // [H,D] (decode, T=1) or [H,T,D] (prefill); `pos` is the position of t=0.
+  static array rope(const array& x, int64_t pos, float base = 10000.0f);
+  static array rmsnorm(const array& x, const array& weight, float eps = 1e-5f);
+  static array silu(const array& x);
+  static array swiglu(const array& gate, const array& up);
 
   // Axis reductions (lazy); argmax yields indices as F32
   array sum(int axis, bool keepdims = false) const;
@@ -1229,6 +1239,21 @@ struct graph {
     return from_node(std::move(n));
   }
 
+  static array rope(const array& x, int64_t pos, float base) {
+    const auto& s = x.shape();
+    if (s.size() < 2 || (s.back() & 1))
+      throw std::invalid_argument(
+          "tl::rope: expect rank>=2 with an even last dim (head_dim) — got " +
+          shape_str(s));
+    auto n = std::make_shared<node>();
+    n->op = op_t::rope;
+    n->shape = s;
+    n->arg0 = base;
+    n->axis = static_cast<int>(pos);
+    n->inputs = {as_node(x)};
+    return from_node(std::move(n));
+  }
+
   // Materialized view of an evaluated node, for kernel consumption.
   static array wrap(const node& n) {
     array a;
@@ -1468,6 +1493,53 @@ struct graph {
         float acc = 0;
         for (int64_t j = 0; j < ctx; j++) acc += s[j] * Vh[j * D + d];
         oh[d] = acc / sum;
+      }
+    }
+    return out;
+  }
+
+  // RoPE on the GPU. x [H,D] (T=1) or [H,T,D], contiguous. Row r's position is
+  // pos + (r % T). Returns nullopt (→ CPU ref) when the kernel declines.
+  static std::optional<array> gpu_rope_(const node& n, const array& x) {
+    int64_t D = x.shape().back();
+    if (D <= 0 || (D & 1)) return std::nullopt;
+    int64_t rows = x.size() / D;
+    int64_t T = x.rank() == 3 ? x.shape()[1] : 1;
+    if (!gpu_mode_(x.size(), kernel_class::elementwise)) return std::nullopt;
+    if (!x.contiguous() || x.offset_ != 0 || !x.storage_.native)
+      return std::nullopt;
+    array out = array::empty(x.shape());
+    if (!out.storage_.native) return std::nullopt;
+    if (!gpu::rope(x.storage_.native, out.storage_.native, rows, T, D, n.axis,
+                   n.arg0))
+      return std::nullopt;
+    return out;
+  }
+
+  // CPU reference RoPE (fallback / non-GPU builds). Half-split convention,
+  // matching tl_rope: pairs (j, j+D/2) rotate by (pos + t)·base^(-2j/D).
+  static array ref_rope_(const array& x, int64_t pos, float base) {
+    int64_t D = x.shape().back();
+    int64_t T = x.rank() == 3 ? x.shape()[1] : 1;
+    int64_t rows = D ? x.size() / D : 0;
+    int64_t half = D / 2;
+    array out = array::empty(x.shape());
+    const float* px = x.raw();
+    float* po = out.data();
+    for (int64_t r = 0; r < rows; r++) {
+      int64_t t = T ? r % T : 0;
+      double position = static_cast<double>(pos + t);
+      const float* xr = px + r * D;
+      float* orr = po + r * D;
+      for (int64_t j = 0; j < half; j++) {
+        double theta = std::pow(static_cast<double>(base),
+                                -2.0 * static_cast<double>(j) / D);
+        double ang = position * theta;
+        float c = static_cast<float>(std::cos(ang));
+        float s = static_cast<float>(std::sin(ang));
+        float x0 = xr[j], x1 = xr[j + half];
+        orr[j] = x0 * c - x1 * s;
+        orr[j + half] = x0 * s + x1 * c;
       }
     }
     return out;
@@ -1856,6 +1928,14 @@ struct graph {
         }
         break;
       }
+      case op_t::rope: {
+        if (auto g = gpu_rope_(n, wrap(*n.inputs[0]))) {
+          r = std::move(*g);
+        } else {
+          r = ref_rope_(in(0), n.axis, n.arg0);
+        }
+        break;
+      }
       case op_t::sum_ax:
       case op_t::max_ax: {
         // GPU row reductions cover the last-axis case (softmax/argmax
@@ -2079,6 +2159,24 @@ inline array array::dot(const array& b) const {
 inline array array::attn_decode(const array& q, const array& K, const array& V,
                                 float scale) {
   return detail::graph::attn_decode(q, K, V, scale);
+}
+
+inline array array::rope(const array& x, int64_t pos, float base) {
+  return detail::graph::rope(x, pos, base);
+}
+
+// RMSNorm: x · rsqrt(mean(x², last) + eps) · weight. Pure composition — the
+// mean/sqrt/mul kernels are already tuned, and this is autograd-ready.
+inline array array::rmsnorm(const array& x, const array& weight, float eps) {
+  array ms = (x * x).mean(static_cast<int>(x.rank()) - 1, /*keepdims=*/true);
+  array inv = 1.0f / (ms + eps).sqrt();  // [.,1] broadcasts over the last dim
+  return (x * inv) * weight;
+}
+
+inline array array::silu(const array& x) { return x * x.sigmoid(); }
+
+inline array array::swiglu(const array& gate, const array& up) {
+  return silu(gate) * up;
 }
 
 inline array array::sum(int axis, bool keepdims) const {

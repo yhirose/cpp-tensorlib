@@ -711,4 +711,25 @@ __global__ void tl_attn_prefill_f32(const float* __restrict__ q,
 #undef TL_AD
 #undef TL_ADPT
 
+// RoPE (rotary position embedding), half-split (GPT-NeoX / HF-llama) convention.
+// x is [rows, D] contiguous (rows = H*T: a [H,T,D] tensor flattened, or [H,D]
+// with T=1). Row r's head-dim vector is at position pos + (r % T). Pairs
+// (j, j+D/2) rotate by angle = position · base^(-2j/D). grid = rows, block = D/2.
+__global__ void tl_rope(const float* __restrict__ x, float* __restrict__ out,
+                        unsigned T, unsigned D, unsigned pos, float base) {
+  const unsigned r = blockIdx.x, j = threadIdx.x;  // j in 0..D/2-1
+  const unsigned half = D >> 1;
+  if (j >= half) return;
+  const unsigned t = T ? (r % T) : 0u;
+  const float position = (float)(pos + t);
+  const float theta = __powf(base, -2.0f * (float)j / (float)D);
+  const float ang = position * theta;
+  const float c = __cosf(ang), s = __sinf(ang);
+  const size_t bi = (size_t)r * D;
+  const float x0 = x[bi + j];
+  const float x1 = x[bi + j + half];
+  out[bi + j] = x0 * c - x1 * s;
+  out[bi + j + half] = x0 * s + x1 * c;
+}
+
 }  // extern "C"

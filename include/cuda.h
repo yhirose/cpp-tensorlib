@@ -295,6 +295,13 @@ struct context {
     return kv_append_fn;
   }
 
+  // RoPE (rotary position embedding) for q/k.
+  CUfunction rope_fn = nullptr;
+  CUfunction rope_() {
+    if (!rope_fn) d.ModuleGetFunction(&rope_fn, mod, "tl_rope");
+    return rope_fn;
+  }
+
   // M9 prefill: bulk cache fill + causal prefill attention.
   CUfunction kv_fill_fn = nullptr, attn_prefill_fn = nullptr;
   CUfunction kv_fill_() {
@@ -665,6 +672,25 @@ inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads
   c.pending = true;
   return c.d.LaunchKernel(c.attn_prefill_(), static_cast<unsigned>(n_q_heads), uT,
                           1, static_cast<unsigned>(D), 1, 1, 0, nullptr, args,
+                          nullptr) == 0;
+}
+
+// RoPE: rotate a contiguous [rows, D] buffer (rows = H*T). Row r's position is
+// pos + (r % T); half-split (GPT-NeoX / HF-llama) convention. D must be even.
+inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
+                 int64_t pos, float base) {
+  auto& c = context::get();
+  if (!c.ready || D <= 0 || (D & 1)) return false;
+  c.device_read_(x);
+  c.device_write_(out);
+  float* px = context::off_(x, 0);
+  float* po = context::off_(out, 0);
+  unsigned uT = static_cast<unsigned>(T), uD = static_cast<unsigned>(D),
+           upos = static_cast<unsigned>(pos);
+  void* args[] = {&px, &po, &uT, &uD, &upos, &base};
+  c.pending = true;
+  return c.d.LaunchKernel(c.rope_(), static_cast<unsigned>(rows), 1, 1,
+                          static_cast<unsigned>(D / 2), 1, 1, 0, nullptr, args,
                           nullptr) == 0;
 }
 
