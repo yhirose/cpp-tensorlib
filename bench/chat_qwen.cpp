@@ -65,15 +65,17 @@ int main(int argc, char** argv) {
   for (size_t i = 0; i < ids.size(); i++) logits = qm::step(M, ids[i], pos++);
   double prefill_ms = ms_since(t_prefill);
 
-  // Greedy generate until <|im_end|> or the budget.
+  // Greedy generate until <|im_end|> or the budget. step_imperative() runs the
+  // whole forward as direct cuda:: kernel calls on persistent scratch (no array
+  // nodes → no host graph-build cost, one sync/step) and GPU-argmaxes — the C1
+  // decode fast path (~2.5x the array path, greedy bit-identical).
   std::vector<int> gen;
   int64_t next = qm::argmax(logits);
   auto t_dec = clk::now();
   for (int64_t i = 0; i < MAX_NEW; i++) {
     if (next == tok.eos_id()) break;
     gen.push_back((int)next);
-    logits = qm::step(M, next, pos++);
-    next = qm::argmax(logits);
+    next = qm::step_imperative(M, next, pos++);
   }
   double dec_ms = ms_since(t_dec);
 

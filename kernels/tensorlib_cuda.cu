@@ -81,6 +81,78 @@ TL_ROW_REDUCE(tl_row_sum, 0.0f, acc + v)
 TL_ROW_REDUCE(tl_row_max, -3.402823466e+38f, (acc > v ? acc : v))
 #undef TL_ROW_REDUCE
 
+// ---- argmax over a single length-n vector -> one int index (out[0]) ----
+// Greedy decoding's last mile: reduce logits[VOCAB] on-device so only a 4-byte
+// index crosses PCIe (vs the 608KB logits D2H the host argmax needed). One
+// block, grid-stride load, tree reduction carrying (value,index). Tie-break
+// matches the host `v[i] > v[bi]` loop exactly — the SMALLEST index wins on
+// ties — so greedy output stays bit-identical to the CPU reference.
+extern "C" __global__ void tl_argmax(const float* __restrict__ in, int* out,
+                                     unsigned n) {
+  extern __shared__ float smem[];
+  float* sval = smem;
+  int* sidx = reinterpret_cast<int*>(smem + blockDim.x);
+  unsigned t = threadIdx.x, T = blockDim.x;
+  float best = -3.402823466e+38f;
+  int besti = 0;
+  // Strict '>' so within a thread's stripe the first (smallest) index wins.
+  for (unsigned i = t; i < n; i += T) {
+    float v = in[i];
+    if (v > best) { best = v; besti = (int)i; }
+  }
+  sval[t] = best;
+  sidx[t] = besti;
+  __syncthreads();
+  for (unsigned s = T >> 1; s > 0; s >>= 1) {
+    if (t < s) {
+      float ov = sval[t + s];
+      int oi = sidx[t + s];
+      // Take the other half if strictly greater, or equal with a smaller index.
+      if (ov > sval[t] || (ov == sval[t] && oi < sidx[t])) {
+        sval[t] = ov;
+        sidx[t] = oi;
+      }
+    }
+    __syncthreads();
+  }
+  if (t == 0) out[0] = sidx[0];
+}
+
+// ---- fused RMSNorm over a single length-n row: out = x * rsqrt(mean(x^2)+eps) * w
+// One block, grid-stride sum-of-squares reduction, then a normalize+scale pass.
+// Matches the array composition (x*x).mean(-1) -> 1/sqrt(ms+eps) -> *x *w exactly
+// (f32, 1/sqrtf not the approximate rsqrtf) so greedy output is unchanged. Kills
+// the ~7 array-op launches per RMSNorm (2/layer + 1 final) in the decode step.
+extern "C" __global__ void tl_rmsnorm(const float* __restrict__ x,
+                                      const float* __restrict__ w,
+                                      float* __restrict__ out, unsigned n,
+                                      float eps) {
+  extern __shared__ float sm[];
+  unsigned t = threadIdx.x, T = blockDim.x;
+  float acc = 0.0f;
+  for (unsigned i = t; i < n; i += T) { float v = x[i]; acc += v * v; }
+  sm[t] = acc;
+  __syncthreads();
+  for (unsigned s = T >> 1; s > 0; s >>= 1) {
+    if (t < s) sm[t] += sm[t + s];
+    __syncthreads();
+  }
+  float inv = 1.0f / sqrtf(sm[0] / (float)n + eps);
+  for (unsigned i = t; i < n; i += T) out[i] = x[i] * inv * w[i];
+}
+
+// ---- fused SwiGLU: out = silu(gate) * up = (gate * sigmoid(gate)) * up ----
+// Elementwise over n (the FF dim). Matches array silu(gate)*up; replaces the
+// sigmoid+mul+mul launch chain with one kernel.
+extern "C" __global__ void tl_swiglu(const float* __restrict__ gate,
+                                     const float* __restrict__ up,
+                                     float* __restrict__ out, unsigned n) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float g = gate[i];
+  out[i] = (g / (1.0f + expf(-g))) * up[i];
+}
+
 // ---- softmax over the last axis (rows×cols out); scale/offset ignored ----
 // Numerically stable (subtract row max). Two shared reductions (max, sum).
 __global__ void tl_softmax(const float* in, float* out, unsigned rows,

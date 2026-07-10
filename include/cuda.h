@@ -43,6 +43,7 @@ using kop = tl::metal::kop;
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -58,10 +59,14 @@ struct CUctx_st;
 struct CUmod_st;
 struct CUfunc_st;
 struct CUstream_st;
+struct CUgraph_st;
+struct CUgraphExec_st;
 using CUcontext = CUctx_st*;
 using CUmodule = CUmod_st*;
 using CUfunction = CUfunc_st*;
 using CUstream = CUstream_st*;
+using CUgraph = CUgraph_st*;
+using CUgraphExec = CUgraphExec_st*;
 
 struct driver {
   CUresult (*Init)(unsigned) = nullptr;
@@ -80,12 +85,34 @@ struct driver {
   CUresult (*MemcpyHtoD)(CUdeviceptr, const void*, size_t) = nullptr;
   CUresult (*MemcpyDtoH)(void*, CUdeviceptr, size_t) = nullptr;
   CUresult (*MemsetD8)(CUdeviceptr, unsigned char, size_t) = nullptr;
+  CUresult (*MemsetD8Async)(CUdeviceptr, unsigned char, size_t, CUstream) =
+      nullptr;
+  // CUDA-graph capture (M9 C1-2). Optional: dlsym'd best-effort; graph_ok()
+  // gates the fast replay path, everything else works without them.
+  CUresult (*MemcpyHtoDAsync)(CUdeviceptr, const void*, size_t, CUstream) =
+      nullptr;
+  CUresult (*StreamCreate)(CUstream*, unsigned) = nullptr;
+  CUresult (*StreamDestroy)(CUstream) = nullptr;
+  CUresult (*StreamSynchronize)(CUstream) = nullptr;
+  CUresult (*StreamBeginCapture)(CUstream, int /*CUstreamCaptureMode*/) =
+      nullptr;
+  CUresult (*StreamEndCapture)(CUstream, CUgraph*) = nullptr;
+  CUresult (*GraphInstantiate)(CUgraphExec*, CUgraph, unsigned long long) =
+      nullptr;
+  CUresult (*GraphLaunch)(CUgraphExec, CUstream) = nullptr;
+  CUresult (*GraphExecDestroy)(CUgraphExec) = nullptr;
+  CUresult (*GraphDestroy)(CUgraph) = nullptr;
 
   bool ok() const {
     return Init && DeviceGet && DevicePrimaryCtxRetain && CtxSetCurrent &&
            CtxSynchronize && ModuleLoadData && ModuleGetFunction &&
            LaunchKernel && MemAlloc && MemFree && MemcpyHtoD && MemcpyDtoH &&
            MemsetD8;
+  }
+  bool graph_ok() const {
+    return MemcpyHtoDAsync && StreamCreate && StreamBeginCapture &&
+           StreamEndCapture && GraphInstantiate && GraphLaunch &&
+           GraphExecDestroy && GraphDestroy && StreamSynchronize;
   }
 };
 
@@ -128,6 +155,11 @@ struct context {
   CUmodule mod = nullptr;
   bool ready = false;
   bool pending = false;
+  // The stream every kernel launch / async copy targets. Null = the default
+  // stream (the normal path). Temporarily set to a capture stream while
+  // recording a CUDA graph, then restored — so no launcher needs a stream arg.
+  CUstream stream = nullptr;
+  CUstream cap_stream = nullptr;  // dedicated capture stream (created on demand)
   std::unordered_map<int, CUfunction> fns;
 
   // Host/device mirror per allocation, keyed by the device pointer (== the
@@ -211,6 +243,32 @@ struct context {
         (CUresult(*)(CUdeviceptr, unsigned char, size_t))S("cuMemsetD8_v2");
     if (!d.MemsetD8)
       d.MemsetD8 = (CUresult(*)(CUdeviceptr, unsigned char, size_t))S("cuMemsetD8");
+    // CUDA-graph symbols (optional; graph_ok() gates their use).
+    d.MemsetD8Async = (CUresult(*)(CUdeviceptr, unsigned char, size_t,
+                                   CUstream))S("cuMemsetD8Async");
+    d.MemcpyHtoDAsync = (CUresult(*)(CUdeviceptr, const void*, size_t,
+                                     CUstream))S("cuMemcpyHtoDAsync_v2");
+    if (!d.MemcpyHtoDAsync)
+      d.MemcpyHtoDAsync = (CUresult(*)(CUdeviceptr, const void*, size_t,
+                                       CUstream))S("cuMemcpyHtoDAsync");
+    d.StreamCreate = (CUresult(*)(CUstream*, unsigned))S("cuStreamCreate");
+    d.StreamDestroy = (CUresult(*)(CUstream))S("cuStreamDestroy_v2");
+    if (!d.StreamDestroy)
+      d.StreamDestroy = (CUresult(*)(CUstream))S("cuStreamDestroy");
+    d.StreamSynchronize = (CUresult(*)(CUstream))S("cuStreamSynchronize");
+    d.StreamBeginCapture =
+        (CUresult(*)(CUstream, int))S("cuStreamBeginCapture_v2");
+    if (!d.StreamBeginCapture)
+      d.StreamBeginCapture =
+          (CUresult(*)(CUstream, int))S("cuStreamBeginCapture");
+    d.StreamEndCapture =
+        (CUresult(*)(CUstream, CUgraph*))S("cuStreamEndCapture");
+    d.GraphInstantiate = (CUresult(*)(CUgraphExec*, CUgraph,
+                                      unsigned long long))S(
+        "cuGraphInstantiateWithFlags");
+    d.GraphLaunch = (CUresult(*)(CUgraphExec, CUstream))S("cuGraphLaunch");
+    d.GraphExecDestroy = (CUresult(*)(CUgraphExec))S("cuGraphExecDestroy");
+    d.GraphDestroy = (CUresult(*)(CUgraph))S("cuGraphDestroy");
     if (!d.ok()) return;
 
     if (d.Init(0) != 0) return;
@@ -315,6 +373,30 @@ struct context {
     return rope_fn;
   }
 
+  // GPU argmax (greedy last-mile): kernel + a persistent 4-byte device result
+  // buffer so the per-token result is a 4-byte D2H, not the 608KB logits copy.
+  CUfunction argmax_fn = nullptr;
+  CUfunction argmax_() {
+    if (!argmax_fn) d.ModuleGetFunction(&argmax_fn, mod, "tl_argmax");
+    return argmax_fn;
+  }
+  CUdeviceptr argmax_res = 0;
+  CUdeviceptr argmax_res_() {
+    if (!argmax_res && d.MemAlloc(&argmax_res, 16) != 0) argmax_res = 0;
+    return argmax_res;
+  }
+
+  // Fused decode-step ops (imperative path): RMSNorm + SwiGLU.
+  CUfunction rmsnorm_fn = nullptr, swiglu_fn = nullptr;
+  CUfunction rmsnorm_() {
+    if (!rmsnorm_fn) d.ModuleGetFunction(&rmsnorm_fn, mod, "tl_rmsnorm");
+    return rmsnorm_fn;
+  }
+  CUfunction swiglu_() {
+    if (!swiglu_fn) d.ModuleGetFunction(&swiglu_fn, mod, "tl_swiglu");
+    return swiglu_fn;
+  }
+
   // M9 prefill: bulk cache fill + causal prefill attention.
   CUfunction kv_fill_fn = nullptr, attn_prefill_fn = nullptr;
   CUfunction kv_fill_() {
@@ -360,7 +442,7 @@ struct context {
     unsigned block = 256, grid = (n + block - 1) / block;
     if (grid == 0) grid = 1;
     pending = true;
-    return d.LaunchKernel(f, grid, 1, 1, block, 1, 1, shared, nullptr, args,
+    return d.LaunchKernel(f, grid, 1, 1, block, 1, 1, shared, stream, args,
                           nullptr) == 0;
   }
 };
@@ -374,6 +456,64 @@ inline void flush() {
   if (!c.pending) return;
   c.d.CtxSynchronize();
   c.pending = false;
+}
+
+// ---- CUDA-graph capture (M9 C1-2): record a fixed launch sequence once and
+// replay it as a single submit, erasing per-launch host overhead. Only the
+// imperative decode step (no host sync / blocking copy mid-stream) is
+// capturable; embed staging + argmax happen outside the captured region.
+inline bool graph_available() { return context::get().d.graph_ok(); }
+
+// Begin capturing: route every subsequent launch/async-copy onto a private
+// capture stream. Drains the default stream first. Returns false if graph
+// support is missing. Pair with capture_end().
+inline bool capture_begin() {
+  auto& c = context::get();
+  if (!c.ready || !c.d.graph_ok()) return false;
+  if (c.pending) flush();
+  if (!c.cap_stream && c.d.StreamCreate(&c.cap_stream, 0) != 0) return false;
+  if (c.d.StreamBeginCapture(c.cap_stream, 0 /*GLOBAL*/) != 0) return false;
+  c.stream = c.cap_stream;
+  return true;
+}
+// End capture and instantiate an executable graph (nullptr on failure).
+// Restores the default stream.
+inline CUgraphExec capture_end() {
+  auto& c = context::get();
+  CUgraph g = nullptr;
+  CUresult r = c.d.StreamEndCapture(c.cap_stream, &g);
+  c.stream = nullptr;
+  if (r != 0 || !g) return nullptr;
+  CUgraphExec e = nullptr;
+  if (c.d.GraphInstantiate(&e, g, 0) != 0) e = nullptr;
+  c.d.GraphDestroy(g);
+  return e;
+}
+// Replay a captured graph on the default stream (marks work pending; the caller
+// flushes or reads results as usual).
+inline bool graph_launch(CUgraphExec e) {
+  auto& c = context::get();
+  if (!c.ready || !e) return false;
+  if (c.d.GraphLaunch(e, nullptr) != 0) return false;
+  c.pending = true;
+  return true;
+}
+inline void graph_destroy(CUgraphExec e) {
+  auto& c = context::get();
+  if (e && c.d.GraphExecDestroy) c.d.GraphExecDestroy(e);
+}
+
+// Blocking H2D into a device buffer's mirror, marking it BOTH (device current).
+// Used to pre-stage inputs (e.g. the embedding row) before a capture, so the
+// captured region contains no blocking copy.
+inline void upload(void* native, const float* src, int64_t n) {
+  auto& c = context::get();
+  if (!c.ready || !native) return;
+  context::mirror* m = c.mirror_(native);
+  if (!m) return;
+  std::memcpy(m->host, src, (size_t)n * sizeof(float));
+  c.d.MemcpyHtoD(m->dev, m->host, m->bytes);
+  m->where = context::BOTH;
 }
 
 // Mirror allocation: a device buffer (returned as `native`) paired with a host
@@ -491,11 +631,17 @@ inline bool gemv_run_(CUfunction f, float* pa, float* pB, float* py,
       ksplit = chunk;
     }
   }
-  if (gy > 1)
-    c.d.MemsetD8(reinterpret_cast<CUdeviceptr>(y_native), 0, (size_t)un * 4);
+  if (gy > 1) {
+    // Zero y for the split-K atomicAdd. Async on the stream (ordered before the
+    // gemv on the same stream) so this stays capturable — a blocking MemsetD8
+    // is illegal mid CUDA-graph capture.
+    CUdeviceptr yd = reinterpret_cast<CUdeviceptr>(y_native);
+    if (c.d.MemsetD8Async) c.d.MemsetD8Async(yd, 0, (size_t)un * 4, c.stream);
+    else c.d.MemsetD8(yd, 0, (size_t)un * 4);
+  }
   void* args[] = {&pa, &pB, &py, &un, &uk, &ksplit};
   c.pending = true;
-  return c.d.LaunchKernel(f, bx, gy, 1, 256, 1, 1, 0, nullptr, args, nullptr) ==
+  return c.d.LaunchKernel(f, bx, gy, 1, 256, 1, 1, 0, c.stream, args, nullptr) ==
          0;
 }
 inline bool gemv_f32(void* a, void* B, void* y, int64_t n, int64_t k) {
@@ -548,9 +694,9 @@ inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
   if (K * 4 <= 24576) {
     unsigned shared = (unsigned)(K * 4);
     return c.d.LaunchKernel(c.gemv_q4s_(), grid, 1, 1, 256, 1, 1, shared,
-                            nullptr, args, nullptr) == 0;
+                            c.stream, args, nullptr) == 0;
   }
-  return c.d.LaunchKernel(c.gemv_q4_(), grid, 1, 1, 256, 1, 1, 0, nullptr, args,
+  return c.d.LaunchKernel(c.gemv_q4_(), grid, 1, 1, 256, 1, 1, 0, c.stream, args,
                           nullptr) == 0;
 }
 
@@ -613,11 +759,11 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
   void* a1[] = {&pq,     &pk,        &pv,    &pm,    &pl,
                 &pacc,   &uctx,      &kv_stride, &group, &chunk,
                 &scale};
-  if (c.d.LaunchKernel(c.attn_split_(D), uh, S, 1, uD, 1, 1, 0, nullptr, a1,
+  if (c.d.LaunchKernel(c.attn_split_(D), uh, S, 1, uD, 1, 1, 0, c.stream, a1,
                        nullptr) != 0)
     return false;
   void* a2[] = {&pm, &pl, &pacc, &po, &S};
-  return c.d.LaunchKernel(c.attn_combine_(), uh, 1, 1, uD, 1, 1, 0, nullptr, a2,
+  return c.d.LaunchKernel(c.attn_combine_(), uh, 1, 1, uD, 1, 1, 0, c.stream, a2,
                           nullptr) == 0;
 }
 
@@ -640,7 +786,7 @@ inline bool kv_append(void* Kc, void* Vc, void* k_new, void* v_new, int64_t pos,
   void* args[] = {&pKc, &pVc, &pk, &pv, &upos, &kv_stride};
   c.pending = true;
   return c.d.LaunchKernel(c.kv_append_(), static_cast<unsigned>(n_kv_heads), 1, 1,
-                          static_cast<unsigned>(D), 1, 1, 0, nullptr, args,
+                          static_cast<unsigned>(D), 1, 1, 0, c.stream, args,
                           nullptr) == 0;
 }
 
@@ -664,7 +810,7 @@ inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
   c.pending = true;
   return c.d.LaunchKernel(c.kv_fill_(), static_cast<unsigned>(n_kv_heads),
                           static_cast<unsigned>(T), 1, static_cast<unsigned>(D),
-                          1, 1, 0, nullptr, args, nullptr) == 0;
+                          1, 1, 0, c.stream, args, nullptr) == 0;
 }
 
 // M9 causal prefill attention: q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D]
@@ -691,7 +837,7 @@ inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads
   void* args[] = {&pq, &pk, &pv, &po, &uT, &kv_stride, &group, &scale};
   c.pending = true;
   return c.d.LaunchKernel(c.attn_prefill_(D), static_cast<unsigned>(n_q_heads), uT,
-                          1, static_cast<unsigned>(D), 1, 1, 0, nullptr, args,
+                          1, static_cast<unsigned>(D), 1, 1, 0, c.stream, args,
                           nullptr) == 0;
 }
 
@@ -710,8 +856,73 @@ inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
   void* args[] = {&px, &po, &uT, &uD, &upos, &base};
   c.pending = true;
   return c.d.LaunchKernel(c.rope_(), static_cast<unsigned>(rows), 1, 1,
-                          static_cast<unsigned>(D / 2), 1, 1, 0, nullptr, args,
+                          static_cast<unsigned>(D / 2), 1, 1, 0, c.stream, args,
                           nullptr) == 0;
+}
+
+// GPU argmax over a length-n device vector (contiguous, offset 0). Reduces on
+// device and D2H's only the 4-byte index — replaces the per-token 608KB logits
+// copy + host scan that greedy decoding otherwise pays. `in` is a native
+// device-buffer handle (e.g. an evaluated logits array's native()); stream
+// ordering means the prior gemv that filled it need not be host-synced first.
+// Returns the argmax index, tie-broken to the smallest index (matches the
+// host `v[i] > v[bi]` loop) so greedy output stays bit-identical.
+inline bool argmax(void* in, int64_t n, int64_t* out_idx) {
+  auto& c = context::get();
+  if (!c.ready || !in || n <= 0 || !out_idx) return false;
+  c.device_read_(in);
+  float* pin = context::off_(in, 0);
+  CUdeviceptr res = c.argmax_res_();
+  if (!res) return false;
+  int* pres = reinterpret_cast<int*>(res);
+  unsigned un = static_cast<unsigned>(n);
+  void* args[] = {&pin, &pres, &un};
+  unsigned block = 256;
+  c.pending = true;
+  if (c.d.LaunchKernel(c.argmax_(), 1, 1, 1, block, 1, 1,
+                       block * (sizeof(float) + sizeof(int)), c.stream, args,
+                       nullptr) != 0)
+    return false;
+  flush();  // the result index must be ready before the 4-byte D2H
+  int h = 0;
+  if (c.d.MemcpyDtoH(&h, res, sizeof(int)) != 0) return false;
+  *out_idx = h;
+  return true;
+}
+
+// Fused RMSNorm over one length-n row: out = x * 1/sqrt(mean(x^2)+eps) * w.
+// x/w/out are native device handles (offset 0). One block; matches the array
+// composition numerically (see tl_rmsnorm). In-place safe (out may alias x).
+inline bool rmsnorm(void* x, void* w, void* out, int64_t n, float eps) {
+  auto& c = context::get();
+  if (!c.ready || n <= 0) return false;
+  c.device_read_(x);
+  c.device_read_(w);
+  c.device_write_(out);
+  float* px = context::off_(x, 0);
+  float* pw = context::off_(w, 0);
+  float* po = context::off_(out, 0);
+  unsigned un = static_cast<unsigned>(n);
+  void* args[] = {&px, &pw, &po, &un, &eps};
+  unsigned block = 256;
+  c.pending = true;
+  return c.d.LaunchKernel(c.rmsnorm_(), 1, 1, 1, block, 1, 1,
+                          block * sizeof(float), c.stream, args, nullptr) == 0;
+}
+
+// Fused SwiGLU: out = silu(gate) * up over n elements. Native handles, offset 0.
+inline bool swiglu(void* gate, void* up, void* out, int64_t n) {
+  auto& c = context::get();
+  if (!c.ready || n <= 0) return false;
+  c.device_read_(gate);
+  c.device_read_(up);
+  c.device_write_(out);
+  float* pg = context::off_(gate, 0);
+  float* pu = context::off_(up, 0);
+  float* po = context::off_(out, 0);
+  unsigned un = static_cast<unsigned>(n);
+  void* args[] = {&pg, &pu, &po, &un};
+  return c.launch1d_(c.swiglu_(), un, args);
 }
 
 // Persistent, device-resident KV cache (roadmap M9, A-surface): K,V buffers
@@ -821,7 +1032,7 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
       if (S > 1) c.d.MemsetD8(reinterpret_cast<CUdeviceptr>(po), 0,
                               (size_t)m * n * 4);  // zero C for atomicAdd
       c.pending = true;
-      return c.d.LaunchKernel(f, gx, gy, S, 256, 1, 1, 0, nullptr, rb,
+      return c.d.LaunchKernel(f, gx, gy, S, 256, 1, 1, 0, c.stream, rb,
                               nullptr) == 0;
     }
   }
@@ -837,7 +1048,7 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
   if (gx == 0) gx = 1;
   if (gy == 0) gy = 1;
   c.pending = true;
-  return c.d.LaunchKernel(sg, gx, gy, 1, bx, by, 1, 0, nullptr, args,
+  return c.d.LaunchKernel(sg, gx, gy, 1, bx, by, 1, 0, c.stream, args,
                           nullptr) == 0;
 }
 
@@ -858,7 +1069,7 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
   unsigned block = 256;
   c.pending = true;
   return c.d.LaunchKernel(f, ur ? ur : 1, 1, 1, block, 1, 1,
-                          block * sizeof(float), nullptr, args, nullptr) == 0;
+                          block * sizeof(float), c.stream, args, nullptr) == 0;
 }
 
 #else  // stubs (Apple, or a build without TENSORLIB_CUDA)
@@ -883,6 +1094,15 @@ inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
                    float) {
   return false;
 }
+inline bool argmax(void*, int64_t, int64_t*) { return false; }
+inline bool rmsnorm(void*, void*, void*, int64_t, float) { return false; }
+inline bool swiglu(void*, void*, void*, int64_t) { return false; }
+inline bool graph_available() { return false; }
+inline bool capture_begin() { return false; }
+inline void* capture_end() { return nullptr; }
+inline bool graph_launch(void*) { return false; }
+inline void graph_destroy(void*) {}
+inline void upload(void*, const float*, int64_t) {}
 inline void sync_to_host(void*, bool) {}
 
 #endif

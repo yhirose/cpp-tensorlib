@@ -139,6 +139,15 @@ if(TENSORLIB_CUDA)
   target_link_libraries(tensorlib_chat_qwen PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_chat_qwen)
 
+  # M9 decode-overhead census: per-region wall-clock breakdown of one decode
+  # step (StepProf). Locates the 6.7x gap to llama.cpp. Not a ctest (external
+  # model file); short/isolated per the WSL2 sysmem-cliff discipline.
+  add_executable(tensorlib_bench_qwen_decode bench/bench_qwen_decode.cpp)
+  target_include_directories(tensorlib_bench_qwen_decode BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+  target_link_libraries(tensorlib_bench_qwen_decode PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_bench_qwen_decode)
+
   # M8 int4-weight decode GEMV bench (Path-B style). Direct cuda:: API.
   add_executable(tensorlib_bench_q4 bench/bench_q4_gemv.cpp)
   target_include_directories(tensorlib_bench_q4 BEFORE PRIVATE

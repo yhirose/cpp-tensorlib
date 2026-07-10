@@ -702,6 +702,81 @@ weight-precision difference, not a bug) — the numpy-on-F16 forward is the tigh
 oracle, torch is only a sanity check. head_dim=64 kernels (new {64,128}
 generalization) validated at maxrel 1e-7 (`ctest attn64`).
 
+### Decode-overhead census + the sync-free step (2026-07-10)
+
+Attacking the 6.7× gap. A per-region wall-clock census of one decode step
+(`bench/bench_qwen_decode.cpp`, `qwenmodel::StepProf`; bf16, RTX 3090/WSL2) split
+the 15.9 ms/token as: **construct (host array-graph build) 35–45%**, per-layer
+`.eval()` regions (launch + sync) ~58%, and the greedy last-mile (608 KB logits
+D2H + 151936-elem host argmax) only **1.7%**. Two structural facts fell out: the
+**GPU compute floor is ~1 ms/token** (bf16 weights ≈1 GB ÷ ~940 GB/s) — so **~94%
+is overhead, not kernels** — and a big slice of that overhead is **pure host CPU**
+(building ~720 array nodes/token), which no amount of GPU work removes.
+
+Two levers landed, each guarded by `check_qwen` (greedy stays bit-identical to
+the numpy-F16 oracle) and measured min-of-rounds (WSL2 boost-clock noise is
+±20 tok/s on a single run — the min pins the boosted-clock ceiling, the only way
+to resolve a ~15% change):
+
+- **GPU argmax** (`tl_argmax`, `cuda::argmax`): block reduction over VOCAB →
+  4-byte index D2H instead of the 608 KB logits copy + host scan; tie-break
+  matches the host `v[i] > v[bi]` loop so greedy is bit-identical. Measured
+  **neutral** (75.1 vs 75.4 tok/s) — the last-mile was only 1.7%, and in
+  isolation it even *added* a second `CtxSynchronize` (`logits.eval()` +
+  `argmax`) that on WSL2 costs more than the 608 KB copy it removes. Kept
+  anyway: it's the **prerequisite for CUDA-graph capture** (a graph can't carry
+  a per-token 608 KB D2H + host branch).
+
+- **Sync-free `realize()`** (the real win): `array::realize()` /
+  `graph::run_noflush` launch an array's graph and adopt its storage **without**
+  the terminal `gpu::flush()`, leaving kernels in flight on the null stream. The
+  kv_cache append/attn and the argmax are stream-ordered after their producers,
+  so they see the writes with **no host sync** — collapsing a step's ~98
+  `CtxSynchronize` (4/layer × 24 + tail) to **~1**. Swapping the model's
+  per-layer `.eval()` → `.realize()` gave **66.2 → 76.7 tok/s (+16%)** on the
+  identical min-of-rounds harness, greedy unchanged. So decode is **not**
+  purely construction-bound — the syncs were costing ~2 ms/token after all;
+  min-of-rounds (not single-run) was needed to see it past the noise.
+
+**Fused imperative decode step (C1-1, the big win).** After `realize()` the
+residual was **host graph construction (~45%) + ~800 kernel launches/token**.
+`qwenmodel::step_imperative` runs the whole forward as **direct `cuda::` kernel
+calls on a persistent `Scratch` arena** (device buffers allocated once, residual
+ping-ponged) — **zero array nodes** (no host graph-build) and **zero per-step
+allocation**. Two fused kernels replace array compositions: `tl_rmsnorm`
+(sum-of-squares reduction + normalize-scale, matching `(x*x).mean→rsqrt→*w`) and
+`tl_swiglu` (`silu(gate)*up`); everything else reuses the existing
+gemv/rope/attn/argmax kernels, all on the null stream with the single sync in
+`cuda::argmax`. **Decode 77 → ~200 tok/s (+156%, 2.6×)**; `chat_qwen` end-to-end
+**208 tok/s**, greedy **character-for-character unchanged** (canonical LLM
+answer), and array-vs-imperative agree **0/12** on a same-cache replay
+(`bench_qwen_decode`). Net session: **67 → 208 tok/s (3.1×)**, gap to llama.cpp
+**6.7× → 2.14×**. This confirmed the census: killing the host construction (and
+collapsing the op count) was worth far more than any dtype/bandwidth lever on a
+0.5B.
+
+**CUDA-graph capture POC — the ceiling is only +10% (C1-2, 2026-07-10).** Built
+the enabling infra (a `context.stream` all launchers target, dlopen'd
+`cuStreamBeginCapture`/`cuStreamEndCapture`/`cuGraphInstantiate`/`cuGraphLaunch`,
+and split-K gemv's blocking `MemsetD8` → `MemsetD8Async` so the region is
+capturable) and captured the imperative forward at a **fixed pos** (numerically
+meaningless, but it isolates launch overhead). Replay + argmax: **221.6 tok/s vs
+imperative 201.6 — only +10%.** So after the imperative rewrite decode is
+**GPU-kernel-execution-bound, not host-launch-bound**: the graph erases the host
+submit sliver (~0.45 ms ÷ 19 launches ≈ 24 µs each), but the GPU still runs
+**456 tiny kernels/token** (19/layer × 24) sequentially — ~4.4 ms of per-kernel
+GPU-side latency at batch-1, where each M=1 gemv underfills the SMs. **This
+redirects the strategy:** the remaining ~2× to llama.cpp (446) is **kernel
+efficiency — fewer/fused/bigger kernels** (llama.cpp fuses norm-into-matmul,
+whole-attention, and runs far fewer launches), **not** launch overhead. Graph
+capture's payoff *shrinks* as you fuse (fewer kernels → less launch overhead to
+hide), so it's a ~10% finisher, not the lever. Crucially the POC measured this
+**before** sinking effort into the risky `pos`-as-device-scalar plumbing (which
+would touch the 1e-7-validated attention kernels) that correct per-token replay
+needs. The capture infra is kept (tested, dormant); the next real decode lever
+is kernel fusion + tuning (a larger, separate effort). Net decode this session:
+**67 → 208 tok/s (3.1×), gap 6.7× → 2.14×**, all greedy bit-identical.
+
 ## vs silarray (M1 Pro, 2026-07-03)
 
 Head-to-head with the predecessor across cpu/gpu/auto. Two separate

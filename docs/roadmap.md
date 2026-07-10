@@ -338,7 +338,7 @@ llama.cpp/exllamav2 hand-write. GGUF-style group quantization (Q4_K etc.) is the
 reference format to stay interop-friendly. Gate: **tokens/sec within reach of
 llama.cpp/exllamav2** on the same quantized model + GPU (not GFLOP/s vs cuBLAS).
 
-### M9 — Fused attention + KV cache  🔨 decode + KV cache + GQA + causal prefill + block-wiring + multi-layer decode loop + real-model chat (Qwen2.5-0.5B) done; speed (per-op overhead) + prefill tiling remain
+### M9 — Fused attention + KV cache  🔨 decode + KV cache + GQA + causal prefill + block-wiring + multi-layer decode loop + real-model chat (Qwen2.5-0.5B) + sync-free step + fused imperative decode step (67→208 tok/s, 2.14× off llama.cpp) + graph-capture ceiling measured (+10% only → kernel-bound) done; kernel fusion/tuning + prefill tiling remain
 
 **Done (fused decode attention, 2026-07-04):** `array::attn_decode(q,K,V,scale)`
 (op_t::attn_dec) → `tl_attn_decode_*`. Flash-attention online-softmax in one pass
@@ -451,6 +451,43 @@ weights are churn-free-safe. So the next decode lever is **per-op overhead**
 graph reuse), NOT bf16/q4 — those pay off only on bandwidth-bound larger models.
 Sampling (temp/top-k/top-p) and Q4_0→`dtype::q4` (needs the q4 GEMV's `K%256`
 relaxed to `K%32` — Qwen hidden 896 isn't a 256 multiple) remain.
+
+**Done (decode-overhead attack — census + sync-free step, 2026-07-10):** a
+per-region census (`bench/bench_qwen_decode.cpp`, `StepProf`) split the 15.9
+ms/token as **host array-graph construction 35–45%**, per-layer eval (launch +
+sync) ~58%, greedy last-mile only **1.7%** — and established the **~1 ms/token
+GPU compute floor** (so ~94% is overhead, and a large slice is *pure host CPU*
+building ~720 nodes/token). Two levers, each `check_qwen`-guarded (greedy
+bit-identical) and measured **min-of-rounds** (WSL2 boost noise is ±20 tok/s
+single-run): (1) **GPU argmax** (`tl_argmax`/`cuda::argmax`, 4-byte index D2H,
+host-matching tie-break) — measured **neutral** (last-mile was 1.7%; in isolation
+it even adds a 2nd sync) but kept as the **CUDA-graph prerequisite**; (2) **sync-
+free `realize()`** (`array::realize()` / `graph::run_noflush`) launches a graph
+and adopts its storage **without** the terminal `CtxSynchronize`, so null-stream
+ordering feeds the kv_cache/argmax kernels — collapsing a step's ~98 syncs to ~1
+and lifting decode **66→77 tok/s (+16%)**. **Done (fused imperative decode step,
+2026-07-10):** `qwenmodel::step_imperative` runs the whole forward as **direct
+`cuda::` calls on a persistent `Scratch` arena** (buffers allocated once,
+residual ping-ponged) — zero array nodes (kills the ~45% host construct), zero
+per-step alloc, one sync/step. Two fused kernels (`tl_rmsnorm`, `tl_swiglu`)
+replace the array compositions; gemv/rope/attn/argmax reused. **Decode 77 → ~200
+tok/s (+156%)**, `chat_qwen` end-to-end **208 tok/s**, greedy bit-identical
+(canonical answer unchanged; array-vs-imperative 0/12 mismatch on same-cache
+replay). **Net session 67 → 208 tok/s (3.1×); gap to llama.cpp 6.7× → 2.14×.**
+**Done (CUDA-graph capture POC — ceiling measured, 2026-07-10):** built the infra
+(a `context.stream` all launchers target, dlopen'd graph symbols, split-K gemv's
+blocking `MemsetD8`→`MemsetD8Async` so the region is capturable) and captured the
+imperative forward at fixed pos. Replay + argmax = **221.6 vs imperative 201.6
+tok/s — only +10%.** So decode is now **GPU-kernel-bound, not host-launch-bound**:
+the graph erases the host submit sliver but the GPU still runs **456 tiny
+kernels/token** (~4.4 ms of per-kernel latency at batch-1). **The remaining ~2×
+to llama.cpp is kernel efficiency (fewer/fused/bigger kernels), not launch
+overhead** — graph capture's payoff shrinks as you fuse. Measured this ceiling
+*before* the risky `pos`-as-device-scalar plumbing (touches the 1e-7 attention
+kernels) that correct per-token replay needs; capture infra kept (tested,
+dormant). **Next real decode lever: kernel fusion + tuning** (fuse
+norm-into-gemv, wider gemv tiles, fused attention) — a larger separate effort;
+CUDA-graph capture is a ~10% finisher on top.
 
 Flash-attention-style fused attention (tiled QKᵀ → online softmax → ·V, never
 materializing the S×S scores), causal masking, and a **KV cache** (append per

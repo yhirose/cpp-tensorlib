@@ -300,6 +300,18 @@ class array {
     return *this;
   }
 
+  // Launch this array's graph WITHOUT the terminal CtxSynchronize, adopting its
+  // storage so native() is valid. The kernels stay in flight on the null
+  // stream; a later same-stream kernel (kv_cache append/attn, GPU argmax) sees
+  // the writes by stream ordering, and the single sync is deferred to the next
+  // host read (raw()/data()) or explicit flush. Use ONLY when the consumer is a
+  // GPU kernel — a host read of *this* array still needs eval()/raw(). This is
+  // the lever that collapses a decode step's ~98 syncs to ~1; see run_noflush.
+  const array& realize() const {
+    realize_();
+    return *this;
+  }
+
  private:
   shape_t shape_;
   std::vector<int64_t> strides_;  // element units
@@ -314,7 +326,9 @@ class array {
   mutable detail::node_ptr const_node_;
 
   static array make_(shape_t shape);
-  void ensure_() const;  // materialize (evaluate + adopt) if lazy
+  void ensure_() const;    // materialize (evaluate + adopt) if lazy, then sync
+  void realize_() const;   // same, but leave kernels in flight (no sync)
+  void materialize_(bool do_flush) const;  // shared body
 
   friend struct detail::graph;
   friend array make_view_(const array& base, shape_t shape,
@@ -1592,8 +1606,15 @@ struct graph {
 
   // One topological pass over all roots (MLX-style batch eval), then each
   // node evaluates through eval_one. Iterative DFS: recursion depth must not
-  // bound graph depth.
-  static void run(const std::vector<node_ptr>& roots) {
+  // bound graph depth. do_flush=false leaves the launched kernels in flight on
+  // the null stream (no CtxSynchronize) — the caller's realize() path, where a
+  // later same-stream kernel consumes the result and a single terminal sync
+  // drains the whole batch (collapses a decode step's ~98 syncs to ~1).
+  static void run(const std::vector<node_ptr>& roots) { run_(roots, true); }
+  static void run_noflush(const std::vector<node_ptr>& roots) {
+    run_(roots, false);
+  }
+  static void run_(const std::vector<node_ptr>& roots, bool do_flush) {
     // Thread-local scratch: run() fires once per eval batch and tiny-graph
     // workloads are per-op-allocation-bound. Nested evaluation cannot happen
     // (kernels never build or evaluate graphs), so reuse is safe. Visited
@@ -1622,7 +1643,7 @@ struct graph {
       }
     }
     for (auto* n : order) eval_one(*n);
-    gpu::flush();  // blocking eval: the batch is done when run() returns
+    if (do_flush) gpu::flush();  // blocking eval: batch done when run() returns
   }
 
   // Allocation-free contiguity check on node metadata (result/constant
@@ -1994,7 +2015,7 @@ struct graph {
 
 }  // namespace detail
 
-inline void array::ensure_() const {
+inline void array::materialize_(bool do_flush) const {
   if (!node_) return;
   if (!node_->evaluated) {
 #ifdef TL_RUNTIME_HOOKS
@@ -2006,12 +2027,18 @@ inline void array::ensure_() const {
     // workloads; an initializer-list vector per call adds up.
     thread_local std::vector<detail::node_ptr> root;
     root.assign(1, node_);
+    // The run_hook is the flushing engine; a no-flush realize falls back to a
+    // full eval under hooks (unused in this project — hooks are off here).
     detail::run_hook(root);
     root.clear();
+    (void)do_flush;
 #else
     thread_local std::vector<detail::node_ptr> root;
     root.assign(1, node_);
-    detail::graph::run(root);
+    if (do_flush)
+      detail::graph::run(root);
+    else
+      detail::graph::run_noflush(root);
     root.clear();
 #endif
   }
@@ -2026,6 +2053,9 @@ inline void array::ensure_() const {
   node_->inputs.clear();
   self->const_node_ = std::move(self->node_);
 }
+
+inline void array::ensure_() const { materialize_(/*do_flush=*/true); }
+inline void array::realize_() const { materialize_(/*do_flush=*/false); }
 
 template <typename... Ts>
 void eval(const Ts&... arrays) {
