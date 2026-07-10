@@ -338,7 +338,7 @@ llama.cpp/exllamav2 hand-write. GGUF-style group quantization (Q4_K etc.) is the
 reference format to stay interop-friendly. Gate: **tokens/sec within reach of
 llama.cpp/exllamav2** on the same quantized model + GPU (not GFLOP/s vs cuBLAS).
 
-### M9 — Fused attention + KV cache  🔨 decode + KV cache + GQA + causal prefill + block-wiring done; cache↔array bridge in the decode loop + GGUF/tokenizer + prefill tiling remain
+### M9 — Fused attention + KV cache  🔨 decode + KV cache + GQA + causal prefill + block-wiring + multi-layer decode loop done; GGUF/tokenizer + prefill tiling remain
 
 **Done (fused decode attention, 2026-07-04):** `array::attn_decode(q,K,V,scale)`
 (op_t::attn_dec) → `tl_attn_decode_*`. Flash-attention online-softmax in one pass
@@ -401,12 +401,25 @@ append → attn_decode → out proj → residual → RMSNorm → SwiGLU MLP → 
 assembled from these + `dot` + `attn_decode` and verified vs a from-scratch CPU
 reference in `bench/check_llm_block.cpp` (ctest `llm_block`, backend-agnostic):
 **decoder-block maxrel 1.8e-7** on GPU, all six unit+block checks green on both
-CUDA and CPU builds. **Remaining to an actual chat:** the block test uses the pure
-MHA `array::attn_decode` for attention — wiring the persistent `cuda::kv_cache`
-(GQA + causal prefill) into a multi-layer decode *loop* needs the array↔native
-bridge (a public `array::native()` + a cached-attention entry, or a small app
-layer); then GGUF weight loading + a BPE tokenizer + sampling (mechanical bulk —
-Fable-appropriate). VJPs for RoPE (training) are deferred.
+CUDA and CPU builds.
+
+**Done (multi-layer decode loop wired to the cache, 2026-07-09):** the "runnable
+LLM" end to end. Added the array↔native bridge — a public **`array::native()`**
+(the evaluated device-buffer handle) — so each layer's attention step hands its
+`q/k/v` arrays' buffers to the stateful `cuda::kv_cache` (`append` then `attn`,
+GQA-aware) and wraps the result back into the array graph, while RMSNorm/RoPE/
+SwiGLU/proj stay pure array ops. `bench/check_llm_decode.cpp` (ctest `llm_decode`)
+drives a **3-layer, GQA (4 q / 2 kv) llama** greedily for 12 steps (6-token prompt
++ 6 generated, integer ids over a random embedding table — no tokenizer yet) and
+checks every step vs a from-scratch CPU reference: **logits maxrel 1.6e-6, greedy
+token sequences match exactly.** ctest 7/7. Lifetime/coherence rest on null-stream
+ordering (append/attn queue before the buffers recycle) + the device mirror (the
+cache's `device_write_` marks its output live, the next `dot` reads it device-side).
+The prompt is fed token-by-token through the decode path (functionally identical to
+causal prefill for the cache/logits; the parallel prefill kernel is a perf
+optimization). **Remaining to an actual chat:** GGUF weight loading + a BPE
+tokenizer + sampling (mechanical bulk — Fable-appropriate); using `attn_prefill`
+for the prompt. VJPs for RoPE (training) are deferred; head_dim still fixed at 128.
 
 Flash-attention-style fused attention (tiled QKᵀ → online softmax → ·V, never
 materializing the S×S scores), causal masking, and a **KV cache** (append per

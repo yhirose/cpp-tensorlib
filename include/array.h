@@ -220,6 +220,12 @@ class array {
   float item() const;                              // size() == 1
   float at(std::initializer_list<int64_t>) const;  // strided single read
 
+  // Raw device-buffer handle (CUDA mirror key), or null on host-only builds /
+  // unevaluated arrays. The bridge for handing an evaluated array's device
+  // buffer to an imperative cuda:: kernel (e.g. the kv_cache decode loop) —
+  // eval() first, then pass native() as the q/k/v pointer. Contiguous, offset 0.
+  void* native() const { return storage_.native; }
+
   // Views (zero-copy on the materialized result) and copies
   array transpose() const;                       // reverse all axes
   array transpose(std::vector<int> axes) const;  // permutation

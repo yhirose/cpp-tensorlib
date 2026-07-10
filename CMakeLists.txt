@@ -102,6 +102,16 @@ if(TENSORLIB_CUDA)
   target_link_libraries(tensorlib_bench_attn PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_bench_attn)
 
+  # M9 end-to-end: multi-layer llama decode loop wired to the persistent
+  # kv_cache (GQA) via the array<->native bridge, verified vs a CPU reference at
+  # every step. Uses the array API + tl::cuda::kv_cache, so CUDA-build only.
+  add_executable(tensorlib_check_llm_decode bench/check_llm_decode.cpp)
+  target_include_directories(tensorlib_check_llm_decode BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(tensorlib_check_llm_decode PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_check_llm_decode)
+  add_test(NAME llm_decode COMMAND tensorlib_check_llm_decode)
+
   # M8 int4-weight decode GEMV bench (Path-B style). Direct cuda:: API.
   add_executable(tensorlib_bench_q4 bench/bench_q4_gemv.cpp)
   target_include_directories(tensorlib_bench_q4 BEFORE PRIVATE
