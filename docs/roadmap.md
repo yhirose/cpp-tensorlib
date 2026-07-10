@@ -338,7 +338,7 @@ llama.cpp/exllamav2 hand-write. GGUF-style group quantization (Q4_K etc.) is the
 reference format to stay interop-friendly. Gate: **tokens/sec within reach of
 llama.cpp/exllamav2** on the same quantized model + GPU (not GFLOP/s vs cuBLAS).
 
-### M9 — Fused attention + KV cache  🔨 decode + KV cache + GQA + causal prefill + block-wiring + multi-layer decode loop done; GGUF/tokenizer + prefill tiling remain
+### M9 — Fused attention + KV cache  🔨 decode + KV cache + GQA + causal prefill + block-wiring + multi-layer decode loop + real-model chat (Qwen2.5-0.5B) done; speed (per-op overhead) + prefill tiling remain
 
 **Done (fused decode attention, 2026-07-04):** `array::attn_decode(q,K,V,scale)`
 (op_t::attn_dec) → `tl_attn_decode_*`. Flash-attention online-softmax in one pass
@@ -420,6 +420,37 @@ causal prefill for the cache/logits; the parallel prefill kernel is a perf
 optimization). **Remaining to an actual chat:** GGUF weight loading + a BPE
 tokenizer + sampling (mechanical bulk — Fable-appropriate); using `attn_prefill`
 for the prompt. VJPs for RoPE (training) are deferred; head_dim still fixed at 128.
+
+**Done (real-model chat — Qwen2.5-0.5B-Instruct end to end, 2026-07-10):** the
+project now *actually chats* on a real GGUF, own kernels only, zero third-party
+runtime deps. Four pieces landed: (1) **head_dim {64,128} generalization** — the
+five attention/KV kernels (`tl_attn_decode`/`split`/`prefill`, `tl_kv_append`/
+`fill`) are now `template<int AD>` on head_dim (NW=AD/32 warps replacing the
+hard-coded 4; the copy/combine kernels read `blockDim.x`), instantiated for
+{64,128} with the launchers dispatching by D; `ctest attn64` validates the D=64
+path vs the same CPU refs (maxrel 1e-7). Qwen2's head_dim is 64 (896/14), so this
+was a hard prereq. (2) **GGUF v3 loader** (`include/gguf.h`, Fable) — mmap +
+typed-KV + tensor directory, validated vs gguf-py (291 tensors match). (3) **Qwen2
+GPT-2 byte-level BPE tokenizer** (`include/tokenizer.h` + generated unicode tables
+in `tokenizer_data.h`, Fable) — token-exact vs HF on 7 cases incl. the chat
+template. (4) **the model forward** (`bench/qwen_model.h`) — F16→F32 widen, GGML
+`[out,in]`→our `[K,N]` transpose at load, QKV bias, RoPE base=1e6 half-split,
+RMSNorm eps=1e-6, GQA 14q/2kv, SwiGLU, composed from the array ops + the D=64
+`kv_cache`. Verified two ways: `check_qwen` matches a **numpy-on-the-same-F16-
+weights** oracle (greedy tokens exact, intermediates ~1e-5); `chat_qwen` generates
+coherent text whose greedy sequence is **character-for-character identical to
+llama.cpp** (F16, same GPU) — the target-scope "match llama.cpp greedy" bar, met
+on real hardware. **Speed finding (the census that matters):** decode is **67
+tok/s vs llama.cpp's 446** (6.7× gap) — and bf16 storage gives **65 tok/s (no
+speedup)**, proving 0.5B decode is **per-op-overhead-bound, not bandwidth-bound**
+(array-graph launch/eval/D2H per op × 24 layers dominates; llama.cpp wins via
+fused kernels + CUDA-graph capture, not arithmetic). Also **the WSL2 sysmem cliff
+did not fire** at 2GB F32 resident (decode stayed 67 tok/s) — confirming resident
+weights are churn-free-safe. So the next decode lever is **per-op overhead**
+(GPU-side argmax to kill the per-token 151936-float logits D2H, fused decode step,
+graph reuse), NOT bf16/q4 — those pay off only on bandwidth-bound larger models.
+Sampling (temp/top-k/top-p) and Q4_0→`dtype::q4` (needs the q4 GEMV's `K%256`
+relaxed to `K%32` — Qwen hidden 896 isn't a 256 multiple) remain.
 
 Flash-attention-style fused attention (tiled QKᵀ → online softmax → ·V, never
 materializing the S×S scores), causal masking, and a **KV cache** (append per

@@ -112,6 +112,33 @@ if(TENSORLIB_CUDA)
   tensorlib_enable_cuda(tensorlib_check_llm_decode)
   add_test(NAME llm_decode COMMAND tensorlib_check_llm_decode)
 
+  # M9 head_dim generalization: the attention/KV kernels are templated on
+  # head_dim {64,128}; this validates the D=64 instantiations (Qwen2 head_dim)
+  # against the same CPU references. Direct cuda:: API, CUDA-build only.
+  add_executable(tensorlib_check_attn64 bench/check_attn64.cpp)
+  target_include_directories(tensorlib_check_attn64 BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(tensorlib_check_attn64 PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_check_attn64)
+  add_test(NAME attn64 COMMAND tensorlib_check_attn64)
+
+  # M9 "actually chat": load a real Qwen2.5-0.5B GGUF (F16) and run the decoder
+  # end to end vs a tight numpy reference on the same weights. Not a ctest (needs
+  # the ~1.2 GB model file, which lives outside the repo). Run manually.
+  add_executable(tensorlib_check_qwen bench/check_qwen.cpp)
+  target_include_directories(tensorlib_check_qwen BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+  target_link_libraries(tensorlib_check_qwen PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_check_qwen)
+
+  # End-to-end chat: own GGUF loader + own BPE tokenizer + own CUDA kernels.
+  # prompt string -> generated text. Not a ctest (needs the external model).
+  add_executable(tensorlib_chat_qwen bench/chat_qwen.cpp)
+  target_include_directories(tensorlib_chat_qwen BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+  target_link_libraries(tensorlib_chat_qwen PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_chat_qwen)
+
   # M8 int4-weight decode GEMV bench (Path-B style). Direct cuda:: API.
   add_executable(tensorlib_bench_q4 bench/bench_q4_gemv.cpp)
   target_include_directories(tensorlib_bench_q4 BEFORE PRIVATE
@@ -212,3 +239,16 @@ endif()
 add_test(NAME cpu  COMMAND tensorlib_test --cpu)
 add_test(NAME gpu  COMMAND tensorlib_test --gpu)
 add_test(NAME auto COMMAND tensorlib_test --auto)
+
+# GGUF v3 reader check (include/gguf.h): parses a real Qwen2.5-0.5B fp16 model
+# and asserts the directory against the reference gguf-py manifest. Pure host
+# binary parsing — no GPU; not a ctest (the model file lives outside the repo).
+add_executable(check_gguf bench/check_gguf.cpp)
+target_link_libraries(check_gguf PRIVATE tensorlib)
+
+# Qwen2 BPE tokenizer check (include/tokenizer.h): encodes the HF-oracle test
+# strings from bench/tokenizer_oracle_data.h and asserts token-exact ids +
+# decode round-trip. Pure host code; not a ctest (needs the 1.2GB model file
+# outside the repo).
+add_executable(check_tokenizer bench/check_tokenizer.cpp)
+target_link_libraries(check_tokenizer PRIVATE tensorlib)

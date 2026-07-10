@@ -447,41 +447,51 @@ __global__ void tl_gemv_q4s(const float* __restrict__ a,
 // — which is launch/materialize-bound, not compute-bound — for the regime that
 // dominates decode-token time.
 //
-// One block per head, blockDim = head_dim = 128 (4 warps). Each warp owns keys
-// i = warp, warp+4, ...; its 32 lanes cooperatively reduce the D=128 score
-// (coalesced K/V row reads, warp-shuffle reduction, no block sync in the loop),
-// keeping per-warp (m,l,acc) running state. A final shared-memory step merges
-// the 4 warps' partial softmax states (flash-attention rescale-by-exp(m_w-m)).
-#define TL_AD 128    // head dim
-#define TL_ADPT 4    // TL_AD / 32 = dims per lane
-__global__ void tl_attn_decode_f32(const float* __restrict__ q,
-                                   const float* __restrict__ K,
-                                   const float* __restrict__ V,
-                                   float* __restrict__ out, unsigned ctx,
-                                   unsigned kv_stride, unsigned group,
-                                   float scale) {
+// One block per head, blockDim = head_dim AD (NW = AD/32 warps). Each warp owns
+// keys i = warp, warp+NW, ...; its 32 lanes cooperatively reduce the AD-long
+// score (coalesced K/V row reads, warp-shuffle reduction, no block sync in the
+// loop), keeping per-warp (m,l,acc) running state. A final shared-memory step
+// merges the NW warps' partial softmax states (flash rescale-by-exp(m_w-m)).
+//
+// head_dim generalization (M9): the kernels are templated on AD (compile-time,
+// because acc[]/sacc[][] are register/smem arrays sized AD/32) and instantiated
+// for {64,128} — the head dims of the target models (Qwen2 = 64, llama-7B = 128).
+// Each lane holds NW = AD/32 dims (d = lane, lane+32, ..., lane+(NW-1)*32) and
+// there are exactly NW warps, so the warp count and the per-lane dim count
+// coincide. extern "C" wrappers below give each instantiation a stable symbol
+// (the driver loads kernels by name): tl_attn_decode_f32[_64], etc.
+}  // close extern "C": the __device__ core templates below can't have C linkage;
+   // each __global__ wrapper re-declares its own extern "C" for a stable symbol.
+template <int AD>
+__device__ void attn_decode_core(const float* __restrict__ q,
+                                  const float* __restrict__ K,
+                                  const float* __restrict__ V,
+                                  float* __restrict__ out, unsigned ctx,
+                                  unsigned kv_stride, unsigned group,
+                                  float scale) {
+  constexpr int NW = AD / 32;                   // warps == dims-per-lane
   const unsigned h = blockIdx.x;                // query head
   const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
-  const unsigned tid = threadIdx.x;  // 0..127
-  const unsigned lane = tid & 31u, warp = tid >> 5;  // 4 warps of 32
-  const float* qh = q + (size_t)h * TL_AD;
+  const unsigned tid = threadIdx.x;             // 0..AD-1
+  const unsigned lane = tid & 31u, warp = tid >> 5;  // NW warps of 32
+  const float* qh = q + (size_t)h * AD;
   // K,V are [H_kv, max_ctx, D]; kv_stride = max_ctx*D lets a persistent cache be
-  // read as its valid prefix [0,ctx) (kv_stride==ctx*TL_AD is the no-cache case).
+  // read as its valid prefix [0,ctx) (kv_stride==ctx*AD is the no-cache case).
   const float* Kh = K + (size_t)kv_h * kv_stride;
   const float* Vh = V + (size_t)kv_h * kv_stride;
 
-  __shared__ float q_sh[TL_AD];
+  __shared__ float q_sh[AD];
   q_sh[tid] = qh[tid];
   __syncthreads();
 
   float m = -1e30f, l = 0.0f;
-  float acc[TL_ADPT] = {};  // lane holds dims d = lane, lane+32, lane+64, +96
+  float acc[NW] = {};  // lane holds dims d = lane, lane+32, ..., lane+(NW-1)*32
 
-  for (unsigned i = warp; i < ctx; i += 4u) {
-    const float* Ki = Kh + (size_t)i * TL_AD;
+  for (unsigned i = warp; i < ctx; i += (unsigned)NW) {
+    const float* Ki = Kh + (size_t)i * AD;
     float partial = 0.0f;
 #pragma unroll
-    for (int r = 0; r < TL_ADPT; r++) partial += q_sh[lane + r * 32] * Ki[lane + r * 32];
+    for (int r = 0; r < NW; r++) partial += q_sh[lane + r * 32] * Ki[lane + r * 32];
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
       partial += __shfl_down_sync(0xffffffffu, partial, off);
@@ -491,67 +501,81 @@ __global__ void tl_attn_decode_f32(const float* __restrict__ q,
     float corr = __expf(m - m_new);
     float p = __expf(s - m_new);
     l = l * corr + p;
-    const float* Vi = Vh + (size_t)i * TL_AD;
+    const float* Vi = Vh + (size_t)i * AD;
 #pragma unroll
-    for (int r = 0; r < TL_ADPT; r++) acc[r] = acc[r] * corr + p * Vi[lane + r * 32];
+    for (int r = 0; r < NW; r++) acc[r] = acc[r] * corr + p * Vi[lane + r * 32];
     m = m_new;
   }
 
-  // merge the 4 warps' partial softmax states through shared memory
-  __shared__ float sm[4], sl[4], sacc[4][TL_AD];
+  // merge the NW warps' partial softmax states through shared memory
+  __shared__ float sm[NW], sl[NW], sacc[NW][AD];
   if (lane == 0) {
     sm[warp] = m;
     sl[warp] = l;
   }
 #pragma unroll
-  for (int r = 0; r < TL_ADPT; r++) sacc[warp][lane + r * 32] = acc[r];
+  for (int r = 0; r < NW; r++) sacc[warp][lane + r * 32] = acc[r];
   __syncthreads();
 
-  float gm = fmaxf(fmaxf(sm[0], sm[1]), fmaxf(sm[2], sm[3]));
+  float gm = -1e30f;
+#pragma unroll
+  for (int w = 0; w < NW; w++) gm = fmaxf(gm, sm[w]);
   float gl = 0.0f, o = 0.0f;
 #pragma unroll
-  for (int w = 0; w < 4; w++) {
+  for (int w = 0; w < NW; w++) {
     float e = __expf(sm[w] - gm);
     gl += sl[w] * e;
     o += sacc[w][tid] * e;
   }
-  out[(size_t)h * TL_AD + tid] = o / gl;
+  out[(size_t)h * AD + tid] = o / gl;
+}
+extern "C" __global__ void tl_attn_decode_f32(const float* q, const float* K,
+    const float* V, float* out, unsigned ctx, unsigned kv_stride,
+    unsigned group, float scale) {
+  attn_decode_core<128>(q, K, V, out, ctx, kv_stride, group, scale);
+}
+extern "C" __global__ void tl_attn_decode_f32_64(const float* q, const float* K,
+    const float* V, float* out, unsigned ctx, unsigned kv_stride,
+    unsigned group, float scale) {
+  attn_decode_core<64>(q, K, V, out, ctx, kv_stride, group, scale);
 }
 
 // Split-KV (flash-decoding): the one-block-per-head kernel above launches only
-// H=32 blocks — 3% of the 82 SMs, so it's occupancy-bound. Partition ctx over
+// H blocks — a few % of the 82 SMs, so it's occupancy-bound. Partition ctx over
 // gridDim.y so grid = H×S fills the SMs; each (head,split) block writes its
 // partial softmax state (m,l,acc at its local max) to scratch, and tl_attn_
 // combine merges the S partials per head. K,V are still each read exactly once.
-__global__ void tl_attn_decode_split(const float* __restrict__ q,
-                                     const float* __restrict__ K,
-                                     const float* __restrict__ V,
-                                     float* __restrict__ pm,
-                                     float* __restrict__ pl,
-                                     float* __restrict__ pacc, unsigned ctx,
-                                     unsigned kv_stride, unsigned group,
-                                     unsigned chunk, float scale) {
+template <int AD>
+__device__ void attn_decode_split_core(const float* __restrict__ q,
+                                        const float* __restrict__ K,
+                                        const float* __restrict__ V,
+                                        float* __restrict__ pm,
+                                        float* __restrict__ pl,
+                                        float* __restrict__ pacc, unsigned ctx,
+                                        unsigned kv_stride, unsigned group,
+                                        unsigned chunk, float scale) {
+  constexpr int NW = AD / 32;
   const unsigned h = blockIdx.x, s = blockIdx.y, S = gridDim.y;
   const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
   const unsigned tid = threadIdx.x;
   const unsigned lane = tid & 31u, warp = tid >> 5;
-  const float* qh = q + (size_t)h * TL_AD;
+  const float* qh = q + (size_t)h * AD;
   const float* Kh = K + (size_t)kv_h * kv_stride;
   const float* Vh = V + (size_t)kv_h * kv_stride;
   const unsigned k0 = s * chunk;
   const unsigned k1 = (k0 + chunk < ctx) ? (k0 + chunk) : ctx;
 
-  __shared__ float q_sh[TL_AD];
+  __shared__ float q_sh[AD];
   q_sh[tid] = qh[tid];
   __syncthreads();
 
   float m = -1e30f, l = 0.0f;
-  float acc[TL_ADPT] = {};
-  for (unsigned i = k0 + warp; i < k1; i += 4u) {
-    const float* Ki = Kh + (size_t)i * TL_AD;
+  float acc[NW] = {};
+  for (unsigned i = k0 + warp; i < k1; i += (unsigned)NW) {
+    const float* Ki = Kh + (size_t)i * AD;
     float partial = 0.0f;
 #pragma unroll
-    for (int r = 0; r < TL_ADPT; r++) partial += q_sh[lane + r * 32] * Ki[lane + r * 32];
+    for (int r = 0; r < NW; r++) partial += q_sh[lane + r * 32] * Ki[lane + r * 32];
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
       partial += __shfl_down_sync(0xffffffffu, partial, off);
@@ -560,25 +584,27 @@ __global__ void tl_attn_decode_split(const float* __restrict__ q,
     float corr = __expf(m - m_new);
     float p = __expf(sc - m_new);
     l = l * corr + p;
-    const float* Vi = Vh + (size_t)i * TL_AD;
+    const float* Vi = Vh + (size_t)i * AD;
 #pragma unroll
-    for (int r = 0; r < TL_ADPT; r++) acc[r] = acc[r] * corr + p * Vi[lane + r * 32];
+    for (int r = 0; r < NW; r++) acc[r] = acc[r] * corr + p * Vi[lane + r * 32];
     m = m_new;
   }
 
-  __shared__ float sm[4], sl[4], sacc[4][TL_AD];
+  __shared__ float sm[NW], sl[NW], sacc[NW][AD];
   if (lane == 0) {
     sm[warp] = m;
     sl[warp] = l;
   }
 #pragma unroll
-  for (int r = 0; r < TL_ADPT; r++) sacc[warp][lane + r * 32] = acc[r];
+  for (int r = 0; r < NW; r++) sacc[warp][lane + r * 32] = acc[r];
   __syncthreads();
 
-  float gm = fmaxf(fmaxf(sm[0], sm[1]), fmaxf(sm[2], sm[3]));
+  float gm = -1e30f;
+#pragma unroll
+  for (int w = 0; w < NW; w++) gm = fmaxf(gm, sm[w]);
   float gl = 0.0f, o = 0.0f;
 #pragma unroll
-  for (int w = 0; w < 4; w++) {
+  for (int w = 0; w < NW; w++) {
     float e = __expf(sm[w] - gm);
     gl += sl[w] * e;
     o += sacc[w][tid] * e;
@@ -588,15 +614,29 @@ __global__ void tl_attn_decode_split(const float* __restrict__ q,
     pm[sidx] = gm;
     pl[sidx] = gl;
   }
-  pacc[sidx * TL_AD + tid] = o;  // un-normalized accumulator at local max gm
+  pacc[sidx * AD + tid] = o;  // un-normalized accumulator at local max gm
+}
+extern "C" __global__ void tl_attn_decode_split(const float* q, const float* K,
+    const float* V, float* pm, float* pl, float* pacc, unsigned ctx,
+    unsigned kv_stride, unsigned group, unsigned chunk, float scale) {
+  attn_decode_split_core<128>(q, K, V, pm, pl, pacc, ctx, kv_stride, group,
+                              chunk, scale);
+}
+extern "C" __global__ void tl_attn_decode_split_64(const float* q,
+    const float* K, const float* V, float* pm, float* pl, float* pacc,
+    unsigned ctx, unsigned kv_stride, unsigned group, unsigned chunk,
+    float scale) {
+  attn_decode_split_core<64>(q, K, V, pm, pl, pacc, ctx, kv_stride, group,
+                             chunk, scale);
 }
 
-// Merge the S per-head partials (each already at its local max) into out.
-__global__ void tl_attn_combine(const float* __restrict__ pm,
-                                const float* __restrict__ pl,
-                                const float* __restrict__ pacc,
-                                float* __restrict__ out, unsigned S) {
-  const unsigned h = blockIdx.x, tid = threadIdx.x;
+// Merge the S per-head partials (each already at its local max) into out. Not
+// templated: the per-dim thread stride D == blockDim.x, so head_dim is implicit.
+extern "C" __global__ void tl_attn_combine(const float* __restrict__ pm,
+                                           const float* __restrict__ pl,
+                                           const float* __restrict__ pacc,
+                                           float* __restrict__ out, unsigned S) {
+  const unsigned h = blockIdx.x, tid = threadIdx.x, D = blockDim.x;
   const size_t base = (size_t)h * S;
   float gm = -1e30f;
   for (unsigned s = 0; s < S; s++) gm = fmaxf(gm, pm[base + s]);
@@ -604,37 +644,39 @@ __global__ void tl_attn_combine(const float* __restrict__ pm,
   for (unsigned s = 0; s < S; s++) {
     float e = __expf(pm[base + s] - gm);
     gl += pl[base + s] * e;
-    o += pacc[(base + s) * TL_AD + tid] * e;
+    o += pacc[(base + s) * D + tid] * e;
   }
-  out[(size_t)h * TL_AD + tid] = o / gl;
+  out[(size_t)h * D + tid] = o / gl;
 }
 
 // Append one decode step's k,v (each [H_kv, D] contiguous) into the persistent
 // cache at row `pos`. The cache is [H_kv, max_ctx, D], so head h's slot for the
 // new token starts at h*kv_stride + pos*D (kv_stride = max_ctx*D). Heads are
-// non-contiguous in the cache, so this is a scatter, not a plain copy.
-// grid.x = H_kv, blockDim = D.
-__global__ void tl_kv_append(float* __restrict__ Kc, float* __restrict__ Vc,
-                             const float* __restrict__ k_new,
-                             const float* __restrict__ v_new, unsigned pos,
-                             unsigned kv_stride) {
-  const unsigned h = blockIdx.x, d = threadIdx.x;
-  const size_t dst = (size_t)h * kv_stride + (size_t)pos * TL_AD + d;
-  const size_t src = (size_t)h * TL_AD + d;
+// non-contiguous in the cache, so this is a scatter, not a plain copy. Not
+// templated: D == blockDim.x. grid.x = H_kv, blockDim = D.
+extern "C" __global__ void tl_kv_append(float* __restrict__ Kc,
+                                        float* __restrict__ Vc,
+                                        const float* __restrict__ k_new,
+                                        const float* __restrict__ v_new,
+                                        unsigned pos, unsigned kv_stride) {
+  const unsigned h = blockIdx.x, d = threadIdx.x, D = blockDim.x;
+  const size_t dst = (size_t)h * kv_stride + (size_t)pos * D + d;
+  const size_t src = (size_t)h * D + d;
   Kc[dst] = k_new[src];
   Vc[dst] = v_new[src];
 }
 
 // Bulk-fill the cache from a prefill's k,v (each [H_kv, T, D] contiguous) into
-// the cache [H_kv, max_ctx, D] rows [0,T). The two differ only in the row
-// stride (T vs max_ctx), so this is a strided copy. grid = (H_kv, T), block = D.
-__global__ void tl_kv_fill(float* __restrict__ Kc, float* __restrict__ Vc,
-                           const float* __restrict__ K,
-                           const float* __restrict__ V, unsigned T,
-                           unsigned kv_stride) {
-  const unsigned h = blockIdx.x, p = blockIdx.y, d = threadIdx.x;
-  const size_t dst = (size_t)h * kv_stride + (size_t)p * TL_AD + d;
-  const size_t src = ((size_t)h * T + p) * TL_AD + d;
+// the cache [H_kv, max_ctx, D] rows [0,T). The two differ only in the row stride
+// (T vs max_ctx), so this is a strided copy. D == blockDim.x. grid = (H_kv, T).
+extern "C" __global__ void tl_kv_fill(float* __restrict__ Kc,
+                                      float* __restrict__ Vc,
+                                      const float* __restrict__ K,
+                                      const float* __restrict__ V, unsigned T,
+                                      unsigned kv_stride) {
+  const unsigned h = blockIdx.x, p = blockIdx.y, d = threadIdx.x, D = blockDim.x;
+  const size_t dst = (size_t)h * kv_stride + (size_t)p * D + d;
+  const size_t src = ((size_t)h * T + p) * D + d;
   Kc[dst] = K[src];
   Vc[dst] = V[src];
 }
@@ -646,33 +688,35 @@ __global__ void tl_kv_fill(float* __restrict__ Kc, float* __restrict__ Vc,
 // (head, query pos) so the grid = H_q×T fills the SMs (no split-KV needed). This
 // is the correctness-first baseline — each query re-streams its keys from DRAM
 // (O(T²) traffic); a query×key tiled flash-attention is the deferred tuning pass.
-// grid = (H_q, T), blockDim = 128 = head_dim (4 warps).
-__global__ void tl_attn_prefill_f32(const float* __restrict__ q,
-                                    const float* __restrict__ K,
-                                    const float* __restrict__ V,
-                                    float* __restrict__ out, unsigned T,
-                                    unsigned kv_stride, unsigned group,
-                                    float scale) {
+// grid = (H_q, T), blockDim = AD = head_dim (NW warps).
+template <int AD>
+__device__ void attn_prefill_core(const float* __restrict__ q,
+                                  const float* __restrict__ K,
+                                  const float* __restrict__ V,
+                                  float* __restrict__ out, unsigned T,
+                                  unsigned kv_stride, unsigned group,
+                                  float scale) {
+  constexpr int NW = AD / 32;
   const unsigned h = blockIdx.x;                // query head
   const unsigned p = blockIdx.y;                // query pos, attends keys 0..p
   const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
   const unsigned tid = threadIdx.x;
   const unsigned lane = tid & 31u, warp = tid >> 5;
-  const float* qh = q + ((size_t)h * T + p) * TL_AD;  // q is [H_q, T, D]
+  const float* qh = q + ((size_t)h * T + p) * AD;  // q is [H_q, T, D]
   const float* Kh = K + (size_t)kv_h * kv_stride;
   const float* Vh = V + (size_t)kv_h * kv_stride;
 
-  __shared__ float q_sh[TL_AD];
+  __shared__ float q_sh[AD];
   q_sh[tid] = qh[tid];
   __syncthreads();
 
   float m = -1e30f, l = 0.0f;
-  float acc[TL_ADPT] = {};
-  for (unsigned i = warp; i <= p; i += 4u) {  // causal: keys 0..p only
-    const float* Ki = Kh + (size_t)i * TL_AD;
+  float acc[NW] = {};
+  for (unsigned i = warp; i <= p; i += (unsigned)NW) {  // causal: keys 0..p only
+    const float* Ki = Kh + (size_t)i * AD;
     float partial = 0.0f;
 #pragma unroll
-    for (int r = 0; r < TL_ADPT; r++) partial += q_sh[lane + r * 32] * Ki[lane + r * 32];
+    for (int r = 0; r < NW; r++) partial += q_sh[lane + r * 32] * Ki[lane + r * 32];
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
       partial += __shfl_down_sync(0xffffffffu, partial, off);
@@ -681,35 +725,46 @@ __global__ void tl_attn_prefill_f32(const float* __restrict__ q,
     float corr = __expf(m - m_new);
     float pp = __expf(s - m_new);
     l = l * corr + pp;
-    const float* Vi = Vh + (size_t)i * TL_AD;
+    const float* Vi = Vh + (size_t)i * AD;
 #pragma unroll
-    for (int r = 0; r < TL_ADPT; r++) acc[r] = acc[r] * corr + pp * Vi[lane + r * 32];
+    for (int r = 0; r < NW; r++) acc[r] = acc[r] * corr + pp * Vi[lane + r * 32];
     m = m_new;
   }
 
-  // merge the 4 warps' partial softmax states (empty warps carry m=-1e30,l=0 →
+  // merge the NW warps' partial softmax states (empty warps carry m=-1e30,l=0 →
   // contribute exp(-inf)=0, correct for the short causal prefixes at small p)
-  __shared__ float sm[4], sl[4], sacc[4][TL_AD];
+  __shared__ float sm[NW], sl[NW], sacc[NW][AD];
   if (lane == 0) {
     sm[warp] = m;
     sl[warp] = l;
   }
 #pragma unroll
-  for (int r = 0; r < TL_ADPT; r++) sacc[warp][lane + r * 32] = acc[r];
+  for (int r = 0; r < NW; r++) sacc[warp][lane + r * 32] = acc[r];
   __syncthreads();
 
-  float gm = fmaxf(fmaxf(sm[0], sm[1]), fmaxf(sm[2], sm[3]));
+  float gm = -1e30f;
+#pragma unroll
+  for (int w = 0; w < NW; w++) gm = fmaxf(gm, sm[w]);
   float gl = 0.0f, o = 0.0f;
 #pragma unroll
-  for (int w = 0; w < 4; w++) {
+  for (int w = 0; w < NW; w++) {
     float e = __expf(sm[w] - gm);
     gl += sl[w] * e;
     o += sacc[w][tid] * e;
   }
-  out[((size_t)h * T + p) * TL_AD + tid] = o / gl;
+  out[((size_t)h * T + p) * AD + tid] = o / gl;
 }
-#undef TL_AD
-#undef TL_ADPT
+extern "C" __global__ void tl_attn_prefill_f32(const float* q, const float* K,
+    const float* V, float* out, unsigned T, unsigned kv_stride, unsigned group,
+    float scale) {
+  attn_prefill_core<128>(q, K, V, out, T, kv_stride, group, scale);
+}
+extern "C" __global__ void tl_attn_prefill_f32_64(const float* q,
+    const float* K, const float* V, float* out, unsigned T, unsigned kv_stride,
+    unsigned group, float scale) {
+  attn_prefill_core<64>(q, K, V, out, T, kv_stride, group, scale);
+}
+extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 
 // RoPE (rotary position embedding), half-split (GPT-NeoX / HF-llama) convention.
 // x is [rows, D] contiguous (rows = H*T: a [H,T,D] tensor flattened, or [H,D]

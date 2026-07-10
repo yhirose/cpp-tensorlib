@@ -270,19 +270,32 @@ struct context {
   }
 
   // M9 fused decode attention (single-pass + split-KV two-pass).
+  // head_dim {64,128} variants (M9): each templated instantiation has its own
+  // symbol; the launchers pick by D. The unsuffixed name is the D=128 build.
   CUfunction attn_decode_fn = nullptr, attn_split_fn = nullptr,
              attn_combine_fn = nullptr;
-  CUfunction attn_decode_() {
+  CUfunction attn_decode_64_fn = nullptr, attn_split_64_fn = nullptr;
+  CUfunction attn_decode_(int64_t D) {
+    if (D == 64) {
+      if (!attn_decode_64_fn)
+        d.ModuleGetFunction(&attn_decode_64_fn, mod, "tl_attn_decode_f32_64");
+      return attn_decode_64_fn;
+    }
     if (!attn_decode_fn)
       d.ModuleGetFunction(&attn_decode_fn, mod, "tl_attn_decode_f32");
     return attn_decode_fn;
   }
-  CUfunction attn_split_() {
+  CUfunction attn_split_(int64_t D) {
+    if (D == 64) {
+      if (!attn_split_64_fn)
+        d.ModuleGetFunction(&attn_split_64_fn, mod, "tl_attn_decode_split_64");
+      return attn_split_64_fn;
+    }
     if (!attn_split_fn)
       d.ModuleGetFunction(&attn_split_fn, mod, "tl_attn_decode_split");
     return attn_split_fn;
   }
-  CUfunction attn_combine_() {
+  CUfunction attn_combine_() {  // head_dim implicit (blockDim.x) — one symbol
     if (!attn_combine_fn)
       d.ModuleGetFunction(&attn_combine_fn, mod, "tl_attn_combine");
     return attn_combine_fn;
@@ -308,7 +321,13 @@ struct context {
     if (!kv_fill_fn) d.ModuleGetFunction(&kv_fill_fn, mod, "tl_kv_fill");
     return kv_fill_fn;
   }
-  CUfunction attn_prefill_() {
+  CUfunction attn_prefill_64_fn = nullptr;
+  CUfunction attn_prefill_(int64_t D) {
+    if (D == 64) {
+      if (!attn_prefill_64_fn)
+        d.ModuleGetFunction(&attn_prefill_64_fn, mod, "tl_attn_prefill_f32_64");
+      return attn_prefill_64_fn;
+    }
     if (!attn_prefill_fn)
       d.ModuleGetFunction(&attn_prefill_fn, mod, "tl_attn_prefill_f32");
     return attn_prefill_fn;
@@ -538,12 +557,12 @@ inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
 // M9 fused decode attention: out(h,:) = softmax(scale·q(h,:)·K(kv,:)^T)·V(kv) in
 // one pass. q [n_q_heads,D], out [n_q_heads,D]; K/V are a [n_kv_heads,kv_max,D]
 // cache read over its valid prefix [0,ctx) (kv_max==ctx is the no-cache case).
-// GQA: q head h reads kv head h/(n_q_heads/n_kv_heads). Contiguous, D==128.
+// GQA: q head h reads kv head h/(n_q_heads/n_kv_heads). Contiguous, D∈{64,128}.
 inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
                         int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
                         int64_t D, float scale) {
   auto& c = context::get();
-  if (!c.ready || D != 128) return false;
+  if (!c.ready || (D != 128 && D != 64)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
   c.device_read_(q);
   c.device_read_(K);
@@ -570,20 +589,21 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
       if (want > 1) S = want;
     }
   }
+  unsigned uD = static_cast<unsigned>(D);
   if (S == 1) {
     void* args[] = {&pq, &pk, &pv, &po, &uctx, &kv_stride, &group, &scale};
     c.pending = true;
-    return c.d.LaunchKernel(c.attn_decode_(), uh, 1, 1, 128, 1, 1, 0, nullptr,
+    return c.d.LaunchKernel(c.attn_decode_(D), uh, 1, 1, uD, 1, 1, 0, nullptr,
                             args, nullptr) == 0;
   }
 
   unsigned chunk = (uctx + S - 1) / S;
-  chunk = (chunk + 3u) & ~3u;  // multiple of the 4 warps
+  chunk = (chunk + 3u) & ~3u;  // multiple of the warp count (4 for D=128, 2 for 64)
   if (chunk == 0) chunk = 4;
   S = (uctx + chunk - 1) / chunk;  // recompute after rounding
-  // scratch: pm[H*S] , pl[H*S] , pacc[H*S*128]
+  // scratch: pm[H*S] , pl[H*S] , pacc[H*S*D]
   size_t hs = (size_t)uh * S;
-  size_t bytes = (hs * 2 + hs * 128) * sizeof(float);
+  size_t bytes = (hs * 2 + hs * (size_t)D) * sizeof(float);
   CUdeviceptr scr = c.attn_scratch_(bytes);
   if (!scr) return false;
   float* pm = reinterpret_cast<float*>(scr);
@@ -593,11 +613,11 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
   void* a1[] = {&pq,     &pk,        &pv,    &pm,    &pl,
                 &pacc,   &uctx,      &kv_stride, &group, &chunk,
                 &scale};
-  if (c.d.LaunchKernel(c.attn_split_(), uh, S, 1, 128, 1, 1, 0, nullptr, a1,
+  if (c.d.LaunchKernel(c.attn_split_(D), uh, S, 1, uD, 1, 1, 0, nullptr, a1,
                        nullptr) != 0)
     return false;
   void* a2[] = {&pm, &pl, &pacc, &po, &S};
-  return c.d.LaunchKernel(c.attn_combine_(), uh, 1, 1, 128, 1, 1, 0, nullptr, a2,
+  return c.d.LaunchKernel(c.attn_combine_(), uh, 1, 1, uD, 1, 1, 0, nullptr, a2,
                           nullptr) == 0;
 }
 
@@ -606,7 +626,7 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
 inline bool kv_append(void* Kc, void* Vc, void* k_new, void* v_new, int64_t pos,
                       int64_t kv_max, int64_t n_kv_heads, int64_t D) {
   auto& c = context::get();
-  if (!c.ready || D != 128) return false;
+  if (!c.ready || (D != 128 && D != 64)) return false;
   c.device_read_(k_new);
   c.device_read_(v_new);
   c.device_write_(Kc);
@@ -629,7 +649,7 @@ inline bool kv_append(void* Kc, void* Vc, void* k_new, void* v_new, int64_t pos,
 inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
                     int64_t kv_max, int64_t n_kv_heads, int64_t D) {
   auto& c = context::get();
-  if (!c.ready || D != 128) return false;
+  if (!c.ready || (D != 128 && D != 64)) return false;
   c.device_read_(K);
   c.device_read_(V);
   c.device_write_(Kc);
@@ -648,13 +668,13 @@ inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
 }
 
 // M9 causal prefill attention: q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D]
-// cache read over [0,T). Query p attends keys 0..p. GQA via group. D==128.
+// cache read over [0,T). Query p attends keys 0..p. GQA via group. D∈{64,128}.
 // One block per (head, query pos); grid=(n_q_heads,T) (T <= 65535 gridDim.y).
 inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads,
                          int64_t n_kv_heads, int64_t T, int64_t kv_max, int64_t D,
                          float scale) {
   auto& c = context::get();
-  if (!c.ready || D != 128) return false;
+  if (!c.ready || (D != 128 && D != 64)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
   if (T <= 0 || T > 65535) return false;  // gridDim.y limit (chunk beyond)
   c.device_read_(q);
@@ -670,7 +690,7 @@ inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads
   unsigned group = static_cast<unsigned>(n_q_heads / n_kv_heads);
   void* args[] = {&pq, &pk, &pv, &po, &uT, &kv_stride, &group, &scale};
   c.pending = true;
-  return c.d.LaunchKernel(c.attn_prefill_(), static_cast<unsigned>(n_q_heads), uT,
+  return c.d.LaunchKernel(c.attn_prefill_(D), static_cast<unsigned>(n_q_heads), uT,
                           1, static_cast<unsigned>(D), 1, 1, 0, nullptr, args,
                           nullptr) == 0;
 }

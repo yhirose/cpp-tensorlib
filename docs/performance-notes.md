@@ -658,6 +658,50 @@ then a second pass to bandwidth-bound: bf16 1.62→1.84×, attention 4→19×, i
 1.24→1.79× (mid-tune). Occupancy (blocks vs 82 SMs) was the recurring first
 bottleneck — split-K/split-KV the recurring fix.
 
+## Real-model chat: Qwen2.5-0.5B end to end (RTX 3090 / WSL2, 2026-07-10)
+
+First real GGUF loaded and generating text on own kernels (roadmap M9 "real-model
+chat"). The census here is the **decode-speed regime finding**, which overturned
+the going-in assumption.
+
+**Going in:** expected bf16/q4 weight storage to be the decode lever (halve weight
+bytes → faster on the bandwidth-bound GEMV) and the WSL2 2GB sysmem cliff to bite
+F32. **Both were wrong for a 0.5B model.** Measured decode (`bench/chat_qwen`,
+greedy, all layers on GPU, RTX 3090):
+
+| weight storage | resident | prefill tok/s | **decode tok/s** |
+|---|---|---|---|
+| F32 | ~2.0 GB | 48.8 | **67.2** |
+| bf16 | ~1.0 GB | 56.9 | **65.0** |
+| **llama.cpp (F16, `llama-bench`)** | 1.17 GB | 9765 | **446** |
+
+**Reading:** (1) bf16 gives **no decode speedup** (65 vs 67) → 0.5B decode is
+**per-op-overhead-bound, not bandwidth-bound**. Per-token ≈15 ms is dominated by
+the array graph's per-op kernel-launch + eval + D2H across 24 layers × ~15 ops,
+not weight-byte traffic. So the M7/M8 bf16/q4 levers (real on bandwidth-bound
+7B-class decode) don't move a 0.5B. (2) The **WSL2 sysmem cliff did not fire** at
+2 GB F32 resident — decode stayed 67 tok/s, not the ~7× collapse the churn-driven
+cliff produces. Confirms [[cuda-wsl2-sysmem-fallback-cliff]]: *resident* weights
+(loaded once, never reallocated) are safe; the cliff is a churn phenomenon. (An
+earlier ~27 tok/s figure was a load-inclusive mis-estimate; the isolated decode
+loop is 67.) (3) **Gap to llama.cpp is 6.7×**, and its cause is overhead, not
+kernels: llama.cpp fuses ops and uses CUDA-graph capture to erase per-token
+launch/sync. The next decode lever is therefore **per-op overhead** — GPU-side
+argmax (kill the per-token 151936-float logits→host D2H that greedy needs only an
+argmax from), a fused decode step, graph reuse — *not* dtype width.
+
+**Correctness (the target-scope bar):** `chat_qwen`'s greedy output is
+**character-for-character identical to llama.cpp** on the same F16 GGUF + same GPU
+("Give me a short introduction to large language models." → "Large language
+models, or LLMs, are artificial intelligence systems that can generate human-like
+text…"). Validated tightly in `check_qwen` against a **numpy forward reading the
+same F16 weights** (greedy exact; embedding/layer-0/final-norm/top-5 maxrel
+~1e-5). Oracle subtlety worth keeping: torch/HF runs the **bf16** original weights
+while the GGUF is **F16**, so torch greedy diverges after ~3 tokens (a
+weight-precision difference, not a bug) — the numpy-on-F16 forward is the tight
+oracle, torch is only a sanity check. head_dim=64 kernels (new {64,128}
+generalization) validated at maxrel 1e-7 (`ctest attn64`).
+
 ## vs silarray (M1 Pro, 2026-07-03)
 
 Head-to-head with the predecessor across cpu/gpu/auto. Two separate
