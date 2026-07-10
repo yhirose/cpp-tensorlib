@@ -795,6 +795,34 @@ decode lever (its own milestone): M=1 dequant-gemv efficiency** — fused QKV /
 gate-up (fewer + wider gemvs → occupancy, drop split-K) and a tuned
 `mul_mat_vec`-class kernel. **Banked here: 208 tok/s, 2.14× off llama.cpp.**
 
+**Decode gemv census + QKV/gate-up fusion → 208 → 245 tok/s (2026-07-10).**
+Diagnosed *why* in-context gemv runs ~220 GB/s vs the isolated bench's ~936, with a
+new isolated bench at the **real Qwen decode shapes** (`bench_qwen_gemv`) plus a
+`no_splitk` diagnostic knob (`cuda::set_no_splitk`, forces gy=1). Two hypotheses
+**refuted**: (a) forcing split-K OFF makes every small-N gemv **3–16× slower**
+(wq 0.30×, wd 0.06×) — split-K is essential, not the culprit; (c) the back-to-back
+7-gemv layer sequence is **−2.4%** vs the sum of isolated medians — inter-kernel
+cadence is ~0 (matches the graph-capture +10% finding). The real cause is a
+**fixed ~14µs per-launch floor** that dominates at small N: `wk` (896×128, 229KB)
+takes 14.4µs = **16 GB/s** (pure floor, bytes irrelevant); `wg` (896×4864, 8.7MB)
+takes 20.2µs for 38× the bytes. The floor amortizes only at large N — `lm_head`
+(896×151936) hits **897 GB/s** (≈peak), and `gateup.fused` (896×9728) **598** vs
+wg+wu separately (431/357). So the lever is **fewer kernels**, not a better kernel
+(a warp-per-row rewrite still can't fill the SMs at N=896 — the `no_splitk` column
+proves the occupancy loss is shape-intrinsic). **Fix: concat wq|wk|wv → [896,1152]
+and wg|wu → [896,9728] at load (`load_w_T_cat`), one GEMV each + device-pointer
+slice** (mid-buffer pointers flow through `off_`; slice reads need no host sync as
+the fused GEMV already marked the base device-live). Per-column split-K is
+identical (bx=1, chunk=32 in both fused and separate) → **bit-identical per
+column**. Imperative path only; the array path keeps the separate loads as the
+oracle, so `bench_qwen_decode`'s array-vs-imperative is a free independent guard
+on the fusion. Result: **imperative 208 → 245 tok/s (+18%)**, graph ceiling 230 →
+257, `chat_qwen` end-to-end ~220, **0/12 EXACT + check_qwen oracle green + 8/8
+ctests**. **Gap to llama.cpp 446: 2.14× → 1.82×.** +466MB resident (both weight
+copies) stays under the ~2GB WSL2 cliff. Remaining ~1.8×: the 5 gemvs/layer still
+pay the per-launch floor (QKV.fused only 107 GB/s at N=1152) — next levers are a
+lower-floor `mul_mat_vec`-class kernel and/or graph capture (now a real +5%).
+
 ## vs silarray (M1 Pro, 2026-07-03)
 
 Head-to-head with the predecessor across cpu/gpu/auto. Two separate

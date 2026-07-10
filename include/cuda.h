@@ -160,6 +160,10 @@ struct context {
   // recording a CUDA graph, then restored — so no launcher needs a stream arg.
   CUstream stream = nullptr;
   CUstream cap_stream = nullptr;  // dedicated capture stream (created on demand)
+  // Diagnostic knob (M9 decode gemv census): when true, gemv_run_ forces gy=1
+  // (no split-K, so no MemsetD8Async + atomicAdd combine). Lets the bench and
+  // the decode loop A/B the split-K path at the small Qwen shapes. Default off.
+  bool no_splitk = false;
   std::unordered_map<int, CUfunction> fns;
 
   // Host/device mirror per allocation, keyed by the device pointer (== the
@@ -454,6 +458,9 @@ struct context {
 };
 
 inline bool available() { return context::get().ready; }
+
+// Diagnostic knob: force gemv to skip split-K (gy=1). See context::no_splitk.
+inline void set_no_splitk(bool v) { context::get().no_splitk = v; }
 inline bool pending() { return context::get().pending; }
 
 // End the batch: block until the GPU finishes (MLX-style eval).
@@ -626,7 +633,7 @@ inline bool gemv_run_(CUfunction f, float* pa, float* pB, float* py,
   if (bx == 0) bx = 1;
   unsigned gy = 1, ksplit = uk;
   const long target = 164;  // ~2 blocks per SM on the 82-SM RTX 3090
-  if (static_cast<long>(bx) < target && uk >= 512) {
+  if (!c.no_splitk && static_cast<long>(bx) < target && uk >= 512) {
     unsigned g = static_cast<unsigned>((target + bx - 1) / bx);
     unsigned chunk = (uk + g - 1) / g;
     chunk = (chunk + 31u) & ~31u;

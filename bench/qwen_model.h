@@ -73,6 +73,35 @@ inline array load_w_T(const gg::model& m, const std::string& n, int64_t in,
   return wdt == tl::dtype::bf16 ? a.to_bf16() : a;
 }
 
+// Column-concatenated fused weight: load several GGML [out,in] tensors that
+// share the same `in` (K) and stack them along the output (N) axis into one
+// [in, Ntot] = [K, Ntot] array, so a single decode GEMV produces all their
+// outputs contiguously (q|k|v or gate|up). Column block b occupies
+// [col_base, col_base+out_b); v[i*Ntot + col_base+o] = f16(raw_b[o*in+i]).
+// Bit-identical per column to loading each separately (same widen, same layout),
+// so the fused GEMV's per-column result matches the separate GEMVs — the M9
+// decode fusion (fewer kernels → amortize the ~14us per-launch floor). Imperative
+// path only; the array path keeps the separate loads as the numeric oracle.
+inline array load_w_T_cat(const gg::model& m,
+                          const std::vector<std::pair<std::string, int64_t>>& parts,
+                          int64_t in, tl::dtype wdt = tl::dtype::f32) {
+  int64_t Ntot = 0;
+  for (const auto& p : parts) Ntot += p.second;
+  std::vector<float> v((size_t)in * Ntot);
+  int64_t col_base = 0;
+  for (const auto& p : parts) {
+    const auto* t = need(m, p.first);
+    const auto* raw = reinterpret_cast<const uint16_t*>(t->data);
+    const int64_t out = p.second;
+    for (int64_t o = 0; o < out; o++)
+      for (int64_t i = 0; i < in; i++)
+        v[(size_t)i * Ntot + (col_base + o)] = f16_to_f32(raw[(size_t)o * in + i]);
+    col_base += out;
+  }
+  array a = array::from(std::move(v), {in, Ntot});
+  return wdt == tl::dtype::bf16 ? a.to_bf16() : a;
+}
+
 // F32 1-D tensor (norms, biases are stored F32 in the GGUF) -> array [1, len].
 inline array load_f32(const gg::model& m, const std::string& n, int64_t len) {
   const auto* t = need(m, n);
@@ -82,6 +111,11 @@ inline array load_f32(const gg::model& m, const std::string& n, int64_t len) {
 
 struct Layer {
   array wq, bq, wk, bk, wv, bv, wo, wg, wu, wd, an, fn;
+  // Fused decode weights (imperative path only): wqkv = [wq|wk|wv] concatenated
+  // along N ([896, 1152]); wgu = [wg|wu] ([896, 9728]). One GEMV each instead of
+  // 3/2, amortizing the per-launch floor. The separate wq/.../wu stay resident as
+  // the array-path oracle.
+  array wqkv, wgu;
   tl::cuda::kv_cache cache;
 };
 
@@ -97,8 +131,10 @@ struct Scratch {
   void* h2b = nullptr;                // post-attn norm out [NE]
   void* qb = nullptr;                 // [NH*HD]
   void *kb = nullptr, *vb = nullptr;  // [NKV*HD]
+  void* qkvb = nullptr;               // fused QKV out [(NH+2*NKV)*HD] = [1152]
   void* ab = nullptr;                 // attn out [NH*HD]
   void *gb = nullptr, *ub = nullptr, *mb = nullptr;  // gate/up/swiglu [FF]
+  void* gub = nullptr;                // fused gate|up out [2*FF] = [9728]
   void* mdb = nullptr;                // mlp-down out [NE]
   void* logitsb = nullptr;            // [VOCAB]
   void* embedb = nullptr;             // staged embedding row [NE] (capture input)
@@ -112,10 +148,12 @@ struct Scratch {
     qb = tl::cuda::alloc(NH * HD * 4, nullptr);
     kb = tl::cuda::alloc(NKV * HD * 4, nullptr);
     vb = tl::cuda::alloc(NKV * HD * 4, nullptr);
+    qkvb = tl::cuda::alloc((NH + 2 * NKV) * HD * 4, nullptr);
     ab = tl::cuda::alloc(NH * HD * 4, nullptr);
     gb = tl::cuda::alloc(FF * 4, nullptr);
     ub = tl::cuda::alloc(FF * 4, nullptr);
     mb = tl::cuda::alloc(FF * 4, nullptr);
+    gub = tl::cuda::alloc(2 * FF * 4, nullptr);
     mdb = tl::cuda::alloc(NE * 4, nullptr);
     logitsb = tl::cuda::alloc(VOCAB * 4, nullptr);
     ready = logitsb != nullptr;
@@ -151,6 +189,13 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32) {
             load_w_T(m, p + "ffn_down.weight", FF, NE, wdt),
             load_f32(m, p + "attn_norm.weight", NE),
             load_f32(m, p + "ffn_norm.weight", NE),
+            // fused QKV and gate|up (imperative decode path); +466MB total over
+            // the 24 layers, staying under the WSL2 ~2GB sysmem-fallback cliff.
+            load_w_T_cat(m, {{p + "attn_q.weight", NH * HD},
+                             {p + "attn_k.weight", NKV * HD},
+                             {p + "attn_v.weight", NKV * HD}}, NE, wdt),
+            load_w_T_cat(m, {{p + "ffn_gate.weight", FF},
+                             {p + "ffn_up.weight", FF}}, NE, wdt),
             {}};
     L.cache.init(NKV, MAXC, HD);
     M.layers.push_back(std::move(L));
@@ -298,25 +343,34 @@ inline void run_layers_(Model& M, void* x0, int64_t pos) {
   // via rmsnorm_res (writes the residual sum AND its norm). The layer input's
   // norm is therefore produced by the *previous* layer's mlp seam — so precompute
   // layer 0's here, and carry each layer's next-input norm in hb.
+  // Slice a fused f32 device buffer by element offset (mid-buffer pointer; the
+  // slice reads are stream-ordered after the fused GEMV and need no host sync).
+  auto off = [](void* p, int64_t nfloats) -> void* {
+    return static_cast<char*>(p) + nfloats * 4;
+  };
   void* x = x0;
   cu::rmsnorm(x, M.layers[0].an.native(), S.hb, NE, EPS);
   for (int64_t l = 0; l < NL; l++) {
     Layer& L = M.layers[l];
     void* ro = S.res[l & 1];  // res_out (x1 then x2) for this layer (ping-pong)
-    gemv_w(L.wq, S.hb, S.qb, NH * HD, NE);
-    cu::rope(S.qb, S.qb, NH, 1, HD, pos, ROPE_BASE, L.bq.native());
-    gemv_w(L.wk, S.hb, S.kb, NKV * HD, NE);
-    cu::rope(S.kb, S.kb, NKV, 1, HD, pos, ROPE_BASE, L.bk.native());
-    gemv_w(L.wv, S.hb, S.vb, NKV * HD, NE);
-    cu::binary(cu::kop::add, S.vb, 0, L.bv.native(), 0, S.vb, 0, NKV * HD, 1, 0);
-    L.cache.append(S.kb, S.vb);
-    L.cache.attn(S.qb, S.ab, NH, SCALE);
+    // Fused QKV: one GEMV -> [q(NH*HD) | k(NKV*HD) | v(NKV*HD)] in S.qkvb, then
+    // slice: rope q & k in place, bias-add v. Same per-column split-K as the
+    // separate wq/wk/wv GEMVs (bx=1, chunk=32), so bit-identical per column.
+    gemv_w(L.wqkv, S.hb, S.qkvb, (NH + 2 * NKV) * HD, NE);
+    void* qp = S.qkvb;
+    void* kp = off(S.qkvb, NH * HD);
+    void* vp = off(S.qkvb, (NH + NKV) * HD);
+    cu::rope(qp, qp, NH, 1, HD, pos, ROPE_BASE, L.bq.native());
+    cu::rope(kp, kp, NKV, 1, HD, pos, ROPE_BASE, L.bk.native());
+    cu::binary(cu::kop::add, vp, 0, L.bv.native(), 0, vp, 0, NKV * HD, 1, 0);
+    L.cache.append(kp, vp);
+    L.cache.attn(qp, S.ab, NH, SCALE);
     gemv_w(L.wo, S.ab, ro, NE, NH * HD);                  // ro = attn @ wo
     // x1 = x + (attn@wo); h2 = rmsnorm(x1, fn) — fused.
     cu::rmsnorm_res(ro, x, L.fn.native(), ro, S.h2b, NE, EPS);
-    gemv_w(L.wg, S.h2b, S.gb, FF, NE);
-    gemv_w(L.wu, S.h2b, S.ub, FF, NE);
-    cu::swiglu(S.gb, S.ub, S.mb, FF);
+    // Fused gate|up: one GEMV -> [gate(FF) | up(FF)] in S.gub; swiglu reads both.
+    gemv_w(L.wgu, S.h2b, S.gub, 2 * FF, NE);
+    cu::swiglu(S.gub, off(S.gub, FF), S.mb, FF);
     gemv_w(L.wd, S.mb, S.mdb, NE, FF);
     // x2 = x1 + mlp; next input norm = rmsnorm(x2, next an | final onorm) — fused.
     void* nextw = (l + 1 < NL) ? M.layers[l + 1].an.native() : M.onorm.native();

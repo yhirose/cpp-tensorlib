@@ -95,6 +95,12 @@ if(TENSORLIB_CUDA)
   target_link_libraries(tensorlib_bench_bf16 PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_bench_bf16)
 
+  add_executable(tensorlib_bench_qwen_gemv bench/bench_qwen_gemv.cpp)
+  target_include_directories(tensorlib_bench_qwen_gemv BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(tensorlib_bench_qwen_gemv PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_bench_qwen_gemv)
+
   # M9 fused decode-attention bench (Path-B style). Direct cuda:: API.
   add_executable(tensorlib_bench_attn bench/bench_attn_decode.cpp)
   target_include_directories(tensorlib_bench_attn BEFORE PRIVATE
