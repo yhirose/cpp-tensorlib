@@ -93,7 +93,8 @@ struct Layer {
 // reuses it).
 struct Scratch {
   void* res[2] = {nullptr, nullptr};  // residual ping-pong [NE]
-  void* hb = nullptr;                 // rmsnorm out [NE] (reused for h2)
+  void* hb = nullptr;                 // input-norm out [NE]
+  void* h2b = nullptr;                // post-attn norm out [NE]
   void* qb = nullptr;                 // [NH*HD]
   void *kb = nullptr, *vb = nullptr;  // [NKV*HD]
   void* ab = nullptr;                 // attn out [NH*HD]
@@ -107,6 +108,7 @@ struct Scratch {
     res[0] = tl::cuda::alloc(NE * 4, nullptr);
     res[1] = tl::cuda::alloc(NE * 4, nullptr);
     hb = tl::cuda::alloc(NE * 4, nullptr);
+    h2b = tl::cuda::alloc(NE * 4, nullptr);
     qb = tl::cuda::alloc(NH * HD * 4, nullptr);
     kb = tl::cuda::alloc(NKV * HD * 4, nullptr);
     vb = tl::cuda::alloc(NKV * HD * 4, nullptr);
@@ -291,32 +293,37 @@ inline bool gemv_w(const array& W, void* a, void* y, int64_t n, int64_t k) {
 inline void run_layers_(Model& M, void* x0, int64_t pos) {
   namespace cu = tl::cuda;
   Scratch& S = M.scratch;
+  // Fused seams (kills 4 elementwise launches/layer): q/k bias folds into rope
+  // (cu::rope bias arg); the two residual adds fold into the following RMSNorms
+  // via rmsnorm_res (writes the residual sum AND its norm). The layer input's
+  // norm is therefore produced by the *previous* layer's mlp seam — so precompute
+  // layer 0's here, and carry each layer's next-input norm in hb.
   void* x = x0;
+  cu::rmsnorm(x, M.layers[0].an.native(), S.hb, NE, EPS);
   for (int64_t l = 0; l < NL; l++) {
     Layer& L = M.layers[l];
-    void* ro = S.res[l & 1];  // res_out for this layer (ping-pong)
-    cu::rmsnorm(x, L.an.native(), S.hb, NE, EPS);
+    void* ro = S.res[l & 1];  // res_out (x1 then x2) for this layer (ping-pong)
     gemv_w(L.wq, S.hb, S.qb, NH * HD, NE);
-    cu::binary(cu::kop::add, S.qb, 0, L.bq.native(), 0, S.qb, 0, NH * HD, 1, 0);
-    cu::rope(S.qb, S.qb, NH, 1, HD, pos, ROPE_BASE);
+    cu::rope(S.qb, S.qb, NH, 1, HD, pos, ROPE_BASE, L.bq.native());
     gemv_w(L.wk, S.hb, S.kb, NKV * HD, NE);
-    cu::binary(cu::kop::add, S.kb, 0, L.bk.native(), 0, S.kb, 0, NKV * HD, 1, 0);
-    cu::rope(S.kb, S.kb, NKV, 1, HD, pos, ROPE_BASE);
+    cu::rope(S.kb, S.kb, NKV, 1, HD, pos, ROPE_BASE, L.bk.native());
     gemv_w(L.wv, S.hb, S.vb, NKV * HD, NE);
     cu::binary(cu::kop::add, S.vb, 0, L.bv.native(), 0, S.vb, 0, NKV * HD, 1, 0);
     L.cache.append(S.kb, S.vb);
     L.cache.attn(S.qb, S.ab, NH, SCALE);
-    gemv_w(L.wo, S.ab, ro, NE, NH * HD);               // ro = attn @ wo
-    cu::binary(cu::kop::add, ro, 0, x, 0, ro, 0, NE, 1, 0);  // x1 = x + (attn@wo)
-    cu::rmsnorm(ro, L.fn.native(), S.hb, NE, EPS);      // h2 reuses hb
-    gemv_w(L.wg, S.hb, S.gb, FF, NE);
-    gemv_w(L.wu, S.hb, S.ub, FF, NE);
+    gemv_w(L.wo, S.ab, ro, NE, NH * HD);                  // ro = attn @ wo
+    // x1 = x + (attn@wo); h2 = rmsnorm(x1, fn) — fused.
+    cu::rmsnorm_res(ro, x, L.fn.native(), ro, S.h2b, NE, EPS);
+    gemv_w(L.wg, S.h2b, S.gb, FF, NE);
+    gemv_w(L.wu, S.h2b, S.ub, FF, NE);
     cu::swiglu(S.gb, S.ub, S.mb, FF);
     gemv_w(L.wd, S.mb, S.mdb, NE, FF);
-    cu::binary(cu::kop::add, ro, 0, S.mdb, 0, ro, 0, NE, 1, 0);  // x2 = x1 + mlp
+    // x2 = x1 + mlp; next input norm = rmsnorm(x2, next an | final onorm) — fused.
+    void* nextw = (l + 1 < NL) ? M.layers[l + 1].an.native() : M.onorm.native();
+    cu::rmsnorm_res(ro, S.mdb, nextw, ro, S.hb, NE, EPS);
     x = ro;
   }
-  cu::rmsnorm(x, M.onorm.native(), S.hb, NE, EPS);
+  // hb now holds the final RMSNorm output (folded into the last layer's seam).
   gemv_w(M.outwT, S.hb, S.logitsb, VOCAB, NE);
 }
 

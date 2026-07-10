@@ -777,6 +777,24 @@ needs. The capture infra is kept (tested, dormant); the next real decode lever
 is kernel fusion + tuning (a larger, separate effort). Net decode this session:
 **67 → 208 tok/s (3.1×), gap 6.7× → 2.14×**, all greedy bit-identical.
 
+**Elementwise fusion is neutral → decode is GEMV-execution-bound (2026-07-10).**
+Fused the two residual adds into the following RMSNorms (`tl_add_rmsnorm`, writes
+the residual sum *and* its norm) and q/k's bias-add into RoPE (`tl_rope` optional
+bias) — removing **4 elementwise launches/layer (96/token, 456 → 360 kernels)**.
+Result: imperative decode **unchanged (~200 tok/s)**; only the graph ceiling
+nudged 221 → 230 (fewer nodes). So the ~12 elementwise kernels/layer were
+already cheap; the **7 gemvs/layer (168/token) reading the weights dominate**.
+Those gemvs run at **~220 GB/s effective** vs the ~936 GB/s the isolated
+`bench_bf16_gemv` hits — the loss is **M=1 small-gemv inefficiency** (short
+back-to-back kernels underfill the SMs; split-K adds a `MemsetD8Async` + atomic
+combine). llama.cpp's 446 tok/s ≈ **~440 GB/s effective**, so its M=1
+`mul_mat_vec` is ~2× more bandwidth-efficient than ours — **that gemv-kernel
+quality gap is the entire remaining ~2×**. The fusion is kept (correct, 0/12 +
+oracle, cleaner, lifts the graph path); the neutral result is the point. **Next
+decode lever (its own milestone): M=1 dequant-gemv efficiency** — fused QKV /
+gate-up (fewer + wider gemvs → occupancy, drop split-K) and a tuned
+`mul_mat_vec`-class kernel. **Banked here: 208 tok/s, 2.14× off llama.cpp.**
+
 ## vs silarray (M1 Pro, 2026-07-03)
 
 Head-to-head with the predecessor across cpu/gpu/auto. Two separate

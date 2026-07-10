@@ -487,7 +487,17 @@ overhead** — graph capture's payoff shrinks as you fuse. Measured this ceiling
 kernels) that correct per-token replay needs; capture infra kept (tested,
 dormant). **Next real decode lever: kernel fusion + tuning** (fuse
 norm-into-gemv, wider gemv tiles, fused attention) — a larger separate effort;
-CUDA-graph capture is a ~10% finisher on top.
+CUDA-graph capture is a ~10% finisher on top. **Done (elementwise fusion —
+neutral, 2026-07-10):** fused the 2 residual adds into the following RMSNorms
+(`tl_add_rmsnorm`) and q/k bias into RoPE (`tl_rope` optional bias), −4
+launches/layer (456→360 kernels/token). Imperative decode **unchanged (~200
+tok/s)** — proving decode is **GEMV-execution-bound, not launch/elementwise-
+bound**: the 7 gemvs/layer reading the weights run at ~220 GB/s effective vs
+~936 GB/s isolated (M=1 underfills the SMs). llama.cpp ≈ 440 GB/s effective, so
+its M=1 `mul_mat_vec` is ~2× more efficient — **that gemv-kernel gap is the
+entire remaining ~2×.** Fusion kept (correct, cleaner). **Banked at 208 tok/s;
+the M=1 dequant-gemv efficiency milestone (fused QKV/gate-up + tuned mul_mat_vec)
+is the remaining path to llama.cpp parity.**
 
 Flash-attention-style fused attention (tiled QKᵀ → online softmax → ·V, never
 materializing the S×S scores), causal masking, and a **KV cache** (append per

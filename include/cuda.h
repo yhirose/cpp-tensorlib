@@ -396,6 +396,12 @@ struct context {
     if (!swiglu_fn) d.ModuleGetFunction(&swiglu_fn, mod, "tl_swiglu");
     return swiglu_fn;
   }
+  CUfunction add_rmsnorm_fn = nullptr;
+  CUfunction add_rmsnorm_() {
+    if (!add_rmsnorm_fn)
+      d.ModuleGetFunction(&add_rmsnorm_fn, mod, "tl_add_rmsnorm");
+    return add_rmsnorm_fn;
+  }
 
   // M9 prefill: bulk cache fill + causal prefill attention.
   CUfunction kv_fill_fn = nullptr, attn_prefill_fn = nullptr;
@@ -844,20 +850,46 @@ inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads
 // RoPE: rotate a contiguous [rows, D] buffer (rows = H*T). Row r's position is
 // pos + (r % T); half-split (GPT-NeoX / HF-llama) convention. D must be even.
 inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
-                 int64_t pos, float base) {
+                 int64_t pos, float base, void* bias = nullptr) {
   auto& c = context::get();
   if (!c.ready || D <= 0 || (D & 1)) return false;
   c.device_read_(x);
+  if (bias) c.device_read_(bias);
   c.device_write_(out);
   float* px = context::off_(x, 0);
+  float* pbias = bias ? context::off_(bias, 0) : nullptr;
   float* po = context::off_(out, 0);
   unsigned uT = static_cast<unsigned>(T), uD = static_cast<unsigned>(D),
            upos = static_cast<unsigned>(pos);
-  void* args[] = {&px, &po, &uT, &uD, &upos, &base};
+  void* args[] = {&px, &pbias, &po, &uT, &uD, &upos, &base};
   c.pending = true;
   return c.d.LaunchKernel(c.rope_(), static_cast<unsigned>(rows), 1, 1,
                           static_cast<unsigned>(D / 2), 1, 1, 0, c.stream, args,
                           nullptr) == 0;
+}
+
+// Fused residual-add + RMSNorm: xout = x + delta; hout = rmsnorm(xout)*w.
+// Writes both (xout is the next residual base, hout the normalized input).
+inline bool rmsnorm_res(void* x, void* delta, void* w, void* xout, void* hout,
+                        int64_t n, float eps) {
+  auto& c = context::get();
+  if (!c.ready || n <= 0) return false;
+  c.device_read_(x);
+  c.device_read_(delta);
+  c.device_read_(w);
+  c.device_write_(xout);
+  c.device_write_(hout);
+  float* px = context::off_(x, 0);
+  float* pd = context::off_(delta, 0);
+  float* pw = context::off_(w, 0);
+  float* pxo = context::off_(xout, 0);
+  float* pho = context::off_(hout, 0);
+  unsigned un = static_cast<unsigned>(n);
+  void* args[] = {&px, &pd, &pw, &pxo, &pho, &un, &eps};
+  unsigned block = 256;
+  c.pending = true;
+  return c.d.LaunchKernel(c.add_rmsnorm_(), 1, 1, 1, block, 1, 1,
+                          block * sizeof(float), c.stream, args, nullptr) == 0;
 }
 
 // GPU argmax over a length-n device vector (contiguous, offset 0). Reduces on
@@ -1096,6 +1128,9 @@ inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
 }
 inline bool argmax(void*, int64_t, int64_t*) { return false; }
 inline bool rmsnorm(void*, void*, void*, int64_t, float) { return false; }
+inline bool rmsnorm_res(void*, void*, void*, void*, void*, int64_t, float) {
+  return false;
+}
 inline bool swiglu(void*, void*, void*, int64_t) { return false; }
 inline bool graph_available() { return false; }
 inline bool capture_begin() { return false; }

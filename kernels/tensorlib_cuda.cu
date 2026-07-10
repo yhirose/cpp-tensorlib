@@ -141,6 +141,36 @@ extern "C" __global__ void tl_rmsnorm(const float* __restrict__ x,
   for (unsigned i = t; i < n; i += T) out[i] = x[i] * inv * w[i];
 }
 
+// ---- fused residual-add + RMSNorm: xout = a+b; hout = rmsnorm(xout,eps)*w ----
+// Folds a decode layer's residual add into the following norm (the o-proj->norm
+// and mlp->next-input-norm seams), writing BOTH the residual sum (needed
+// downstream as the next residual base) and the normalized+scaled output. One
+// block. xout may alias a (in-place residual). Removes 2 elementwise launches
+// per layer — pure per-kernel-latency wins on the launch-bound decode step.
+extern "C" __global__ void tl_add_rmsnorm(const float* __restrict__ a,
+                                          const float* __restrict__ b,
+                                          const float* __restrict__ w,
+                                          float* __restrict__ xout,
+                                          float* __restrict__ hout, unsigned n,
+                                          float eps) {
+  extern __shared__ float sm[];
+  unsigned t = threadIdx.x, T = blockDim.x;
+  float acc = 0.0f;
+  for (unsigned i = t; i < n; i += T) {
+    float v = a[i] + b[i];
+    xout[i] = v;
+    acc += v * v;
+  }
+  sm[t] = acc;
+  __syncthreads();
+  for (unsigned s = T >> 1; s > 0; s >>= 1) {
+    if (t < s) sm[t] += sm[t + s];
+    __syncthreads();
+  }
+  float inv = 1.0f / sqrtf(sm[0] / (float)n + eps);
+  for (unsigned i = t; i < n; i += T) hout[i] = xout[i] * inv * w[i];
+}
+
 // ---- fused SwiGLU: out = silu(gate) * up = (gate * sigmoid(gate)) * up ----
 // Elementwise over n (the FF dim). Matches array silu(gate)*up; replaces the
 // sigmoid+mul+mul launch chain with one kernel.
@@ -842,7 +872,10 @@ extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 // x is [rows, D] contiguous (rows = H*T: a [H,T,D] tensor flattened, or [H,D]
 // with T=1). Row r's head-dim vector is at position pos + (r % T). Pairs
 // (j, j+D/2) rotate by angle = position · base^(-2j/D). grid = rows, block = D/2.
-__global__ void tl_rope(const float* __restrict__ x, float* __restrict__ out,
+// RoPE with an optional fused bias: rotates x (+bias if non-null). Folding q/k's
+// bias-add into rope removes 2 elementwise launches per decode layer.
+__global__ void tl_rope(const float* __restrict__ x,
+                        const float* __restrict__ bias, float* __restrict__ out,
                         unsigned T, unsigned D, unsigned pos, float base) {
   const unsigned r = blockIdx.x, j = threadIdx.x;  // j in 0..D/2-1
   const unsigned half = D >> 1;
@@ -853,8 +886,12 @@ __global__ void tl_rope(const float* __restrict__ x, float* __restrict__ out,
   const float ang = position * theta;
   const float c = __cosf(ang), s = __sinf(ang);
   const size_t bi = (size_t)r * D;
-  const float x0 = x[bi + j];
-  const float x1 = x[bi + j + half];
+  float x0 = x[bi + j];
+  float x1 = x[bi + j + half];
+  if (bias) {
+    x0 += bias[bi + j];
+    x1 += bias[bi + j + half];
+  }
   out[bi + j] = x0 * c - x1 * s;
   out[bi + j + half] = x0 * s + x1 * c;
 }
