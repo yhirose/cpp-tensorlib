@@ -481,6 +481,41 @@ __global__ void tl_gemv_bf16v8(const float* __restrict__ a,
   }
 }
 
+// Warp-per-row bf16 GEMV (M9 decode lever A): weights in [N,K] (K contiguous per
+// output row = GGML-native, so the loader drops the transpose). One WARP per
+// output row n; its 32 lanes split K, each lane consuming 8 bf16 per step via one
+// 16-byte uint4 load — consecutive lanes read consecutive 16B, so the warp issues
+// one coalesced 512-byte transaction — MAC into an F32 accumulator, then warp-
+// shuffle-reduce and a single store. NO split-K, so NO MemsetD8Async prezero and
+// NO atomicAdd combine: one launch, one grid. This targets the small-N Qwen decode
+// gemvs (wk/wo/QKV.fused), where split-K's per-launch floor (memset op + atomic
+// tail + underfilled grid) dominates the tiny byte count. Requires K % 8 == 0
+// (every transformer dim); the last partial 256-block is handled by the per-lane
+// k0 < K guard (tail lanes simply skip — no K % 256 requirement like q4).
+__global__ void tl_gemv_bf16_row(const float* __restrict__ a,
+                                 const __nv_bfloat16* __restrict__ B,
+                                 float* __restrict__ y, unsigned N, unsigned K) {
+  const unsigned n = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const unsigned lane = threadIdx.x & 31u;
+  if (n >= N) return;
+  const __nv_bfloat16* row = B + (size_t)n * K;
+  float acc = 0.0f;
+  for (unsigned k0 = lane * 8u; k0 < K; k0 += 256u) {
+    uint4 raw = *reinterpret_cast<const uint4*>(&row[k0]);
+    float2 f0 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.x));
+    float2 f1 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.y));
+    float2 f2 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.z));
+    float2 f3 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.w));
+    acc += a[k0 + 0] * f0.x + a[k0 + 1] * f0.y + a[k0 + 2] * f1.x +
+           a[k0 + 3] * f1.y + a[k0 + 4] * f2.x + a[k0 + 5] * f2.y +
+           a[k0 + 6] * f3.x + a[k0 + 7] * f3.y;
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  if (lane == 0) y[n] = acc;
+}
+
 // ---- M8 int4-weight decode GEMV: y[n] = sum_k a[k] * dequant(Wq[n,k]) ----
 // The quantized-inference heart: weights are group-symmetric int4 in [N,K]
 // (out×in) layout so the K-axis quantization groups are contiguous (GGUF/GPTQ

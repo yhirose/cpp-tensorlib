@@ -102,6 +102,50 @@ inline array load_w_T_cat(const gg::model& m,
   return wdt == tl::dtype::bf16 ? a.to_bf16() : a;
 }
 
+// Row-major weight for the warp-per-row decode GEMV (lever A): GGML physical
+// [out,in] widened straight to array [out,in] = [N,K] — NO transpose (K stays
+// contiguous per output row, the layout tl_gemv_bf16_row wants). The imperative
+// bf16 decode path uses this; the array path keeps the [K,N] load_w_T as oracle.
+inline array load_w_T_row(const gg::model& m, const std::string& n, int64_t in,
+                          int64_t out, tl::dtype wdt = tl::dtype::bf16) {
+  const auto* t = need(m, n);
+  const auto* raw = reinterpret_cast<const uint16_t*>(t->data);
+  std::vector<float> v((size_t)out * in);
+  for (int64_t o = 0; o < out; o++)
+    for (int64_t i = 0; i < in; i++)
+      v[(size_t)o * in + i] = f16_to_f32(raw[(size_t)o * in + i]);
+  array a = array::from(std::move(v), {out, in});
+  return wdt == tl::dtype::bf16 ? a.to_bf16() : a;
+}
+
+// Row-concatenated fused weight for the warp-per-row GEMV: stack several GGML
+// [out,in] tensors that share `in` (K) along the OUTPUT (row) axis into one
+// [Ntot, in] = [N,K] array (q|k|v or gate|up). Row block b occupies rows
+// [row_base, row_base+out_b); the fused GEMV's output [Ntot] is q|k|v (or
+// gate|up) contiguous — same output layout as the separate/column-cat GEMVs, so
+// the downstream slices are unchanged. Reduction order differs from split-K, so
+// it is greedy-equivalent (not bit-identical) to the array oracle.
+inline array load_w_T_cat_row(
+    const gg::model& m,
+    const std::vector<std::pair<std::string, int64_t>>& parts, int64_t in,
+    tl::dtype wdt = tl::dtype::bf16) {
+  int64_t Ntot = 0;
+  for (const auto& p : parts) Ntot += p.second;
+  std::vector<float> v((size_t)Ntot * in);
+  int64_t row_base = 0;
+  for (const auto& p : parts) {
+    const auto* t = need(m, p.first);
+    const auto* raw = reinterpret_cast<const uint16_t*>(t->data);
+    const int64_t out = p.second;
+    for (int64_t o = 0; o < out; o++)
+      for (int64_t i = 0; i < in; i++)
+        v[(size_t)(row_base + o) * in + i] = f16_to_f32(raw[(size_t)o * in + i]);
+    row_base += out;
+  }
+  array a = array::from(std::move(v), {Ntot, in});
+  return wdt == tl::dtype::bf16 ? a.to_bf16() : a;
+}
+
 // F32 1-D tensor (norms, biases are stored F32 in the GGUF) -> array [1, len].
 inline array load_f32(const gg::model& m, const std::string& n, int64_t len) {
   const auto* t = need(m, n);
@@ -111,11 +155,17 @@ inline array load_f32(const gg::model& m, const std::string& n, int64_t len) {
 
 struct Layer {
   array wq, bq, wk, bk, wv, bv, wo, wg, wu, wd, an, fn;
-  // Fused decode weights (imperative path only): wqkv = [wq|wk|wv] concatenated
-  // along N ([896, 1152]); wgu = [wg|wu] ([896, 9728]). One GEMV each instead of
-  // 3/2, amortizing the per-launch floor. The separate wq/.../wu stay resident as
-  // the array-path oracle.
-  array wqkv, wgu;
+  // Fused decode weights (imperative path only): wqkv = [wq|wk|wv], wgu = [wg|wu]
+  // concatenated. One GEMV each instead of 3/2, amortizing the per-launch floor.
+  // The separate wq/.../wu stay resident as the array-path oracle.
+  //
+  // Layout depends on the storage dtype (set in build): in bf16 mode these hold
+  // ROW-major [N,K] and feed the warp-per-row gemv_bf16_row (lever A, ~1.4-1.9x
+  // on the small-N floor-bound shapes); wo_row/wd_row are the row-major copies of
+  // the two shared weights (wo/wd stay [K,N] for the array oracle). In f32 mode
+  // wqkv/wgu hold column-major [K,N] for the split-K path and wo_row/wd_row are
+  // empty. lm_head stays split-K [K,N] in both (neutral + saves the [N,K] copy).
+  array wqkv, wgu, wo_row, wd_row;
   tl::cuda::kv_cache cache;
 };
 
@@ -166,15 +216,18 @@ struct Model {
   array onorm;                // final norm [1, NE]
   std::vector<Layer> layers;
   Scratch scratch;
+  bool row = false;  // imperative gemvs use warp-per-row [N,K] (bf16 only)
 };
 
 // wdt = the linear-weight storage dtype (f32 exact, or bf16 for the <2GB/decode
 // path). Biases, norms and the embedding stay F32 (elementwise / row-gather).
 inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32) {
+  const bool row = (wdt == tl::dtype::bf16);  // warp-per-row [N,K] imperative gemvs
   Model M{reinterpret_cast<const uint16_t*>(need(m, "token_embd.weight")->data),
-          load_w_T(m, "output.weight", NE, VOCAB, wdt),
+          load_w_T(m, "output.weight", NE, VOCAB, wdt),  // lm_head stays [K,N]
           load_f32(m, "output_norm.weight", NE),
           {}};
+  M.row = row;
   for (int64_t l = 0; l < NL; l++) {
     std::string p = "blk." + std::to_string(l) + ".";
     Layer L{load_w_T(m, p + "attn_q.weight", NE, NH * HD, wdt),
@@ -189,13 +242,23 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32) {
             load_w_T(m, p + "ffn_down.weight", FF, NE, wdt),
             load_f32(m, p + "attn_norm.weight", NE),
             load_f32(m, p + "ffn_norm.weight", NE),
-            // fused QKV and gate|up (imperative decode path); +466MB total over
-            // the 24 layers, staying under the WSL2 ~2GB sysmem-fallback cliff.
-            load_w_T_cat(m, {{p + "attn_q.weight", NH * HD},
-                             {p + "attn_k.weight", NKV * HD},
-                             {p + "attn_v.weight", NKV * HD}}, NE, wdt),
-            load_w_T_cat(m, {{p + "ffn_gate.weight", FF},
-                             {p + "ffn_up.weight", FF}}, NE, wdt),
+            // Fused QKV and gate|up (imperative decode path). In bf16 mode: ROW
+            // [N,K] for the warp-per-row gemv (lever A). In f32: column [K,N] for
+            // split-K. +466MB over 24 layers either way. wo_row/wd_row (bf16 only)
+            // are the row copies of the two shared weights (+247MB), keeping the
+            // total under the WSL2 ~2GB cliff (lm_head deliberately not copied).
+            row ? load_w_T_cat_row(m, {{p + "attn_q.weight", NH * HD},
+                                       {p + "attn_k.weight", NKV * HD},
+                                       {p + "attn_v.weight", NKV * HD}}, NE)
+                : load_w_T_cat(m, {{p + "attn_q.weight", NH * HD},
+                                   {p + "attn_k.weight", NKV * HD},
+                                   {p + "attn_v.weight", NKV * HD}}, NE, wdt),
+            row ? load_w_T_cat_row(m, {{p + "ffn_gate.weight", FF},
+                                       {p + "ffn_up.weight", FF}}, NE)
+                : load_w_T_cat(m, {{p + "ffn_gate.weight", FF},
+                                   {p + "ffn_up.weight", FF}}, NE, wdt),
+            row ? load_w_T_row(m, p + "attn_output.weight", NH * HD, NE) : array{},
+            row ? load_w_T_row(m, p + "ffn_down.weight", FF, NE) : array{},
             {}};
     L.cache.init(NKV, MAXC, HD);
     M.layers.push_back(std::move(L));
@@ -348,6 +411,15 @@ inline void run_layers_(Model& M, void* x0, int64_t pos) {
   auto off = [](void* p, int64_t nfloats) -> void* {
     return static_cast<char*>(p) + nfloats * 4;
   };
+  // Decode GEMV: warp-per-row [N,K] (lever A, bf16 imperative) when Wrow is
+  // populated, else the split-K [K,N] path on Wcol. y layout is identical either
+  // way (contiguous [n]), so the fused-output slices below are unchanged.
+  const bool row = M.row;
+  auto gv = [&](const array& Wrow, const array& Wcol, void* a, void* y, int64_t n,
+                int64_t k) {
+    if (row) tl::cuda::gemv_bf16_row(a, Wrow.native(), y, n, k);
+    else gemv_w(Wcol, a, y, n, k);
+  };
   void* x = x0;
   cu::rmsnorm(x, M.layers[0].an.native(), S.hb, NE, EPS);
   for (int64_t l = 0; l < NL; l++) {
@@ -356,7 +428,7 @@ inline void run_layers_(Model& M, void* x0, int64_t pos) {
     // Fused QKV: one GEMV -> [q(NH*HD) | k(NKV*HD) | v(NKV*HD)] in S.qkvb, then
     // slice: rope q & k in place, bias-add v. Same per-column split-K as the
     // separate wq/wk/wv GEMVs (bx=1, chunk=32), so bit-identical per column.
-    gemv_w(L.wqkv, S.hb, S.qkvb, (NH + 2 * NKV) * HD, NE);
+    gv(L.wqkv, L.wqkv, S.hb, S.qkvb, (NH + 2 * NKV) * HD, NE);
     void* qp = S.qkvb;
     void* kp = off(S.qkvb, NH * HD);
     void* vp = off(S.qkvb, (NH + NKV) * HD);
@@ -365,13 +437,13 @@ inline void run_layers_(Model& M, void* x0, int64_t pos) {
     cu::binary(cu::kop::add, vp, 0, L.bv.native(), 0, vp, 0, NKV * HD, 1, 0);
     L.cache.append(kp, vp);
     L.cache.attn(qp, S.ab, NH, SCALE);
-    gemv_w(L.wo, S.ab, ro, NE, NH * HD);                  // ro = attn @ wo
+    gv(L.wo_row, L.wo, S.ab, ro, NE, NH * HD);            // ro = attn @ wo
     // x1 = x + (attn@wo); h2 = rmsnorm(x1, fn) — fused.
     cu::rmsnorm_res(ro, x, L.fn.native(), ro, S.h2b, NE, EPS);
     // Fused gate|up: one GEMV -> [gate(FF) | up(FF)] in S.gub; swiglu reads both.
-    gemv_w(L.wgu, S.h2b, S.gub, 2 * FF, NE);
+    gv(L.wgu, L.wgu, S.h2b, S.gub, 2 * FF, NE);
     cu::swiglu(S.gub, off(S.gub, FF), S.mb, FF);
-    gemv_w(L.wd, S.mb, S.mdb, NE, FF);
+    gv(L.wd_row, L.wd, S.mb, S.mdb, NE, FF);
     // x2 = x1 + mlp; next input norm = rmsnorm(x2, next an | final onorm) — fused.
     void* nextw = (l + 1 < NL) ? M.layers[l + 1].an.native() : M.onorm.native();
     cu::rmsnorm_res(ro, S.mdb, nextw, ro, S.hb, NE, EPS);

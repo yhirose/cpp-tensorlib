@@ -319,6 +319,12 @@ struct context {
       d.ModuleGetFunction(&gemv_bf16v8_fn, mod, "tl_gemv_bf16v8");
     return gemv_bf16v8_fn;
   }
+  CUfunction gemv_bf16_row_fn = nullptr;
+  CUfunction gemv_bf16_row_() {
+    if (!gemv_bf16_row_fn)
+      d.ModuleGetFunction(&gemv_bf16_row_fn, mod, "tl_gemv_bf16_row");
+    return gemv_bf16_row_fn;
+  }
 
   // M8 int4-weight decode GEMV (global-a + shared-a variants).
   CUfunction gemv_q4_fn = nullptr, gemv_q4s_fn = nullptr;
@@ -680,6 +686,27 @@ inline bool gemv_bf16(void* a, void* B, void* y, int64_t n, int64_t k) {
                    context::off_(B, 0), context::off_(y, 0), y,
                    static_cast<unsigned>(n), static_cast<unsigned>(k),
                    v8 ? 8u : 1u);
+}
+
+// Warp-per-row bf16 decode GEMV (lever A): y(N) = a(1,K) @ W[N,K], W row-major
+// (K contiguous per output row). One warp/output row, no split-K — no memset, no
+// atomic combine. The small-N floor-bound lever; see tl_gemv_bf16_row. Requires
+// K % 8 == 0 (host-gated; caller falls back to the split-K [K,N] path otherwise).
+inline bool gemv_bf16_row(void* a, void* B, void* y, int64_t n, int64_t k) {
+  auto& c = context::get();
+  if (!c.ready || (k % 8) != 0) return false;
+  c.device_read_(a);
+  c.device_read_(B);  // B reinterpreted as __nv_bfloat16* [N][K] in-kernel
+  c.device_write_(y);
+  float* pa = context::off_(a, 0);
+  float* pB = context::off_(B, 0);
+  float* py = context::off_(y, 0);
+  unsigned uN = static_cast<unsigned>(n), uK = static_cast<unsigned>(k);
+  void* args[] = {&pa, &pB, &py, &uN, &uK};
+  unsigned grid = static_cast<unsigned>((n + 7) / 8);  // 8 warps/block, 1 row/warp
+  c.pending = true;
+  return c.d.LaunchKernel(c.gemv_bf16_row_(), grid, 1, 1, 256, 1, 1, 0, c.stream,
+                          args, nullptr) == 0;
 }
 
 // M8 int4-weight decode GEMV: y(N) = a(1,K) @ dequant(Wq[N,K]), F32 accumulate.

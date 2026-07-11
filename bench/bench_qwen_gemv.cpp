@@ -69,21 +69,27 @@ struct Op {
     release(a, 0, nullptr); release(B, 0, nullptr); release(y, 0, nullptr);
   }
   void run() const { gemv_bf16(a, B, y, N, K); }
+  // Warp-per-row [N,K] variant (lever A). Speed is layout-agnostic (same K*N*2
+  // random bytes, same access footprint), so it reuses the same B buffer — only
+  // the in-kernel interpretation differs. Compared head-to-head with split-K.
+  void run_row() const { gemv_bf16_row(a, B, y, N, K); }
 };
 
 static const int R = 50, ROUNDS = 7;
 
-static double time_op(const Op& op) {
-  op.run(); flush();  // warmup
+template <typename F>
+static double time_fn(F&& run) {
+  run(); flush();  // warmup
   std::vector<double> ms;
   for (int r = 0; r < ROUNDS; r++) {
     auto t0 = clk::now();
-    for (int i = 0; i < R; i++) op.run();
+    for (int i = 0; i < R; i++) run();
     flush();
     ms.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count() / R);
   }
   return median(ms);
 }
+static double time_op(const Op& op) { return time_fn([&] { op.run(); }); }
 
 int main() {
   if (!available()) { std::printf("no CUDA device — skipping\n"); return 0; }
@@ -100,8 +106,10 @@ int main() {
   };
 
   std::printf("=== per-shape bf16 gemv (median of %d rounds x %d launches) ===\n", ROUNDS, R);
-  std::printf("%-22s %10s %10s %8s   %10s %10s\n", "shape", "splitK ms",
-              "noK ms", "splitK/noK", "splitK GB/s", "noK GB/s");
+  std::printf("split-K = column-per-thread [K,N] + gridDim.y atomic combine (current);"
+              " row = warp-per-row [N,K], no split-K (lever A)\n");
+  std::printf("%-22s %10s %10s %10s %9s   %9s %9s %9s\n", "shape", "splitK ms",
+              "noK ms", "row ms", "sK/row", "splitK GB/s", "noK GB/s", "row GB/s");
   for (const auto& s : shapes) {
     Op op{s.name, s.K, s.N};
     op.alloc_();
@@ -110,9 +118,11 @@ int main() {
     set_no_splitk(true);
     double ms_n = time_op(op);
     set_no_splitk(false);
+    double ms_r = time_fn([&] { op.run_row(); });
     double bytes = (double)s.K * s.N * 2;
-    std::printf("%-22s %10.4f %10.4f %8.2f   %10.1f %10.1f\n", s.name, ms_k, ms_n,
-                ms_k / ms_n, bytes / (ms_k * 1e6), bytes / (ms_n * 1e6));
+    std::printf("%-22s %10.4f %10.4f %10.4f %9.2f   %9.1f %9.1f %9.1f\n", s.name,
+                ms_k, ms_n, ms_r, ms_k / ms_r, bytes / (ms_k * 1e6),
+                bytes / (ms_n * 1e6), bytes / (ms_r * 1e6));
     op.free_();
   }
 
