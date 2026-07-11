@@ -823,6 +823,35 @@ copies) stays under the ~2GB WSL2 cliff. Remaining ~1.8×: the 5 gemvs/layer sti
 pay the per-launch floor (QKV.fused only 107 GB/s at N=1152) — next levers are a
 lower-floor `mul_mat_vec`-class kernel and/or graph capture (now a real +5%).
 
+**Warp-per-row [N,K] gemv (lever A) → 245 → ~330 tok/s (2026-07-10).** The
+mul_mat_vec-class kernel above. The split-K kernel is column-per-thread over
+`[K,N]` weights and pays, every launch, a `MemsetD8Async` prezero + an `atomicAdd`
+combine across the K-splits + an underfilled grid — all fixed cost that dwarfs the
+tiny byte count at small N. New `tl_gemv_bf16_row`: weights in `[N,K]` (K
+contiguous per output row = **GGML-native, so `load_w_T_row`/`load_w_T_cat_row`
+drop the transpose — just a widen**), **one warp per output row**, its 32 lanes
+split K via 16-byte `uint4` loads (consecutive lanes → consecutive 16B → one
+coalesced 512B warp transaction), shuffle-reduce, single store. **No split-K → no
+memset, no atomic, one clean launch.** Only `K % 8 == 0` needed (every dim); the
+partial last 256-block is handled by the per-lane `k0 < K` guard (K=896 = 3×256+128
+→ tail lanes skip; no `K % 256` requirement like q4). Diagnosis-first held: added a
+`row` column to `bench_qwen_gemv` (reuses the same `B` buffer — speed is
+layout-agnostic) and **row beat split-K on *every* Qwen shape**: QKV.fused **1.89×**
+(133→253 GB/s), wo **1.79×** (89→160), wd **1.68×** (322→540), gateup **1.36×**
+(593→804), wk **1.91×**; `lm_head` **neutral** (1.02×, both ~950 GB/s = at HBM
+peak — never floor-bound). Integrated **bf16 imperative only** (`Model.row` flag +
+a `gv()` dispatch lambda in `run_layers_`): `wqkv`/`wgu` become row `[N,K]` (net 0
+memory), plus `wo_row`/`wd_row` row copies (+247MB); **`lm_head` stays split-K**
+(neutral + skips the +272MB `[N,K]` copy) → 1644 MiB resident, under the cliff. The
+array `[K,N]` split-K path is untouched as the oracle; because the row reduction
+order differs it is **greedy-equivalent, not bit-identical** — yet
+`bench_qwen_decode` still reports **0/12 EXACT**. Result: **imperative 245 → ~330
+tok/s (+35%, min of 6 rounds, stable 327–334)**, graph ceiling 343–357 (now a real
++5–8% finisher), `chat_qwen` coherent, **check_qwen greedy MATCH + 8/8 ctests**,
+f32 fallback path 0/12 EXACT. **Gap to llama.cpp 446: 1.82× → ~1.35×; net session
+67 → 330 tok/s (4.9×).** The per-launch floor is now gone, so the next real lever
+is **bandwidth**: Q4_0 → `dtype::q4` (0.625 B/weight vs bf16's 2).
+
 ## vs silarray (M1 Pro, 2026-07-03)
 
 Head-to-head with the predecessor across cpu/gpu/auto. Two separate
