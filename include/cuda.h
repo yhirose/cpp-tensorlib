@@ -711,11 +711,13 @@ inline bool gemv_bf16_row(void* a, void* B, void* y, int64_t n, int64_t k) {
 
 // M8 int4-weight decode GEMV: y(N) = a(1,K) @ dequant(Wq[N,K]), F32 accumulate.
 // qw = packed int4 [N][K/8] words, scales = f32 [N][K/group]. One warp/output.
-// K % 256 == 0, group % 8 == 0 (host-gated).
+// K % group == 0, group % 8 == 0 (host-gated); the kernel's per-lane tail guard
+// lifts the old K % 256 requirement (Qwen K=896 = 3×256+128 works).
 inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
                     int64_t K, int64_t group) {
   auto& c = context::get();
-  if (!c.ready || (K % 256) != 0 || (group % 8) != 0) return false;
+  if (!c.ready || group <= 0 || (K % group) != 0 || (group % 8) != 0)
+    return false;
   c.device_read_(a);
   c.device_read_(qw);
   c.device_read_(scales);

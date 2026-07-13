@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -32,13 +33,21 @@ int main(int argc, char** argv) {
   tl::dtype wdt = (argc > 2 && std::string(argv[2]) == "f32") ? tl::dtype::f32
                                                               : tl::dtype::bf16;
   int64_t n_dec = argc > 3 ? std::atoll(argv[3]) : 64;
+  // argv[4] q4 spec: "mlp" (wgu,wd), "lm" (lm_head), "all"/"q4" (both), else none.
+  std::string q4spec = argc > 4 ? argv[4] : "";
+  bool q4_mlp = q4spec.find("mlp") != std::string::npos ||
+                q4spec == "all" || q4spec == "q4";
+  bool q4_lm = q4spec.find("lm") != std::string::npos ||
+               q4spec == "all" || q4spec == "q4";
 
   qm::gg::model m(path);
   if (!qm::check_config(m)) { std::printf("config mismatch\n"); return 2; }
   tl::use_gpu();
-  std::printf("model %s | weights %s | %lld decode steps\n", path.c_str(),
-              wdt == tl::dtype::bf16 ? "bf16" : "f32", (long long)n_dec);
-  qm::Model M = qm::build(m, wdt);
+  const bool q4on = q4_mlp || q4_lm;
+  std::printf("model %s | weights %s | q4: mlp=%d lm=%d | %lld decode steps\n",
+              path.c_str(), wdt == tl::dtype::bf16 ? "bf16" : "f32", q4_mlp, q4_lm,
+              (long long)n_dec);
+  qm::Model M = qm::build(m, wdt, q4_mlp, q4_lm);
 
   // Short deterministic prefill so the cache/pos are realistic, then time a
   // fixed run of decode steps. A few warmup steps first (module load, fn cache,
@@ -57,18 +66,30 @@ int main(int argc, char** argv) {
   // same cache slot with identical k,v), run step_imperative, compare.
   {
     int mism = 0;
+    double maxrel = 0.0;  // worst per-token top-logit relative gap (q4 vs bf16)
     int64_t p = pos, nx = next;
     std::vector<int64_t> saved(M.layers.size());
+    std::vector<float> bf16_logits;
     for (int i = 0; i < 12; i++) {
       for (size_t j = 0; j < M.layers.size(); j++) saved[j] = M.layers[j].cache.pos;
-      int64_t ta = qm::step_greedy(M, nx, p);
+      // array (bf16 oracle) logits + greedy token
+      bf16_logits = qm::step(M, nx, p);
+      int64_t ta = qm::argmax(bf16_logits);
       for (size_t j = 0; j < M.layers.size(); j++) M.layers[j].cache.pos = saved[j];
-      int64_t tb = qm::step_imperative(M, nx, p);
+      // imperative logits (q4 when enabled) from identical cache state
+      const float* imp = qm::imperative_logits(M, nx, p);
+      int64_t tb = qm::argmax(std::vector<float>(imp, imp + qm::VOCAB));
       if (ta != tb) mism++;
+      double denom = 1.0 + std::fabs((double)bf16_logits[ta]);
+      maxrel = std::max(maxrel, std::fabs((double)imp[ta] - bf16_logits[ta]) / denom);
       nx = ta; p++;
     }
-    std::printf("array-vs-imperative greedy: %d/12 mismatch %s\n", mism,
-                mism == 0 ? "(EXACT)" : "(!!)");
+    if (q4on)
+      std::printf("array(bf16)-vs-imperative(q4) greedy divergence: %d/12  "
+                  "(top-logit maxrel %.2e — expected: q4 is lossy)\n", mism, maxrel);
+    else
+      std::printf("array-vs-imperative greedy: %d/12 mismatch %s\n", mism,
+                  mism == 0 ? "(EXACT)" : "(!!)");
     pos = p; next = nx;
   }
 

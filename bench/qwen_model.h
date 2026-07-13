@@ -166,6 +166,12 @@ struct Layer {
   // wqkv/wgu hold column-major [K,N] for the split-K path and wo_row/wd_row are
   // empty. lm_head stays split-K [K,N] in both (neutral + saves the [N,K] copy).
   array wqkv, wgu, wo_row, wd_row;
+  // q4 (group-symmetric int4, group=32) copies of the large bandwidth-bound MLP
+  // weights (imperative bf16 path, when Model.q4_mlp). ~0.625 B/wt vs bf16's 2 →
+  // wgu 1.74×, wd 1.38× in the isolated bench. These REPLACE wgu/wd_row (the row
+  // bf16 fields stay empty), saving memory. Attention proj (QKV.fused, wo) stays
+  // bf16-row — q4 loses there (still floor-bound; dequant > byte savings).
+  array wgu_q4, wd_q4;
   tl::cuda::kv_cache cache;
 };
 
@@ -187,6 +193,7 @@ struct Scratch {
   void* gub = nullptr;                // fused gate|up out [2*FF] = [9728]
   void* mdb = nullptr;                // mlp-down out [NE]
   void* logitsb = nullptr;            // [VOCAB]
+  float* logits_host = nullptr;       // host mirror of logitsb (divergence checks)
   void* embedb = nullptr;             // staged embedding row [NE] (capture input)
   bool ready = false;
   void init() {
@@ -205,7 +212,7 @@ struct Scratch {
     mb = tl::cuda::alloc(FF * 4, nullptr);
     gub = tl::cuda::alloc(2 * FF * 4, nullptr);
     mdb = tl::cuda::alloc(NE * 4, nullptr);
-    logitsb = tl::cuda::alloc(VOCAB * 4, nullptr);
+    logitsb = tl::cuda::alloc(VOCAB * 4, &logits_host);
     ready = logitsb != nullptr;
   }
 };
@@ -214,20 +221,34 @@ struct Model {
   const uint16_t* embed_f16;  // token_embd raw F16 [vocab, NE] (row-gather source)
   array outwT;                // logits weight [NE, VOCAB] (transposed output.weight)
   array onorm;                // final norm [1, NE]
+  array outwT_q4;             // q4 lm_head (imperative, when q4_lmhead); outwT
+                              // stays bf16 as the array-path oracle
   std::vector<Layer> layers;
   Scratch scratch;
   bool row = false;  // imperative gemvs use warp-per-row [N,K] (bf16 only)
+  bool q4_mlp = false;     // imperative MLP gemvs (wgu, wd) use q4
+  bool q4_lmhead = false;  // imperative lm_head gemv uses q4
 };
 
 // wdt = the linear-weight storage dtype (f32 exact, or bf16 for the <2GB/decode
 // path). Biases, norms and the embedding stay F32 (elementwise / row-gather).
-inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32) {
+// q4_mlp / q4_lmhead quantize the large bandwidth-bound gemvs to group-int4 in
+// the imperative decode path (bf16 base only). Lossy — greedy diverges from the
+// F16 oracle; validated by coherence + divergence, not greedy-exact.
+inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
+                   bool q4_mlp = false, bool q4_lmhead = false) {
   const bool row = (wdt == tl::dtype::bf16);  // warp-per-row [N,K] imperative gemvs
+  const bool q4m = q4_mlp && row;             // q4 requires the bf16/row base
+  const bool q4lm = q4_lmhead && row;
+  const tl::dtype f32 = tl::dtype::f32;
   Model M{reinterpret_cast<const uint16_t*>(need(m, "token_embd.weight")->data),
           load_w_T(m, "output.weight", NE, VOCAB, wdt),  // lm_head stays [K,N]
           load_f32(m, "output_norm.weight", NE),
-          {}};
+          // q4 lm_head (imperative): quantize the f32 [K,VOCAB] then keep only q4.
+          q4lm ? load_w_T(m, "output.weight", NE, VOCAB, f32).to_q4() : array{}};
   M.row = row;
+  M.q4_mlp = q4m;
+  M.q4_lmhead = q4lm;
   for (int64_t l = 0; l < NL; l++) {
     std::string p = "blk." + std::to_string(l) + ".";
     Layer L{load_w_T(m, p + "attn_q.weight", NE, NH * HD, wdt),
@@ -253,12 +274,20 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32) {
                 : load_w_T_cat(m, {{p + "attn_q.weight", NH * HD},
                                    {p + "attn_k.weight", NKV * HD},
                                    {p + "attn_v.weight", NKV * HD}}, NE, wdt),
-            row ? load_w_T_cat_row(m, {{p + "ffn_gate.weight", FF},
-                                       {p + "ffn_up.weight", FF}}, NE)
-                : load_w_T_cat(m, {{p + "ffn_gate.weight", FF},
-                                   {p + "ffn_up.weight", FF}}, NE, wdt),
+            // wgu: bf16-row when row & !q4; column [K,N] in f32; empty when q4m
+            // (replaced by wgu_q4). wd_row likewise.
+            (row && !q4m) ? load_w_T_cat_row(m, {{p + "ffn_gate.weight", FF},
+                                                 {p + "ffn_up.weight", FF}}, NE)
+            : row ? array{}
+                  : load_w_T_cat(m, {{p + "ffn_gate.weight", FF},
+                                     {p + "ffn_up.weight", FF}}, NE, wdt),
             row ? load_w_T_row(m, p + "attn_output.weight", NH * HD, NE) : array{},
-            row ? load_w_T_row(m, p + "ffn_down.weight", FF, NE) : array{},
+            (row && !q4m) ? load_w_T_row(m, p + "ffn_down.weight", FF, NE) : array{},
+            // q4 MLP (imperative, when q4m): quantize the f32 [K,N] fused/down.
+            q4m ? load_w_T_cat(m, {{p + "ffn_gate.weight", FF},
+                                   {p + "ffn_up.weight", FF}}, NE, f32).to_q4()
+                : array{},
+            q4m ? load_w_T(m, p + "ffn_down.weight", FF, NE, f32).to_q4() : array{},
             {}};
     L.cache.init(NKV, MAXC, HD);
     M.layers.push_back(std::move(L));
@@ -393,6 +422,15 @@ inline bool gemv_w(const array& W, void* a, void* y, int64_t n, int64_t k) {
              : tl::cuda::gemv_f32(a, W.native(), y, n, k);
 }
 
+// q4 decode GEMV: y(N) = a(1,K) @ dequant(Wq). Wq is a q4 array (logical [K,N],
+// storage [packed [N][K/2] | scales [N][K/32]]); the scales pointer is mid-buffer
+// (rides along the base upload — same split as the array-path gpu_gemv_q4).
+inline bool gemv_q4_w(const array& Wq, void* a, void* y) {
+  const int64_t K = Wq.shape()[0], N = Wq.shape()[1];
+  void* scales = static_cast<char*>(Wq.native()) + N * K / 2;
+  return tl::cuda::gemv_q4(a, Wq.native(), scales, y, N, K, tl::kQ4Group);
+}
+
 // The 24 decoder layers + final RMSNorm + lm_head gemv as direct cuda:: calls
 // on the Scratch buffers, reading layer-0 residual from x0 and writing logits
 // to S.logitsb. NO array nodes, NO host sync / blocking copy — so this region
@@ -441,16 +479,19 @@ inline void run_layers_(Model& M, void* x0, int64_t pos) {
     // x1 = x + (attn@wo); h2 = rmsnorm(x1, fn) — fused.
     cu::rmsnorm_res(ro, x, L.fn.native(), ro, S.h2b, NE, EPS);
     // Fused gate|up: one GEMV -> [gate(FF) | up(FF)] in S.gub; swiglu reads both.
-    gv(L.wgu, L.wgu, S.h2b, S.gub, 2 * FF, NE);
+    if (M.q4_mlp) gemv_q4_w(L.wgu_q4, S.h2b, S.gub);  // [K=NE, N=2*FF]
+    else gv(L.wgu, L.wgu, S.h2b, S.gub, 2 * FF, NE);
     cu::swiglu(S.gub, off(S.gub, FF), S.mb, FF);
-    gv(L.wd_row, L.wd, S.mb, S.mdb, NE, FF);
+    if (M.q4_mlp) gemv_q4_w(L.wd_q4, S.mb, S.mdb);    // [K=FF, N=NE]
+    else gv(L.wd_row, L.wd, S.mb, S.mdb, NE, FF);
     // x2 = x1 + mlp; next input norm = rmsnorm(x2, next an | final onorm) — fused.
     void* nextw = (l + 1 < NL) ? M.layers[l + 1].an.native() : M.onorm.native();
     cu::rmsnorm_res(ro, S.mdb, nextw, ro, S.hb, NE, EPS);
     x = ro;
   }
   // hb now holds the final RMSNorm output (folded into the last layer's seam).
-  gemv_w(M.outwT, S.hb, S.logitsb, VOCAB, NE);
+  if (M.q4_lmhead) gemv_q4_w(M.outwT_q4, S.hb, S.logitsb);  // [K=NE, N=VOCAB]
+  else gemv_w(M.outwT, S.hb, S.logitsb, VOCAB, NE);
 }
 
 // Fully imperative decode step (C1): embed row -> run_layers_ -> GPU argmax.
@@ -465,6 +506,17 @@ inline int64_t step_imperative(Model& M, int64_t id, int64_t pos) {
   int64_t idx = 0;
   tl::cuda::argmax(M.scratch.logitsb, VOCAB, &idx);
   return idx;
+}
+
+// Run the imperative forward and return the logits [VOCAB] on the host (device
+// mirror of scratch.logitsb). For the q4-vs-bf16 divergence measurement — the
+// quantization-quality analogue of step_imperative's greedy token.
+inline const float* imperative_logits(Model& M, int64_t id, int64_t pos) {
+  array e = embed_row(M, id);
+  e.realize();
+  run_layers_(M, e.native(), pos);
+  tl::cuda::sync_to_host(M.scratch.logitsb, false);
+  return M.scratch.logits_host;
 }
 
 // Gather the embedding row for token `id` into the staged capture buffer

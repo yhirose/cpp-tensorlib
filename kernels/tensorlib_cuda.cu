@@ -524,18 +524,23 @@ __global__ void tl_gemv_bf16_row(const float* __restrict__ a,
 // decode lever. One WARP per output row n; its 32 lanes split K (each lane one
 // uint32 = 8 packed int4 per step, coalesced within the warp), dequantize in
 // registers (w = scale·(nibble-8)), MAC into an F32 accumulator, then warp-
-// shuffle-reduce. Requires K % 256 == 0 and group % 8 == 0 (transformer dims).
+// shuffle-reduce. Requires K % group == 0 and group % 8 == 0 (every transformer
+// dim; group=32). The last partial 256-block (when K % 256 != 0, e.g. Qwen's
+// K=896 = 3×256+128) is handled by the per-lane k0 < K guard — tail lanes skip,
+// exactly as tl_gemv_bf16_row does — so no K % 256 requirement.
 // Per-warp int4 dot over a lane's K-slice, into acc (macro so both the global-a
 // and shared-a kernels share the body — a template can't live in extern "C").
 #define TL_Q4_DOT(AEXPR)                                                    \
   float acc = 0.0f;                                                         \
   for (unsigned base = 0; base < K; base += 256u) {                         \
     const unsigned k0 = base + lane * 8u;                                   \
-    unsigned w = qrow[k0 >> 3];                                             \
-    float sc = srow[k0 / G];                                                \
-    _Pragma("unroll") for (int j = 0; j < 8; j++) {                         \
-      int q = (int)((w >> (j * 4)) & 0xFu) - 8;                             \
-      acc += (AEXPR) * (sc * (float)q);                                     \
+    if (k0 < K) {                                                           \
+      unsigned w = qrow[k0 >> 3];                                           \
+      float sc = srow[k0 / G];                                              \
+      _Pragma("unroll") for (int j = 0; j < 8; j++) {                       \
+        int q = (int)((w >> (j * 4)) & 0xFu) - 8;                           \
+        acc += (AEXPR) * (sc * (float)q);                                   \
+      }                                                                     \
     }                                                                       \
   }                                                                         \
   _Pragma("unroll") for (int off = 16; off > 0; off >>= 1) acc +=           \

@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -50,6 +51,9 @@ struct Op {
   void* a = nullptr;
   void* B = nullptr;
   void* y = nullptr;
+  void* qw = nullptr;  // q4 packed int4 [N][K/2]
+  void* sc = nullptr;  // q4 scales f32 [N][K/G]
+  static constexpr int64_t G = 32;
   void alloc_() {
     float* ha = nullptr;
     float* hB = nullptr;  // host mirror (bytes); gemv's device_read_ uploads it
@@ -64,15 +68,40 @@ struct Op {
     for (int64_t i = 0; i < K; i++) ha[i] = rnd();
     uint16_t* Bb = reinterpret_cast<uint16_t*>(hB);
     for (int64_t i = 0; i < K * N; i++) Bb[i] = f32_to_bf16(rnd());
+    // q4 operand: quantize fresh random f32 into [N][K/2] int4 + [N][K/G] scales
+    // (values irrelevant for speed — a valid q4 layout of the right bytes is all
+    // the bandwidth measurement needs). Same convention as to_q4: scale=amax/7.
+    float* hqw = nullptr;
+    float* hsc = nullptr;
+    qw = alloc(N * K / 2, &hqw);
+    sc = alloc(N * (K / G) * 4, &hsc);
+    uint32_t* words = reinterpret_cast<uint32_t*>(hqw);
+    for (int64_t n = 0; n < N; n++)
+      for (int64_t g = 0; g < K / G; g++) {
+        float wt[G], ma = 1e-8f;
+        for (int64_t j = 0; j < G; j++) { wt[j] = rnd(); ma = std::max(ma, std::fabs(wt[j])); }
+        float scale = ma / 7.0f;
+        hsc[n * (K / G) + g] = scale;
+        for (int64_t j = 0; j < G; j++) {
+          int q = std::max(-8, std::min(7, (int)std::lround(wt[j] / scale)));
+          int64_t k = g * G + j;
+          uint32_t& wd = words[n * (K / 8) + k / 8];
+          unsigned slot = (unsigned)(k % 8);
+          wd = (wd & ~(0xFu << (slot * 4))) | ((unsigned)(q + 8) << (slot * 4));
+        }
+      }
   }
   void free_() {
     release(a, 0, nullptr); release(B, 0, nullptr); release(y, 0, nullptr);
+    release(qw, 0, nullptr); release(sc, 0, nullptr);
   }
   void run() const { gemv_bf16(a, B, y, N, K); }
   // Warp-per-row [N,K] variant (lever A). Speed is layout-agnostic (same K*N*2
   // random bytes, same access footprint), so it reuses the same B buffer — only
   // the in-kernel interpretation differs. Compared head-to-head with split-K.
   void run_row() const { gemv_bf16_row(a, B, y, N, K); }
+  // q4 warp-per-row [N,K] (bandwidth lever): ~0.625 B/wt vs bf16's 2.
+  void run_q4() const { gemv_q4(a, qw, sc, y, N, K, G); }
 };
 
 static const int R = 50, ROUNDS = 7;
@@ -105,24 +134,23 @@ int main() {
       {"gateup.fused[896x9728]", 896, 9728},
   };
 
-  std::printf("=== per-shape bf16 gemv (median of %d rounds x %d launches) ===\n", ROUNDS, R);
-  std::printf("split-K = column-per-thread [K,N] + gridDim.y atomic combine (current);"
-              " row = warp-per-row [N,K], no split-K (lever A)\n");
-  std::printf("%-22s %10s %10s %10s %9s   %9s %9s %9s\n", "shape", "splitK ms",
-              "noK ms", "row ms", "sK/row", "splitK GB/s", "noK GB/s", "row GB/s");
+  std::printf("=== per-shape decode gemv (median of %d rounds x %d launches) ===\n", ROUNDS, R);
+  std::printf("split-K = column-per-thread [K,N] bf16 (pre-lever-A); row = warp-per-row"
+              " [N,K] bf16 (lever A, current); q4 = warp-per-row [N,K] int4 (~0.625 B/wt)\n");
+  std::printf("%-22s %9s %9s %9s %8s %8s   %9s %9s\n", "shape", "splitK ms",
+              "row ms", "q4 ms", "row/q4", "q4 b/wt", "row GB/s", "q4 GB/s");
   for (const auto& s : shapes) {
     Op op{s.name, s.K, s.N};
     op.alloc_();
     set_no_splitk(false);
     double ms_k = time_op(op);
-    set_no_splitk(true);
-    double ms_n = time_op(op);
-    set_no_splitk(false);
     double ms_r = time_fn([&] { op.run_row(); });
-    double bytes = (double)s.K * s.N * 2;
-    std::printf("%-22s %10.4f %10.4f %10.4f %9.2f   %9.1f %9.1f %9.1f\n", s.name,
-                ms_k, ms_n, ms_r, ms_k / ms_r, bytes / (ms_k * 1e6),
-                bytes / (ms_n * 1e6), bytes / (ms_r * 1e6));
+    double ms_q = time_fn([&] { op.run_q4(); });
+    double bf16_bytes = (double)s.K * s.N * 2;
+    double q4_bytes = (double)s.K * s.N * 0.5 + (double)s.N * (s.K / Op::G) * 4;
+    std::printf("%-22s %9.4f %9.4f %9.4f %8.2f %8.3f   %9.1f %9.1f\n", s.name,
+                ms_k, ms_r, ms_q, ms_r / ms_q, q4_bytes / ((double)s.K * s.N),
+                bf16_bytes / (ms_r * 1e6), q4_bytes / (ms_q * 1e6));
     op.free_();
   }
 

@@ -44,9 +44,14 @@ int main(int argc, char** argv) {
   // consumes it natively. Pass "f32" as argv[3] to force exact F32 (~2GB).
   tl::dtype wdt = (argc > 3 && std::string(argv[3]) == "f32") ? tl::dtype::f32
                                                               : tl::dtype::bf16;
-  std::printf("weight storage: %s\n", wdt == tl::dtype::bf16 ? "bf16" : "f32");
+  // argv[4] q4 spec: "mlp", "lm", "all"/"q4" — quantize those imperative gemvs.
+  std::string q4spec = argc > 4 ? argv[4] : "";
+  bool q4_mlp = q4spec.find("mlp") != std::string::npos || q4spec == "all" || q4spec == "q4";
+  bool q4_lm = q4spec.find("lm") != std::string::npos || q4spec == "all" || q4spec == "q4";
+  std::printf("weight storage: %s | q4: mlp=%d lm=%d\n",
+              wdt == tl::dtype::bf16 ? "bf16" : "f32", q4_mlp, q4_lm);
   auto t_build = clk::now();
-  qm::Model M = qm::build(m, wdt);
+  qm::Model M = qm::build(m, wdt, q4_mlp, q4_lm);
   double build_ms = ms_since(t_build);
 
   // Qwen2 chat template (matches the model's default system prompt).

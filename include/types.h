@@ -22,7 +22,8 @@ enum class dtype : uint8_t { f32, bf16, q4 };
 inline int64_t dtype_size(dtype dt) { return dt == dtype::bf16 ? 2 : 4; }
 
 // q4 layout: fixed group size, one buffer = [packed int4 [N][K/2] | scales
-// f32 [N][K/kQ4Group]]. K must be a multiple of 256 (kernel) and kQ4Group.
+// f32 [N][K/kQ4Group]]. K must be a multiple of kQ4Group (the kernel's per-lane
+// tail guard handles K % 256 != 0, e.g. Qwen's K=896).
 inline constexpr int64_t kQ4Group = 32;
 inline int64_t q4_bytes(int64_t N, int64_t K) {
   return N * K / 2 + N * (K / kQ4Group) * 4;

@@ -243,7 +243,7 @@ class array {
   array to_f32() const;   // bf16/q4 -> F32 contiguous copy (F32: returns *this)
   // F32 [K,N] weight -> group-symmetric int4 (M8). Logical shape stays [K,N];
   // storage is packed [N,K] int4 + per-group scales. The decode GEMV consumes
-  // it natively; other ops dequantize via to_f32(). K % 256 == 0 required.
+  // it natively; other ops dequantize via to_f32(). K % kQ4Group (32) required.
   array to_q4() const;
 
   // Elementwise (lazy)
@@ -647,8 +647,8 @@ inline array array::to_q4() const {
   if (storage_.dt == tl::dtype::q4) return *this;
   if (rank() != 2) throw std::logic_error("tl::to_q4: expect [K,N]");
   const int64_t K = shape_[0], N = shape_[1], G = tl::kQ4Group;
-  if (K % 256 != 0 || K % G != 0)
-    throw std::logic_error("tl::to_q4: K must be a multiple of 256");
+  if (K % G != 0)
+    throw std::logic_error("tl::to_q4: K must be a multiple of kQ4Group (32)");
   const float* pi = raw();  // [K,N], strided ok
   int64_t s0 = strides_[0], s1 = strides_[1];
   array out;
