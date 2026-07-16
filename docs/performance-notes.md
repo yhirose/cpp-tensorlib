@@ -852,6 +852,32 @@ f32 fallback path 0/12 EXACT. **Gap to llama.cpp 446: 1.82× → ~1.35×; net se
 67 → 330 tok/s (4.9×).** The per-launch floor is now gone, so the next real lever
 is **bandwidth**: Q4_0 → `dtype::q4` (0.625 B/weight vs bf16's 2).
 
+**Q4 (group-int4) bandwidth lever → +6% at the ceiling, kept opt-in (2026-07-10).**
+With the per-launch floor killed by lever A, the remaining decode cost is HBM
+traffic, so the next lever is the dtype: `dtype::q4` reads **~0.625 B/weight** vs
+bf16's 2 (group-32 symmetric int4, `scale = amax/7`; one buffer = `[packed int4
+[N][K/2] | scales f32 [N][K/32]]`). The q4 kernel (`tl_gemv_q4`) was already the
+warp-per-row `[N,K]` shape lever A landed on, so it drops straight in — the only
+change was generalizing its tail from `K % 256` to `K % 32` (a per-lane `k0 < K`
+guard on the uint32 read + 8-nibble loop; bit-exact on `K % 256 == 0` shapes since
+the guard is always-true there, verified via `bench_q4` maxrel 6e-6). **Diagnosis
+first held again**: a `q4` column added to `bench_qwen_gemv` showed the expected
+**hybrid** — q4 wins the large-N bandwidth-bound gemvs (MLP gate/up/down, lm_head)
+but *loses* the small-N attention projections, where lever A already erased the
+floor and the dequant overhead now exceeds the byte savings. So integrated **q4 for
+the MLP gemvs only** (`wgu`/`wd`), attention stays bf16-row, lm_head optional.
+Measured (graph ceiling = the noise-free axis; WSL2 boost noise ±20 tok/s masks it
+at the imperative level): baseline **357** → q4-MLP **379 (+6.2%)** → q4-all (+lm_head)
+**379.5** — lm_head q4 is marginal (it's already at HBM peak as split-K, so cutting
+its bytes barely moves it) while costing the most quality. q4-MLP also frees **~430MB**
+(replaces the bf16 row copies). **Cost is quality**: q4 is lossy, so greedy diverges
+from the bf16 oracle **2/12** (q4-MLP) / **3/12** (q4-all), top-logit maxrel 3.15e-2 /
+3.94e-2 — `chat_qwen` stays coherent for all configs, but the token stream can
+differ. **Decision: default stays bf16-row (bit-exact oracle-matching); q4 is
+opt-in** (`--q4=mlp` / `lm` / `all`) for users who want the +6% and −430MB and accept
+the lossiness. Array `[K,N]` split-K path untouched as the bf16 oracle → array-vs-
+imperative divergence is the built-in quality gauge. Committed 478c5d4.
+
 ## vs silarray (M1 Pro, 2026-07-03)
 
 Head-to-head with the predecessor across cpu/gpu/auto. Two separate
