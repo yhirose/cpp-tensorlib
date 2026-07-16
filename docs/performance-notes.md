@@ -878,6 +878,33 @@ opt-in** (`--q4=mlp` / `lm` / `all`) for users who want the +6% and −430MB and
 the lossiness. Array `[K,N]` split-K path untouched as the bf16 oracle → array-vs-
 imperative divergence is the built-in quality gauge. Committed 478c5d4.
 
+**bf16 KV cache → REFUTED for Qwen 0.5B (neutral), real 1.64× at llama-7B; kept
+dormant (2026-07-16).** The flagged next decode lever: store the KV cache as bf16
+(2 B) so the attention kernels stream half the K,V bytes every step (~2× the KV
+floor). Built as a storage-dtype seam that leaves the f32 path byte-identical: the
+attention read cores (`attn_decode_core`, `_split_core`, `attn_prefill_core`) and
+the write kernels (`tl_kv_append`, `tl_kv_fill`) gained a `typename KT ∈ {float,
+__nv_bfloat16}` template with a `kv_ld`/`kv_st` widen/narrow seam; new bf16 symbols
+(`tl_attn_decode_bf16[_64]`, `…_split_bf16[_64]`, `…_prefill_bf16[_64]`,
+`tl_kv_{append,fill}_bf16`) sit beside the untouched f32 ones, and `kv_cache` gained
+a `dtype` flag (default f32) that routes to the matching instantiation — q/out/
+scratch stay f32; all indices/`kv_stride` are element counts so only the width
+changes. **Measure-first (`bench_attn_decode`, bf16 column) held the line**: at the
+**llama-7B shape** (H=32, D=128) bf16 KV is a real lever — 1.05× at ctx=512 growing
+to **1.64× at ctx≥2048** (901→737 GB/s at half the bytes), maxrel vs the f32 CPU
+ref only **~1e-4** (bf16's 8-bit mantissa + attention's averaging, ~300× tighter
+than q4). But at the **REAL Qwen2.5-0.5B shape** (14 q / **2 kv** heads, D=64) it is
+**NEUTRAL — 1.00× (even 0.98×)** across every realistic ctx 128–2048: per-layer attn
+is a flat ~28–32 µs regardless of dtype because the 2-KV-head footprint is tiny and
+the kernel is **launch/occupancy-floor-bound, not bandwidth-bound** (the same lesson
+as the whole session — on 0.5B decode the weight-reading gemvs are the cost, 2-head
+attention is a rounding error). So per the "土俵で測ってから積む" discipline it is
+**NOT wired into the Qwen decode path** (neutral + lossy = a strict loss there). The
+infra is kept **tested + dormant** (f32 path byte-identical, 8/8 ctest green, the
+arena bench exercises + documents where it pays), a real lever the moment a
+llama-class model (many KV heads, long ctx) is added — mirroring the graph-capture
+"kept tested + dormant" precedent.
+
 ## vs silarray (M1 Pro, 2026-07-03)
 
 Head-to-head with the predecessor across cpu/gpu/auto. Two separate

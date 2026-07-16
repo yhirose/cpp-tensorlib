@@ -43,14 +43,21 @@ int main() {
 
   std::printf("fused decode attention — H=%lld heads, D=%lld, scale=1/sqrt(D)\n",
               (long long)H, (long long)D);
-  std::printf("%-8s %10s %10s %10s   %14s\n", "ctx", "ms/layer", "KV GB/s",
-              "maxrel", "model ms (x%d)");
+  std::printf("f32 = 4B K,V (baseline); bf16 = 2B K,V (M9 KV bandwidth lever, "
+              "~2x the KV floor). maxrel is vs the f32 CPU reference.\n");
+  std::printf("%-8s %9s %9s %8s   %9s %9s %9s   %10s\n", "ctx", "f32 ms",
+              "bf16 ms", "f32/bf16", "f32 GB/s", "bf16 GB/s", "bf16 maxrel",
+              "model bf16");
   for (int64_t ctx : ctxs) {
     float *hq = nullptr, *hK = nullptr, *hV = nullptr, *ho = nullptr;
     void* q = alloc(H * D * 4, &hq);
     void* K = alloc(H * ctx * D * 4, &hK);
     void* V = alloc(H * ctx * D * 4, &hV);
     void* o = alloc(H * D * 4, &ho);
+    // bf16 K,V cache holding the same values (narrowed): filled once via kv_fill
+    // (f32 in -> bf16 out), the exact write path the model uses.
+    void* Kb = alloc(H * ctx * D * 2, nullptr);
+    void* Vb = alloc(H * ctx * D * 2, nullptr);
 
     uint32_t st = 99u;
     auto rnd = [&] {
@@ -64,12 +71,21 @@ int main() {
       hK[i] = rnd();
       hV[i] = rnd();
     }
+    // Narrow the f32 K,V into the bf16 cache buffers (kv_fill: [H,ctx,D] -> cache
+    // rows [0,ctx), kv_max=ctx so no padding). H_kv = H here (no GQA).
+    kv_fill(Kb, Vb, K, V, ctx, ctx, H, D, /*kv_bf16=*/true);
+    flush();
 
-    attn_decode(q, K, V, o, H, H, ctx, ctx, D, scale);
+    auto run = [&](bool bf16) {
+      attn_decode(q, bf16 ? Kb : K, bf16 ? Vb : V, o, H, H, ctx, ctx, D, scale,
+                  bf16);
+    };
+    run(true);
     flush();
     sync_to_host(o, false);
 
-    // CPU reference per head: softmax(scale·q·Kᵀ)·V
+    // CPU reference per head: softmax(scale·q·Kᵀ)·V (f32 values). Compared to the
+    // bf16-cache run below — so maxrel is the bf16 quantization error, end to end.
     double maxrel = 0;
     std::vector<float> scores(ctx);
     for (int64_t h = 0; h < H; h++) {
@@ -98,27 +114,85 @@ int main() {
       }
     }
 
-    std::vector<double> ms;
-    for (int r = 0; r < ROUNDS; r++) {
-      auto t0 = clk::now();
-      for (int i = 0; i < R; i++) attn_decode(q, K, V, o, H, H, ctx, ctx, D, scale);
-      flush();
-      ms.push_back(
-          std::chrono::duration<double, std::milli>(clk::now() - t0).count() /
-          R);
-    }
-    double layer_ms = median(ms);
-    double kv_gbs = 2.0 * H * ctx * D * 4 / (layer_ms * 1e6);
-    std::printf("%-8lld %10.4f %10.1f %10.1e   %11.2f ms\n", (long long)ctx,
-                layer_ms, kv_gbs, maxrel, layer_ms * LAYERS);
+    auto time = [&](bool bf16) {
+      std::vector<double> ms;
+      for (int r = 0; r < ROUNDS; r++) {
+        auto t0 = clk::now();
+        for (int i = 0; i < R; i++) run(bf16);
+        flush();
+        ms.push_back(
+            std::chrono::duration<double, std::milli>(clk::now() - t0).count() / R);
+      }
+      return median(ms);
+    };
+    double f32_ms = time(false), bf16_ms = time(true);
+    double f32_gbs = 2.0 * H * ctx * D * 4 / (f32_ms * 1e6);
+    double bf16_gbs = 2.0 * H * ctx * D * 2 / (bf16_ms * 1e6);
+    std::printf("%-8lld %9.4f %9.4f %8.2f   %9.1f %9.1f %9.1e   %8.2f ms\n",
+                (long long)ctx, f32_ms, bf16_ms, f32_ms / bf16_ms, f32_gbs,
+                bf16_gbs, maxrel, bf16_ms * LAYERS);
 
     release(q, 0, nullptr);
     release(K, 0, nullptr);
     release(V, 0, nullptr);
     release(o, 0, nullptr);
+    release(Kb, 0, nullptr);
+    release(Vb, 0, nullptr);
   }
   std::printf(
       "\n(compare model ms vs bench_llm's unfused decode attention ~48 ms)\n");
+
+  // ---- REAL Qwen2.5-0.5B decode shape: HQ=14, HKV=2, D=64 (the actual target).
+  // Tiny KV footprint (2 kv heads x ctx x 64) at short chat contexts, so this is
+  // the honest test of whether bf16 KV moves the needle on THIS model vs the
+  // llama-7B ceiling above. Per-layer attn ms x24 layers = the full-model delta.
+  {
+    const int64_t HQ = 14, HKV = 2, D = 64;
+    const int64_t group = HQ / HKV, LY = 24;
+    const float sc = 1.0f / std::sqrt((float)D);
+    const int64_t qctxs[] = {128, 256, 512, 1024, 2048};
+    std::printf("\nQwen2.5-0.5B decode attn — %lld q / %lld kv heads, D=%lld, "
+                "x%lld layers\n", (long long)HQ, (long long)HKV, (long long)D,
+                (long long)LY);
+    std::printf("%-8s %9s %9s %8s   %11s %11s\n", "ctx", "f32 us", "bf16 us",
+                "f32/bf16", "f32 model", "bf16 model");
+    for (int64_t ctx : qctxs) {
+      float *hq = nullptr, *hK = nullptr, *hV = nullptr;
+      void* q = alloc(HQ * D * 4, &hq);
+      void* K = alloc(HKV * ctx * D * 4, &hK);
+      void* V = alloc(HKV * ctx * D * 4, &hV);
+      void* o = alloc(HQ * D * 4, nullptr);
+      void* Kb = alloc(HKV * ctx * D * 2, nullptr);
+      void* Vb = alloc(HKV * ctx * D * 2, nullptr);
+      uint32_t st = 7u;
+      auto rnd = [&] { st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+                       return (int32_t)st * (1.0f / 2147483648.0f); };
+      for (int64_t i = 0; i < HQ * D; i++) hq[i] = rnd();
+      for (int64_t i = 0; i < HKV * ctx * D; i++) { hK[i] = rnd(); hV[i] = rnd(); }
+      kv_fill(Kb, Vb, K, V, ctx, ctx, HKV, D, true);
+      flush();
+      auto run = [&](bool bf16) {
+        attn_decode(q, bf16 ? Kb : K, bf16 ? Vb : V, o, HQ, HKV, ctx, ctx, D, sc,
+                    bf16);
+      };
+      auto time = [&](bool bf16) {
+        run(bf16); flush();
+        std::vector<double> ms;
+        for (int r = 0; r < ROUNDS; r++) {
+          auto t0 = clk::now();
+          for (int i = 0; i < R; i++) run(bf16);
+          flush();
+          ms.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count() / R);
+        }
+        return median(ms);
+      };
+      double f = time(false), b = time(true);
+      std::printf("%-8lld %9.2f %9.2f %8.2f   %8.3f ms %8.3f ms\n", (long long)ctx,
+                  f * 1000, b * 1000, f / b, f * LY, b * LY);
+      release(q, 0, nullptr); release(K, 0, nullptr); release(V, 0, nullptr);
+      release(o, 0, nullptr); release(Kb, 0, nullptr); release(Vb, 0, nullptr);
+    }
+  }
 
   // ---- KV cache + GQA: grow the cache one token at a time, verify prefix reads
   // + the GQA head mapping against a from-scratch CPU reference at checkpoint

@@ -604,10 +604,22 @@ __global__ void tl_gemv_q4s(const float* __restrict__ a,
 // (the driver loads kernels by name): tl_attn_decode_f32[_64], etc.
 }  // close extern "C": the __device__ core templates below can't have C linkage;
    // each __global__ wrapper re-declares its own extern "C" for a stable symbol.
-template <int AD>
+
+// KV-cache storage-dtype seam (bf16 KV, M9). The cores below are templated on the
+// K/V element type KT ∈ {float, __nv_bfloat16}: kv_ld widens a cached element to
+// f32 for the dot/accumulate, kv_st narrows an f32 projection on store. KT=float
+// is the identity (the original f32 path, byte-for-byte unchanged); KT=bf16 halves
+// the cache bytes the attention kernels stream every step. q/out/scratch stay f32;
+// kv_stride and all indices are ELEMENT counts, so only the element width changes.
+__device__ __forceinline__ float kv_ld(float x) { return x; }
+__device__ __forceinline__ float kv_ld(__nv_bfloat16 x) { return __bfloat162float(x); }
+__device__ __forceinline__ void kv_st(float* p, float x) { *p = x; }
+__device__ __forceinline__ void kv_st(__nv_bfloat16* p, float x) { *p = __float2bfloat16(x); }
+
+template <int AD, typename KT = float>
 __device__ void attn_decode_core(const float* __restrict__ q,
-                                  const float* __restrict__ K,
-                                  const float* __restrict__ V,
+                                  const KT* __restrict__ K,
+                                  const KT* __restrict__ V,
                                   float* __restrict__ out, unsigned ctx,
                                   unsigned kv_stride, unsigned group,
                                   float scale) {
@@ -619,8 +631,8 @@ __device__ void attn_decode_core(const float* __restrict__ q,
   const float* qh = q + (size_t)h * AD;
   // K,V are [H_kv, max_ctx, D]; kv_stride = max_ctx*D lets a persistent cache be
   // read as its valid prefix [0,ctx) (kv_stride==ctx*AD is the no-cache case).
-  const float* Kh = K + (size_t)kv_h * kv_stride;
-  const float* Vh = V + (size_t)kv_h * kv_stride;
+  const KT* Kh = K + (size_t)kv_h * kv_stride;
+  const KT* Vh = V + (size_t)kv_h * kv_stride;
 
   __shared__ float q_sh[AD];
   q_sh[tid] = qh[tid];
@@ -630,10 +642,11 @@ __device__ void attn_decode_core(const float* __restrict__ q,
   float acc[NW] = {};  // lane holds dims d = lane, lane+32, ..., lane+(NW-1)*32
 
   for (unsigned i = warp; i < ctx; i += (unsigned)NW) {
-    const float* Ki = Kh + (size_t)i * AD;
+    const KT* Ki = Kh + (size_t)i * AD;
     float partial = 0.0f;
 #pragma unroll
-    for (int r = 0; r < NW; r++) partial += q_sh[lane + r * 32] * Ki[lane + r * 32];
+    for (int r = 0; r < NW; r++)
+      partial += q_sh[lane + r * 32] * kv_ld(Ki[lane + r * 32]);
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
       partial += __shfl_down_sync(0xffffffffu, partial, off);
@@ -643,9 +656,10 @@ __device__ void attn_decode_core(const float* __restrict__ q,
     float corr = __expf(m - m_new);
     float p = __expf(s - m_new);
     l = l * corr + p;
-    const float* Vi = Vh + (size_t)i * AD;
+    const KT* Vi = Vh + (size_t)i * AD;
 #pragma unroll
-    for (int r = 0; r < NW; r++) acc[r] = acc[r] * corr + p * Vi[lane + r * 32];
+    for (int r = 0; r < NW; r++)
+      acc[r] = acc[r] * corr + p * kv_ld(Vi[lane + r * 32]);
     m = m_new;
   }
 
@@ -681,16 +695,26 @@ extern "C" __global__ void tl_attn_decode_f32_64(const float* q, const float* K,
     unsigned group, float scale) {
   attn_decode_core<64>(q, K, V, out, ctx, kv_stride, group, scale);
 }
+extern "C" __global__ void tl_attn_decode_bf16(const float* q,
+    const __nv_bfloat16* K, const __nv_bfloat16* V, float* out, unsigned ctx,
+    unsigned kv_stride, unsigned group, float scale) {
+  attn_decode_core<128, __nv_bfloat16>(q, K, V, out, ctx, kv_stride, group, scale);
+}
+extern "C" __global__ void tl_attn_decode_bf16_64(const float* q,
+    const __nv_bfloat16* K, const __nv_bfloat16* V, float* out, unsigned ctx,
+    unsigned kv_stride, unsigned group, float scale) {
+  attn_decode_core<64, __nv_bfloat16>(q, K, V, out, ctx, kv_stride, group, scale);
+}
 
 // Split-KV (flash-decoding): the one-block-per-head kernel above launches only
 // H blocks — a few % of the 82 SMs, so it's occupancy-bound. Partition ctx over
 // gridDim.y so grid = H×S fills the SMs; each (head,split) block writes its
 // partial softmax state (m,l,acc at its local max) to scratch, and tl_attn_
 // combine merges the S partials per head. K,V are still each read exactly once.
-template <int AD>
+template <int AD, typename KT = float>
 __device__ void attn_decode_split_core(const float* __restrict__ q,
-                                        const float* __restrict__ K,
-                                        const float* __restrict__ V,
+                                        const KT* __restrict__ K,
+                                        const KT* __restrict__ V,
                                         float* __restrict__ pm,
                                         float* __restrict__ pl,
                                         float* __restrict__ pacc, unsigned ctx,
@@ -702,8 +726,8 @@ __device__ void attn_decode_split_core(const float* __restrict__ q,
   const unsigned tid = threadIdx.x;
   const unsigned lane = tid & 31u, warp = tid >> 5;
   const float* qh = q + (size_t)h * AD;
-  const float* Kh = K + (size_t)kv_h * kv_stride;
-  const float* Vh = V + (size_t)kv_h * kv_stride;
+  const KT* Kh = K + (size_t)kv_h * kv_stride;
+  const KT* Vh = V + (size_t)kv_h * kv_stride;
   const unsigned k0 = s * chunk;
   const unsigned k1 = (k0 + chunk < ctx) ? (k0 + chunk) : ctx;
 
@@ -714,10 +738,11 @@ __device__ void attn_decode_split_core(const float* __restrict__ q,
   float m = -1e30f, l = 0.0f;
   float acc[NW] = {};
   for (unsigned i = k0 + warp; i < k1; i += (unsigned)NW) {
-    const float* Ki = Kh + (size_t)i * AD;
+    const KT* Ki = Kh + (size_t)i * AD;
     float partial = 0.0f;
 #pragma unroll
-    for (int r = 0; r < NW; r++) partial += q_sh[lane + r * 32] * Ki[lane + r * 32];
+    for (int r = 0; r < NW; r++)
+      partial += q_sh[lane + r * 32] * kv_ld(Ki[lane + r * 32]);
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
       partial += __shfl_down_sync(0xffffffffu, partial, off);
@@ -726,9 +751,10 @@ __device__ void attn_decode_split_core(const float* __restrict__ q,
     float corr = __expf(m - m_new);
     float p = __expf(sc - m_new);
     l = l * corr + p;
-    const float* Vi = Vh + (size_t)i * AD;
+    const KT* Vi = Vh + (size_t)i * AD;
 #pragma unroll
-    for (int r = 0; r < NW; r++) acc[r] = acc[r] * corr + p * Vi[lane + r * 32];
+    for (int r = 0; r < NW; r++)
+      acc[r] = acc[r] * corr + p * kv_ld(Vi[lane + r * 32]);
     m = m_new;
   }
 
@@ -771,6 +797,20 @@ extern "C" __global__ void tl_attn_decode_split_64(const float* q,
   attn_decode_split_core<64>(q, K, V, pm, pl, pacc, ctx, kv_stride, group,
                              chunk, scale);
 }
+extern "C" __global__ void tl_attn_decode_split_bf16(const float* q,
+    const __nv_bfloat16* K, const __nv_bfloat16* V, float* pm, float* pl,
+    float* pacc, unsigned ctx, unsigned kv_stride, unsigned group,
+    unsigned chunk, float scale) {
+  attn_decode_split_core<128, __nv_bfloat16>(q, K, V, pm, pl, pacc, ctx,
+                                             kv_stride, group, chunk, scale);
+}
+extern "C" __global__ void tl_attn_decode_split_bf16_64(const float* q,
+    const __nv_bfloat16* K, const __nv_bfloat16* V, float* pm, float* pl,
+    float* pacc, unsigned ctx, unsigned kv_stride, unsigned group,
+    unsigned chunk, float scale) {
+  attn_decode_split_core<64, __nv_bfloat16>(q, K, V, pm, pl, pacc, ctx,
+                                            kv_stride, group, chunk, scale);
+}
 
 // Merge the S per-head partials (each already at its local max) into out. Not
 // templated: the per-dim thread stride D == blockDim.x, so head_dim is implicit.
@@ -796,31 +836,53 @@ extern "C" __global__ void tl_attn_combine(const float* __restrict__ pm,
 // new token starts at h*kv_stride + pos*D (kv_stride = max_ctx*D). Heads are
 // non-contiguous in the cache, so this is a scatter, not a plain copy. Not
 // templated: D == blockDim.x. grid.x = H_kv, blockDim = D.
-extern "C" __global__ void tl_kv_append(float* __restrict__ Kc,
-                                        float* __restrict__ Vc,
-                                        const float* __restrict__ k_new,
-                                        const float* __restrict__ v_new,
-                                        unsigned pos, unsigned kv_stride) {
+template <typename KT>
+__device__ void kv_append_core(KT* __restrict__ Kc, KT* __restrict__ Vc,
+                               const float* __restrict__ k_new,
+                               const float* __restrict__ v_new, unsigned pos,
+                               unsigned kv_stride) {
   const unsigned h = blockIdx.x, d = threadIdx.x, D = blockDim.x;
   const size_t dst = (size_t)h * kv_stride + (size_t)pos * D + d;
   const size_t src = (size_t)h * D + d;
-  Kc[dst] = k_new[src];
-  Vc[dst] = v_new[src];
+  kv_st(&Kc[dst], k_new[src]);  // narrow to KT (identity for f32)
+  kv_st(&Vc[dst], v_new[src]);
+}
+extern "C" __global__ void tl_kv_append(float* Kc, float* Vc,
+                                        const float* k_new, const float* v_new,
+                                        unsigned pos, unsigned kv_stride) {
+  kv_append_core(Kc, Vc, k_new, v_new, pos, kv_stride);
+}
+extern "C" __global__ void tl_kv_append_bf16(__nv_bfloat16* Kc,
+                                             __nv_bfloat16* Vc,
+                                             const float* k_new,
+                                             const float* v_new, unsigned pos,
+                                             unsigned kv_stride) {
+  kv_append_core(Kc, Vc, k_new, v_new, pos, kv_stride);
 }
 
 // Bulk-fill the cache from a prefill's k,v (each [H_kv, T, D] contiguous) into
 // the cache [H_kv, max_ctx, D] rows [0,T). The two differ only in the row stride
 // (T vs max_ctx), so this is a strided copy. D == blockDim.x. grid = (H_kv, T).
-extern "C" __global__ void tl_kv_fill(float* __restrict__ Kc,
-                                      float* __restrict__ Vc,
-                                      const float* __restrict__ K,
-                                      const float* __restrict__ V, unsigned T,
-                                      unsigned kv_stride) {
+template <typename KT>
+__device__ void kv_fill_core(KT* __restrict__ Kc, KT* __restrict__ Vc,
+                             const float* __restrict__ K,
+                             const float* __restrict__ V, unsigned T,
+                             unsigned kv_stride) {
   const unsigned h = blockIdx.x, p = blockIdx.y, d = threadIdx.x, D = blockDim.x;
   const size_t dst = (size_t)h * kv_stride + (size_t)p * D + d;
   const size_t src = ((size_t)h * T + p) * D + d;
-  Kc[dst] = K[src];
-  Vc[dst] = V[src];
+  kv_st(&Kc[dst], K[src]);  // narrow to KT (identity for f32)
+  kv_st(&Vc[dst], V[src]);
+}
+extern "C" __global__ void tl_kv_fill(float* Kc, float* Vc, const float* K,
+                                      const float* V, unsigned T,
+                                      unsigned kv_stride) {
+  kv_fill_core(Kc, Vc, K, V, T, kv_stride);
+}
+extern "C" __global__ void tl_kv_fill_bf16(__nv_bfloat16* Kc, __nv_bfloat16* Vc,
+                                           const float* K, const float* V,
+                                           unsigned T, unsigned kv_stride) {
+  kv_fill_core(Kc, Vc, K, V, T, kv_stride);
 }
 
 // Causal prefill attention: process all T query positions of a prompt at once.
@@ -831,10 +893,10 @@ extern "C" __global__ void tl_kv_fill(float* __restrict__ Kc,
 // is the correctness-first baseline — each query re-streams its keys from DRAM
 // (O(T²) traffic); a query×key tiled flash-attention is the deferred tuning pass.
 // grid = (H_q, T), blockDim = AD = head_dim (NW warps).
-template <int AD>
+template <int AD, typename KT = float>
 __device__ void attn_prefill_core(const float* __restrict__ q,
-                                  const float* __restrict__ K,
-                                  const float* __restrict__ V,
+                                  const KT* __restrict__ K,
+                                  const KT* __restrict__ V,
                                   float* __restrict__ out, unsigned T,
                                   unsigned kv_stride, unsigned group,
                                   float scale) {
@@ -845,8 +907,8 @@ __device__ void attn_prefill_core(const float* __restrict__ q,
   const unsigned tid = threadIdx.x;
   const unsigned lane = tid & 31u, warp = tid >> 5;
   const float* qh = q + ((size_t)h * T + p) * AD;  // q is [H_q, T, D]
-  const float* Kh = K + (size_t)kv_h * kv_stride;
-  const float* Vh = V + (size_t)kv_h * kv_stride;
+  const KT* Kh = K + (size_t)kv_h * kv_stride;
+  const KT* Vh = V + (size_t)kv_h * kv_stride;
 
   __shared__ float q_sh[AD];
   q_sh[tid] = qh[tid];
@@ -855,10 +917,11 @@ __device__ void attn_prefill_core(const float* __restrict__ q,
   float m = -1e30f, l = 0.0f;
   float acc[NW] = {};
   for (unsigned i = warp; i <= p; i += (unsigned)NW) {  // causal: keys 0..p only
-    const float* Ki = Kh + (size_t)i * AD;
+    const KT* Ki = Kh + (size_t)i * AD;
     float partial = 0.0f;
 #pragma unroll
-    for (int r = 0; r < NW; r++) partial += q_sh[lane + r * 32] * Ki[lane + r * 32];
+    for (int r = 0; r < NW; r++)
+      partial += q_sh[lane + r * 32] * kv_ld(Ki[lane + r * 32]);
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
       partial += __shfl_down_sync(0xffffffffu, partial, off);
@@ -867,9 +930,10 @@ __device__ void attn_prefill_core(const float* __restrict__ q,
     float corr = __expf(m - m_new);
     float pp = __expf(s - m_new);
     l = l * corr + pp;
-    const float* Vi = Vh + (size_t)i * AD;
+    const KT* Vi = Vh + (size_t)i * AD;
 #pragma unroll
-    for (int r = 0; r < NW; r++) acc[r] = acc[r] * corr + pp * Vi[lane + r * 32];
+    for (int r = 0; r < NW; r++)
+      acc[r] = acc[r] * corr + pp * kv_ld(Vi[lane + r * 32]);
     m = m_new;
   }
 
@@ -905,6 +969,16 @@ extern "C" __global__ void tl_attn_prefill_f32_64(const float* q,
     const float* K, const float* V, float* out, unsigned T, unsigned kv_stride,
     unsigned group, float scale) {
   attn_prefill_core<64>(q, K, V, out, T, kv_stride, group, scale);
+}
+extern "C" __global__ void tl_attn_prefill_bf16(const float* q,
+    const __nv_bfloat16* K, const __nv_bfloat16* V, float* out, unsigned T,
+    unsigned kv_stride, unsigned group, float scale) {
+  attn_prefill_core<128, __nv_bfloat16>(q, K, V, out, T, kv_stride, group, scale);
+}
+extern "C" __global__ void tl_attn_prefill_bf16_64(const float* q,
+    const __nv_bfloat16* K, const __nv_bfloat16* V, float* out, unsigned T,
+    unsigned kv_stride, unsigned group, float scale) {
+  attn_prefill_core<64, __nv_bfloat16>(q, K, V, out, T, kv_stride, group, scale);
 }
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 

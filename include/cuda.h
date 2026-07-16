@@ -28,6 +28,7 @@
 #include <cstdint>
 
 #include "metal.h"  // reuse tl::metal::kop (platform-independent op enum)
+#include "types.h"  // tl::dtype (KV cache storage width)
 
 namespace tl {
 namespace cuda {
@@ -340,28 +341,31 @@ struct context {
   // M9 fused decode attention (single-pass + split-KV two-pass).
   // head_dim {64,128} variants (M9): each templated instantiation has its own
   // symbol; the launchers pick by D. The unsuffixed name is the D=128 build.
+  // Each attention/KV kernel has an f32 and a bf16-KV-storage instantiation
+  // (M9 bf16 KV cache): the bf16 variants read/write K,V as __nv_bfloat16 while
+  // q/out/scratch stay f32. The getters pick by (D, kv_bf16); a small 2x2 cache.
   CUfunction attn_decode_fn = nullptr, attn_split_fn = nullptr,
              attn_combine_fn = nullptr;
   CUfunction attn_decode_64_fn = nullptr, attn_split_64_fn = nullptr;
-  CUfunction attn_decode_(int64_t D) {
-    if (D == 64) {
-      if (!attn_decode_64_fn)
-        d.ModuleGetFunction(&attn_decode_64_fn, mod, "tl_attn_decode_f32_64");
-      return attn_decode_64_fn;
-    }
-    if (!attn_decode_fn)
-      d.ModuleGetFunction(&attn_decode_fn, mod, "tl_attn_decode_f32");
-    return attn_decode_fn;
+  CUfunction attn_decode_bf16_fn = nullptr, attn_decode_bf16_64_fn = nullptr;
+  CUfunction attn_split_bf16_fn = nullptr, attn_split_bf16_64_fn = nullptr;
+  CUfunction attn_decode_(int64_t D, bool bf16 = false) {
+    CUfunction* slot = bf16 ? (D == 64 ? &attn_decode_bf16_64_fn : &attn_decode_bf16_fn)
+                            : (D == 64 ? &attn_decode_64_fn : &attn_decode_fn);
+    if (!*slot)
+      d.ModuleGetFunction(slot, mod,
+                          bf16 ? (D == 64 ? "tl_attn_decode_bf16_64" : "tl_attn_decode_bf16")
+                               : (D == 64 ? "tl_attn_decode_f32_64" : "tl_attn_decode_f32"));
+    return *slot;
   }
-  CUfunction attn_split_(int64_t D) {
-    if (D == 64) {
-      if (!attn_split_64_fn)
-        d.ModuleGetFunction(&attn_split_64_fn, mod, "tl_attn_decode_split_64");
-      return attn_split_64_fn;
-    }
-    if (!attn_split_fn)
-      d.ModuleGetFunction(&attn_split_fn, mod, "tl_attn_decode_split");
-    return attn_split_fn;
+  CUfunction attn_split_(int64_t D, bool bf16 = false) {
+    CUfunction* slot = bf16 ? (D == 64 ? &attn_split_bf16_64_fn : &attn_split_bf16_fn)
+                            : (D == 64 ? &attn_split_64_fn : &attn_split_fn);
+    if (!*slot)
+      d.ModuleGetFunction(slot, mod,
+                          bf16 ? (D == 64 ? "tl_attn_decode_split_bf16_64" : "tl_attn_decode_split_bf16")
+                               : (D == 64 ? "tl_attn_decode_split_64" : "tl_attn_decode_split"));
+    return *slot;
   }
   CUfunction attn_combine_() {  // head_dim implicit (blockDim.x) — one symbol
     if (!attn_combine_fn)
@@ -370,10 +374,12 @@ struct context {
   }
 
   // M9 KV cache append (scatter one token's k,v into the persistent cache).
-  CUfunction kv_append_fn = nullptr;
-  CUfunction kv_append_() {
-    if (!kv_append_fn) d.ModuleGetFunction(&kv_append_fn, mod, "tl_kv_append");
-    return kv_append_fn;
+  CUfunction kv_append_fn = nullptr, kv_append_bf16_fn = nullptr;
+  CUfunction kv_append_(bool bf16 = false) {
+    CUfunction* slot = bf16 ? &kv_append_bf16_fn : &kv_append_fn;
+    if (!*slot)
+      d.ModuleGetFunction(slot, mod, bf16 ? "tl_kv_append_bf16" : "tl_kv_append");
+    return *slot;
   }
 
   // RoPE (rotary position embedding) for q/k.
@@ -414,21 +420,24 @@ struct context {
   }
 
   // M9 prefill: bulk cache fill + causal prefill attention.
-  CUfunction kv_fill_fn = nullptr, attn_prefill_fn = nullptr;
-  CUfunction kv_fill_() {
-    if (!kv_fill_fn) d.ModuleGetFunction(&kv_fill_fn, mod, "tl_kv_fill");
-    return kv_fill_fn;
+  CUfunction kv_fill_fn = nullptr, kv_fill_bf16_fn = nullptr,
+             attn_prefill_fn = nullptr;
+  CUfunction kv_fill_(bool bf16 = false) {
+    CUfunction* slot = bf16 ? &kv_fill_bf16_fn : &kv_fill_fn;
+    if (!*slot)
+      d.ModuleGetFunction(slot, mod, bf16 ? "tl_kv_fill_bf16" : "tl_kv_fill");
+    return *slot;
   }
   CUfunction attn_prefill_64_fn = nullptr;
-  CUfunction attn_prefill_(int64_t D) {
-    if (D == 64) {
-      if (!attn_prefill_64_fn)
-        d.ModuleGetFunction(&attn_prefill_64_fn, mod, "tl_attn_prefill_f32_64");
-      return attn_prefill_64_fn;
-    }
-    if (!attn_prefill_fn)
-      d.ModuleGetFunction(&attn_prefill_fn, mod, "tl_attn_prefill_f32");
-    return attn_prefill_fn;
+  CUfunction attn_prefill_bf16_fn = nullptr, attn_prefill_bf16_64_fn = nullptr;
+  CUfunction attn_prefill_(int64_t D, bool bf16 = false) {
+    CUfunction* slot = bf16 ? (D == 64 ? &attn_prefill_bf16_64_fn : &attn_prefill_bf16_fn)
+                            : (D == 64 ? &attn_prefill_64_fn : &attn_prefill_fn);
+    if (!*slot)
+      d.ModuleGetFunction(slot, mod,
+                          bf16 ? (D == 64 ? "tl_attn_prefill_bf16_64" : "tl_attn_prefill_bf16")
+                               : (D == 64 ? "tl_attn_prefill_f32_64" : "tl_attn_prefill_f32"));
+    return *slot;
   }
 
   // Reusable device scratch for split-KV partials. Grown as needed, reused
@@ -748,7 +757,7 @@ inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
 // GQA: q head h reads kv head h/(n_q_heads/n_kv_heads). Contiguous, D∈{64,128}.
 inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
                         int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
-                        int64_t D, float scale) {
+                        int64_t D, float scale, bool kv_bf16 = false) {
   auto& c = context::get();
   if (!c.ready || (D != 128 && D != 64)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
@@ -781,8 +790,8 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
   if (S == 1) {
     void* args[] = {&pq, &pk, &pv, &po, &uctx, &kv_stride, &group, &scale};
     c.pending = true;
-    return c.d.LaunchKernel(c.attn_decode_(D), uh, 1, 1, uD, 1, 1, 0, nullptr,
-                            args, nullptr) == 0;
+    return c.d.LaunchKernel(c.attn_decode_(D, kv_bf16), uh, 1, 1, uD, 1, 1, 0,
+                            nullptr, args, nullptr) == 0;
   }
 
   unsigned chunk = (uctx + S - 1) / S;
@@ -801,8 +810,8 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
   void* a1[] = {&pq,     &pk,        &pv,    &pm,    &pl,
                 &pacc,   &uctx,      &kv_stride, &group, &chunk,
                 &scale};
-  if (c.d.LaunchKernel(c.attn_split_(D), uh, S, 1, uD, 1, 1, 0, c.stream, a1,
-                       nullptr) != 0)
+  if (c.d.LaunchKernel(c.attn_split_(D, kv_bf16), uh, S, 1, uD, 1, 1, 0,
+                       c.stream, a1, nullptr) != 0)
     return false;
   void* a2[] = {&pm, &pl, &pacc, &po, &S};
   return c.d.LaunchKernel(c.attn_combine_(), uh, 1, 1, uD, 1, 1, 0, c.stream, a2,
@@ -812,7 +821,8 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
 // M9 KV cache append: scatter one decode step's k,v (each [n_kv_heads,D] device
 // buffers) into the cache (K,V each [n_kv_heads,kv_max,D]) at row `pos`.
 inline bool kv_append(void* Kc, void* Vc, void* k_new, void* v_new, int64_t pos,
-                      int64_t kv_max, int64_t n_kv_heads, int64_t D) {
+                      int64_t kv_max, int64_t n_kv_heads, int64_t D,
+                      bool kv_bf16 = false) {
   auto& c = context::get();
   if (!c.ready || (D != 128 && D != 64)) return false;
   c.device_read_(k_new);
@@ -827,15 +837,16 @@ inline bool kv_append(void* Kc, void* Vc, void* k_new, void* v_new, int64_t pos,
   unsigned kv_stride = static_cast<unsigned>(kv_max * D);
   void* args[] = {&pKc, &pVc, &pk, &pv, &upos, &kv_stride};
   c.pending = true;
-  return c.d.LaunchKernel(c.kv_append_(), static_cast<unsigned>(n_kv_heads), 1, 1,
-                          static_cast<unsigned>(D), 1, 1, 0, c.stream, args,
+  return c.d.LaunchKernel(c.kv_append_(kv_bf16), static_cast<unsigned>(n_kv_heads),
+                          1, 1, static_cast<unsigned>(D), 1, 1, 0, c.stream, args,
                           nullptr) == 0;
 }
 
 // M9 prefill: bulk-copy a prompt's k,v (each [n_kv_heads,T,D] device buffers)
 // into the cache (K,V each [n_kv_heads,kv_max,D]) rows [0,T). grid=(n_kv_heads,T).
 inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
-                    int64_t kv_max, int64_t n_kv_heads, int64_t D) {
+                    int64_t kv_max, int64_t n_kv_heads, int64_t D,
+                    bool kv_bf16 = false) {
   auto& c = context::get();
   if (!c.ready || (D != 128 && D != 64)) return false;
   c.device_read_(K);
@@ -850,7 +861,7 @@ inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
   unsigned kv_stride = static_cast<unsigned>(kv_max * D);
   void* args[] = {&pKc, &pVc, &pk, &pv, &uT, &kv_stride};
   c.pending = true;
-  return c.d.LaunchKernel(c.kv_fill_(), static_cast<unsigned>(n_kv_heads),
+  return c.d.LaunchKernel(c.kv_fill_(kv_bf16), static_cast<unsigned>(n_kv_heads),
                           static_cast<unsigned>(T), 1, static_cast<unsigned>(D),
                           1, 1, 0, c.stream, args, nullptr) == 0;
 }
@@ -860,7 +871,7 @@ inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
 // One block per (head, query pos); grid=(n_q_heads,T) (T <= 65535 gridDim.y).
 inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads,
                          int64_t n_kv_heads, int64_t T, int64_t kv_max, int64_t D,
-                         float scale) {
+                         float scale, bool kv_bf16 = false) {
   auto& c = context::get();
   if (!c.ready || (D != 128 && D != 64)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
@@ -878,8 +889,9 @@ inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads
   unsigned group = static_cast<unsigned>(n_q_heads / n_kv_heads);
   void* args[] = {&pq, &pk, &pv, &po, &uT, &kv_stride, &group, &scale};
   c.pending = true;
-  return c.d.LaunchKernel(c.attn_prefill_(D), static_cast<unsigned>(n_q_heads), uT,
-                          1, static_cast<unsigned>(D), 1, 1, 0, c.stream, args,
+  return c.d.LaunchKernel(c.attn_prefill_(D, kv_bf16),
+                          static_cast<unsigned>(n_q_heads), uT, 1,
+                          static_cast<unsigned>(D), 1, 1, 0, c.stream, args,
                           nullptr) == 0;
 }
 
@@ -1002,27 +1014,35 @@ struct kv_cache {
   void* K = nullptr;  // native device-buffer handles (see alloc())
   void* V = nullptr;
   int64_t n_kv_heads = 0, max_ctx = 0, D = 0, pos = 0;
+  // KV storage dtype (M9 bf16 KV cache). f32 = the exact baseline; bf16 halves
+  // the K,V bytes the attention kernels stream every step (~2x the KV floor) at
+  // a small precision cost. q/out/scratch stay f32. init() picks the width;
+  // append/attn/prefill route to the matching kernel instantiation.
+  bool kv_bf16 = false;
 
-  bool init(int64_t kv_heads, int64_t maxctx, int64_t d) {
+  bool init(int64_t kv_heads, int64_t maxctx, int64_t d, dtype kv_dt = dtype::f32) {
     n_kv_heads = kv_heads;
     max_ctx = maxctx;
     D = d;
     pos = 0;
-    K = alloc(n_kv_heads * max_ctx * D * 4, nullptr);
-    V = alloc(n_kv_heads * max_ctx * D * 4, nullptr);
+    kv_bf16 = (kv_dt == dtype::bf16);
+    int64_t w = kv_bf16 ? 2 : 4;  // bytes per K/V element
+    K = alloc(n_kv_heads * max_ctx * D * w, nullptr);
+    V = alloc(n_kv_heads * max_ctx * D * w, nullptr);
     return K && V;
   }
   // k_new/v_new: [n_kv_heads, D] device buffers (this step's projected k,v).
   bool append(void* k_new, void* v_new) {
     if (pos >= max_ctx) return false;
-    if (!kv_append(K, V, k_new, v_new, pos, max_ctx, n_kv_heads, D)) return false;
+    if (!kv_append(K, V, k_new, v_new, pos, max_ctx, n_kv_heads, D, kv_bf16))
+      return false;
     pos++;
     return true;
   }
   // q/out: [n_q_heads, D] device buffers. Attends over the cached prefix.
   bool attn(void* q, void* out, int64_t n_q_heads, float scale) {
     return attn_decode(q, K, V, out, n_q_heads, n_kv_heads, pos, max_ctx, D,
-                       scale);
+                       scale, kv_bf16);
   }
   // Prefill a T-token prompt: bulk-fill the cache from k_src/v_src
   // ([n_kv_heads,T,D]) and run causal attention (q/out [n_q_heads,T,D]). Leaves
@@ -1030,10 +1050,11 @@ struct kv_cache {
   bool prefill(void* q, void* k_src, void* v_src, void* out, int64_t T,
                int64_t n_q_heads, float scale) {
     if (T <= 0 || T > max_ctx) return false;
-    if (!kv_fill(K, V, k_src, v_src, T, max_ctx, n_kv_heads, D)) return false;
+    if (!kv_fill(K, V, k_src, v_src, T, max_ctx, n_kv_heads, D, kv_bf16))
+      return false;
     pos = T;
     return attn_prefill(q, K, V, out, n_q_heads, n_kv_heads, T, max_ctx, D,
-                        scale);
+                        scale, kv_bf16);
   }
   void destroy() {
     if (K) release(K, 0, nullptr);
