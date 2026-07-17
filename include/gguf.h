@@ -7,12 +7,23 @@
 // wire format throughout (matches every target we run on). Quantized tensor
 // codes (ggml_type) are stored verbatim; dequantization is the consumer's job.
 //
-// Header-only, std + POSIX (mmap) only — no third-party deps, C++17.
+// Header-only, no third-party deps, C++17. Memory mapping is POSIX mmap on
+// Unix and CreateFileMapping/MapViewOfFile on Windows (see unmap_()/the ctor).
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <cstdint>
 #include <cstring>
@@ -117,6 +128,25 @@ class model {
   // mmap + parse the whole directory up front; throws std::runtime_error on
   // IO errors, bad magic, or an unsupported version.
   explicit model(const std::string& path) {
+#ifdef _WIN32
+    HANDLE fh = ::CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (fh == INVALID_HANDLE_VALUE)
+      throw std::runtime_error("gguf: cannot open " + path);
+    LARGE_INTEGER li;
+    if (!::GetFileSizeEx(fh, &li) || li.QuadPart <= 0) {
+      ::CloseHandle(fh);
+      throw std::runtime_error("gguf: cannot stat " + path);
+    }
+    size_ = static_cast<size_t>(li.QuadPart);
+    HANDLE mh = ::CreateFileMappingA(fh, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    ::CloseHandle(fh);  // the mapping object keeps the file alive
+    if (!mh) throw std::runtime_error("gguf: mmap failed for " + path);
+    map_ = ::MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
+    ::CloseHandle(mh);  // the view keeps the mapping alive
+    if (!map_) throw std::runtime_error("gguf: mmap failed for " + path);
+#else
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("gguf: cannot open " + path);
     struct stat st;
@@ -131,25 +161,23 @@ class model {
       map_ = nullptr;
       throw std::runtime_error("gguf: mmap failed for " + path);
     }
+#endif
     try {
       parse_();
     } catch (...) {
-      ::munmap(map_, size_);
-      map_ = nullptr;
+      unmap_();
       throw;
     }
   }
 
-  ~model() {
-    if (map_) ::munmap(map_, size_);
-  }
+  ~model() { unmap_(); }
 
   model(const model&) = delete;
   model& operator=(const model&) = delete;
   model(model&& o) noexcept { *this = std::move(o); }
   model& operator=(model&& o) noexcept {
     if (this != &o) {
-      if (map_) ::munmap(map_, size_);
+      unmap_();
       map_ = o.map_; size_ = o.size_; o.map_ = nullptr; o.size_ = 0;
       version_ = o.version_; alignment_ = o.alignment_;
       kv_ = std::move(o.kv_);
@@ -180,6 +208,18 @@ class model {
   const std::vector<tensor_info>& tensors() const { return tensors_; }
 
  private:
+  // Platform-appropriate teardown of the mapping; null-safe and idempotent so
+  // the ctor's catch, the dtor, and move-assign can all share it.
+  void unmap_() noexcept {
+    if (!map_) return;
+#ifdef _WIN32
+    ::UnmapViewOfFile(map_);
+#else
+    ::munmap(map_, size_);
+#endif
+    map_ = nullptr;
+  }
+
   // ---- bounds-checked little-endian cursor over the mapping ----------------
   const uint8_t* base_() const { return static_cast<const uint8_t*>(map_); }
 

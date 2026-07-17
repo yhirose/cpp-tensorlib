@@ -20,12 +20,23 @@ if(APPLE)
 endif()
 
 if(TENSORLIB_CUDA)
-  # The CUDA backend does NOT link CUDA — the driver is dlopen'd (cuda.h) and
-  # kernels run as PTX JIT'd by the driver. So nvcc is used only to compile
+  # The CUDA backend does NOT link CUDA — the driver is loaded at runtime
+  # (dlopen on Unix, LoadLibrary(nvcuda.dll) on Windows; see cuda.h) and kernels
+  # run as PTX JIT'd by the driver. So nvcc is used only to compile
   # kernels/tensorlib_cuda.cu to PTX, which bin2c turns into a byte array the
-  # header #includes (off-Apple compilers predate C23 #embed). enable_language
-  # locates nvcc (CMAKE_CUDA_COMPILER); nothing links against libcudart.
-  enable_language(CUDA)
+  # header #includes (off-Apple compilers predate C23 #embed). We deliberately
+  # DON'T enable_language(CUDA): that probes the full host-compiler CUDA
+  # toolchain and fails on Windows without the Visual Studio CUDA integration.
+  # Locating nvcc directly is all the PTX step needs. (On Windows, nvcc still
+  # invokes cl.exe for preprocessing, so cl.exe must be on PATH — the CI uses
+  # ilammy/msvc-dev-cmd; locally, run from a Developer Command Prompt.)
+  find_program(TL_NVCC NAMES nvcc
+    HINTS ENV CUDA_PATH ENV CUDA_HOME /usr/local/cuda
+    PATH_SUFFIXES bin)
+  if(NOT TL_NVCC)
+    message(FATAL_ERROR
+      "TENSORLIB_CUDA=ON but nvcc was not found. Add it to PATH or set CUDA_PATH.")
+  endif()
   # PTX virtual arch: compute_80 PTX JITs onto any sm_80+ device (the RTX 3090
   # is sm_86), so one PTX blob is portable across recent GPUs.
   if(NOT TENSORLIB_CUDA_PTX_ARCH)
@@ -35,7 +46,7 @@ if(TENSORLIB_CUDA)
   set(TL_CUDA_INC ${CMAKE_BINARY_DIR}/tensorlib_cuda_ptx.inc)
   add_custom_command(
     OUTPUT ${TL_CUDA_PTX}
-    COMMAND ${CMAKE_CUDA_COMPILER} -arch=${TENSORLIB_CUDA_PTX_ARCH} -ptx
+    COMMAND ${TL_NVCC} -arch=${TENSORLIB_CUDA_PTX_ARCH} -ptx
             ${CMAKE_CURRENT_SOURCE_DIR}/kernels/tensorlib_cuda.cu -o ${TL_CUDA_PTX}
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/tensorlib_cuda.cu
     COMMENT "nvcc: tensorlib_cuda.cu -> PTX (${TENSORLIB_CUDA_PTX_ARCH})"
@@ -258,16 +269,12 @@ add_test(NAME auto COMMAND tensorlib_test --auto)
 # GGUF v3 reader check (include/gguf.h): parses a real Qwen2.5-0.5B fp16 model
 # and asserts the directory against the reference gguf-py manifest. Pure host
 # binary parsing — no GPU; not a ctest (the model file lives outside the repo).
-# gguf.h is POSIX-only (mmap/open/unistd.h) with no Windows fallback yet, so
-# skip these targets on Windows rather than break the plain CI build there.
-if(NOT WIN32)
-  add_executable(check_gguf bench/check_gguf.cpp)
-  target_link_libraries(check_gguf PRIVATE tensorlib)
+add_executable(check_gguf bench/check_gguf.cpp)
+target_link_libraries(check_gguf PRIVATE tensorlib)
 
-  # Qwen2 BPE tokenizer check (include/tokenizer.h): encodes the HF-oracle test
-  # strings from bench/tokenizer_oracle_data.h and asserts token-exact ids +
-  # decode round-trip. Pure host code; not a ctest (needs the 1.2GB model file
-  # outside the repo).
-  add_executable(check_tokenizer bench/check_tokenizer.cpp)
-  target_link_libraries(check_tokenizer PRIVATE tensorlib)
-endif()
+# Qwen2 BPE tokenizer check (include/tokenizer.h): encodes the HF-oracle test
+# strings from bench/tokenizer_oracle_data.h and asserts token-exact ids +
+# decode round-trip. Pure host code; not a ctest (needs the 1.2GB model file
+# outside the repo).
+add_executable(check_tokenizer bench/check_tokenizer.cpp)
+target_link_libraries(check_tokenizer PRIVATE tensorlib)

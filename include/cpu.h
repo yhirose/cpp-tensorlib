@@ -35,9 +35,37 @@
 #define TL_CPU_NEON 1
 #endif
 
-#if defined(__x86_64__) || defined(__i386__)
+// x86 detection covers both the GCC/Clang macros and the MSVC ones (_M_X64 /
+// _M_IX86 — MSVC defines neither __x86_64__ nor __i386__).
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || \
+    defined(_M_IX86)
 #include <immintrin.h>
 #define TL_CPU_X86 1
+#if defined(_MSC_VER)
+#include <intrin.h>  // __cpuidex / _xgetbv
+#endif
+#endif
+
+// Portable helper macros bridging the GCC/Clang builtins to MSVC:
+//   TL_TARGET(feat) — per-function ISA opt-in, e.g. TL_TARGET("avx2,fma").
+//     GCC/Clang need it so an ISA-specific kernel can be compiled in a
+//     baseline-x86 TU and dispatched at runtime; MSVC has no such attribute
+//     and accepts the intrinsics unconditionally, so it expands to nothing
+//     there. Parametrized on the feature string so the deferred AVX-512 kernel
+//     reuses it as TL_TARGET("avx512f,...") rather than a second macro.
+//   TL_PREFETCH(p)  — software prefetch hint; a no-op where unavailable.
+#if defined(_MSC_VER)
+#define TL_TARGET(feat)
+#else
+#define TL_TARGET(feat) __attribute__((target(feat)))
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define TL_PREFETCH(p) __builtin_prefetch(p)
+#elif defined(_MSC_VER) && defined(TL_CPU_X86)
+#define TL_PREFETCH(p) _mm_prefetch(reinterpret_cast<const char*>(p), _MM_HINT_T0)
+#else
+#define TL_PREFETCH(p) ((void)0)
 #endif
 
 #include "cpu_threadpool.h"
@@ -168,8 +196,8 @@ inline void ukernel_neon(int64_t kc, const float* ap, const float* bp,
   }
   int64_t p = 0;
   for (; p + 4 <= kc; p += 4) {
-    __builtin_prefetch(ap + (p + 16) * MR);
-    __builtin_prefetch(bp + (p + 16) * NR);
+    TL_PREFETCH(ap + (p + 16) * MR);
+    TL_PREFETCH(bp + (p + 16) * NR);
     TL_CPU_KSTEP(p);
     TL_CPU_KSTEP(p + 1);
     TL_CPU_KSTEP(p + 2);
@@ -198,13 +226,13 @@ inline void ukernel_neon(int64_t kc, const float* ap, const float* bp,
 // AVX2 8×8: NR=8 = one __m256 per row, so 8 accumulators (of 16 ymm). Per
 // k-step: one B load (8 floats) broadcast-multiplied by each of the 8 A
 // values — the x86 analogue of the NEON lane-FMA kernel. K-unrolled ×4 with
-// prefetch, matching NEON. `target("avx2,fma")` lets this compile and be
+// prefetch, matching NEON. TL_TARGET("avx2,fma") lets this compile and be
 // called from a baseline-x86 TU; select_ukernel guards it behind CPUID.
 // NOTE: this is the correct-and-compile-checked first cut, register-tuned on
 // the x86 box (Rosetta stops at SSE4.2, so it cannot execute on Apple). A
 // wider AVX-512 kernel wants NR=16 (a second packing layout) and is deferred
 // to that box — see docs/roadmap.md.
-__attribute__((target("avx2,fma"))) inline void ukernel_avx2(
+TL_TARGET("avx2,fma") inline void ukernel_avx2(
     int64_t kc, const float* ap, const float* bp, float* c, int64_t ldc,
     int mr, int nr) {
   __m256 ab[MR];
@@ -224,8 +252,8 @@ __attribute__((target("avx2,fma"))) inline void ukernel_avx2(
   }
   int64_t p = 0;
   for (; p + 4 <= kc; p += 4) {
-    __builtin_prefetch(ap + (p + 16) * MR);
-    __builtin_prefetch(bp + (p + 16) * NR);
+    TL_PREFETCH(ap + (p + 16) * MR);
+    TL_PREFETCH(bp + (p + 16) * NR);
     TL_CPU_KSTEP(p);
     TL_CPU_KSTEP(p + 1);
     TL_CPU_KSTEP(p + 2);
@@ -253,8 +281,8 @@ __attribute__((target("avx2,fma"))) inline void ukernel_avx2(
 // B relative to compute; 6×16 raises in-register reuse — the reason it is the
 // standard AVX2 GEMM tile. Packs to MR=6/NR=16 (a distinct layout from the
 // 8×8 kernels; the driver picks it via the descriptor). K-unrolled ×4 with
-// prefetch, mirroring the 8×8 kernel. `target("avx2,fma")` + CPUID-guarded.
-__attribute__((target("avx2,fma"))) inline void ukernel_avx2_6x16(
+// prefetch, mirroring the 8×8 kernel. TL_TARGET("avx2,fma") + CPUID-guarded.
+TL_TARGET("avx2,fma") inline void ukernel_avx2_6x16(
     int64_t kc, const float* ap, const float* bp, float* c, int64_t ldc,
     int mr, int nr) {
   constexpr int KMR = 6, KNR = 16;
@@ -290,8 +318,8 @@ __attribute__((target("avx2,fma"))) inline void ukernel_avx2_6x16(
   }
   int64_t p = 0;
   for (; p + 4 <= kc; p += 4) {
-    __builtin_prefetch(ap + (p + 16) * KMR);
-    __builtin_prefetch(bp + (p + 16) * KNR);
+    TL_PREFETCH(ap + (p + 16) * KMR);
+    TL_PREFETCH(bp + (p + 16) * KNR);
     TL_CPU_KSTEP(p);
     TL_CPU_KSTEP(p + 1);
     TL_CPU_KSTEP(p + 2);
@@ -316,6 +344,25 @@ __attribute__((target("avx2,fma"))) inline void ukernel_avx2_6x16(
       for (int j = 0; j < nr; j++) c[i * ldc + j] += tmp[i][j];
   }
 }
+// Runtime AVX2+FMA probe. GCC/Clang expose __builtin_cpu_supports; MSVC has no
+// equivalent, so hand-roll the CPUID/XGETBV check: leaf-1 ECX[12]=FMA and
+// ECX[27]=OSXSAVE, XCR0 must report XMM+YMM state (the OS preserves the ymm
+// regs across context switches), and leaf-7 subleaf-0 EBX[5]=AVX2.
+inline bool cpu_has_avx2_fma() {
+#if defined(_MSC_VER)
+  int r[4];
+  __cpuid(r, 1);
+  const bool fma = (r[2] & (1 << 12)) != 0;
+  const bool osxsave = (r[2] & (1 << 27)) != 0;
+  if (!osxsave) return false;
+  if ((_xgetbv(0) & 0x6) != 0x6) return false;  // XMM + YMM state enabled
+  __cpuidex(r, 7, 0);
+  const bool avx2 = (r[1] & (1 << 5)) != 0;
+  return avx2 && fma;
+#else
+  return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#endif
+}
 #endif  // TL_CPU_X86
 
 // Pick the microkernel once, by ISA then (on x86) by CPUID. On ARM the choice
@@ -325,7 +372,7 @@ inline ukernel_desc select_ukernel() {
 #if defined(TL_CPU_NEON)
   return {&ukernel_neon, MR, NR};
 #elif defined(TL_CPU_X86)
-  if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+  if (cpu_has_avx2_fma()) {
 #ifdef TL_CPU_AVX2_8X8
     return {&ukernel_avx2, MR, NR};  // A/B: the original 8×8 tile
 #else

@@ -42,6 +42,11 @@ jobs:
         with:
           method: network
           sub-packages: '["nvcc", "cudart"]'
+      # nvcc -ptx still preprocesses with the host compiler; on Windows that is
+      # cl.exe, which msvc-dev-cmd puts on PATH (no-op on Linux via the guard).
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DTENSORLIB_CUDA=ON
       - name: Build

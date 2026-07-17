@@ -40,7 +40,17 @@ using kop = tl::metal::kop;
 }  // namespace cuda
 }  // namespace tl
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -51,6 +61,25 @@ using kop = tl::metal::kop;
 
 namespace tl {
 namespace cuda {
+
+// Dynamic-loader shim: dlopen/dlsym on Unix, LoadLibrary/GetProcAddress on
+// Windows (where the driver ships as nvcuda.dll). Symbols are cast to the
+// hand-declared function-pointer types by the caller, same as before.
+inline void* dl_open(const char* path) {
+#ifdef _WIN32
+  return reinterpret_cast<void*>(::LoadLibraryA(path));
+#else
+  return ::dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+#endif
+}
+inline void* dl_sym(void* lib, const char* name) {
+#ifdef _WIN32
+  return reinterpret_cast<void*>(
+      ::GetProcAddress(reinterpret_cast<HMODULE>(lib), name));
+#else
+  return ::dlsym(lib, name);
+#endif
+}
 
 // ---- driver API surface (declared by hand; loaded from libcuda via dlopen) ----
 using CUresult = int;
@@ -209,14 +238,18 @@ struct context {
   }
 
   context() {
+#ifdef _WIN32
+    const char* paths[] = {"nvcuda.dll"};
+#else
     const char* paths[] = {"/usr/lib/wsl/lib/libcuda.so.1", "libcuda.so.1",
                            "libcuda.so"};
+#endif
     for (const char* p : paths) {
-      lib = dlopen(p, RTLD_NOW | RTLD_GLOBAL);
+      lib = dl_open(p);
       if (lib) break;
     }
     if (!lib) return;  // no driver → available()==false → CPU fallback
-    auto S = [&](const char* n) { return dlsym(lib, n); };
+    auto S = [&](const char* n) { return dl_sym(lib, n); };
     d.Init = (CUresult(*)(unsigned))S("cuInit");
     d.DeviceGet = (CUresult(*)(CUdevice*, int))S("cuDeviceGet");
     d.DeviceGetCount = (CUresult(*)(int*))S("cuDeviceGetCount");
