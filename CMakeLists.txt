@@ -44,9 +44,17 @@ if(TENSORLIB_CUDA)
   endif()
   set(TL_CUDA_PTX ${CMAKE_BINARY_DIR}/tensorlib_cuda.ptx)
   set(TL_CUDA_INC ${CMAKE_BINARY_DIR}/tensorlib_cuda_ptx.inc)
+  set(TL_NVCC_ARGS -arch=${TENSORLIB_CUDA_PTX_ARCH} -ptx)
+  if(WIN32)
+    # windows-latest runners ship a Visual Studio newer than nvcc's supported
+    # host-compiler window, and nvcc's version gate hard-errors on it (C1189).
+    # For PTX (device) codegen the host compiler only preprocesses, so skipping
+    # the gate is safe here. No-op where the host compiler is in range.
+    list(APPEND TL_NVCC_ARGS -allow-unsupported-compiler)
+  endif()
   add_custom_command(
     OUTPUT ${TL_CUDA_PTX}
-    COMMAND ${TL_NVCC} -arch=${TENSORLIB_CUDA_PTX_ARCH} -ptx
+    COMMAND ${TL_NVCC} ${TL_NVCC_ARGS}
             ${CMAKE_CURRENT_SOURCE_DIR}/kernels/tensorlib_cuda.cu -o ${TL_CUDA_PTX}
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/tensorlib_cuda.cu
     COMMENT "nvcc: tensorlib_cuda.cu -> PTX (${TENSORLIB_CUDA_PTX_ARCH})"
