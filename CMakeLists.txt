@@ -276,6 +276,15 @@ add_test(NAME cpu  COMMAND tensorlib_test --cpu)
 add_test(NAME gpu  COMMAND tensorlib_test --gpu)
 add_test(NAME auto COMMAND tensorlib_test --auto)
 
+# CPU microkernel correctness oracle (bench/check_cpu_ukernel.cpp): validates
+# each available ukernel (scalar; NEON on ARM; AVX2 on x86) against a naive
+# triple loop across full and edge tiles. Pure host code, no external deps and
+# no GPU — the one check with nothing to skip on, so it runs as a ctest
+# everywhere (unlike check_gguf/tokenizer/qwen, which need the model file).
+add_executable(tensorlib_check_cpu_ukernel bench/check_cpu_ukernel.cpp)
+target_link_libraries(tensorlib_check_cpu_ukernel PRIVATE tensorlib)
+add_test(NAME cpu_ukernel COMMAND tensorlib_check_cpu_ukernel)
+
 # GGUF v3 reader check (include/gguf.h): parses a real Qwen2.5-0.5B fp16 model
 # and asserts the directory against the reference gguf-py manifest. Pure host
 # binary parsing — no GPU; not a ctest (the model file lives outside the repo).
