@@ -2300,9 +2300,7 @@ inline array concat(const std::vector<array>& parts) {
 // the only function referencing the evaluator and device backends by name —
 // keep it out of translation units that must stay backend-free.
 inline void install_runtime_hooks() {
-  detail::storage_make_hook = [](int64_t n, dtype dt) {
-    return storage::make_device_(n, dt);
-  };
+  detail::storage_make_hook = &storage::make_device_;
   detail::cpu_barrier_hook = &gpu::cpu_barrier;
   detail::host_sync_hook = &gpu::sync_to_host;
   detail::gpu_pending_hook = &gpu::pending;
