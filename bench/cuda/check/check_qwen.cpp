@@ -1,6 +1,6 @@
 // M9 "actually chat" — numeric proof. Load a real Qwen2.5-0.5B-Instruct GGUF (F16
 // weights) and run the decoder end to end, verified against a tight numpy
-// reference that reads the SAME F16 weights (bench/qwen_oracle_data.h). Identical
+// reference that reads the SAME F16 weights (bench/cuda/qwen_oracle_data.h). Identical
 // weights => the C++ forward must match the reference to ~1e-4 at every checkpoint
 // (embedding, layer-0 residual, final norm, top-5 logits) AND reproduce the greedy
 // token sequence exactly. Proves weight loading + GGML->our layout transpose +

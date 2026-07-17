@@ -11,11 +11,11 @@
 // definitive OpenBLAS-90% gate is on the x86 box with a tuned build.
 //
 // Build (own vs ref only):
-//   c++ -std=c++2b -O2 -I include bench/bench_cpu_gemm.cpp -o /tmp/bcg \
+//   c++ -std=c++2b -O2 -I include bench/cpu/speed/bench_cpu_gemm.cpp -o /tmp/bcg \
 //       -framework Accelerate -framework Metal -framework Foundation
 // With OpenBLAS (the gate) on macOS/Homebrew:
 //   c++ -std=c++2b -O2 -I include -DBENCH_HAS_OPENBLAS \
-//       -I/opt/homebrew/opt/openblas/include bench/bench_cpu_gemm.cpp \
+//       -I/opt/homebrew/opt/openblas/include bench/cpu/speed/bench_cpu_gemm.cpp \
 //       -o /tmp/bcg -framework Accelerate -framework Metal -framework Foundation \
 //       -L/opt/homebrew/opt/openblas/lib -lopenblas
 //

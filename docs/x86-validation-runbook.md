@@ -54,13 +54,13 @@ x86 with AVX2 actually selected (not just the ARM/NEON path the Mac tested).
 
 ## 2. AVX2 numerical validation — the first real execution
 
-`bench/check_cpu_ukernel.cpp` compares each available microkernel against a
+`bench/cpu/check/check_cpu_ukernel.cpp` compares each available microkernel against a
 naive triple loop over full and edge tiles. On x86 this is the **first time the
 AVX2 kernel runs and is checked numerically** (on the Mac it only ran scalar +
 NEON).
 
 ```sh
-g++ -std=c++2b -O2 -I include bench/check_cpu_ukernel.cpp -o check_uk -pthread
+g++ -std=c++2b -O2 -I include bench/cpu/check/check_cpu_ukernel.cpp -o check_uk -pthread
 ./check_uk        # expect: scalar / avx2-8x8 / avx2-6x16: ok / ALL OK
 ```
 
@@ -79,12 +79,12 @@ Linux build of the dispatch-path bench: drop the Mac `-framework` flags, add
 
 ```sh
 # own vs ref only:
-g++ -std=c++2b -O2 -I include bench/bench_cpu_gemm.cpp -o bcg -pthread
+g++ -std=c++2b -O2 -I include bench/cpu/speed/bench_cpu_gemm.cpp -o bcg -pthread
 ./bcg
 
 # with the OpenBLAS gate (threads matched inside the harness):
 g++ -std=c++2b -O2 -I include -DBENCH_HAS_OPENBLAS $(pkg-config --cflags openblas) \
-    bench/bench_cpu_gemm.cpp -o bcg_gate -pthread $(pkg-config --libs openblas)
+    bench/cpu/speed/bench_cpu_gemm.cpp -o bcg_gate -pthread $(pkg-config --libs openblas)
 ./bcg_gate
 ```
 
@@ -104,7 +104,7 @@ calls `cpu::sgemm` directly (≈1s compile) with `-D` overrides:
 
 ```sh
 for kc in 256 384 512 768; do
-  g++ -std=c++2b -O2 -I include -DTL_CPU_KC=$kc bench/bench_cpu_sweep.cpp \
+  g++ -std=c++2b -O2 -I include -DTL_CPU_KC=$kc bench/cpu/speed/bench_cpu_sweep.cpp \
       -o sw_$kc -pthread
 done
 # interleave, take per-size medians (see below), pick the KC; repeat for MC.

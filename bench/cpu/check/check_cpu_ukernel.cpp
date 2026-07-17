@@ -8,8 +8,9 @@
 // so the AVX2 kernel compiles but cannot run — see docs/roadmap.md M5).
 //
 // Build + run (native):
-//   c++ -std=c++2b -O2 -I include bench/check_cpu_ukernel.cpp -o chk && ./chk
+//   c++ -std=c++2b -O2 -I include bench/cpu/check/check_cpu_ukernel.cpp -o chk && ./chk
 // On the x86 box this exercises scalar + AVX2; on ARM, scalar + NEON.
+// (Also wired into CMake as the `cpu_ukernel` ctest — see CMakeLists.txt.)
 
 #include <cmath>
 #include <cstdio>

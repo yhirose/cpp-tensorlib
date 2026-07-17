@@ -2,7 +2,7 @@
 // directly (no graph/eval), so it compiles in ~1s and isolates the GEMM.
 // Compile per config with -DTL_CPU_MC/KC/NC (the cpu.h constants are
 // #ifndef-guarded for exactly this):
-//   c++ -std=c++2b -O2 -I include -DTL_CPU_KC=512 bench/bench_cpu_sweep.cpp -o sw && ./sw
+//   c++ -std=c++2b -O2 -I include -DTL_CPU_KC=512 bench/cpu/speed/bench_cpu_sweep.cpp -o sw && ./sw
 // Interleave configs and take the per-size medians (performance-notes.md
 // measurement discipline; check uptime < ~4 first).
 #include <algorithm>

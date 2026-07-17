@@ -161,7 +161,7 @@ bytes (bf16/int4 storage) and fusing attention — not F32 GFLOP/s.
   the fused epilogue scale as alpha. `tl::use_accelerate_ = false` forces
   the oracle; tests compare both paths on every dispatchable op class
   including edge shapes.
-- `bench/bench_main.cpp` — interleaved A/B medians (accel vs ref).
+- `bench/shared/speed/bench_main.cpp` — interleaved A/B medians (accel vs ref).
 
 ## Earlier state (M2)
 

@@ -174,7 +174,7 @@ context + module-from-PTX loader, managed alloc/release, and binary/unary/gemm/
 row_op launchers — same signatures as metal.h so the seam is backend-agnostic,
 reusing `metal::kop`. The PTX is embedded via **bin2c** (a build-generated
 `tensorlib_cuda_ptx.inc` byte array), *not* C23 `#embed`, because the off-Apple
-compilers (g++ 11 / clang 14) predate `#embed`. `bench/check_cuda.cpp` validates
+compilers (g++ 11 / clang 14) predate `#embed`. `bench/cuda/check/check_cuda.cpp` validates
 all ops on the RTX 3090 vs CPU references (binary+affine, sigmoid, GEMM NN + NT,
 row_sum+affine, softmax — all ok). Stubs compile cleanly with no `TENSORLIB_CUDA`
 and on Apple, so non-CUDA builds are unaffected.
@@ -399,7 +399,7 @@ SiLU, SwiGLU are pure compositions** of existing ops (`rmsnorm = x·rsqrt(mean(x
 construction. A full **llama decoder block** (RMSNorm → qkv proj → RoPE(q,k) →
 append → attn_decode → out proj → residual → RMSNorm → SwiGLU MLP → residual) is
 assembled from these + `dot` + `attn_decode` and verified vs a from-scratch CPU
-reference in `bench/check_llm_block.cpp` (ctest `llm_block`, backend-agnostic):
+reference in `bench/shared/check/check_llm_block.cpp` (ctest `llm_block`, backend-agnostic):
 **decoder-block maxrel 1.8e-7** on GPU, all six unit+block checks green on both
 CUDA and CPU builds.
 
@@ -408,7 +408,7 @@ LLM" end to end. Added the array↔native bridge — a public **`array::native()
 (the evaluated device-buffer handle) — so each layer's attention step hands its
 `q/k/v` arrays' buffers to the stateful `cuda::kv_cache` (`append` then `attn`,
 GQA-aware) and wraps the result back into the array graph, while RMSNorm/RoPE/
-SwiGLU/proj stay pure array ops. `bench/check_llm_decode.cpp` (ctest `llm_decode`)
+SwiGLU/proj stay pure array ops. `bench/cuda/check/check_llm_decode.cpp` (ctest `llm_decode`)
 drives a **3-layer, GQA (4 q / 2 kv) llama** greedily for 12 steps (6-token prompt
 + 6 generated, integer ids over a random embedding table — no tokenizer yet) and
 checks every step vs a from-scratch CPU reference: **logits maxrel 1.6e-6, greedy
@@ -433,7 +433,7 @@ was a hard prereq. (2) **GGUF v3 loader** (`include/gguf.h`, Fable) — mmap +
 typed-KV + tensor directory, validated vs gguf-py (291 tensors match). (3) **Qwen2
 GPT-2 byte-level BPE tokenizer** (`include/tokenizer.h` + generated unicode tables
 in `tokenizer_data.h`, Fable) — token-exact vs HF on 7 cases incl. the chat
-template. (4) **the model forward** (`bench/qwen_model.h`) — F16→F32 widen, GGML
+template. (4) **the model forward** (`bench/cuda/qwen_model.h`) — F16→F32 widen, GGML
 `[out,in]`→our `[K,N]` transpose at load, QKV bias, RoPE base=1e6 half-split,
 RMSNorm eps=1e-6, GQA 14q/2kv, SwiGLU, composed from the array ops + the D=64
 `kv_cache`. Verified two ways: `check_qwen` matches a **numpy-on-the-same-F16-
@@ -453,7 +453,7 @@ Sampling (temp/top-k/top-p) and Q4_0→`dtype::q4` (needs the q4 GEMV's `K%256`
 relaxed to `K%32` — Qwen hidden 896 isn't a 256 multiple) remain.
 
 **Done (decode-overhead attack — census + sync-free step, 2026-07-10):** a
-per-region census (`bench/bench_qwen_decode.cpp`, `StepProf`) split the 15.9
+per-region census (`bench/cuda/speed/bench_qwen_decode.cpp`, `StepProf`) split the 15.9
 ms/token as **host array-graph construction 35–45%**, per-layer eval (launch +
 sync) ~58%, greedy last-mile only **1.7%** — and established the **~1 ms/token
 GPU compute floor** (so ~94% is overhead, and a large slice is *pure host CPU*

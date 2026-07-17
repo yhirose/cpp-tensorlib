@@ -235,7 +235,7 @@ Tuning targets, in likely priority: thread-local reusable pack buffers,
 skip the pool for single-block work, MR/NR + MC/KC/NC sweep, software
 prefetch, K-unroll in the microkernel. → Done; see the tuning pass below.
 
-**Gate caveat (2026-07-03):** `bench/bench_cpu_gemm.cpp` links OpenBLAS
+**Gate caveat (2026-07-03):** `bench/cpu/speed/bench_cpu_gemm.cpp` links OpenBLAS
 when present (`tensorlib_bench_cpu`). But Homebrew's OpenBLAS on M1
 appears to use generic ARMV8 microkernels, not M1-tuned ones — the
 *untuned* own kernel already beats it ~1.8× at 1024³ (threads matched
@@ -300,7 +300,7 @@ within noise — a ~4% edge only at 2048³, a ~2% *loss* at 512³, a tie at
 1024³ (KC=512, 4 interleaved rounds). Not worth its messier NR=12 edge
 handling and near-full register file; 8×8 (20/32 regs) stays and keeps
 headroom for future unroll/prefetch work. Block-size sweep harness:
-`bench/bench_cpu_sweep.cpp` — calls `cpu::sgemm` directly (compiles in
+`bench/cpu/speed/bench_cpu_sweep.cpp` — calls `cpu::sgemm` directly (compiles in
 ~1s) with `-DTL_CPU_MC/KC/NC` overrides (the constants in cpu.h are
 `#ifndef`-guarded for this).
 
@@ -393,7 +393,7 @@ roadmap.md — best measured on native Linux, not this WSL2 box.
 ## Own CUDA GEMM stage-2 (M6, RTX 3090 / WSL2, 2026-07-03)
 
 The SGEMM tuning sprint over the correctness-first one-output-per-thread
-kernel. Bench: `bench/bench_cuda_gemm.cpp` links cuBLAS + the CUDA runtime as a
+kernel. Bench: `bench/cuda/speed/bench_cuda_gemm.cpp` links cuBLAS + the CUDA runtime as a
 **measurement reference only** (like OpenBLAS on the CPU side — never a library
 dependency; cuda.h still dlopen's the driver). Timing is CUDA events on the null
 stream, R launches per batch, median of interleaved own-vs-cuBLAS rounds. All
@@ -666,7 +666,7 @@ the going-in assumption.
 
 **Going in:** expected bf16/q4 weight storage to be the decode lever (halve weight
 bytes → faster on the bandwidth-bound GEMV) and the WSL2 2GB sysmem cliff to bite
-F32. **Both were wrong for a 0.5B model.** Measured decode (`bench/chat_qwen`,
+F32. **Both were wrong for a 0.5B model.** Measured decode (`bench/cuda/chat_qwen`,
 greedy, all layers on GPU, RTX 3090):
 
 | weight storage | resident | prefill tok/s | **decode tok/s** |
@@ -705,7 +705,7 @@ generalization) validated at maxrel 1e-7 (`ctest attn64`).
 ### Decode-overhead census + the sync-free step (2026-07-10)
 
 Attacking the 6.7× gap. A per-region wall-clock census of one decode step
-(`bench/bench_qwen_decode.cpp`, `qwenmodel::StepProf`; bf16, RTX 3090/WSL2) split
+(`bench/cuda/speed/bench_qwen_decode.cpp`, `qwenmodel::StepProf`; bf16, RTX 3090/WSL2) split
 the 15.9 ms/token as: **construct (host array-graph build) 35–45%**, per-layer
 `.eval()` regions (launch + sync) ~58%, and the greedy last-mile (608 KB logits
 D2H + 151936-elem host argmax) only **1.7%**. Two structural facts fell out: the

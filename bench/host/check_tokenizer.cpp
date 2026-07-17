@@ -1,5 +1,5 @@
 // Token-exact check of tl::tokenizer (include/tokenizer.h) against HF
-// Qwen2.5-0.5B-Instruct ground truth (bench/tokenizer_oracle_data.h).
+// Qwen2.5-0.5B-Instruct ground truth (bench/host/tokenizer_oracle_data.h).
 // argv[1] = gguf path. Exit 0 iff every case encodes to the exact id
 // sequence and decode() round-trips the text.
 
@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "../include/tokenizer.h"
+#include "../../include/tokenizer.h"
 #include "tokenizer_oracle_data.h"
 
 static void print_ids(const char* label, const std::vector<int>& v) {

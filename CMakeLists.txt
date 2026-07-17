@@ -91,7 +91,7 @@ if(TENSORLIB_CUDA)
   # Kernel-level CUDA oracle (like check_cpu_ukernel for the CPU backend):
   # every op vs a CPU reference, direct on the cuda:: API. Only built/run when
   # CUDA is enabled.
-  add_executable(tensorlib_check_cuda bench/check_cuda.cpp)
+  add_executable(tensorlib_check_cuda bench/cuda/check/check_cuda.cpp)
   target_link_libraries(tensorlib_check_cuda PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_check_cuda)
   add_test(NAME cuda_ukernel COMMAND tensorlib_check_cuda)
@@ -100,7 +100,7 @@ if(TENSORLIB_CUDA)
   # drives a 784-256-10 ReLU MLP to a real test-accuracy target. Skips-as-pass
   # with no GPU (CI) or no data (offline); fetches MNIST once via curl into the
   # build dir. A few seconds on-device.
-  add_executable(tensorlib_check_mnist bench/check_mnist.cpp)
+  add_executable(tensorlib_check_mnist bench/shared/check/check_mnist.cpp)
   target_link_libraries(tensorlib_check_mnist PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_check_mnist)
   add_test(NAME mnist_converge COMMAND tensorlib_check_mnist
@@ -110,20 +110,20 @@ if(TENSORLIB_CUDA)
   # times bf16 vs f32 weight storage on the memory-bound decode GEMV. Needs the
   # project cuda.h before the CUDA TK's driver header (same BEFORE-include idiom
   # as bench_cuda_gemm).
-  add_executable(tensorlib_bench_bf16 bench/bench_bf16_gemv.cpp)
+  add_executable(tensorlib_bench_bf16 bench/cuda/speed/bench_bf16_gemv.cpp)
   target_include_directories(tensorlib_bench_bf16 BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(tensorlib_bench_bf16 PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_bench_bf16)
 
-  add_executable(tensorlib_bench_qwen_gemv bench/bench_qwen_gemv.cpp)
+  add_executable(tensorlib_bench_qwen_gemv bench/cuda/speed/bench_qwen_gemv.cpp)
   target_include_directories(tensorlib_bench_qwen_gemv BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(tensorlib_bench_qwen_gemv PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_bench_qwen_gemv)
 
   # M9 fused decode-attention bench (Path-B style). Direct cuda:: API.
-  add_executable(tensorlib_bench_attn bench/bench_attn_decode.cpp)
+  add_executable(tensorlib_bench_attn bench/cuda/speed/bench_attn_decode.cpp)
   target_include_directories(tensorlib_bench_attn BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(tensorlib_bench_attn PRIVATE tensorlib)
@@ -132,7 +132,7 @@ if(TENSORLIB_CUDA)
   # M9 end-to-end: multi-layer llama decode loop wired to the persistent
   # kv_cache (GQA) via the array<->native bridge, verified vs a CPU reference at
   # every step. Uses the array API + tl::cuda::kv_cache, so CUDA-build only.
-  add_executable(tensorlib_check_llm_decode bench/check_llm_decode.cpp)
+  add_executable(tensorlib_check_llm_decode bench/cuda/check/check_llm_decode.cpp)
   target_include_directories(tensorlib_check_llm_decode BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(tensorlib_check_llm_decode PRIVATE tensorlib)
@@ -142,7 +142,7 @@ if(TENSORLIB_CUDA)
   # M9 head_dim generalization: the attention/KV kernels are templated on
   # head_dim {64,128}; this validates the D=64 instantiations (Qwen2 head_dim)
   # against the same CPU references. Direct cuda:: API, CUDA-build only.
-  add_executable(tensorlib_check_attn64 bench/check_attn64.cpp)
+  add_executable(tensorlib_check_attn64 bench/cuda/check/check_attn64.cpp)
   target_include_directories(tensorlib_check_attn64 BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(tensorlib_check_attn64 PRIVATE tensorlib)
@@ -152,31 +152,31 @@ if(TENSORLIB_CUDA)
   # M9 "actually chat": load a real Qwen2.5-0.5B GGUF (F16) and run the decoder
   # end to end vs a tight numpy reference on the same weights. Not a ctest (needs
   # the ~1.2 GB model file, which lives outside the repo). Run manually.
-  add_executable(tensorlib_check_qwen bench/check_qwen.cpp)
+  add_executable(tensorlib_check_qwen bench/cuda/check/check_qwen.cpp)
   target_include_directories(tensorlib_check_qwen BEFORE PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench/cuda)
   target_link_libraries(tensorlib_check_qwen PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_check_qwen)
 
   # End-to-end chat: own GGUF loader + own BPE tokenizer + own CUDA kernels.
   # prompt string -> generated text. Not a ctest (needs the external model).
-  add_executable(tensorlib_chat_qwen bench/chat_qwen.cpp)
+  add_executable(tensorlib_chat_qwen bench/cuda/chat_qwen.cpp)
   target_include_directories(tensorlib_chat_qwen BEFORE PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench/cuda)
   target_link_libraries(tensorlib_chat_qwen PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_chat_qwen)
 
   # M9 decode-overhead census: per-region wall-clock breakdown of one decode
   # step (StepProf). Locates the 6.7x gap to llama.cpp. Not a ctest (external
   # model file); short/isolated per the WSL2 sysmem-cliff discipline.
-  add_executable(tensorlib_bench_qwen_decode bench/bench_qwen_decode.cpp)
+  add_executable(tensorlib_bench_qwen_decode bench/cuda/speed/bench_qwen_decode.cpp)
   target_include_directories(tensorlib_bench_qwen_decode BEFORE PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench/cuda)
   target_link_libraries(tensorlib_bench_qwen_decode PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_bench_qwen_decode)
 
   # M8 int4-weight decode GEMV bench (Path-B style). Direct cuda:: API.
-  add_executable(tensorlib_bench_q4 bench/bench_q4_gemv.cpp)
+  add_executable(tensorlib_bench_q4 bench/cuda/speed/bench_q4_gemv.cpp)
   target_include_directories(tensorlib_bench_q4 BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(tensorlib_bench_q4 PRIVATE tensorlib)
@@ -200,7 +200,7 @@ if(TENSORLIB_CUDA)
           ${CMAKE_CUDA_COMPILER_LIBRARY_ROOT}/targets/x86_64-linux/include
           /usr/local/cuda/include)
   if(CUBLAS_LIB AND CUDART_LIB AND CUDA_TK_INC)
-    add_executable(tensorlib_bench_cuda bench/bench_cuda_gemm.cpp)
+    add_executable(tensorlib_bench_cuda bench/cuda/speed/bench_cuda_gemm.cpp)
     target_link_libraries(tensorlib_bench_cuda PRIVATE tensorlib
       ${CUBLAS_LIB} ${CUDART_LIB})
     # The project include MUST come before the CUDA Toolkit include: the bench's
@@ -216,7 +216,7 @@ if(TENSORLIB_CUDA)
   endif()
 endif()
 
-add_executable(tensorlib_bench bench/bench_main.cpp)
+add_executable(tensorlib_bench bench/shared/speed/bench_main.cpp)
 target_link_libraries(tensorlib_bench PRIVATE tensorlib)
 
 # auto-mode CPU/GPU crossover census (misc/census.cpp). Device-agnostic array
@@ -227,19 +227,19 @@ target_link_libraries(tensorlib_census PRIVATE tensorlib)
 
 # Local-LLM shape bench — the dev harness for M7-M9 (decode/prefill GEMM +
 # attention at real decoder-layer shapes). Same backend-agnostic array API.
-add_executable(tensorlib_bench_llm bench/bench_llm.cpp)
+add_executable(tensorlib_bench_llm bench/shared/speed/bench_llm.cpp)
 target_link_libraries(tensorlib_bench_llm PRIVATE tensorlib)
 
 # MNIST-shaped MLP training bench (synthetic data, hand-rolled backprop) — a
 # real end-to-end workload (loss down / acc up) exercising the full training op
 # mix on the GPU. Fixed-step throughput, sub-second; no data download.
-add_executable(tensorlib_bench_mlp bench/bench_mlp_train.cpp)
+add_executable(tensorlib_bench_mlp bench/shared/speed/bench_mlp_train.cpp)
 target_link_libraries(tensorlib_bench_mlp PRIVATE tensorlib)
 
 # M9 model-surface check: RoPE op + RMSNorm/SiLU/SwiGLU compositions + a full
 # llama decoder block, all via the array API, verified vs a from-scratch CPU
 # reference. Backend-agnostic; gates correctness of the transformer wiring.
-add_executable(tensorlib_check_llm_block bench/check_llm_block.cpp)
+add_executable(tensorlib_check_llm_block bench/shared/check/check_llm_block.cpp)
 target_link_libraries(tensorlib_check_llm_block PRIVATE tensorlib)
 add_test(NAME llm_block COMMAND tensorlib_check_llm_block)
 
@@ -256,7 +256,7 @@ endif()
 
 # Own CPU GEMM bench (M5 tuning). Links OpenBLAS for the off-Apple gate when
 # present (ARM OpenBLAS = same NEON ISA); own-vs-ref only otherwise.
-add_executable(tensorlib_bench_cpu bench/bench_cpu_gemm.cpp)
+add_executable(tensorlib_bench_cpu bench/cpu/speed/bench_cpu_gemm.cpp)
 target_link_libraries(tensorlib_bench_cpu PRIVATE tensorlib)
 find_library(OPENBLAS_LIB openblas
   PATHS /opt/homebrew/opt/openblas/lib /usr/local/opt/openblas/lib)
@@ -276,24 +276,25 @@ add_test(NAME cpu  COMMAND tensorlib_test --cpu)
 add_test(NAME gpu  COMMAND tensorlib_test --gpu)
 add_test(NAME auto COMMAND tensorlib_test --auto)
 
-# CPU microkernel correctness oracle (bench/check_cpu_ukernel.cpp): validates
-# each available ukernel (scalar; NEON on ARM; AVX2 on x86) against a naive
-# triple loop across full and edge tiles. Pure host code, no external deps and
-# no GPU — the one check with nothing to skip on, so it runs as a ctest
-# everywhere (unlike check_gguf/tokenizer/qwen, which need the model file).
-add_executable(tensorlib_check_cpu_ukernel bench/check_cpu_ukernel.cpp)
+# CPU microkernel correctness oracle (bench/cpu/check/check_cpu_ukernel.cpp):
+# validates each available ukernel (scalar; NEON on ARM; AVX2 on x86) against a
+# naive triple loop across full and edge tiles. Pure host code, no external
+# deps and no GPU — the one check with nothing to skip on, so it runs as a
+# ctest everywhere (unlike check_gguf/tokenizer/qwen, which need the model
+# file).
+add_executable(tensorlib_check_cpu_ukernel bench/cpu/check/check_cpu_ukernel.cpp)
 target_link_libraries(tensorlib_check_cpu_ukernel PRIVATE tensorlib)
 add_test(NAME cpu_ukernel COMMAND tensorlib_check_cpu_ukernel)
 
 # GGUF v3 reader check (include/gguf.h): parses a real Qwen2.5-0.5B fp16 model
 # and asserts the directory against the reference gguf-py manifest. Pure host
 # binary parsing — no GPU; not a ctest (the model file lives outside the repo).
-add_executable(check_gguf bench/check_gguf.cpp)
+add_executable(check_gguf bench/host/check_gguf.cpp)
 target_link_libraries(check_gguf PRIVATE tensorlib)
 
 # Qwen2 BPE tokenizer check (include/tokenizer.h): encodes the HF-oracle test
-# strings from bench/tokenizer_oracle_data.h and asserts token-exact ids +
+# strings from bench/host/tokenizer_oracle_data.h and asserts token-exact ids +
 # decode round-trip. Pure host code; not a ctest (needs the 1.2GB model file
 # outside the repo).
-add_executable(check_tokenizer bench/check_tokenizer.cpp)
+add_executable(check_tokenizer bench/host/check_tokenizer.cpp)
 target_link_libraries(check_tokenizer PRIVATE tensorlib)
