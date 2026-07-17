@@ -2300,9 +2300,9 @@ inline array concat(const std::vector<array>& parts) {
 // the only function referencing the evaluator and device backends by name —
 // keep it out of translation units that must stay backend-free.
 inline void install_runtime_hooks() {
-  // The hook seam is F32-only (bf16 bypasses it in storage::make); wrap the
-  // now-defaulted-dtype allocator to keep the hook signature unchanged.
-  detail::storage_make_hook = [](int64_t n) { return storage::make_device_(n); };
+  detail::storage_make_hook = [](int64_t n, dtype dt) {
+    return storage::make_device_(n, dt);
+  };
   detail::cpu_barrier_hook = &gpu::cpu_barrier;
   detail::host_sync_hook = &gpu::sync_to_host;
   detail::gpu_pending_hook = &gpu::pending;

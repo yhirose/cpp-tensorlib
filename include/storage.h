@@ -95,7 +95,7 @@ struct storage {
 namespace detail {
 
 // Runtime hooks (see the storage comment). Null until installed.
-inline storage (*storage_make_hook)(int64_t) = nullptr;
+inline storage (*storage_make_hook)(int64_t, dtype) = nullptr;
 inline void (*cpu_barrier_hook)() = nullptr;
 // Host↔device coherence (CUDA device-mirror). Called with (native, for_write)
 // before a CPU read/write of a managed buffer to pull the device copy back
@@ -110,15 +110,11 @@ inline bool (*gpu_pending_hook)() = nullptr;
 }  // namespace detail
 
 inline storage storage::make(int64_t n, dtype dt) {
-  // The embedder hook predates dtype and is F32-only (its signature is part of
-  // the culebra seam); bf16 allocations go straight to the device path, which
-  // heap-falls-back exactly like the hookless build.
-  if (dt != dtype::f32) return make_device_(n, dt);
 #ifdef TL_RUNTIME_HOOKS
-  if (detail::storage_make_hook) return detail::storage_make_hook(n);
-  return make_heap_(n);
+  if (detail::storage_make_hook) return detail::storage_make_hook(n, dt);
+  return make_heap_(n, dt);
 #else
-  return make_device_(n);
+  return make_device_(n, dt);
 #endif
 }
 
