@@ -197,6 +197,20 @@ TEST_CASE("reductions") {
 
   // reduction over a strided view
   CHECK(a.transpose().sum(0).at({1}) == 15.0f);
+
+  // rank-3 contiguous reduce over each axis: exercises the outer x axis x
+  // inner split of the fast path (inner = 4, 2, 1 respectively).
+  auto b = array::from({1, 2, 3, 4, 5, 6, 7, 8}, {2, 2, 2});
+  auto b0 = b.sum(0);  // inner=4
+  CHECK(b0.shape() == tl::shape_t{2, 2});
+  CHECK(b0.at({0, 0}) == 6.0f);   // 1+5
+  CHECK(b0.at({1, 1}) == 12.0f);  // 4+8
+  auto b1 = b.sum(1);  // inner=2
+  CHECK(b1.at({0, 0}) == 4.0f);   // 1+3
+  CHECK(b1.at({1, 1}) == 14.0f);  // 6+8
+  auto b2 = b.sum(2);  // inner=1 (contiguous running sum)
+  CHECK(b2.at({0, 0}) == 3.0f);   // 1+2
+  CHECK(b2.at({1, 1}) == 15.0f);  // 7+8
 }
 
 TEST_CASE("activations") {

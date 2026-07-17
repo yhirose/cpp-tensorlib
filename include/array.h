@@ -724,6 +724,27 @@ array map_binary(const array& a, const array& b, F f) {
   auto* po = out.data();
   const auto* pa = a.raw();
   const auto* pb = b.raw();
+
+  // Rank-2 contiguous broadcast fast path: covers the common matrix cases —
+  // bias/row-vector [1,N], column-vector [M,1], and scalar broadcasts — with
+  // flat row/col loops instead of the coordinate walker. broadcast_strides
+  // already yields a 0 step on each broadcast axis, so a full operand steps
+  // (N,1), a column vector (1,0), a row vector (0,1), a scalar (0,0). When the
+  // inner step is 1 the inner loop is contiguous and vectorizes.
+  if (shape.size() == 2 && a.contiguous() && b.contiguous()) {
+    auto ra = broadcast_strides(a.shape(), a.strides(), shape);
+    auto rb = broadcast_strides(b.shape(), b.strides(), shape);
+    int64_t M = shape[0], N = shape[1];
+    int64_t o = 0;
+    for (int64_t i = 0; i < M; i++) {
+      const float* pai = pa + i * ra[0];
+      const float* pbi = pb + i * rb[0];
+      int64_t sa = ra[1], sb = rb[1];
+      for (int64_t j = 0; j < N; j++, o++) po[o] = f(pai[j * sa], pbi[j * sb]);
+    }
+    return out;
+  }
+
   for_each_index(shape,
                  {broadcast_strides(a.shape(), a.strides(), shape),
                   broadcast_strides(b.shape(), b.strides(), shape)},
@@ -757,7 +778,34 @@ array reduce_axis(const array& a, int axis, bool keepdims, float init, F f) {
   auto out_shape = reduce_shape(a.shape(), axis, keepdims);
   int r = static_cast<int>(a.rank());
   auto out = array::full(out_shape, init);
-  // Map each input index to its accumulator: axis contributes stride 0.
+  auto* po = out.data();
+  const auto* pi = a.raw();
+
+  // Contiguous fast path: split the row-major buffer into
+  // outer × axis_len × inner and accumulate each axis slab into the matching
+  // output slot with flat pointer loops — the accumulator index is just the
+  // (outer, inner) position, so no per-element coordinate walk is needed. The
+  // inner loop is contiguous (vectorizable for +/max). Reducing the last axis
+  // makes inner == 1 (a plain running sum over contiguous values).
+  if (a.contiguous()) {
+    const auto& sh = a.shape();
+    int64_t axis_len = sh[axis];
+    int64_t inner = 1, outer = 1;
+    for (int i = axis + 1; i < r; i++) inner *= sh[i];
+    for (int i = 0; i < axis; i++) outer *= sh[i];
+    for (int64_t o = 0; o < outer; o++) {
+      const float* base = pi + o * axis_len * inner;
+      float* od = po + o * inner;
+      for (int64_t k = 0; k < axis_len; k++) {
+        const float* src = base + k * inner;
+        for (int64_t j = 0; j < inner; j++) f(od[j], src[j]);
+      }
+    }
+    return out;
+  }
+
+  // Generic (strided/broadcast/transposed) fallback: map each input index to
+  // its accumulator, axis contributing stride 0.
   auto out_strides = contiguous_strides(out_shape);
   std::vector<int64_t> acc_strides(r, 0);
   for (int i = 0, oi = 0; i < r; i++) {
@@ -767,8 +815,6 @@ array reduce_axis(const array& a, int axis, bool keepdims, float init, F f) {
     }
     acc_strides[i] = out_strides[oi++];
   }
-  auto* po = out.data();
-  const auto* pi = a.raw();
   for_each_index(a.shape(), {a.strides(), acc_strides},
                  [&](int64_t, const std::vector<int64_t>& off) {
                    f(po[off[1]], pi[off[0]]);
