@@ -35,7 +35,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # windows-2022 (not -latest): windows-latest moved to Visual Studio 18,
+        # which is past nvcc's supported host-compiler window (VS 2017-2022) and
+        # hard-errors the PTX build (C1189). VS 2022 is in range. The plain
+        # `test` job below stays on windows-latest — only the CUDA/nvcc path
+        # needs the pinned toolset.
+        os: [ubuntu-latest, windows-2022]
     steps:
       - uses: actions/checkout@v4
       - uses: Jimver/cuda-toolkit@v0.2.19

@@ -46,10 +46,12 @@ if(TENSORLIB_CUDA)
   set(TL_CUDA_INC ${CMAKE_BINARY_DIR}/tensorlib_cuda_ptx.inc)
   set(TL_NVCC_ARGS -arch=${TENSORLIB_CUDA_PTX_ARCH} -ptx)
   if(WIN32)
-    # windows-latest runners ship a Visual Studio newer than nvcc's supported
-    # host-compiler window, and nvcc's version gate hard-errors on it (C1189).
-    # For PTX (device) codegen the host compiler only preprocesses, so skipping
-    # the gate is safe here. No-op where the host compiler is in range.
+    # nvcc's host-compiler version gate hard-errors (C1189) on a Visual Studio
+    # newer than its supported window (VS 2017-2022) — e.g. VS 18 on an updated
+    # runner or dev box. PTX is device code (the host compiler only
+    # preprocesses), so skipping the gate is safe. No-op where the VS is in
+    # range; the CI pins windows-2022 (in range), and this additionally lets a
+    # newer local toolchain build -DTENSORLIB_CUDA=ON.
     list(APPEND TL_NVCC_ARGS -allow-unsupported-compiler)
   endif()
   add_custom_command(
