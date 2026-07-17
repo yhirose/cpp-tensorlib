@@ -1,11 +1,29 @@
 cpp-tensorlib
 =============
 
-Cross-platform F32 tensor library — the matrix foundation for
-[culebra](https://github.com/yhirose/culebra)'s Tensor type.
+[![](https://github.com/yhirose/cpp-tensorlib/workflows/CI/badge.svg)](https://github.com/yhirose/cpp-tensorlib/actions)
 
-* Header-only, **C++17 minimum** (builds cleanly through C++23) —
-  `#include <tensorlib.h>`
+A C++17 **header-only, cross-platform** tensor library with **zero
+third-party dependencies** — CPU (own SIMD kernels) and GPU (own Metal /
+CUDA kernels) on macOS, Linux, and Windows, from a single `#include
+<tensorlib.h>`. No BLAS, no cuBLAS/cuDNN, no CUTLASS: every accelerated
+kernel — GEMM, GEMV, attention, quantized (int4) matmul — is hand-written
+in this repo, so the only thing a consumer links against is the OS itself
+(and the CUDA *driver*, which is `dlopen`'d at runtime, not linked).
+
+As a full end-to-end proof of that promise, the library also drives a real
+local-LLM chat pipeline — GGUF loader, BPE tokenizer, and a Qwen2.5 decoder,
+all on the same own-kernel, zero-dependency foundation (see
+[LLM inference](#llm-inference) below).
+
+* **Header-only, C++17 minimum** (builds cleanly through C++23) —
+  `#include <tensorlib.h>`, nothing to link or build separately.
+* **Cross-platform**: macOS (Accelerate + Metal), Linux/Windows (own
+  BLIS-style CPU microkernels — scalar/AVX2/NEON — and own CUDA kernels).
+  One dispatch seam, no platform `#ifdef`s in consumer code.
+* **Zero third-party dependencies**: no OpenBLAS, cuBLAS, cuDNN, or
+  CUTLASS anywhere in the accelerated paths (see
+  [Dependency policy](#dependency-policy)).
 * MLX-style **lazy evaluation**: ops build a graph; `tl::eval()` evaluates
   multiple arrays in one topological pass, with build-time peephole fusion
   (every node carries an affine epilogue, so scalar chains and
@@ -13,16 +31,15 @@ Cross-platform F32 tensor library — the matrix foundation for
 * Switchable backend via `tl::use_cpu()` / `tl::use_gpu()` / `tl::use_auto()`
   (auto picks CPU or GPU per op from measured per-kernel-class thresholds).
 * Zero-copy views (transpose / reshape / slice), numpy broadcast rules.
-* Data type: `float` (BF16 storage type planned; see the milestones).
-
-> **Status: work in progress.** The macOS backend (Accelerate + Metal) is
-> complete and fast; the reference implementation runs everywhere as an
-> oracle and fallback. The own-CPU (Linux/Windows SIMD) and CUDA backends
-> are not yet implemented — see the milestones below.
+* Data types: `float` (primary), plus `bf16`/`int4` storage dtypes for the
+  bandwidth-bound LLM decode path (see the milestones).
 
 Design informed by [silarray](https://github.com/yhirose/silarray) (the
 macOS-only experiment this succeeds), rebuilt for three platforms with a
-single dispatch seam the backends plug into.
+single dispatch seam the backends plug into. Serves as the matrix
+foundation for [culebra](https://github.com/yhirose/culebra)'s Tensor type
+(culebra keeps autograd/VJP; this library owns the graph, fusion, and
+execution).
 
 Example
 -------
@@ -38,7 +55,7 @@ auto d = (a + b).relu();           // also lazy
 
 tl::eval(c, d);                    // evaluate both in one pass
 
-tl::use_gpu();                     // route to Metal (macOS)
+tl::use_gpu();                     // route to Metal (macOS) or CUDA (Linux/Windows)
 auto e = a.dot(b);
 tl::use_auto();                    // CPU or GPU per op, by measured size
 ```
@@ -49,7 +66,7 @@ Backends
 | Platform | CPU | GPU |
 |----------|-----|-----|
 | macOS | Accelerate (vDSP / vForce / CBLAS) ✅ | Metal / MSL (`#embed` JIT), STEEL SGEMM ✅ |
-| Linux / Windows | own BLIS-style microkernels (planned, M5) | own CUDA kernels, dlopen'd driver API (planned, M6) |
+| Linux / Windows | own BLIS-style microkernels (scalar / AVX2 / NEON, runtime-dispatched) ✅ | own CUDA kernels, PTX JIT'd by a `dlopen`'d driver ✅ |
 | any | reference strided implementation (oracle + fallback) ✅ | — |
 
 Everything reduces to strides through one index walker, so views, broadcast
@@ -57,10 +74,24 @@ and transposed operands share a single code path. Accelerated backends
 replace it per-op at the `graph::eval_one` dispatch seam; the seam carries
 no platform `#ifdef`s (non-Apple builds get inline stubs).
 
-**Dependency policy:** zero third-party dependencies (doctest is vendored,
-tests only). macOS links only OS frameworks. The planned CPU/CUDA backends
-use own kernels — no OpenBLAS, cuBLAS or CUTLASS; the CUDA driver is
-`dlopen`'d so binaries run (and fall back to CPU) without it.
+Dependency policy
+------------------
+
+**Zero third-party dependencies, on every platform.** No OpenBLAS, no
+cuBLAS/cuDNN, no CUTLASS — every accelerated kernel (CPU SIMD, CUDA GEMM/
+GEMV/attention, int4 dequant-matmul) is hand-written in this repo. What each
+platform links against:
+
+* **macOS** — only OS frameworks (`Accelerate`, `Metal`, `Foundation`).
+* **Linux / Windows (CPU)** — nothing; own microkernels compiled straight
+  into the consumer binary.
+* **Linux / Windows (CUDA)** — nothing linked. Kernels are compiled to PTX
+  at *build* time (`nvcc`, build-time only — not a runtime dependency) and
+  the CUDA driver is `dlopen`'d (`LoadLibrary` on Windows) at *run* time, so
+  a binary built with `-DTENSORLIB_CUDA=ON` still runs — falling back to
+  CPU — on a machine with no NVIDIA driver at all.
+* **Tests only** — `doctest` is vendored (not a runtime dependency of the
+  library itself).
 
 Build and test
 --------------
@@ -72,14 +103,44 @@ ctest --test-dir build --output-on-failure   # cpu / gpu / auto modes
 ./build/tensorlib_bench                       # micro-benchmarks
 ```
 
+On Linux/Windows with an NVIDIA GPU, add `-DTENSORLIB_CUDA=ON` (needs `nvcc`
+on `PATH` at *build* time only — see [Dependency policy](#dependency-policy)):
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DTENSORLIB_CUDA=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
 Requires **C++17 or newer** — the headers use inline variables,
 `std::optional`, and structured bindings, but nothing from C++20/23, so any
 `g++ >= 11` / `clang++ >= 13` works (Apple Clang too). The bundled CMake build
 compiles the tests at C++23, but consuming the headers only needs C++17.
 Exception: the **macOS/Metal** backend `#embed`s its shader source, so
 *building on macOS* additionally needs a `#embed`-capable compiler (Clang 19+);
-non-Apple builds never reach that `#embed`. The GPU backend needs macOS with
-Metal; elsewhere the tests exercise the CPU path and the GPU-mode fallback.
+non-Apple builds never reach that `#embed`.
+
+LLM inference
+-------------
+
+`bench/cuda/chat_qwen.cpp` is the end-to-end proof of the header-only,
+zero-dependency, cross-platform claims above: it loads a real
+Qwen2.5-Instruct GGUF model and chats, using nothing but this library's own
+kernels — own GGUF v3 reader (`include/gguf.h`), own GPT-2-byte-BPE
+tokenizer (`include/tokenizer.h`), and own CUDA decode kernels. No GGML, no
+llama.cpp, no third-party inference runtime anywhere in the path.
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DTENSORLIB_CUDA=ON
+cmake --build build --target tensorlib_chat_qwen
+./build/tensorlib_chat_qwen path/to/qwen2.5-0.5b-instruct.gguf "What is the capital of France?"
+```
+
+Decode throughput on an RTX 3090 has gone from 3.5 to ~330 tok/s over the
+course of the CUDA decode-path work — about 1.35x off llama.cpp on the same
+shape. See `bench/cuda/speed/bench_qwen_decode.cpp` and
+[docs/performance-notes.md](docs/performance-notes.md) for the measurement
+methodology and the full tuning history.
 
 Documentation
 -------------
