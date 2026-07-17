@@ -258,12 +258,16 @@ add_test(NAME auto COMMAND tensorlib_test --auto)
 # GGUF v3 reader check (include/gguf.h): parses a real Qwen2.5-0.5B fp16 model
 # and asserts the directory against the reference gguf-py manifest. Pure host
 # binary parsing — no GPU; not a ctest (the model file lives outside the repo).
-add_executable(check_gguf bench/check_gguf.cpp)
-target_link_libraries(check_gguf PRIVATE tensorlib)
+# gguf.h is POSIX-only (mmap/open/unistd.h) with no Windows fallback yet, so
+# skip these targets on Windows rather than break the plain CI build there.
+if(NOT WIN32)
+  add_executable(check_gguf bench/check_gguf.cpp)
+  target_link_libraries(check_gguf PRIVATE tensorlib)
 
-# Qwen2 BPE tokenizer check (include/tokenizer.h): encodes the HF-oracle test
-# strings from bench/tokenizer_oracle_data.h and asserts token-exact ids +
-# decode round-trip. Pure host code; not a ctest (needs the 1.2GB model file
-# outside the repo).
-add_executable(check_tokenizer bench/check_tokenizer.cpp)
-target_link_libraries(check_tokenizer PRIVATE tensorlib)
+  # Qwen2 BPE tokenizer check (include/tokenizer.h): encodes the HF-oracle test
+  # strings from bench/tokenizer_oracle_data.h and asserts token-exact ids +
+  # decode round-trip. Pure host code; not a ctest (needs the 1.2GB model file
+  # outside the repo).
+  add_executable(check_tokenizer bench/check_tokenizer.cpp)
+  target_link_libraries(check_tokenizer PRIVATE tensorlib)
+endif()
