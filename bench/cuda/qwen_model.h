@@ -562,6 +562,61 @@ inline void set_cache_pos(Model& M, int64_t p) {
   for (auto& L : M.layers) L.cache.pos = p;
 }
 
+// CUDA-graph-captured greedy decoder (A-min). Captures the device-pos forward
+// once (after prefill, at the first decode position) and replays it per token —
+// collapsing the ~360 per-token kernel launches into one graph submit. Correct
+// across positions because rope/kv-append/attn read the position from the device
+// counter d_pos, which a captured tl_incr_u32 advances each replay. embed staging
+// + argmax stay on the host side of each step (cheap; see bench census). Falls
+// back gracefully: ok()==false when graph support is missing or capture failed,
+// and the caller should use step_imperative instead. f32 KV, S=1 attn (Qwen).
+struct captured_decoder {
+  void* d_pos = nullptr;
+  tl::cuda::CUgraphExec exec = nullptr;  // opaque executable-graph handle
+  bool ready = false;
+
+  // Capture the forward at `pos` (the first decode position; == prompt length),
+  // priming it with `first_id`'s embedding. Leaves d_pos = pos so the first
+  // step() processes position `pos`.
+  void init(Model& M, int64_t first_id, int64_t pos) {
+    namespace cu = tl::cuda;
+    if (!cu::graph_available()) return;
+    d_pos = cu::alloc(4, nullptr);
+    if (!d_pos) return;
+    stage_embed(M, first_id);
+    cu::upload_u32(d_pos, (unsigned)pos);
+    run_layers_(M, M.scratch.embedb, pos, d_pos);  // warm (grow scratch); advances d_pos
+    cu::flush();
+    cu::upload_u32(d_pos, (unsigned)pos);          // reset after warm
+    if (!cu::capture_begin()) return;
+    run_layers_(M, M.scratch.embedb, pos, d_pos);  // recorded, not executed
+    exec = cu::capture_end();
+    ready = exec != nullptr;
+  }
+
+  // One captured step: feed token `id` at the current device position, replay,
+  // GPU-argmax the logits. d_pos auto-advances (captured tl_incr_u32), so the
+  // next step processes pos+1. Returns the greedy next token.
+  int64_t step(Model& M, int64_t id) {
+    namespace cu = tl::cuda;
+    stage_embed(M, id);       // gather id's row -> S.embedb (host + blocking H2D)
+    cu::graph_launch(exec);   // replay: append@d_pos, attn, logits, incr d_pos
+    int64_t idx = 0;
+    cu::argmax(M.scratch.logitsb, VOCAB, &idx);
+    return idx;
+  }
+
+  bool ok() const { return ready; }
+  void destroy() {
+    namespace cu = tl::cuda;
+    if (exec) cu::graph_destroy(exec);
+    if (d_pos) cu::release(d_pos, 0, nullptr);
+    exec = nullptr;
+    d_pos = nullptr;
+    ready = false;
+  }
+};
+
 inline std::string default_path() {
   const char* home = std::getenv("HOME");
   return std::string(home ? home : ".") + "/models/qwen2.5-0.5b-instruct-fp16.gguf";

@@ -70,19 +70,28 @@ int main(int argc, char** argv) {
   for (size_t i = 0; i < ids.size(); i++) logits = qm::step(M, ids[i], pos++);
   double prefill_ms = ms_since(t_prefill);
 
-  // Greedy generate until <|im_end|> or the budget. step_imperative() runs the
-  // whole forward as direct cuda:: kernel calls on persistent scratch (no array
-  // nodes → no host graph-build cost, one sync/step) and GPU-argmaxes — the C1
-  // decode fast path (~2.5x the array path, greedy bit-identical).
+  // Greedy generate until <|im_end|> or the budget. Prefer the CUDA-graph-
+  // captured decoder: it captures the device-pos forward once (after prefill)
+  // and replays it per token — collapsing ~360 kernel launches/token into one
+  // graph submit (~1.4x the imperative path on Qwen 0.5B). Correct across
+  // positions via the device pos counter. Falls back to step_imperative() (the
+  // C1 fast path: whole forward as direct cuda:: calls on persistent scratch,
+  // one sync/step) when graph capture is unavailable. Both are greedy; capture
+  // is guarded argmax-equivalent to imperative in bench_qwen_decode.
   std::vector<int> gen;
   int64_t next = qm::argmax(logits);
+  qm::captured_decoder cap;
+  cap.init(M, next, pos);  // capture at the first decode position
+  std::printf("decode path: %s\n\n", cap.ok() ? "CUDA-graph capture" : "imperative");
   auto t_dec = clk::now();
-  for (int64_t i = 0; i < MAX_NEW; i++) {
+  for (int64_t i = 0; i < MAX_NEW && pos < qm::MAXC; i++) {
     if (next == tok.eos_id()) break;
     gen.push_back((int)next);
-    next = qm::step_imperative(M, next, pos++);
+    next = cap.ok() ? cap.step(M, next) : qm::step_imperative(M, next, pos);
+    pos++;
   }
   double dec_ms = ms_since(t_dec);
+  cap.destroy();
 
   std::printf("=== assistant ===\n%s\n", tok.decode(gen).c_str());
   std::printf(
