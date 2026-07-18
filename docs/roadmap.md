@@ -312,6 +312,14 @@ Blackwell) is a forward-looking extension of the same seam.
 
 ### M8 — Quantized (int4/int8) dequant-fused matmul  🔨 int4 done & integrated; tuning + int8/GGUF remain
 
+> **Update 2026-07-17:** the `tl_gemv_q4s` shared-a variant named below was
+> removed; `tl_gemv_q4` was rewritten to one-block-per-row + K-adaptive block
+> size (llama.cpp's `mul_mat_vec_f` strategy), which makes the shared-a staging
+> pointless (each thread reads a disjoint K-slice, no intra-block `a` reuse
+> left to amortize). See the M9 decode-speed notes and commits 63a9064 /
+> 12f423a / a426bb0. The 2026-07-04 analysis below is kept as the point-in-time
+> record.
+
 **Done (int4 GEMV kernel + integration, 2026-07-04):** `tl_gemv_q4`/`tl_gemv_q4s`
 — group-symmetric int4 weights in [N,K] layout (groups along K contiguous,
 GGUF/GPTQ convention), one warp per output, dequant in registers

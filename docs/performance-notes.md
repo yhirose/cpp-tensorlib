@@ -592,6 +592,17 @@ K·4 ≤ 24 KB — larger K collapses occupancy) helps but the strided a_sh read
 bank-conflict. Integrated as `dtype::q4` (storage-dtype path; `a.dot(Wq)` rides
 the bf16 widen-fallback seam) → **decode 61.7 tok/s** (vs bf16 42.5).
 
+> **Update 2026-07-17 (supersedes the global-a/shared-a split above):** the whole
+> global-a-vs-shared-a distinction is gone. `tl_gemv_q4` was rewritten to
+> one-block-per-row + K-adaptive block size (llama.cpp `mul_mat_vec_f` strategy;
+> commits 12f423a / a426bb0), and `tl_gemv_q4s` was deleted. Under one-row-per-
+> block every thread reads a **disjoint** K-slice, so there is no per-warp
+> activation re-read for shared staging to amortize — the a-traffic problem this
+> paragraph chases was an artifact of the old 8-rows/block layout, not intrinsic.
+> On the RTX 3090 at real Qwen decode this fix is net-neutral for q4 (its win was
+> mostly absorbed by the same fix applied to the bf16-row path); see the M9
+> decode-speed history. The analysis above is the 2026-07-04 point-in-time record.
+
 ### WSL2 sysmem-fallback cliff — root cause of the long-run bench slowdown (2026-07-04)
 
 `bench_llm` (array `eval()`) is clean at the M9 length but, once an int4 section
