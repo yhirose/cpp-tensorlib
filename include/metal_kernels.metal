@@ -31,6 +31,38 @@ EW_BINARY(add_, a[i] + b[i])
 EW_BINARY(sub_, a[i] - b[i])
 EW_BINARY(mul_, a[i] * b[i])
 EW_BINARY(div_, a[i] / b[i])
+EW_BINARY(pow_, pow(a[i], b[i]))
+
+// Rank-2 broadcast binary: out[r,c] = f(a[r*ars + c*acs], b[r*brs + c*bcs]).
+// Per-operand strides express every rank-2 broadcast (row vector, column
+// vector, scalar) in one kernel, so bias/gamma/beta ops stay on the GPU
+// instead of falling back to the CPU mid-graph (each fallback costs a full
+// pipeline flush). Output is contiguous row-major [M, N].
+struct ew_bcast_params {
+  float scale;
+  float offset;
+  uint M;
+  uint N;
+  uint ars, acs, brs, bcs;
+};
+
+#define EW_BCAST(name, expr)                                     \
+  kernel void name(device const float* a [[buffer(0)]],          \
+                   device const float* b [[buffer(1)]],          \
+                   device float* out [[buffer(2)]],              \
+                   constant ew_bcast_params& p [[buffer(3)]],    \
+                   uint2 g [[thread_position_in_grid]]) {        \
+    if (g.x >= p.N || g.y >= p.M) return;                        \
+    float av = a[g.y * p.ars + g.x * p.acs];                     \
+    float bv = b[g.y * p.brs + g.x * p.bcs];                     \
+    out[g.y * p.N + g.x] = fma(expr, p.scale, p.offset);         \
+  }
+
+EW_BCAST(badd_, av + bv)
+EW_BCAST(bsub_, av - bv)
+EW_BCAST(bmul_, av * bv)
+EW_BCAST(bdiv_, av / bv)
+EW_BCAST(bpow_, pow(av, bv))
 
 #define EW_UNARY(name, expr)                                   \
   kernel void name(device const float* a [[buffer(0)]],        \

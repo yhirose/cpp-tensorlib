@@ -672,6 +672,7 @@ inline void sync_to_host(void* native, bool for_write) {
 // out = (a OP b) * scale + offset, contiguous; offsets in bytes.
 inline bool binary(kop op, void* a, int64_t ao, void* b, int64_t bo, void* out,
                    int64_t oo, int64_t n, float scale, float offset) {
+  if (op == kop::pow_) return false;  // no CUDA pow kernel yet — CPU fallback
   auto& c = context::get();
   if (!c.ready) return false;
   c.device_read_(a);
@@ -683,6 +684,14 @@ inline bool binary(kop op, void* a, int64_t ao, void* b, int64_t bo, void* out,
   unsigned un = static_cast<unsigned>(n);
   void* args[] = {&pa, &pb, &po, &un, &scale, &offset};
   return c.launch1d_(c.fn_(op), un, args);
+}
+
+// Rank-2 broadcast binary — no CUDA kernel yet; false sends the evaluator
+// down the CPU fallback, matching pre-bcast behavior on this backend.
+inline bool binary_bcast(kop, void*, int64_t, int64_t, int64_t, void*, int64_t,
+                         int64_t, int64_t, void*, int64_t, int64_t, int64_t,
+                         float, float) {
+  return false;
 }
 
 inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo, int64_t n,
@@ -1350,6 +1359,11 @@ inline void* alloc(int64_t, float**) { return nullptr; }
 inline void release(void*, int64_t, float*) {}
 inline bool binary(kop, void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
                    float, float) {
+  return false;
+}
+inline bool binary_bcast(kop, void*, int64_t, int64_t, int64_t, void*, int64_t,
+                         int64_t, int64_t, void*, int64_t, int64_t, int64_t,
+                         float, float) {
   return false;
 }
 inline bool unary(kop, void*, int64_t, void*, int64_t, int64_t, float, float) {

@@ -1385,6 +1385,7 @@ struct graph {
       case op_t::sub: return gpu::kop::sub;
       case op_t::mul: return gpu::kop::mul;
       case op_t::div: return gpu::kop::div;
+      case op_t::pow_: return gpu::kop::pow_;
       case op_t::exp_: return gpu::kop::exp_;
       case op_t::log_: return gpu::kop::log_;
       case op_t::sqrt_: return gpu::kop::sqrt_;
@@ -1394,19 +1395,53 @@ struct graph {
     }
   }
 
+  // Broadcast (strided) variant of a binary kop; nullopt when the op has no
+  // broadcast kernel.
+  static std::optional<gpu::kop> to_bcast_kop_(op_t op) {
+    switch (op) {
+      case op_t::add: return gpu::kop::badd;
+      case op_t::sub: return gpu::kop::bsub;
+      case op_t::mul: return gpu::kop::bmul;
+      case op_t::div: return gpu::kop::bdiv;
+      case op_t::pow_: return gpu::kop::bpow;
+      default: return std::nullopt;
+    }
+  }
+
   static std::optional<array> gpu_binary(const node& n, const array& a,
                                            const array& b) {
-    if (!gpu_mode_(num_elements(n.shape), kernel_class::elementwise) ||
-        !a.contiguous() || !b.contiguous() || a.shape() != b.shape()) {
+    if (!gpu_mode_(num_elements(n.shape), kernel_class::elementwise)) {
       return std::nullopt;
     }
     if (!a.storage_.native || !b.storage_.native) return std::nullopt;
+    if (a.contiguous() && b.contiguous() && a.shape() == b.shape()) {
+      auto out = array::empty(n.shape);
+      if (out.size() == 0) return out;
+      if (!out.storage_.native) return std::nullopt;
+      if (!gpu::binary(to_kop_(n.op), a.storage_.native, a.offset_ * 4,
+                         b.storage_.native, b.offset_ * 4, out.storage_.native,
+                         out.offset_ * 4, out.size(), n.scale, n.offset)) {
+        return std::nullopt;
+      }
+      return out;
+    }
+    // Rank-2 broadcast (bias / row vector / column vector / scalar): one
+    // stride-parameterized kernel keeps the op on the GPU — a CPU fallback
+    // here drains the whole pending pipeline (commit + wait) mid-graph.
+    if (n.shape.size() != 2 || !a.contiguous() || !b.contiguous()) {
+      return std::nullopt;
+    }
+    auto k = to_bcast_kop_(n.op);
+    if (!k) return std::nullopt;
+    auto ra = broadcast_strides(a.shape(), a.strides(), n.shape);
+    auto rb = broadcast_strides(b.shape(), b.strides(), n.shape);
     auto out = array::empty(n.shape);
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
-    if (!gpu::binary(to_kop_(n.op), a.storage_.native, a.offset_ * 4,
-                       b.storage_.native, b.offset_ * 4, out.storage_.native,
-                       out.offset_ * 4, out.size(), n.scale, n.offset)) {
+    if (!gpu::binary_bcast(*k, a.storage_.native, a.offset_ * 4, ra[0], ra[1],
+                           b.storage_.native, b.offset_ * 4, rb[0], rb[1],
+                           out.storage_.native, out.offset_ * 4, n.shape[0],
+                           n.shape[1], n.scale, n.offset)) {
       return std::nullopt;
     }
     return out;
@@ -1896,10 +1931,17 @@ struct graph {
         }
         break;
       }
-      case op_t::pow_:
-        r = map_binary(in(0), in(1),
-                       [](float x, float y) { return std::pow(x, y); });
+      case op_t::pow_: {
+        auto a = in(0), b = in(1);
+        if (auto g = gpu_binary(n, a, b)) {
+          r = std::move(*g);
+          epi_done = true;  // kernel applies the epilogue in the store
+        } else {
+          r = map_binary(a, b,
+                         [](float x, float y) { return std::pow(x, y); });
+        }
         break;
+      }
       case op_t::gt:
         r = map_binary(in(0), in(1),
                        [](float x, float y) { return x > y ? 1.0f : 0.0f; });
@@ -2056,9 +2098,24 @@ struct graph {
                                  : ref::max(a, n.axis, n.keepdims);
         break;
       }
-      case op_t::mean_ax:
-        r = ref::mean(in(0), n.axis, n.keepdims);
+      case op_t::mean_ax: {
+        // Last-axis mean lowers to the row_sum kernel with 1/cols folded into
+        // the epilogue scale — no dedicated kernel, and no CPU fallback that
+        // would drain the GPU pipeline mid-graph (layer-norm's op mix).
+        auto a = in(0);
+        if (n.axis == static_cast<int>(a.rank()) - 1 &&
+            a.shape().back() > 0) {
+          float inv = 1.0f / static_cast<float>(a.shape().back());
+          if (auto g = gpu_row(gpu::kop::row_sum, a, n.shape, true,
+                               n.scale * inv, n.offset)) {
+            r = std::move(*g);
+            epi_done = true;
+            break;
+          }
+        }
+        r = ref::mean(a, n.axis, n.keepdims);
         break;
+      }
       case op_t::argmax_ax:
         r = ref::argmax(in(0), n.axis, n.keepdims);
         break;

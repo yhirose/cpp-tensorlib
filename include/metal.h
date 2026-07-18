@@ -39,7 +39,8 @@ namespace tl {
 namespace metal {
 
 enum class kop {
-  add, sub, mul, div, exp_, log_, sqrt_, sigmoid, relu, affine,
+  add, sub, mul, div, pow_, exp_, log_, sqrt_, sigmoid, relu, affine,
+  badd, bsub, bmul, bdiv, bpow,  // rank-2 broadcast binary (strided operands)
   sgemm32, sgemm32x64, sgemm64x32, sgemm64, steel, steel32x64,
   softmax, row_sum, row_max
 };
@@ -86,6 +87,12 @@ struct context {
       case kop::sub: return "sub_";
       case kop::mul: return "mul_";
       case kop::div: return "div_";
+      case kop::pow_: return "pow_";
+      case kop::badd: return "badd_";
+      case kop::bsub: return "bsub_";
+      case kop::bmul: return "bmul_";
+      case kop::bdiv: return "bdiv_";
+      case kop::bpow: return "bpow_";
       case kop::exp_: return "exp_";
       case kop::log_: return "log_";
       case kop::sqrt_: return "sqrt_";
@@ -243,6 +250,55 @@ inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo,
 }
 
 namespace detail_ {
+struct ew_bcast_params {
+  float scale;
+  float offset;
+  uint32_t M, N;
+  uint32_t ars, acs, brs, bcs;  // per-operand row/col strides (elements)
+};
+}  // namespace detail_
+
+// Rank-2 broadcast binary: out[r,c] = f(a[r*ars+c*acs], b[r*brs+c*bcs]) into a
+// contiguous [M,N] output. One kernel covers every rank-2 broadcast (row
+// vector, column vector, per-row scalar), keeping bias/gamma/beta chains on
+// the GPU instead of a CPU fallback that drains the pipeline. Encodes without
+// committing, like binary().
+inline bool binary_bcast(kop op, void* a, int64_t ao, int64_t ars, int64_t acs,
+                         void* b, int64_t bo, int64_t brs, int64_t bcs,
+                         void* out, int64_t oo, int64_t m, int64_t n,
+                         float scale, float offset) {
+  auto& c = context::get();
+  if (!c.device) return false;
+  auto pso = c.pso_(op);
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  objc::send(c.enc, "setBuffer:offset:atIndex:", a,
+             static_cast<unsigned long>(ao), 0ul);
+  objc::send(c.enc, "setBuffer:offset:atIndex:", b,
+             static_cast<unsigned long>(bo), 1ul);
+  objc::send(c.enc, "setBuffer:offset:atIndex:", out,
+             static_cast<unsigned long>(oo), 2ul);
+  detail_::ew_bcast_params p{
+      scale,
+      offset,
+      static_cast<uint32_t>(m),
+      static_cast<uint32_t>(n),
+      static_cast<uint32_t>(ars),
+      static_cast<uint32_t>(acs),
+      static_cast<uint32_t>(brs),
+      static_cast<uint32_t>(bcs)};
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), 3ul);
+  using fn = void (*)(objc::id, objc::sel_t, mtl_size, mtl_size);
+  reinterpret_cast<fn>(objc_msgSend)(
+      c.enc, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"),
+      mtl_size{(static_cast<unsigned long>(n) + 31ul) / 32ul,
+               (static_cast<unsigned long>(m) + 7ul) / 8ul, 1},
+      mtl_size{32, 8, 1});
+  return true;
+}
+
+namespace detail_ {
 
 struct gemm_params {
   uint32_t M, N, K, lda, ldb, trans_a, trans_b;
@@ -374,6 +430,11 @@ inline void* alloc(int64_t, float**) { return nullptr; }
 inline void release(void*, int64_t, float*) {}
 inline bool binary(kop, void*, int64_t, void*, int64_t, void*, int64_t,
                    int64_t, float, float) {
+  return false;
+}
+inline bool binary_bcast(kop, void*, int64_t, int64_t, int64_t, void*, int64_t,
+                         int64_t, int64_t, void*, int64_t, int64_t, int64_t,
+                         float, float) {
   return false;
 }
 inline bool unary(kop, void*, int64_t, void*, int64_t, int64_t, float, float) {

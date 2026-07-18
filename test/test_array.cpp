@@ -373,6 +373,44 @@ TEST_CASE("metal backend matches the ref oracle") {
   }
 }
 
+TEST_CASE("metal broadcast / pow / mean kernels match oracle") {
+  // The rank-2 broadcast kernel (badd_..bpow_), the flat pow_ kernel, and the
+  // mean->row_sum lowering keep bias/gamma/layer-norm chains on the GPU. Odd
+  // sizes exercise the 32x8 threadgroup edge tiles.
+  auto m = random_array({33, 17}, 31);
+  auto row = random_array({1, 17}, 32);   // gamma/beta-style row vector
+  auto col = random_array({33, 1}, 33);   // bias/rowmax-style column vector
+  auto one = random_array({1, 1}, 34);    // scalar
+
+  CHECK(matches_gpu_oracle([&] { return m + row; }));
+  CHECK(matches_gpu_oracle([&] { return m - col; }));
+  CHECK(matches_gpu_oracle([&] { return m * row; }));
+  CHECK(matches_gpu_oracle([&] { return m / (col * col + 1.0f); }));
+  CHECK(matches_gpu_oracle([&] { return col + m; }));   // broadcast on the left
+  CHECK(matches_gpu_oracle([&] { return m + one; }));
+  CHECK(matches_gpu_oracle([&] { return (m + row) * 2.0f - 1.0f; }));  // epilogue
+
+  // pow: same-shape (flat kernel) and broadcast exponent
+  auto e = random_array({33, 17}, 35);
+  CHECK(matches_gpu_oracle([&] { return tl::pow(m * m + 1.0f, e); }));
+  CHECK(matches_gpu_oracle([&] { return tl::pow(m * m + 1.0f, -0.5f); }));
+
+  // mean over the last axis lowers to row_sum * (1/cols) in the kernel
+  CHECK(matches_gpu_oracle([&] { return m.mean(1, true); }));
+  CHECK(matches_gpu_oracle([&] { return m.mean(1); }));
+  CHECK(matches_gpu_oracle([&] { return m.mean(1, true) * 3.0f + 1.0f; }));
+
+  // layer-norm-shaped chain: the op mix that used to ping-pong CPU<->GPU
+  auto gamma = random_array({1, 17}, 36);
+  auto beta = random_array({1, 17}, 37);
+  CHECK(matches_gpu_oracle([&] {
+    auto mu = m.mean(1, true);
+    auto d = m - mu;
+    auto var = (d * d).mean(1, true);
+    return d * tl::pow(var + 1e-5f, -0.5f) * gamma + beta;
+  }));
+}
+
 TEST_CASE("metal SGEMM / softmax / reductions match oracle") {
   if (!tl::gpu_available()) return;
 
