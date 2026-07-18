@@ -482,25 +482,33 @@ __global__ void tl_gemv_bf16v8(const float* __restrict__ a,
 }
 
 // Warp-per-row bf16 GEMV (M9 decode lever A): weights in [N,K] (K contiguous per
-// output row = GGML-native, so the loader drops the transpose). One WARP per
-// output row n; its 32 lanes split K, each lane consuming 8 bf16 per step via one
-// 16-byte uint4 load — consecutive lanes read consecutive 16B, so the warp issues
-// one coalesced 512-byte transaction — MAC into an F32 accumulator, then warp-
-// shuffle-reduce and a single store. NO split-K, so NO MemsetD8Async prezero and
-// NO atomicAdd combine: one launch, one grid. This targets the small-N Qwen decode
-// gemvs (wk/wo/QKV.fused), where split-K's per-launch floor (memset op + atomic
-// tail + underfilled grid) dominates the tiny byte count. Requires K % 8 == 0
-// (every transformer dim); the last partial 256-block is handled by the per-lane
-// k0 < K guard (tail lanes simply skip — no K % 256 requirement like q4).
+// output row = GGML-native, so the loader drops the transpose). ONE BLOCK per
+// output row n (grid.x == N); its threads split K, each lane consuming 8 bf16
+// per step via one 16-byte uint4 load — consecutive lanes read consecutive 16B,
+// so each warp issues one coalesced 512-byte transaction — MAC into an F32
+// accumulator, warp-shuffle-reduce, then (when the block has >1 warp) a shared-
+// mem cross-warp reduce. NO split-K, so NO MemsetD8Async prezero and NO
+// atomicAdd combine: one launch, one grid.
+//
+// Block size is chosen host-side per K (gemv_row_block_size, 32..256 threads —
+// llama.cpp's mul_mat_vec_f strategy) so a wide row (large K) gets more warps
+// collaborating on the reduction, while grid.x == N (not N/8 as the earlier
+// 8-rows/block packing did) so small-N shapes (e.g. Qwen wk/wv, N=128) still
+// get one block per SM instead of leaving most of the GPU idle. Requires
+// K % 8 == 0 (every transformer dim); the last partial block is handled by the
+// per-thread k0 < K guard (tail threads simply skip — no K % 256 requirement).
 __global__ void tl_gemv_bf16_row(const float* __restrict__ a,
                                  const __nv_bfloat16* __restrict__ B,
                                  float* __restrict__ y, unsigned N, unsigned K) {
-  const unsigned n = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const unsigned lane = threadIdx.x & 31u;
+  const unsigned n = blockIdx.x;
   if (n >= N) return;
+  const unsigned tid = threadIdx.x;
+  const unsigned lane = tid & 31u;
+  const unsigned warp_id = tid >> 5;
+  const unsigned nwarps = blockDim.x >> 5;
   const __nv_bfloat16* row = B + (size_t)n * K;
   float acc = 0.0f;
-  for (unsigned k0 = lane * 8u; k0 < K; k0 += 256u) {
+  for (unsigned k0 = tid * 8u; k0 < K; k0 += blockDim.x * 8u) {
     uint4 raw = *reinterpret_cast<const uint4*>(&row[k0]);
     float2 f0 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.x));
     float2 f1 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.y));
@@ -513,7 +521,20 @@ __global__ void tl_gemv_bf16_row(const float* __restrict__ a,
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1)
     acc += __shfl_down_sync(0xffffffffu, acc, off);
-  if (lane == 0) y[n] = acc;
+  if (nwarps == 1) {
+    if (lane == 0) y[n] = acc;
+    return;
+  }
+  extern __shared__ float gemv_row_sdata[];
+  if (lane == 0) gemv_row_sdata[warp_id] = acc;
+  __syncthreads();
+  if (warp_id == 0) {
+    acc = (lane < nwarps) ? gemv_row_sdata[lane] : 0.0f;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) y[n] = acc;
+  }
 }
 
 // ---- M8 int4-weight decode GEMV: y[n] = sum_k a[k] * dequant(Wq[n,k]) ----

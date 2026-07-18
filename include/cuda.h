@@ -730,10 +730,25 @@ inline bool gemv_bf16(void* a, void* B, void* y, int64_t n, int64_t k) {
                    v8 ? 8u : 1u);
 }
 
+// Block size (32..256 threads) for tl_gemv_bf16_row, chosen per K to minimize
+// the per-thread iteration count (llama.cpp's mul_mat_vec_f strategy) — a wide
+// row (large K) gets more warps collaborating on the reduction. Ties keep the
+// smaller block size.
+inline unsigned gemv_row_block_size(int64_t k) {
+  unsigned best = 32;
+  int64_t niter_best = (k + 8 * 32 - 1) / (8 * 32);
+  for (unsigned bs = 64; bs <= 256; bs += 32) {
+    int64_t niter = (k + 8 * (int64_t)bs - 1) / (8 * (int64_t)bs);
+    if (niter < niter_best) { niter_best = niter; best = bs; }
+  }
+  return best;
+}
+
 // Warp-per-row bf16 decode GEMV (lever A): y(N) = a(1,K) @ W[N,K], W row-major
-// (K contiguous per output row). One warp/output row, no split-K — no memset, no
-// atomic combine. The small-N floor-bound lever; see tl_gemv_bf16_row. Requires
-// K % 8 == 0 (host-gated; caller falls back to the split-K [K,N] path otherwise).
+// (K contiguous per output row). ONE BLOCK per output row (grid.x == N), no
+// split-K — no memset, no atomic combine. The small-N floor-bound lever; see
+// tl_gemv_bf16_row. Requires K % 8 == 0 (host-gated; caller falls back to the
+// split-K [K,N] path otherwise).
 inline bool gemv_bf16_row(void* a, void* B, void* y, int64_t n, int64_t k) {
   auto& c = context::get();
   if (!c.ready || (k % 8) != 0) return false;
@@ -745,10 +760,11 @@ inline bool gemv_bf16_row(void* a, void* B, void* y, int64_t n, int64_t k) {
   float* py = context::off_(y, 0);
   unsigned uN = static_cast<unsigned>(n), uK = static_cast<unsigned>(k);
   void* args[] = {&pa, &pB, &py, &uN, &uK};
-  unsigned grid = static_cast<unsigned>((n + 7) / 8);  // 8 warps/block, 1 row/warp
+  unsigned block = gemv_row_block_size(k);
+  unsigned smem = block > 32 ? (block >> 5) * sizeof(float) : 0u;
   c.pending = true;
-  return c.d.LaunchKernel(c.gemv_bf16_row_(), grid, 1, 1, 256, 1, 1, 0, c.stream,
-                          args, nullptr) == 0;
+  return c.d.LaunchKernel(c.gemv_bf16_row_(), uN, 1, 1, block, 1, 1, smem,
+                          c.stream, args, nullptr) == 0;
 }
 
 // M8 int4-weight decode GEMV: y(N) = a(1,K) @ dequant(Wq[N,K]), F32 accumulate.
