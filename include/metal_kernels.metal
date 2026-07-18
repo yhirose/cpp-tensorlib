@@ -238,8 +238,9 @@ TL_SGEMM_KERNEL(sgemm_64_, 64, 64, 16)
 
 // ---------------------------------------------------------------------------
 // STEEL SGEMM (ported from silarray, which ported it from MLX — proven at
-// MLX parity on this machine class). NN operands only; transposed views fall
-// back to the sgemm_32/64x32 family. Differences from the simple tile above
+// MLX parity on this machine class). Covers NN plus single-transposed
+// operands (_ta_/_tb_ via the transposing loader); only TT falls back to
+// the sgemm_32/64x32 family. Differences from the simple tile above
 // that make 16 accumulators per simdgroup work (the naive 64×64 collapses):
 // explicit float2 fragment registers (frag_type) instead of full
 // simdgroup_matrix locals, loader pointers precomputed once (no div/mod in
@@ -349,6 +350,90 @@ struct SteelLoader {
 
   METAL_FUNC void next() { src += tile_stride; }
 };
+
+// Transposing BlockLoader (silarray port) — reads a BROWS x BCOLS tile of the
+// SOURCE (vectorized along its contiguous BCOLS dim) and stores it TRANSPOSED
+// into threadgroup memory, so the MMA keeps its NN layout while the device
+// operand stays in its original (transposed-view) storage. Thread mapping is
+// bi = idx % BROWS (one src row per thread): consecutive lanes scatter to
+// consecutive threadgroup banks, keeping the transposed stores at worst
+// 2-way bank-conflicted. All instantiations cover the tile in one pass.
+template <short BROWS, short BCOLS, short dst_ld, short reduction_dim, short tgp_size>
+struct SteelLoaderT {
+  STEEL_CONST short vec_size = (BCOLS * BROWS) / tgp_size;
+  static_assert(BCOLS == vec_size * (tgp_size / BROWS),
+                "SteelLoaderT: tile must be covered in one pass");
+
+  const int src_ld;
+  const int tile_stride;
+  const short bi;
+  const short bj;
+  threadgroup float* dst;
+  const device float* src;
+
+  struct alignas(16) ReadVec { float v[vec_size]; };
+
+  METAL_FUNC SteelLoaderT(const device float* src_, int src_ld_,
+                          threadgroup float* dst_, ushort sid, ushort lane)
+      : src_ld(src_ld_),
+        tile_stride(reduction_dim ? BCOLS : BROWS * src_ld_),
+        bi(short(sid * 32 + lane) % BROWS),
+        bj(vec_size * (short(sid * 32 + lane) / BROWS)),
+        dst(dst_ + bj * dst_ld + bi),
+        src(src_ + bi * src_ld_ + bj) {}
+
+  METAL_FUNC void load_unsafe() const {
+    ReadVec v = *((const device ReadVec*)(&src[0]));
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < vec_size; j++) dst[j * dst_ld] = v.v[j];
+  }
+
+  // tile_dim is in SOURCE coordinates (x = cols, y = rows), matching
+  // SteelLoader::load_safe.
+  METAL_FUNC void load_safe(short2 tile_dim) const {
+    tile_dim -= short2(bj, bi);
+    if (tile_dim.x <= 0 || tile_dim.y <= 0) {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < vec_size; j++) dst[j * dst_ld] = 0.0f;
+      return;
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < vec_size; j++) {
+      bool valid = (j < tile_dim.x);
+      dst[j * dst_ld] = valid ? src[valid ? j : 0] : 0.0f;
+    }
+  }
+
+  // Row-clipped (trailing SOURCE rows out of bounds, all columns valid).
+  METAL_FUNC void load_safe_rows(short valid_rows) const {
+    if (bi < valid_rows) {
+      load_unsafe();
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < vec_size; j++) dst[j * dst_ld] = 0.0f;
+    }
+  }
+
+  // Column-clipped (trailing SOURCE cols out of bounds, all rows valid).
+  METAL_FUNC void load_safe_cols(short valid_cols) const {
+    valid_cols -= bj;
+    if (valid_cols >= vec_size) {
+      load_unsafe();
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < vec_size; j++)
+        dst[j * dst_ld] = j < valid_cols ? src[j] : 0.0f;
+    }
+  }
+
+  METAL_FUNC void next() { src += tile_stride; }
+};
+
+// Compile-time type selection (MSL has no <type_traits>)
+template <bool C, typename Then, typename Else>
+struct select_type { using type = Then; };
+template <typename Then, typename Else>
+struct select_type<false, Then, Else> { using type = Else; };
 
 template <short BM, short BN, short BK, short WM, short WN,
           short lda_tgp, short ldb_tgp>
@@ -490,8 +575,10 @@ struct SteelMMA {
 
 // Unified STEEL body — BN = 64, WM = WN = 2; BM ∈ {64, 32}. gemm_params
 // reuse: `a_fast` carries swizzle_log for STEEL dispatches (32-family
-// ignores swizzle; STEEL ignores the fast flags).
-template <short BM>
+// ignores swizzle; STEEL ignores the fast flags). TA/TB select the
+// transposing loader for an operand whose device storage is a transposed
+// view (backward-pass matmuls, attention's Q·Kᵀ) — the MMA stays NN.
+template <short BM, bool TA = false, bool TB = false>
 void steel_body_(device const float* A, device const float* B,
                  device float* C, constant gemm_params& p,
                  threadgroup float* As, threadgroup float* Bs,
@@ -507,14 +594,16 @@ void steel_body_(device const float* A, device const float* B,
   if (tid_x >= tiles_n || tid_y >= tiles_m) return;
 
   short row0 = tid_y * BM, col0 = tid_x * BN;
-  A += row0 * int(p.lda);
-  B += int(col0);
+  A += TA ? int(row0) : row0 * int(p.lda);
+  B += TB ? col0 * int(p.ldb) : int(col0);
 
   constexpr short lda_nn = BK + pad, ldb_nn = BN + pad;
-  SteelLoader<BM, BK, lda_nn, true, tgp_size> loader_a(A, int(p.lda), As, sid,
-                                                       ushort(lane));
-  SteelLoader<BK, BN, ldb_nn, false, tgp_size> loader_b(B, int(p.ldb), Bs, sid,
-                                                        ushort(lane));
+  typename select_type<TA, SteelLoaderT<BK, BM, lda_nn, false, tgp_size>,
+                       SteelLoader<BM, BK, lda_nn, true, tgp_size>>::type
+      loader_a(A, int(p.lda), As, sid, ushort(lane));
+  typename select_type<TB, SteelLoaderT<BN, BK, ldb_nn, true, tgp_size>,
+                       SteelLoader<BK, BN, ldb_nn, false, tgp_size>>::type
+      loader_b(B, int(p.ldb), Bs, sid, ushort(lane));
   SteelMMA<BM, BN, BK, WM, WN, lda_nn, ldb_nn> mma_op(sid, lane);
 
   int k_iters = int(p.K / BK);
@@ -530,8 +619,9 @@ void steel_body_(device const float* A, device const float* B,
     loader_a.src += k_jump_a;
     loader_b.src += k_jump_b;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    loader_a.load_safe(short2(lbk, tgp_bm));
-    loader_b.load_safe(short2(tgp_bn, lbk));
+    // load_safe takes SOURCE-coordinate extents (x = cols, y = rows)
+    loader_a.load_safe(TA ? short2(tgp_bm, lbk) : short2(lbk, tgp_bm));
+    loader_b.load_safe(TB ? short2(lbk, tgp_bn) : short2(tgp_bn, lbk));
     threadgroup_barrier(mem_flags::mem_threadgroup);
     mma_op.mma(As, Bs);
     loader_a.src -= k_jump_a;
@@ -553,9 +643,12 @@ void steel_body_(device const float* A, device const float* B,
       loader_b.next();
     }
   } else if (n_full) {
+    // M-edge only: A clips on the logical M extent (source rows when NN,
+    // source cols when TA), B stays on the vectorized load.
     for (int k = 0; k < k_iters; k++) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      loader_a.load_safe_rows(tgp_bm);
+      if (TA) loader_a.load_safe_cols(tgp_bm);
+      else loader_a.load_safe_rows(tgp_bm);
       loader_b.load_unsafe();
       threadgroup_barrier(mem_flags::mem_threadgroup);
       mma_op.mma(As, Bs);
@@ -566,7 +659,8 @@ void steel_body_(device const float* A, device const float* B,
     for (int k = 0; k < k_iters; k++) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
       loader_a.load_unsafe();
-      loader_b.load_safe(short2(tgp_bn, BK));
+      if (TB) loader_b.load_safe_rows(tgp_bn);
+      else loader_b.load_safe(short2(tgp_bn, BK));
       threadgroup_barrier(mem_flags::mem_threadgroup);
       mma_op.template mma<true>(As, Bs);
       loader_a.next();
@@ -575,8 +669,10 @@ void steel_body_(device const float* A, device const float* B,
   } else {
     for (int k = 0; k < k_iters; k++) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      loader_a.load_safe_rows(tgp_bm);
-      loader_b.load_safe_cols(tgp_bn);
+      if (TA) loader_a.load_safe_cols(tgp_bm);
+      else loader_a.load_safe_rows(tgp_bm);
+      if (TB) loader_b.load_safe_rows(tgp_bn);
+      else loader_b.load_safe_cols(tgp_bn);
       threadgroup_barrier(mem_flags::mem_threadgroup);
       mma_op.mma(As, Bs);
       loader_a.next();
@@ -597,7 +693,7 @@ void steel_body_(device const float* A, device const float* B,
   }
 }
 
-#define TL_STEEL_KERNEL(name, BM)                                            \
+#define TL_STEEL_KERNEL(name, BM, TA, TB)                                    \
   kernel void name(device const float* A [[buffer(0)]],                      \
                    device const float* B [[buffer(1)]],                      \
                    device float* C [[buffer(2)]],                            \
@@ -607,11 +703,17 @@ void steel_body_(device const float* A, device const float* B,
                    uint lane [[thread_index_in_simdgroup]]) {                \
     threadgroup float As[BM * 20];                                           \
     threadgroup float Bs[16 * 68];                                           \
-    steel_body_<BM>(A, B, C, p, As, Bs, tgid, sid, lane);                    \
+    steel_body_<BM, TA, TB>(A, B, C, p, As, Bs, tgid, sid, lane);            \
   }
 
-TL_STEEL_KERNEL(sgemm_steel_, 64)
-TL_STEEL_KERNEL(sgemm_steel_32x64_, 32)
+TL_STEEL_KERNEL(sgemm_steel_, 64, false, false)
+TL_STEEL_KERNEL(sgemm_steel_32x64_, 32, false, false)
+// Transposed-operand variants: _ta_ reads A's transposed view in place
+// (dW = xᵀ @ g), _tb_ reads B's (dx = g @ Wᵀ, attention's Q·Kᵀ).
+TL_STEEL_KERNEL(sgemm_steel_ta_, 64, true, false)
+TL_STEEL_KERNEL(sgemm_steel_tb_, 64, false, true)
+TL_STEEL_KERNEL(sgemm_steel_32x64_ta_, 32, true, false)
+TL_STEEL_KERNEL(sgemm_steel_32x64_tb_, 32, false, true)
 
 
 // ---------------------------------------------------------------------------

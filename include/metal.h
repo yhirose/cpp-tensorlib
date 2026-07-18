@@ -41,7 +41,8 @@ namespace metal {
 enum class kop {
   add, sub, mul, div, pow_, exp_, log_, sqrt_, sigmoid, relu, affine,
   badd, bsub, bmul, bdiv, bpow,  // rank-2 broadcast binary (strided operands)
-  sgemm32, sgemm32x64, sgemm64x32, sgemm64, steel, steel32x64,
+  sgemm32, sgemm32x64, sgemm64x32, sgemm64,
+  steel, steel32x64, steel_ta, steel_tb, steel32x64_ta, steel32x64_tb,
   softmax, row_sum, row_max
 };
 
@@ -105,6 +106,10 @@ struct context {
       case kop::sgemm64: return "sgemm_64_";
       case kop::steel: return "sgemm_steel_";
       case kop::steel32x64: return "sgemm_steel_32x64_";
+      case kop::steel_ta: return "sgemm_steel_ta_";
+      case kop::steel_tb: return "sgemm_steel_tb_";
+      case kop::steel32x64_ta: return "sgemm_steel_32x64_ta_";
+      case kop::steel32x64_tb: return "sgemm_steel_32x64_tb_";
       case kop::softmax: return "softmax_";
       case kop::row_sum: return "row_sum_";
       case kop::row_max: return "row_max_";
@@ -333,18 +338,21 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b,
                  int64_t m, int64_t n, int64_t k, float scale, float offset) {
   auto& c = context::get();
   if (!c.device) return false;
-  // Dispatch ladder. STEEL (BN=64 bands) covers NN shapes with enough width;
-  // BM band follows silarray (M < 97 → 32×64 tiles). Transposed or narrow
+  // Dispatch ladder. STEEL (BN=64 bands) covers NN and single-transposed
+  // shapes with enough width (the transposing loader reads the view in
+  // place); BM band follows silarray (M < 97 → 32×64 tiles). TT or narrow
   // shapes take the simple-tile family, which reads transposed views in
   // place. Gates are provisional pending a full census vs PyTorch-MPS.
-  bool steel = !ta && !tb && m >= 16 && n >= 48 && k >= 16;
+  bool steel = !(ta && tb) && m >= 16 && n >= 48 && k >= 16;
   kop kk_;
   unsigned long bm, bn;
   uint32_t fast_a, fast_b;  // STEEL reuses the a_fast slot for swizzle_log
   unsigned long gx, gy;
   if (steel) {
     bool band32 = m < 97;
-    kk_ = band32 ? kop::steel32x64 : kop::steel;
+    kk_ = band32 ? (ta ? kop::steel32x64_ta
+                       : tb ? kop::steel32x64_tb : kop::steel32x64)
+                 : (ta ? kop::steel_ta : tb ? kop::steel_tb : kop::steel);
     bm = band32 ? 32 : 64;
     bn = 64;
     unsigned long tiles_n = (static_cast<unsigned long>(n) + bn - 1) / bn;

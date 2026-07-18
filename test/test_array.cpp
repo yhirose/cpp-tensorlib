@@ -439,6 +439,23 @@ TEST_CASE("metal SGEMM / softmax / reductions match oracle") {
   CHECK(matches_gpu_oracle([&] { return p.dot(rr.transpose().transpose()); }, 2e-3f, 2e-4f));
   CHECK(matches_gpu_oracle([&] { return q.dot(rr.transpose()); }, 2e-3f, 2e-4f));
 
+  // STEEL transposed-operand band (_ta_/_tb_ transposing loaders): aligned,
+  // M/N edges, K remainder, both BM bands (m < 97 → 32×64). TT falls back
+  // to the simple-tile family — covered as the third form.
+  struct { int64_t m, k, n; } tshapes[] = {
+      {128, 64, 128}, {70, 30, 100}, {97, 33, 65}, {16, 16, 48}, {33, 128, 64},
+  };
+  for (auto s : tshapes) {
+    auto at = random_array({s.k, s.m}, seed++);  // A stored transposed
+    auto b2 = random_array({s.k, s.n}, seed++);
+    auto a2 = random_array({s.m, s.k}, seed++);
+    auto bt = random_array({s.n, s.k}, seed++);  // B stored transposed
+    CHECK(matches_gpu_oracle([&] { return at.transpose().dot(b2); }, 2e-3f, 2e-4f));
+    CHECK(matches_gpu_oracle([&] { return a2.dot(bt.transpose()); }, 2e-3f, 2e-4f));
+    CHECK(matches_gpu_oracle([&] { return at.transpose().dot(bt.transpose()); },
+                             2e-3f, 2e-4f));
+  }
+
   // softmax over the last axis, incl. wide rows (cols > threadgroup width)
   for (int64_t cols : {1, 10, 63, 256, 1000}) {
     auto x = random_array({7, cols}, 70 + static_cast<int>(cols));
