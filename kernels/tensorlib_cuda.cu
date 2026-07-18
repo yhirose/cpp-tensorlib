@@ -1069,10 +1069,8 @@ __global__ void tl_rope_dpos(const float* __restrict__ x,
   rope_core(x, bias, out, T, D, *d_pos, base);
 }
 
-// One-thread device-scalar increment: *p += 1. Bumps the shared decode pos
-// counter at the tail of a captured forward so each replay advances it.
-__global__ void tl_incr_u32(unsigned* p) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) ++*p;
-}
+// Device-scalar increment: *p += 1. Bumps the shared decode pos counter at the
+// tail of a captured forward so each replay advances it. Launched <<<1,1>>>.
+__global__ void tl_incr_u32(unsigned* p) { ++*p; }
 
 }  // extern "C"

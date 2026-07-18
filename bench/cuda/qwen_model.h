@@ -195,8 +195,10 @@ struct Scratch {
   void* logitsb = nullptr;            // [VOCAB]
   float* logits_host = nullptr;       // host mirror of logitsb (divergence checks)
   void* embedb = nullptr;             // staged embedding row [NE] (capture input)
+  std::vector<float> embed_host;      // reused host staging buffer for embedb
   bool ready = false;
   void init() {
+    embed_host.resize(NE);
     embedb = tl::cuda::alloc(NE * 4, nullptr);
     res[0] = tl::cuda::alloc(NE * 4, nullptr);
     res[1] = tl::cuda::alloc(NE * 4, nullptr);
@@ -543,10 +545,10 @@ inline const float* imperative_logits(Model& M, int64_t id, int64_t pos) {
 // S.embedb (host gather + blocking upload; marks it device-current). Kept out
 // of the captured region since it involves a host gather + blocking copy.
 inline void stage_embed(Model& M, int64_t id) {
-  std::vector<float> v(NE);
+  float* v = M.scratch.embed_host.data();  // reused buffer (no per-token alloc)
   const uint16_t* r = M.embed_f16 + (size_t)id * NE;
   for (int64_t i = 0; i < NE; i++) v[i] = f16_to_f32(r[i]);
-  tl::cuda::upload(M.scratch.embedb, v.data(), NE);
+  tl::cuda::upload(M.scratch.embedb, v, NE);
 }
 
 // Reset all KV caches to position 0 (replay from a fresh prefill). Used by the
@@ -572,15 +574,17 @@ inline void set_cache_pos(Model& M, int64_t p) {
 // and the caller should use step_imperative instead. f32 KV, S=1 attn (Qwen).
 struct captured_decoder {
   void* d_pos = nullptr;
-  tl::cuda::CUgraphExec exec = nullptr;  // opaque executable-graph handle
-  bool ready = false;
+  tl::cuda::CUgraphExec exec = nullptr;  // opaque handle; non-null == captured
+  int64_t cur_pos = 0, max_ctx = 0;      // capacity bound owned by the mechanism
 
   // Capture the forward at `pos` (the first decode position; == prompt length),
   // priming it with `first_id`'s embedding. Leaves d_pos = pos so the first
   // step() processes position `pos`.
   void init(Model& M, int64_t first_id, int64_t pos) {
     namespace cu = tl::cuda;
-    if (!cu::graph_available()) return;
+    if (!cu::graph_available() || M.layers.empty()) return;
+    max_ctx = M.layers[0].cache.max_ctx;
+    cur_pos = pos;
     d_pos = cu::alloc(4, nullptr);
     if (!d_pos) return;
     stage_embed(M, first_id);
@@ -591,29 +595,31 @@ struct captured_decoder {
     if (!cu::capture_begin()) return;
     run_layers_(M, M.scratch.embedb, pos, d_pos);  // recorded, not executed
     exec = cu::capture_end();
-    ready = exec != nullptr;
   }
 
   // One captured step: feed token `id` at the current device position, replay,
   // GPU-argmax the logits. d_pos auto-advances (captured tl_incr_u32), so the
-  // next step processes pos+1. Returns the greedy next token.
+  // next step processes pos+1. Returns the greedy next token, or -1 once the KV
+  // cache is full (the bound lives here, not on the caller — kv_append_dpos has
+  // no OOB guard, unlike the host append()).
   int64_t step(Model& M, int64_t id) {
     namespace cu = tl::cuda;
+    if (cur_pos >= max_ctx) return -1;
     stage_embed(M, id);       // gather id's row -> S.embedb (host + blocking H2D)
     cu::graph_launch(exec);   // replay: append@d_pos, attn, logits, incr d_pos
     int64_t idx = 0;
     cu::argmax(M.scratch.logitsb, VOCAB, &idx);
+    cur_pos++;
     return idx;
   }
 
-  bool ok() const { return ready; }
+  bool ok() const { return exec != nullptr; }
   void destroy() {
     namespace cu = tl::cuda;
     if (exec) cu::graph_destroy(exec);
     if (d_pos) cu::release(d_pos, 0, nullptr);
     exec = nullptr;
     d_pos = nullptr;
-    ready = false;
   }
 };
 

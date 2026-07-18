@@ -120,165 +120,93 @@ int main(int argc, char** argv) {
   std::printf("  array gpu-argmax   %6.3f ms/tok   %5.1f tok/s\n", gpu_min, 1000.0 / gpu_min);
   std::printf("  imperative         %6.3f ms/tok   %5.1f tok/s\n\n", imp_min, 1000.0 / imp_min);
 
-  // CUDA-graph capture POC (C1-2): capture the imperative forward once at a
-  // fixed pos and replay it. Numerically meaningless (pos is baked), but it
-  // measures the LAUNCH-OVERHEAD CEILING — replay+argmax vs ~19 launches+argmax.
-  namespace cu = tl::cuda;
-  if (!cu::graph_available()) {
-    std::printf("graph POC: CUDA-graph symbols unavailable — skipped\n");
-  } else {
-    qm::stage_embed(M, next);
-    qm::run_layers_(M, M.scratch.embedb, pos);  // warm (grow attn scratch, resident weights)
-    cu::flush();
-    if (!cu::capture_begin()) {
-      std::printf("graph POC: capture_begin failed\n");
-    } else {
-      qm::run_layers_(M, M.scratch.embedb, pos);
-      auto exec = cu::capture_end();
-      if (!exec) {
-        std::printf("graph POC: capture/instantiate failed\n");
-      } else {
-        cu::graph_launch(exec); cu::flush();  // warm the exec
-        double graph_min = 1e9;
-        int64_t idx = 0;
-        for (int r = 0; r < ROUNDS; r++) {
-          auto tb = clk::now();
-          for (int64_t i = 0; i < n_dec; i++) {
-            cu::graph_launch(exec);
-            cu::argmax(M.scratch.logitsb, qm::VOCAB, &idx);
-          }
-          graph_min = std::min(graph_min, ms_since(tb) / n_dec);
-        }
-        std::printf("=== graph-capture CEILING (fixed-pos replay + argmax) ===\n");
-        std::printf("  graph replay       %6.3f ms/tok   %5.1f tok/s   (vs imperative %.1f)\n\n",
-                    graph_min, 1000.0 / graph_min, 1000.0 / imp_min);
-        cu::graph_destroy(exec);
-      }
-    }
-  }
-
   // ---- Correct captured decode (A-min): device-pos so replay advances ----
-  // The fixed-pos POC above is numerically meaningless (pos baked). Here rope /
-  // kv-append / decode-attn read the position from a device u32 (d_pos) and a
-  // tl_incr_u32 at the forward's tail advances it, so ONE instantiated graph
-  // replays correctly as the sequence grows — the real +launch-overhead win.
-  // Guarded first: at a fixed pos the dpos forward must match the host-pos
-  // forward (same kernels/values); then captured and timed.
-  if (cu::graph_available() && !q4on) {
-    void* d_pos = cu::alloc(4, nullptr);
-    if (!d_pos) {
-      std::printf("captured decode: d_pos alloc failed — skipped\n");
-    } else {
-      const int64_t P = pos;
-      qm::stage_embed(M, next);
-      // (1) host-pos reference logits at P
-      qm::set_cache_pos(M, P);
-      qm::run_layers_(M, M.scratch.embedb, P);
-      cu::sync_to_host(M.scratch.logitsb, false);
-      std::vector<float> ref(M.scratch.logits_host,
-                             M.scratch.logits_host + qm::VOCAB);
-      // (2) dpos forward at the same P (writes row P identically); compare
-      qm::set_cache_pos(M, P);
-      cu::upload_u32(d_pos, (unsigned)P);
-      qm::run_layers_(M, M.scratch.embedb, P, d_pos);
-      cu::sync_to_host(M.scratch.logitsb, false);
-      const float* got = M.scratch.logits_host;
-      int mism = 0;
-      double maxrel = 0.0;
-      for (int64_t i = 0; i < qm::VOCAB; i++) {
-        if (ref[i] != got[i]) mism++;
-        double denom = 1.0 + std::fabs((double)ref[i]);
-        maxrel = std::max(maxrel, std::fabs((double)got[i] - ref[i]) / denom);
-      }
-      int64_t ref_arg = qm::argmax(ref);
-      std::printf("dpos-vs-hostpos logits at pos %lld: %d/%d differ, maxrel %.2e "
-                  "%s\n", (long long)P, mism, (int)qm::VOCAB, maxrel,
-                  (maxrel < 1e-5 ? "(OK — lm_head split-K atomicAdd noise)"
-                                 : "(!! dpos error)"));
-
-      // (3) capture the dpos forward and time replay + argmax (min of rounds).
-      qm::set_cache_pos(M, P);
-      cu::upload_u32(d_pos, (unsigned)P);
-      qm::run_layers_(M, M.scratch.embedb, P, d_pos);  // warm; advances d_pos
-      cu::flush();
-      cu::upload_u32(d_pos, (unsigned)P);  // reset after warm
-      if (cu::capture_begin()) {
-        qm::run_layers_(M, M.scratch.embedb, P, d_pos);
-        auto exec = cu::capture_end();
-        if (!exec) {
-          std::printf("captured decode: capture/instantiate failed\n");
-        } else {
-          // Guard: the captured replay must recompute FRESH logits at P (not
-          // replay stale device state) — its argmax must equal the reference.
-          cu::upload_u32(d_pos, (unsigned)P);
-          cu::graph_launch(exec);
-          cu::sync_to_host(M.scratch.logitsb, false);
-          int64_t cap_arg = qm::argmax(std::vector<float>(
-              M.scratch.logits_host, M.scratch.logits_host + qm::VOCAB));
-          std::printf("captured-replay argmax: graph=%lld ref=%lld %s\n",
-                      (long long)cap_arg, (long long)ref_arg,
-                      cap_arg == ref_arg ? "(MATCH)" : "(!! stale/incomplete graph)");
-          cu::graph_launch(exec); cu::flush();  // warm exec
-          // Pure-replay ceiling (no host per token): graph_launch only, one flush
-          // per round. Measures the ABSOLUTE floor a fully-device-resident loop
-          // could reach — the gap to embed+replay+argmax below is the host
-          // round-trip (embed gather+H2D, argmax 4B D2H sync) a device loop erases.
-          double raw_min = 1e9;
-          for (int r = 0; r < ROUNDS; r++) {
-            cu::upload_u32(d_pos, (unsigned)P);
-            cu::flush();
-            auto tb = clk::now();
-            for (int64_t i = 0; i < n_dec; i++) cu::graph_launch(exec);
-            cu::flush();
-            raw_min = std::min(raw_min, ms_since(tb) / n_dec);
-          }
-          // Replay + argmax, NO embed staging: isolates the argmax 4B-D2H-sync
-          // cost from the embed gather+H2D cost (raw..this = argmax; this..full
-          // = embed). Tells us which half a device-resident loop should target.
-          double ra_min = 1e9;
-          {
-            int64_t di = 0;
-            for (int r = 0; r < ROUNDS; r++) {
-              cu::upload_u32(d_pos, (unsigned)P);
-              cu::flush();
-              auto tb = clk::now();
-              for (int64_t i = 0; i < n_dec; i++) {
-                cu::graph_launch(exec);
-                cu::argmax(M.scratch.logitsb, qm::VOCAB, &di);
-              }
-              ra_min = std::min(ra_min, ms_since(tb) / n_dec);
-            }
-          }
-          // End-to-end per token: stage the next embedding (host gather + H2D,
-          // OUTSIDE the graph) + graph_launch + GPU argmax — the same work
-          // step_imperative does, so this is apples-to-apples vs `imperative`.
-          double cap_min = 1e9;
-          int64_t idx = next;
-          for (int r = 0; r < ROUNDS; r++) {
-            cu::upload_u32(d_pos, (unsigned)P);  // bounded ctx per round
-            cu::flush();
-            auto tb = clk::now();
-            for (int64_t i = 0; i < n_dec; i++) {
-              qm::stage_embed(M, idx);  // gather prev token's row -> S.embedb
-              cu::graph_launch(exec);
-              cu::argmax(M.scratch.logitsb, qm::VOCAB, &idx);
-            }
-            cap_min = std::min(cap_min, ms_since(tb) / n_dec);
-          }
-          std::printf("=== correct captured decode (device-pos) ===\n");
-          std::printf("  pure replay only   %6.3f ms/tok   %5.1f tok/s   (ceiling: no host/token)\n",
-                      raw_min, 1000.0 / raw_min);
-          std::printf("  replay+argmax      %6.3f ms/tok   %5.1f tok/s   (+argmax 4B-D2H, no embed)\n",
-                      ra_min, 1000.0 / ra_min);
-          std::printf("  embed+replay+argmax%6.3f ms/tok   %5.1f tok/s   (vs imperative %.1f, +%.0f%%)\n\n",
-                      cap_min, 1000.0 / cap_min, 1000.0 / imp_min,
-                      100.0 * (imp_min / cap_min - 1.0));
-          cu::graph_destroy(exec);
-        }
-      }
-      qm::set_cache_pos(M, pos);  // restore for the census run below
+  // rope / kv-append / decode-attn read the position from a device u32 (d_pos)
+  // and a tl_incr_u32 at the forward's tail advances it, so ONE instantiated
+  // graph replays correctly as the sequence grows — the real +launch-overhead
+  // win, via the SHIPPED qm::captured_decoder (same code chat_qwen uses). Guarded
+  // first (dpos forward == host-pos forward; captured replay is fresh not stale),
+  // then timed in three probes to attribute the per-token host round-trip.
+  namespace cu = tl::cuda;
+  qm::captured_decoder cap;
+  if (cu::graph_available() && !q4on) cap.init(M, next, pos);
+  if (!cap.ok()) {
+    std::printf("captured decode: unavailable (no graph support or q4) — skipped\n");
+  } else {
+    const int64_t P = pos;
+    void* d_pos = cap.d_pos;
+    // (1) host-pos reference logits at P; (2) dpos forward at the same P (writes
+    // row P identically) — the dpos KERNELS must match the host-pos kernels.
+    qm::stage_embed(M, next);
+    qm::set_cache_pos(M, P);
+    qm::run_layers_(M, M.scratch.embedb, P);
+    cu::sync_to_host(M.scratch.logitsb, false);
+    std::vector<float> ref(M.scratch.logits_host, M.scratch.logits_host + qm::VOCAB);
+    qm::set_cache_pos(M, P);
+    cu::upload_u32(d_pos, (unsigned)P);
+    qm::run_layers_(M, M.scratch.embedb, P, d_pos);
+    cu::sync_to_host(M.scratch.logitsb, false);
+    const float* got = M.scratch.logits_host;
+    int mism = 0;
+    double maxrel = 0.0;
+    for (int64_t i = 0; i < qm::VOCAB; i++) {
+      if (ref[i] != got[i]) mism++;
+      double denom = 1.0 + std::fabs((double)ref[i]);
+      maxrel = std::max(maxrel, std::fabs((double)got[i] - ref[i]) / denom);
     }
+    int64_t ref_arg = qm::argmax(ref);
+    std::printf("dpos-vs-hostpos logits at pos %lld: %d/%d differ, maxrel %.2e %s\n",
+                (long long)P, mism, (int)qm::VOCAB, maxrel,
+                (maxrel < 1e-5 ? "(OK — lm_head split-K atomicAdd noise)"
+                               : "(!! dpos error)"));
+
+    // (3) the captured replay must recompute FRESH logits at P (not replay stale
+    // device state) — its argmax must equal the host-pos reference.
+    cu::upload_u32(d_pos, (unsigned)P);
+    cu::graph_launch(cap.exec);
+    cu::sync_to_host(M.scratch.logitsb, false);
+    int64_t cap_arg = qm::argmax(std::vector<float>(
+        M.scratch.logits_host, M.scratch.logits_host + qm::VOCAB));
+    std::printf("captured-replay argmax: graph=%lld ref=%lld %s\n",
+                (long long)cap_arg, (long long)ref_arg,
+                cap_arg == ref_arg ? "(MATCH)" : "(!! stale/incomplete graph)");
+    cu::graph_launch(cap.exec); cu::flush();  // warm exec
+
+    // Min-of-rounds timing; each round resets d_pos (bounded ctx) then times
+    // n_dec iterations of `body`. Three probes attribute the per-token cost:
+    // pure replay (ceiling, no host) -> +argmax 4B-D2H -> +embed gather/H2D
+    // (== the shipped captured_decoder::step, apples-to-apples vs imperative).
+    auto bench = [&](auto body) {
+      double m = 1e9;
+      for (int r = 0; r < ROUNDS; r++) {
+        cu::upload_u32(d_pos, (unsigned)P);
+        cap.cur_pos = P;  // keep step()'s host bound in sync with the device reset
+        cu::flush();
+        auto tb = clk::now();
+        for (int64_t i = 0; i < n_dec; i++) body(i);
+        cu::flush();
+        m = std::min(m, ms_since(tb) / n_dec);
+      }
+      return m;
+    };
+    int64_t di = 0, idx = next;
+    double raw_min = bench([&](int64_t) { cu::graph_launch(cap.exec); });
+    double ra_min = bench([&](int64_t) {
+      cu::graph_launch(cap.exec);
+      cu::argmax(M.scratch.logitsb, qm::VOCAB, &di);
+    });
+    double cap_min = bench([&](int64_t) { idx = cap.step(M, idx); });
+    std::printf("=== correct captured decode (device-pos) ===\n");
+    std::printf("  pure replay only   %6.3f ms/tok   %5.1f tok/s   (ceiling: no host/token)\n",
+                raw_min, 1000.0 / raw_min);
+    std::printf("  replay+argmax      %6.3f ms/tok   %5.1f tok/s   (+argmax 4B-D2H, no embed)\n",
+                ra_min, 1000.0 / ra_min);
+    std::printf("  embed+replay+argmax%6.3f ms/tok   %5.1f tok/s   (vs imperative %.1f, +%.0f%%)\n\n",
+                cap_min, 1000.0 / cap_min, 1000.0 / imp_min,
+                100.0 * (imp_min / cap_min - 1.0));
+    qm::set_cache_pos(M, pos);  // restore for the census run below
   }
+  cap.destroy();
 
   // Census run (per-region breakdown; prof timers add a little host overhead,
   // so read the %s, not the absolute total, against the timing above).

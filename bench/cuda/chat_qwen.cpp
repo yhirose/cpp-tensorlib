@@ -87,7 +87,10 @@ int main(int argc, char** argv) {
   for (int64_t i = 0; i < MAX_NEW && pos < qm::MAXC; i++) {
     if (next == tok.eos_id()) break;
     gen.push_back((int)next);
+    // captured_decoder::step self-bounds (returns -1 when the KV cache is full);
+    // step_imperative relies on the loop's pos < MAXC guard.
     next = cap.ok() ? cap.step(M, next) : qm::step_imperative(M, next, pos);
+    if (next < 0) break;
     pos++;
   }
   double dec_ms = ms_since(t_dec);
