@@ -735,12 +735,26 @@ array map_binary(const array& a, const array& b, F f) {
     auto ra = broadcast_strides(a.shape(), a.strides(), shape);
     auto rb = broadcast_strides(b.shape(), b.strides(), shape);
     int64_t M = shape[0], N = shape[1];
+    int64_t sa = ra[1], sb = rb[1];
     int64_t o = 0;
     for (int64_t i = 0; i < M; i++) {
       const float* pai = pa + i * ra[0];
       const float* pbi = pb + i * rb[0];
-      int64_t sa = ra[1], sb = rb[1];
-      for (int64_t j = 0; j < N; j++, o++) po[o] = f(pai[j * sa], pbi[j * sb]);
+      // Hoist a broadcast operand's per-row value and split on the inner stride
+      // so each variant is a stride-1 (or constant) inner loop that vectorizes;
+      // the generic j*stride form is an unpredictable gather to the compiler.
+      if (sa == 1 && sb == 1) {
+        for (int64_t j = 0; j < N; j++, o++) po[o] = f(pai[j], pbi[j]);
+      } else if (sa == 1 && sb == 0) {  // b constant within each row ([M,1])
+        float bv = pbi[0];
+        for (int64_t j = 0; j < N; j++, o++) po[o] = f(pai[j], bv);
+      } else if (sa == 0 && sb == 1) {
+        float av = pai[0];
+        for (int64_t j = 0; j < N; j++, o++) po[o] = f(av, pbi[j]);
+      } else {  // (0,0): both per-row scalars
+        float av = pai[0], bv = pbi[0];
+        for (int64_t j = 0; j < N; j++, o++) po[o] = f(av, bv);
+      }
     }
     return out;
   }
@@ -784,15 +798,29 @@ array reduce_axis(const array& a, int axis, bool keepdims, float init, F f) {
   // Contiguous fast path: split the row-major buffer into
   // outer × axis_len × inner and accumulate each axis slab into the matching
   // output slot with flat pointer loops — the accumulator index is just the
-  // (outer, inner) position, so no per-element coordinate walk is needed. The
-  // inner loop is contiguous (vectorizable for +/max). Reducing the last axis
-  // makes inner == 1 (a plain running sum over contiguous values).
+  // (outer, inner) position, so no per-element coordinate walk is needed.
   if (a.contiguous()) {
     const auto& sh = a.shape();
     int64_t axis_len = sh[axis];
     int64_t inner = 1, outer = 1;
     for (int i = axis + 1; i < r; i++) inner *= sh[i];
     for (int i = 0; i < axis; i++) outer *= sh[i];
+    if (inner == 1) {
+      // Last-axis reduction: accumulate each contiguous run into a LOCAL, then
+      // store once. Accumulating straight into po[o] instead carries the
+      // dependency through memory (store-to-load per element, no vectorize) —
+      // ~40x slower here, and this is the common case (softmax denominators,
+      // bias/feature-sum gradients, per-row norms).
+      for (int64_t o = 0; o < outer; o++) {
+        const float* base = pi + o * axis_len;
+        float acc = init;
+        for (int64_t k = 0; k < axis_len; k++) f(acc, base[k]);
+        po[o] = acc;
+      }
+      return out;
+    }
+    // inner > 1: each po[j] is an independent accumulator, so the contiguous
+    // inner loop vectorizes with no cross-element dependency.
     for (int64_t o = 0; o < outer; o++) {
       const float* base = pi + o * axis_len * inner;
       float* od = po + o * inner;

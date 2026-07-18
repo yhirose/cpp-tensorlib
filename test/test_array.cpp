@@ -195,6 +195,11 @@ TEST_CASE("reductions") {
   // negative axis
   CHECK(a.sum(-1).at({0}) == 6.0f);
 
+  // last-axis max/mean go through the local-accumulator path (inner == 1)
+  CHECK(a.max(1).at({0}) == 3.0f);   // max(1,2,3)
+  CHECK(a.max(1).at({1}) == 6.0f);   // max(4,5,6)
+  CHECK(a.mean(1).at({1}) == doctest::Approx(5.0f));  // mean(4,5,6)
+
   // reduction over a strided view
   CHECK(a.transpose().sum(0).at({1}) == 15.0f);
 
