@@ -219,6 +219,36 @@ int main(int argc, char** argv) {
                       (long long)cap_arg, (long long)ref_arg,
                       cap_arg == ref_arg ? "(MATCH)" : "(!! stale/incomplete graph)");
           cu::graph_launch(exec); cu::flush();  // warm exec
+          // Pure-replay ceiling (no host per token): graph_launch only, one flush
+          // per round. Measures the ABSOLUTE floor a fully-device-resident loop
+          // could reach — the gap to embed+replay+argmax below is the host
+          // round-trip (embed gather+H2D, argmax 4B D2H sync) a device loop erases.
+          double raw_min = 1e9;
+          for (int r = 0; r < ROUNDS; r++) {
+            cu::upload_u32(d_pos, (unsigned)P);
+            cu::flush();
+            auto tb = clk::now();
+            for (int64_t i = 0; i < n_dec; i++) cu::graph_launch(exec);
+            cu::flush();
+            raw_min = std::min(raw_min, ms_since(tb) / n_dec);
+          }
+          // Replay + argmax, NO embed staging: isolates the argmax 4B-D2H-sync
+          // cost from the embed gather+H2D cost (raw..this = argmax; this..full
+          // = embed). Tells us which half a device-resident loop should target.
+          double ra_min = 1e9;
+          {
+            int64_t di = 0;
+            for (int r = 0; r < ROUNDS; r++) {
+              cu::upload_u32(d_pos, (unsigned)P);
+              cu::flush();
+              auto tb = clk::now();
+              for (int64_t i = 0; i < n_dec; i++) {
+                cu::graph_launch(exec);
+                cu::argmax(M.scratch.logitsb, qm::VOCAB, &di);
+              }
+              ra_min = std::min(ra_min, ms_since(tb) / n_dec);
+            }
+          }
           // End-to-end per token: stage the next embedding (host gather + H2D,
           // OUTSIDE the graph) + graph_launch + GPU argmax — the same work
           // step_imperative does, so this is apples-to-apples vs `imperative`.
@@ -235,8 +265,12 @@ int main(int argc, char** argv) {
             }
             cap_min = std::min(cap_min, ms_since(tb) / n_dec);
           }
-          std::printf("=== correct captured decode (device-pos, embed+replay+argmax) ===\n");
-          std::printf("  captured decode    %6.3f ms/tok   %5.1f tok/s   (vs imperative %.1f, +%.0f%%)\n\n",
+          std::printf("=== correct captured decode (device-pos) ===\n");
+          std::printf("  pure replay only   %6.3f ms/tok   %5.1f tok/s   (ceiling: no host/token)\n",
+                      raw_min, 1000.0 / raw_min);
+          std::printf("  replay+argmax      %6.3f ms/tok   %5.1f tok/s   (+argmax 4B-D2H, no embed)\n",
+                      ra_min, 1000.0 / ra_min);
+          std::printf("  embed+replay+argmax%6.3f ms/tok   %5.1f tok/s   (vs imperative %.1f, +%.0f%%)\n\n",
                       cap_min, 1000.0 / cap_min, 1000.0 / imp_min,
                       100.0 * (imp_min / cap_min - 1.0));
           cu::graph_destroy(exec);
