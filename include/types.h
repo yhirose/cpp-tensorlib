@@ -96,17 +96,23 @@ inline int64_t auto_threshold_(kernel_class kc) {
     case kernel_class::reduction: return 16'000;        // GPU from ~16K
   }
 #else
-  // Metal / M1 Pro census 2026-07-03 (load ~4, interleaved medians):
-  //   matmul      1024^3=1.07e9 tie, 1280^3=2.1e9 tie, 1536^3=3.6e9 GPU wins
-  //               → crossover ~2e9 (~1260^3). AMX is strong; standalone GPU
-  //               matmul only pays off past here.
+  // Metal / M1 Pro. elementwise/reduction: census 2026-07-03 (load ~4,
+  // interleaved medians):
   //   elementwise 1M cpu wins (0.15 vs 0.25 ms), 4M GPU wins (0.55 vs 0.91)
   //               → crossover ~2e6.
   //   reduction   softmax 256x256=65536 tie, 1024x256=262144 GPU wins clearly
   //               (0.26 vs 0.87 ms) → crossover ~2e5. Set slightly above the
   //               softmax crossover for the lighter row_sum/row_max.
+  //   matmul      re-anchored 2026-07-18 on the pipelined transformer bench
+  //               (STEEL kernels incl. transposed operands, no mid-graph
+  //               drains): GPU wins from the d=768 block (largest gemm
+  //               256·768·3072 = 6.0e8), CPU still wins at d=512 (2.7e8)
+  //               → crossover ~5e8. The old 2e9 (~1260^3) was the standalone
+  //               single-op+flush crossover; in-graph the flush amortizes,
+  //               and the sticky rule drags the rest of the block along, so
+  //               the pipelined anchor is the one auto_ should use.
   switch (kc) {
-    case kernel_class::matmul: return 2'000'000'000;    // ~1260^3
+    case kernel_class::matmul: return 500'000'000;      // ~794^3 (pipelined)
     case kernel_class::elementwise: return 2'000'000;   // 2M elements
     case kernel_class::reduction: return 200'000;       // ~2e5 elements
   }
