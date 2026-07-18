@@ -709,6 +709,24 @@ extern "C" __global__ void tl_attn_decode_f32_64(const float* q, const float* K,
     unsigned group, float scale) {
   attn_decode_core<64>(q, K, V, out, ctx, kv_stride, group, scale);
 }
+// Device-pos variants (CUDA-graph capture): ctx = *d_pos + 1 (the decode step
+// attends the cached prefix [0, pos] after this step's k,v were appended at row
+// pos). Single-block-per-head (S=1) only — its grid is (H,1,1), pos-independent,
+// so one instantiated graph replays at any pos; the split-KV path's grid is
+// ctx-derived and not capturable this way. Body is attn_decode_core, byte-
+// identical to the by-value kernels. f32 KV (Qwen decode).
+extern "C" __global__ void tl_attn_decode_f32_dpos(const float* q,
+    const float* K, const float* V, float* out,
+    const unsigned* __restrict__ d_pos, unsigned kv_stride, unsigned group,
+    float scale) {
+  attn_decode_core<128>(q, K, V, out, *d_pos + 1u, kv_stride, group, scale);
+}
+extern "C" __global__ void tl_attn_decode_f32_64_dpos(const float* q,
+    const float* K, const float* V, float* out,
+    const unsigned* __restrict__ d_pos, unsigned kv_stride, unsigned group,
+    float scale) {
+  attn_decode_core<64>(q, K, V, out, *d_pos + 1u, kv_stride, group, scale);
+}
 extern "C" __global__ void tl_attn_decode_bf16(const float* q,
     const __nv_bfloat16* K, const __nv_bfloat16* V, float* out, unsigned ctx,
     unsigned kv_stride, unsigned group, float scale) {
@@ -866,6 +884,18 @@ extern "C" __global__ void tl_kv_append(float* Kc, float* Vc,
                                         unsigned pos, unsigned kv_stride) {
   kv_append_core(Kc, Vc, k_new, v_new, pos, kv_stride);
 }
+// Device-pos variant (CUDA-graph capture): write row = *d_pos, read from a device
+// scalar so replay targets the advancing cache row. Body is kv_append_core,
+// byte-identical to tl_kv_append — only the pos source differs. f32 KV only
+// (Qwen's decode path); a bf16 sibling would mirror this if a bf16-KV model is
+// captured.
+extern "C" __global__ void tl_kv_append_dpos(float* Kc, float* Vc,
+                                             const float* k_new,
+                                             const float* v_new,
+                                             const unsigned* __restrict__ d_pos,
+                                             unsigned kv_stride) {
+  kv_append_core(Kc, Vc, k_new, v_new, *d_pos, kv_stride);
+}
 extern "C" __global__ void tl_kv_append_bf16(__nv_bfloat16* Kc,
                                              __nv_bfloat16* Vc,
                                              const float* k_new,
@@ -1002,9 +1032,9 @@ extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 // (j, j+D/2) rotate by angle = position · base^(-2j/D). grid = rows, block = D/2.
 // RoPE with an optional fused bias: rotates x (+bias if non-null). Folding q/k's
 // bias-add into rope removes 2 elementwise launches per decode layer.
-__global__ void tl_rope(const float* __restrict__ x,
-                        const float* __restrict__ bias, float* __restrict__ out,
-                        unsigned T, unsigned D, unsigned pos, float base) {
+static __device__ __forceinline__ void rope_core(
+    const float* __restrict__ x, const float* __restrict__ bias,
+    float* __restrict__ out, unsigned T, unsigned D, unsigned pos, float base) {
   const unsigned r = blockIdx.x, j = threadIdx.x;  // j in 0..D/2-1
   const unsigned half = D >> 1;
   if (j >= half) return;
@@ -1022,6 +1052,27 @@ __global__ void tl_rope(const float* __restrict__ x,
   }
   out[bi + j] = x0 * c - x1 * s;
   out[bi + j + half] = x0 * s + x1 * c;
+}
+__global__ void tl_rope(const float* __restrict__ x,
+                        const float* __restrict__ bias, float* __restrict__ out,
+                        unsigned T, unsigned D, unsigned pos, float base) {
+  rope_core(x, bias, out, T, D, pos, base);
+}
+// Device-pos variant (CUDA-graph capture): reads the sequence position from a
+// device scalar `*d_pos` instead of a by-value host arg, so one instantiated
+// graph replays correctly as pos advances. The math is rope_core, byte-identical
+// to tl_rope — only the pos SOURCE differs (register arg -> device load).
+__global__ void tl_rope_dpos(const float* __restrict__ x,
+                             const float* __restrict__ bias,
+                             float* __restrict__ out, unsigned T, unsigned D,
+                             const unsigned* __restrict__ d_pos, float base) {
+  rope_core(x, bias, out, T, D, *d_pos, base);
+}
+
+// One-thread device-scalar increment: *p += 1. Bumps the shared decode pos
+// counter at the tail of a captured forward so each replay advances it.
+__global__ void tl_incr_u32(unsigned* p) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) ++*p;
 }
 
 }  // extern "C"

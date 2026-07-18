@@ -418,6 +418,33 @@ struct context {
     return rope_fn;
   }
 
+  // Device-pos variants (CUDA-graph capture): pos/ctx read from a device scalar
+  // so one instantiated graph replays correctly as the decode position advances.
+  CUfunction rope_dpos_fn = nullptr, incr_u32_fn = nullptr,
+             kv_append_dpos_fn = nullptr, attn_decode_dpos_fn = nullptr,
+             attn_decode_dpos_64_fn = nullptr;
+  CUfunction rope_dpos_() {
+    if (!rope_dpos_fn) d.ModuleGetFunction(&rope_dpos_fn, mod, "tl_rope_dpos");
+    return rope_dpos_fn;
+  }
+  CUfunction incr_u32_() {
+    if (!incr_u32_fn) d.ModuleGetFunction(&incr_u32_fn, mod, "tl_incr_u32");
+    return incr_u32_fn;
+  }
+  CUfunction kv_append_dpos_() {
+    if (!kv_append_dpos_fn)
+      d.ModuleGetFunction(&kv_append_dpos_fn, mod, "tl_kv_append_dpos");
+    return kv_append_dpos_fn;
+  }
+  CUfunction attn_decode_dpos_(int64_t D) {
+    CUfunction* slot = D == 64 ? &attn_decode_dpos_64_fn : &attn_decode_dpos_fn;
+    if (!*slot)
+      d.ModuleGetFunction(slot, mod,
+                          D == 64 ? "tl_attn_decode_f32_64_dpos"
+                                  : "tl_attn_decode_f32_dpos");
+    return *slot;
+  }
+
   // GPU argmax (greedy last-mile): kernel + a persistent 4-byte device result
   // buffer so the per-token result is a 4-byte D2H, not the 608KB logits copy.
   CUfunction argmax_fn = nullptr;
@@ -570,6 +597,18 @@ inline void upload(void* native, const float* src, int64_t n) {
   if (!m) return;
   std::memcpy(m->host, src, (size_t)n * sizeof(float));
   c.d.MemcpyHtoD(m->dev, m->host, m->bytes);
+  m->where = context::BOTH;
+}
+
+// Set a device u32 scalar (e.g. the capture pos counter) via its mirror. Raw
+// 4-byte H2D — the mirror's host bytes are set to `val` then copied to device.
+inline void upload_u32(void* native, unsigned val) {
+  auto& c = context::get();
+  if (!c.ready || !native) return;
+  context::mirror* m = c.mirror_(native);
+  if (!m || m->bytes < 4) return;
+  std::memcpy(m->host, &val, 4);
+  c.d.MemcpyHtoD(m->dev, m->host, 4);
   m->where = context::BOTH;
 }
 
@@ -862,6 +901,91 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
                           nullptr) == 0;
 }
 
+// ---- CUDA-graph-capture device-pos launchers (A-min). Each mirrors its
+// by-value sibling but sources pos/ctx from a device scalar `d_pos` (a 4-byte
+// device buffer the caller owns) and launches on c.stream so the op is captured.
+// attn_decode_dpos is single-block-per-head (S=1) only — pos-independent grid.
+
+// RoPE reading pos from *d_pos (else identical to rope()).
+inline bool rope_dpos(void* x, void* out, int64_t rows, int64_t T, int64_t D,
+                      void* d_pos, float base, void* bias = nullptr) {
+  auto& c = context::get();
+  if (!c.ready || D <= 0 || (D & 1)) return false;
+  c.device_read_(x);
+  if (bias) c.device_read_(bias);
+  c.device_write_(out);
+  c.device_read_(d_pos);
+  float* px = context::off_(x, 0);
+  float* pbias = bias ? context::off_(bias, 0) : nullptr;
+  float* po = context::off_(out, 0);
+  float* pp = context::off_(d_pos, 0);
+  unsigned uT = (unsigned)T, uD = (unsigned)D;
+  void* args[] = {&px, &pbias, &po, &uT, &uD, &pp, &base};
+  c.pending = true;
+  return c.d.LaunchKernel(c.rope_dpos_(), (unsigned)rows, 1, 1, (unsigned)(D / 2),
+                          1, 1, 0, c.stream, args, nullptr) == 0;
+}
+
+// One-thread *d_pos += 1 (tail of a captured forward; advances the counter).
+inline bool incr_u32(void* d_pos) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_write_(d_pos);
+  float* pp = context::off_(d_pos, 0);
+  void* args[] = {&pp};
+  c.pending = true;
+  return c.d.LaunchKernel(c.incr_u32_(), 1, 1, 1, 1, 1, 1, 0, c.stream, args,
+                          nullptr) == 0;
+}
+
+// KV append with write-row = *d_pos (else identical to kv_append(); f32 KV).
+inline bool kv_append_dpos(void* Kc, void* Vc, void* k_new, void* v_new,
+                           void* d_pos, int64_t kv_max, int64_t n_kv_heads,
+                           int64_t D) {
+  auto& c = context::get();
+  if (!c.ready || (D != 128 && D != 64)) return false;
+  c.device_read_(k_new);
+  c.device_read_(v_new);
+  c.device_read_(d_pos);
+  c.device_write_(Kc);
+  c.device_write_(Vc);
+  float* pKc = context::off_(Kc, 0);
+  float* pVc = context::off_(Vc, 0);
+  float* pk = context::off_(k_new, 0);
+  float* pv = context::off_(v_new, 0);
+  float* pp = context::off_(d_pos, 0);
+  unsigned kv_stride = (unsigned)(kv_max * D);
+  void* args[] = {&pKc, &pVc, &pk, &pv, &pp, &kv_stride};
+  c.pending = true;
+  return c.d.LaunchKernel(c.kv_append_dpos_(), (unsigned)n_kv_heads, 1, 1,
+                          (unsigned)D, 1, 1, 0, c.stream, args, nullptr) == 0;
+}
+
+// Decode attention with ctx = *d_pos + 1, single-block-per-head (S=1). f32 KV.
+inline bool attn_decode_dpos(void* q, void* K, void* V, void* out,
+                             int64_t n_q_heads, int64_t n_kv_heads, void* d_pos,
+                             int64_t kv_max, int64_t D, float scale) {
+  auto& c = context::get();
+  if (!c.ready || (D != 128 && D != 64)) return false;
+  if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
+  c.device_read_(q);
+  c.device_read_(K);
+  c.device_read_(V);
+  c.device_read_(d_pos);
+  c.device_write_(out);
+  float* pq = context::off_(q, 0);
+  float* pk = context::off_(K, 0);
+  float* pv = context::off_(V, 0);
+  float* po = context::off_(out, 0);
+  float* pp = context::off_(d_pos, 0);
+  unsigned kv_stride = (unsigned)(kv_max * D);
+  unsigned group = (unsigned)(n_q_heads / n_kv_heads);
+  void* args[] = {&pq, &pk, &pv, &po, &pp, &kv_stride, &group, &scale};
+  c.pending = true;
+  return c.d.LaunchKernel(c.attn_decode_dpos_(D), (unsigned)n_q_heads, 1, 1,
+                          (unsigned)D, 1, 1, 0, c.stream, args, nullptr) == 0;
+}
+
 // M9 KV cache append: scatter one decode step's k,v (each [n_kv_heads,D] device
 // buffers) into the cache (K,V each [n_kv_heads,kv_max,D]) at row `pos`.
 inline bool kv_append(void* Kc, void* Vc, void* k_new, void* v_new, int64_t pos,
@@ -1087,6 +1211,18 @@ struct kv_cache {
   bool attn(void* q, void* out, int64_t n_q_heads, float scale) {
     return attn_decode(q, K, V, out, n_q_heads, n_kv_heads, pos, max_ctx, D,
                        scale, kv_bf16);
+  }
+  // CUDA-graph-capture variants: write row / ctx come from the shared device
+  // scalar d_pos (not the host `pos`), so a captured forward replays at the
+  // advancing position. The host `pos` is NOT touched here — a tl_incr_u32 at the
+  // captured forward's tail advances d_pos, and the orchestrator keeps host `pos`
+  // in step out-of-band. f32 KV only (see the dpos launchers).
+  bool append_dpos(void* k_new, void* v_new, void* d_pos) {
+    return kv_append_dpos(K, V, k_new, v_new, d_pos, max_ctx, n_kv_heads, D);
+  }
+  bool attn_dpos(void* q, void* out, int64_t n_q_heads, void* d_pos, float scale) {
+    return attn_decode_dpos(q, K, V, out, n_q_heads, n_kv_heads, d_pos, max_ctx,
+                            D, scale);
   }
   // Prefill a T-token prompt: bulk-fill the cache from k_src/v_src
   // ([n_kv_heads,T,D]) and run causal attention (q/out [n_q_heads,T,D]). Leaves

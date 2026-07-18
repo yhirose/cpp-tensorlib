@@ -436,8 +436,15 @@ inline bool gemv_q4_w(const array& Wq, void* a, void* y) {
 // to S.logitsb. NO array nodes, NO host sync / blocking copy — so this region
 // is CUDA-graph-capturable (embed staging + argmax stay outside). All kernels
 // target context.stream (default null, or the capture stream during recording).
-inline void run_layers_(Model& M, void* x0, int64_t pos) {
+// d_pos (optional): a device u32 scalar holding the decode position. When set,
+// the three pos-dependent ops (rope, kv append, decode attn) read it from the
+// device instead of the host `pos`, and a tl_incr_u32 at the tail advances it —
+// so the whole forward is CUDA-graph-capturable and one instantiated graph
+// replays correctly as pos grows (A-min). All caches share the one counter (every
+// layer is at the same sequence position). d_pos==nullptr = the normal host path.
+inline void run_layers_(Model& M, void* x0, int64_t pos, void* d_pos = nullptr) {
   namespace cu = tl::cuda;
+  const bool cap = d_pos != nullptr;
   Scratch& S = M.scratch;
   // Fused seams (kills 4 elementwise launches/layer): q/k bias folds into rope
   // (cu::rope bias arg); the two residual adds fold into the following RMSNorms
@@ -470,11 +477,21 @@ inline void run_layers_(Model& M, void* x0, int64_t pos) {
     void* qp = S.qkvb;
     void* kp = off(S.qkvb, NH * HD);
     void* vp = off(S.qkvb, (NH + NKV) * HD);
-    cu::rope(qp, qp, NH, 1, HD, pos, ROPE_BASE, L.bq.native());
-    cu::rope(kp, kp, NKV, 1, HD, pos, ROPE_BASE, L.bk.native());
+    if (cap) {
+      cu::rope_dpos(qp, qp, NH, 1, HD, d_pos, ROPE_BASE, L.bq.native());
+      cu::rope_dpos(kp, kp, NKV, 1, HD, d_pos, ROPE_BASE, L.bk.native());
+    } else {
+      cu::rope(qp, qp, NH, 1, HD, pos, ROPE_BASE, L.bq.native());
+      cu::rope(kp, kp, NKV, 1, HD, pos, ROPE_BASE, L.bk.native());
+    }
     cu::binary(cu::kop::add, vp, 0, L.bv.native(), 0, vp, 0, NKV * HD, 1, 0);
-    L.cache.append(kp, vp);
-    L.cache.attn(qp, S.ab, NH, SCALE);
+    if (cap) {
+      L.cache.append_dpos(kp, vp, d_pos);
+      L.cache.attn_dpos(qp, S.ab, NH, d_pos, SCALE);
+    } else {
+      L.cache.append(kp, vp);
+      L.cache.attn(qp, S.ab, NH, SCALE);
+    }
     gv(L.wo_row, L.wo, S.ab, ro, NE, NH * HD);            // ro = attn @ wo
     // x1 = x + (attn@wo); h2 = rmsnorm(x1, fn) — fused.
     cu::rmsnorm_res(ro, x, L.fn.native(), ro, S.h2b, NE, EPS);
@@ -492,6 +509,9 @@ inline void run_layers_(Model& M, void* x0, int64_t pos) {
   // hb now holds the final RMSNorm output (folded into the last layer's seam).
   if (M.q4_lmhead) gemv_q4_w(M.outwT_q4, S.hb, S.logitsb);  // [K=NE, N=VOCAB]
   else gemv_w(M.outwT, S.hb, S.logitsb, VOCAB, NE);
+  // Tail of the captured region: advance the shared device pos so the next
+  // graph replay reads pos+1 (lm_head is pos-independent, so order vs it is free).
+  if (cap) cu::incr_u32(d_pos);
 }
 
 // Fully imperative decode step (C1): embed row -> run_layers_ -> GPU argmax.
@@ -533,6 +553,13 @@ inline void stage_embed(Model& M, int64_t id) {
 // bench's array-vs-imperative greedy-equivalence check.
 inline void reset_cache(Model& M) {
   for (auto& L : M.layers) L.cache.pos = 0;
+}
+// Set all KV caches' host pos. The device-pos (capture) path leaves host pos
+// untouched — a captured replay advances only the device counter — so the
+// orchestrator sets host pos explicitly for state bookkeeping / the dpos-vs-host
+// correctness check (every layer is at the same sequence position).
+inline void set_cache_pos(Model& M, int64_t p) {
+  for (auto& L : M.layers) L.cache.pos = p;
 }
 
 inline std::string default_path() {
