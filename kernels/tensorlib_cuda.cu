@@ -481,6 +481,36 @@ __global__ void tl_gemv_bf16v8(const float* __restrict__ a,
   }
 }
 
+// Block-wide sum-reduce + store for the one-block-per-row GEMVs (tl_gemv_bf16_row,
+// tl_gemv_q4): every lane brings its partial `acc` (already summed over its own
+// K-slice); the block's total lands in *y_n. Warp-shuffle within each warp, then
+// (only when nwarps>1) one round through dynamic shared memory. The launcher
+// sizes the shared region (block>32 ? nwarps*4 : 0) and single-warp blocks return
+// before ever dereferencing it. Assumes nwarps<=32 (block<=1024; the launcher
+// caps block at 256, so 8). Shared here rather than templated on the fetch so the
+// two extern "C" __global__ kernels — which differ ONLY in how they load each
+// element (bf16 uint4 vs int4 dequant) — don't duplicate the reduction.
+static __device__ __forceinline__ void gemv_row_block_store(
+    float acc, unsigned lane, unsigned warp_id, unsigned nwarps, float* y_n) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  if (nwarps == 1) {
+    if (lane == 0) *y_n = acc;
+    return;
+  }
+  extern __shared__ float gemv_row_sdata[];
+  if (lane == 0) gemv_row_sdata[warp_id] = acc;
+  __syncthreads();
+  if (warp_id == 0) {
+    acc = (lane < nwarps) ? gemv_row_sdata[lane] : 0.0f;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) *y_n = acc;
+  }
+}
+
 // Warp-per-row bf16 GEMV (M9 decode lever A): weights in [N,K] (K contiguous per
 // output row = GGML-native, so the loader drops the transpose). ONE BLOCK per
 // output row n (grid.x == N); its threads split K, each lane consuming 8 bf16
@@ -518,23 +548,7 @@ __global__ void tl_gemv_bf16_row(const float* __restrict__ a,
            a[k0 + 3] * f1.y + a[k0 + 4] * f2.x + a[k0 + 5] * f2.y +
            a[k0 + 6] * f3.x + a[k0 + 7] * f3.y;
   }
-#pragma unroll
-  for (int off = 16; off > 0; off >>= 1)
-    acc += __shfl_down_sync(0xffffffffu, acc, off);
-  if (nwarps == 1) {
-    if (lane == 0) y[n] = acc;
-    return;
-  }
-  extern __shared__ float gemv_row_sdata[];
-  if (lane == 0) gemv_row_sdata[warp_id] = acc;
-  __syncthreads();
-  if (warp_id == 0) {
-    acc = (lane < nwarps) ? gemv_row_sdata[lane] : 0.0f;
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-      acc += __shfl_down_sync(0xffffffffu, acc, off);
-    if (lane == 0) y[n] = acc;
-  }
+  gemv_row_block_store(acc, lane, warp_id, nwarps, &y[n]);
 }
 
 // ---- M8 int4-weight decode GEMV: y[n] = sum_k a[k] * dequant(Wq[n,k]) ----
@@ -578,23 +592,7 @@ __global__ void tl_gemv_q4(const float* __restrict__ a,
       acc += a[k0 + j] * (sc * (float)q);
     }
   }
-#pragma unroll
-  for (int off = 16; off > 0; off >>= 1)
-    acc += __shfl_down_sync(0xffffffffu, acc, off);
-  if (nwarps == 1) {
-    if (lane == 0) y[n] = acc;
-    return;
-  }
-  extern __shared__ float gemv_q4_sdata[];
-  if (lane == 0) gemv_q4_sdata[warp_id] = acc;
-  __syncthreads();
-  if (warp_id == 0) {
-    acc = (lane < nwarps) ? gemv_q4_sdata[lane] : 0.0f;
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-      acc += __shfl_down_sync(0xffffffffu, acc, off);
-    if (lane == 0) y[n] = acc;
-  }
+  gemv_row_block_store(acc, lane, warp_id, nwarps, &y[n]);
 }
 
 // ---- M9 fused decode attention (flash-attention, one query row per head) ----

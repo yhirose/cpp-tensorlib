@@ -726,18 +726,25 @@ inline bool gemv_bf16(void* a, void* B, void* y, int64_t n, int64_t k) {
                    v8 ? 8u : 1u);
 }
 
-// Block size (32..256 threads) for tl_gemv_bf16_row, chosen per K to minimize
-// the per-thread iteration count (llama.cpp's mul_mat_vec_f strategy) — a wide
-// row (large K) gets more warps collaborating on the reduction. Ties keep the
-// smaller block size.
+// Block size (32..256 threads) for the one-block-per-row GEMVs (tl_gemv_bf16_row,
+// tl_gemv_q4), chosen per K to minimize the per-thread iteration count (llama.cpp's
+// mul_mat_vec_f strategy) — a wide row (large K) gets more warps collaborating on
+// the reduction. Ties keep the smaller block size (loop only replaces on strictly
+// fewer iters). Always a multiple of 32 and <=256, as both kernels require.
 inline unsigned gemv_row_block_size(int64_t k) {
   unsigned best = 32;
-  int64_t niter_best = (k + 8 * 32 - 1) / (8 * 32);
-  for (unsigned bs = 64; bs <= 256; bs += 32) {
-    int64_t niter = (k + 8 * (int64_t)bs - 1) / (8 * (int64_t)bs);
+  int64_t niter_best = INT64_MAX;
+  for (unsigned bs = 32; bs <= 256; bs += 32) {
+    int64_t niter = (k + 8 * bs - 1) / (8 * bs);
     if (niter < niter_best) { niter_best = niter; best = bs; }
   }
   return best;
+}
+// Companion dynamic-shared size for a gemv_row_block_size block: one float per
+// warp for the cross-warp reduce, or 0 for a single-warp block (which never
+// touches shared). Kept beside the block-size policy so the two can't drift.
+inline unsigned gemv_row_smem(unsigned block) {
+  return block > 32 ? (block >> 5) * (unsigned)sizeof(float) : 0u;
 }
 
 // Warp-per-row bf16 decode GEMV (lever A): y(N) = a(1,K) @ W[N,K], W row-major
@@ -757,10 +764,9 @@ inline bool gemv_bf16_row(void* a, void* B, void* y, int64_t n, int64_t k) {
   unsigned uN = static_cast<unsigned>(n), uK = static_cast<unsigned>(k);
   void* args[] = {&pa, &pB, &py, &uN, &uK};
   unsigned block = gemv_row_block_size(k);
-  unsigned smem = block > 32 ? (block >> 5) * sizeof(float) : 0u;
   c.pending = true;
-  return c.d.LaunchKernel(c.gemv_bf16_row_(), uN, 1, 1, block, 1, 1, smem,
-                          c.stream, args, nullptr) == 0;
+  return c.d.LaunchKernel(c.gemv_bf16_row_(), uN, 1, 1, block, 1, 1,
+                          gemv_row_smem(block), c.stream, args, nullptr) == 0;
 }
 
 // M8 int4-weight decode GEMV: y(N) = a(1,K) @ dequant(Wq[N,K]), F32 accumulate.
@@ -784,10 +790,9 @@ inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
   unsigned uN = (unsigned)N, uK = (unsigned)K, uG = (unsigned)group;
   void* args[] = {&pa, &pq, &ps, &py, &uN, &uK, &uG};
   unsigned block = gemv_row_block_size(K);
-  unsigned smem = block > 32 ? (block >> 5) * sizeof(float) : 0u;
   c.pending = true;
-  return c.d.LaunchKernel(c.gemv_q4_(), uN, 1, 1, block, 1, 1, smem, c.stream,
-                          args, nullptr) == 0;
+  return c.d.LaunchKernel(c.gemv_q4_(), uN, 1, 1, block, 1, 1,
+                          gemv_row_smem(block), c.stream, args, nullptr) == 0;
 }
 
 // M9 fused decode attention: out(h,:) = softmax(scale·q(h,:)·K(kv,:)^T)·V(kv) in
