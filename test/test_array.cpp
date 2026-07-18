@@ -141,6 +141,45 @@ TEST_CASE("views: transpose / reshape / slice are zero-copy") {
   CHECK(s.at({0, 0}) == 4.0f);  // slice starts at row 1, unaffected
 }
 
+TEST_CASE("views over a lazy source defer without a batch boundary") {
+  // A view of a still-lazy computation composes strides at eval instead of
+  // forcing the source to materialize — keeping it in the same eval batch.
+  // Correctness: deferring must match materializing the source first.
+  auto lazy_prod = [] {
+    auto A = array::from({1, 2, 3, 4, 5, 6}, {2, 3});
+    auto B = array::from({1, 0, 2, 0, 1, 0, 3, 1, 0, 2, 1, 1}, {3, 4});
+    return A.dot(B);  // [2,4], lazy
+  };
+  auto eager_prod = [&] {
+    auto p = lazy_prod();
+    p.eval();
+    return p;
+  };
+
+  CHECK(allclose(lazy_prod().transpose(), eager_prod().transpose()));
+  CHECK(allclose(lazy_prod().reshape({4, 2}), eager_prod().reshape({4, 2})));
+  CHECK(allclose(lazy_prod().slice(1, 1), eager_prod().slice(1, 1)));
+  // view of view: transpose (non-contiguous) then reshape must clone
+  CHECK(allclose(lazy_prod().transpose().reshape({8}),
+                 eager_prod().transpose().reshape({8})));
+  CHECK(allclose(lazy_prod().transpose().transpose(),
+                 eager_prod().transpose().transpose()));
+  // a lazy transposed view feeding a matmul (gemm reads composed strides)
+  auto L = array::full({5, 4}, 0.5f);
+  CHECK(allclose(L.dot(lazy_prod().transpose()),
+                 L.dot(eager_prod().transpose())));
+
+  // Batch-collapse: transposing a lazy product used to force its own eval
+  // (a boundary); now build triggers no evaluation and the whole chain
+  // evaluates as one batch (each detail::run_ bumps visit_counter).
+  uint64_t before = tl::detail::visit_counter;
+  auto K = array::full({8, 6}, 0.3f).dot(array::full({6, 4}, 0.1f));  // lazy
+  auto scores = array::full({5, 4}, 0.2f).dot(K.transpose());
+  CHECK(tl::detail::visit_counter == before);  // build did not evaluate
+  scores.eval();
+  CHECK(tl::detail::visit_counter == before + 1);  // exactly one batch
+}
+
 TEST_CASE("dot") {
   auto a = array::from({1, 2, 3, 4, 5, 6}, {2, 3});
   auto b = array::from({7, 8, 9, 10, 11, 12}, {3, 2});

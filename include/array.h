@@ -155,6 +155,9 @@ struct node {
     attn_dec,  // fused decode attention: softmax(arg0 · q·Kᵀ)·V
     rope,      // rotary position embedding (arg0=base, axis=position offset)
     sum_ax, mean_ax, max_ax, argmax_ax, sum_to_,
+    view_,     // zero-copy view (transpose/reshape/slice) over a still-lazy
+               // source: composes strides at eval, no kernel, no flush — keeps
+               // the source in the same batch instead of forcing a boundary.
   };
 
   op_t op = op_t::constant;
@@ -164,6 +167,13 @@ struct node {
   float arg0 = 0.0f;  // op-specific scalar (attn_dec: softmax scale)
   int axis = 0;
   bool keepdims = false;
+
+  // view_ parameters (only meaningful when op == view_). view_axes is empty
+  // for non-transpose views (no allocation on the common non-view node).
+  enum class vkind : uint8_t { transpose, reshape, slice };
+  vkind view_kind = vkind::reshape;
+  std::vector<int> view_axes;  // transpose permutation
+  int64_t view_start = 0;      // slice start along axis 0
 
   // constant source / evaluated result
   storage stor;
@@ -340,6 +350,12 @@ class array {
   void ensure_() const;    // materialize (evaluate + adopt) if lazy, then sync
   void realize_() const;   // same, but leave kernels in flight (no sync)
   void materialize_(bool do_flush) const;  // shared body
+  // Build a deferred view node over this array's still-lazy source (node_ set).
+  // The strides/offset are the caller-computed view layout; eval composes them
+  // against the source's evaluated storage without a kernel or a flush.
+  array lazy_view_(detail::node::vkind kind, shape_t vshape,
+                   std::vector<int64_t> vstrides, int64_t voffset,
+                   std::vector<int> axes, int64_t start) const;
 
   friend struct detail::graph;
   friend array make_view_(const array& base, shape_t shape,
@@ -412,6 +428,24 @@ inline array array::make_(shape_t shape) {
   return a;
 }
 
+inline array array::lazy_view_(detail::node::vkind kind, shape_t vshape,
+                               std::vector<int64_t> vstrides, int64_t voffset,
+                               std::vector<int> axes, int64_t start) const {
+  auto n = std::make_shared<detail::node>();
+  n->op = detail::node::op_t::view_;
+  n->view_kind = kind;
+  n->view_axes = std::move(axes);
+  n->view_start = start;
+  n->shape = vshape;
+  n->inputs = {node_};  // the still-lazy source computation
+  array v;
+  v.shape_ = std::move(vshape);
+  v.strides_ = std::move(vstrides);
+  v.offset_ = voffset;
+  v.node_ = std::move(n);
+  return v;
+}
+
 inline array array::empty(shape_t shape) { return make_(std::move(shape)); }
 
 inline array array::full(shape_t shape, float v) {
@@ -440,7 +474,9 @@ inline array array::from(std::vector<float> v, shape_t shape) {
 }
 
 inline bool array::contiguous() const {
-  if (node_) return true;  // results materialize contiguous
+  // strides_ tracks the eventual layout even while lazy: a computation node
+  // materializes contiguous (from_node sets contiguous strides), while a lazy
+  // view node carries its real (possibly strided) layout.
   return strides_ == detail::contiguous_strides(shape_);
 }
 
@@ -526,12 +562,15 @@ inline array array::transpose(std::vector<int> axes) const {
   if (axes.size() != rank()) {
     throw std::invalid_argument("tl::transpose: bad axes");
   }
-  realize_();
   shape_t shape(rank());
   std::vector<int64_t> strides(rank());
   for (size_t i = 0; i < rank(); i++) {
     shape[i] = shape_[axes[i]];
     strides[i] = strides_[axes[i]];
+  }
+  if (node_) {  // lazy source: defer as a view node — no batch boundary
+    return lazy_view_(detail::node::vkind::transpose, std::move(shape),
+                      std::move(strides), offset_, std::move(axes), 0);
   }
   return make_view_(*this, std::move(shape), std::move(strides), offset_);
 }
@@ -540,9 +579,13 @@ inline array array::reshape(shape_t shape) const {
   if (detail::num_elements(shape) != size()) {
     throw std::invalid_argument("tl::reshape: size mismatch");
   }
+  auto strides = detail::contiguous_strides(shape);
+  if (node_ && contiguous()) {  // lazy contiguous source: defer, no boundary
+    return lazy_view_(detail::node::vkind::reshape, shape, std::move(strides),
+                      offset_, {}, 0);
+  }
   realize_();
   if (!contiguous()) return clone().reshape(std::move(shape));
-  auto strides = detail::contiguous_strides(shape);
   return make_view_(*this, std::move(shape), std::move(strides), offset_);
 }
 
@@ -550,11 +593,15 @@ inline array array::slice(int64_t start, int64_t count) const {
   if (rank() == 0 || start < 0 || start + count > shape_[0]) {
     throw std::invalid_argument("tl::slice: out of range");
   }
-  realize_();
   auto shape = shape_;
   shape[0] = count;
-  return make_view_(*this, std::move(shape), strides_,
-                    offset_ + start * strides_[0]);
+  int64_t voff = offset_ + start * strides_[0];
+  if (node_) {  // lazy source: defer as a view node — no batch boundary
+    return lazy_view_(detail::node::vkind::slice, std::move(shape), strides_,
+                      voff, {}, start);
+  }
+  realize_();
+  return make_view_(*this, std::move(shape), strides_, voff);
 }
 
 inline array array::clone() const {
@@ -2152,6 +2199,21 @@ struct graph {
       case op_t::sum_to_:
         r = ref::sum_to(in(0), n.shape);
         break;
+      case op_t::view_: {
+        // Pure layout: the source is evaluated, so re-applying the view on the
+        // materialized wrap composes strides only (make_view_, no kernel, no
+        // barrier). A reshape of a non-contiguous view is the sole case that
+        // copies — inherent, and rare.
+        array src = wrap(*n.inputs[0]);
+        array v;
+        switch (n.view_kind) {
+          case node::vkind::transpose: v = src.transpose(n.view_axes); break;
+          case node::vkind::reshape: v = src.reshape(n.shape); break;
+          case node::vkind::slice: v = src.slice(n.view_start, n.shape[0]); break;
+        }
+        store(n, v);
+        return;
+      }
     }
     if (!epi_done && (n.scale != 1.0f || n.offset != 0.0f)) {
       float s = n.scale, o = n.offset;
