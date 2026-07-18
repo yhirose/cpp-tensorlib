@@ -188,6 +188,12 @@ inline void (*run_noflush_hook)(const std::vector<node_ptr>&) = nullptr;
 // nodes are single-threaded like the rest of evaluation).
 inline uint64_t visit_counter = 0;
 
+// Whole-batch GPU bias for auto_ mode: set by graph::run_ for the span of one
+// evaluation batch when its total matmul work crosses batch_matmul_bias_
+// threshold_ (types.h), read by gpu_mode_. thread_local because each eval
+// thread runs its own batch.
+inline thread_local bool batch_gpu_bias_ = false;
+
 }  // namespace detail
 
 class array {
@@ -1381,6 +1387,7 @@ struct graph {
     if (device_ == device_type::gpu) return true;
     if (device_ != device_type::auto_) return false;
     if (gpu::pending()) return true;
+    if (batch_gpu_bias_) return true;  // batch pinned to GPU (see run_)
     return n >= auto_threshold_(kc);
   }
 
@@ -1755,6 +1762,24 @@ struct graph {
           stack.pop_back();
         }
       }
+    }
+    // Auto-mode whole-batch device bias: sum this batch's matmul work and, if
+    // the block as a whole earns the GPU, pin every op in it there so the
+    // sub-threshold projection gemms don't strand on the CPU and thrash the
+    // pipeline (types.h batch_matmul_bias_threshold_). cpu/gpu modes and a
+    // pipeline already in flight short-circuit gpu_mode_, so skip the scan.
+    struct BiasGuard {
+      ~BiasGuard() { batch_gpu_bias_ = false; }
+    } bias_guard;
+    if (device_ == device_type::auto_ && gpu::available() && !gpu::pending()) {
+      int64_t work = 0;
+      for (const node* n : order) {
+        if (n->op != node::op_t::dot || n->inputs.size() != 2) continue;
+        const auto& sa = n->inputs[0]->shape;
+        const auto& sb = n->inputs[1]->shape;
+        if (sa.size() == 2 && sb.size() == 2) work += sa[0] * sa[1] * sb[1];
+      }
+      if (work >= batch_matmul_bias_threshold_()) batch_gpu_bias_ = true;
     }
     for (auto* n : order) eval_one(*n);
     if (do_flush) gpu::flush();  // blocking eval: batch done when run() returns

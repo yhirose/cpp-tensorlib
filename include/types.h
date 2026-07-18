@@ -7,6 +7,7 @@
 // backends, no kernel changes). Activations, results and scalars stay F32.
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 namespace tl {
@@ -118,6 +119,38 @@ inline int64_t auto_threshold_(kernel_class kc) {
   }
 #endif
   return 1'000'000'000'000;  // unreachable
+}
+
+// Batch device bias (auto_ mode). The per-op auto_threshold_ is greedy: it
+// decides each op in isolation, so a transformer block's small projection
+// gemms (e.g. seq·d·d = 256·768·768 = 1.5e8, below the matmul threshold)
+// strand on the CPU while its one big FFN gemm goes to the GPU — the batch
+// then thrashes CPU⇄GPU (each hand-off is a blocking flush). This threshold
+// is compared against the *sum* of M·N·K over every dot in one evaluation
+// batch (graph::run_); above it the whole batch is pinned to the GPU so the
+// projections ride along and the pipeline stays on one device. Env override
+// TL_BATCH_MATMUL_BIAS (element-product units) for host calibration, mirroring
+// the misc/census.cpp re-measure note above.
+inline int64_t batch_matmul_bias_threshold_() {
+  static const int64_t v = []() -> int64_t {
+    if (const char* e = std::getenv("TL_BATCH_MATMUL_BIAS")) {
+      char* end = nullptr;
+      long long x = std::strtoll(e, &end, 10);
+      if (end != e && x > 0) return static_cast<int64_t>(x);
+    }
+#if defined(TENSORLIB_CUDA)
+    return 4'000'000;             // GPU wins early; a couple of small gemms
+#else
+    // Metal / M1 Pro, calibrated 2026-07-18 on the pipelined transformer bench
+    // (position-rotated, per-config min). The batch bias helps only when the
+    // whole block is GPU-favourable: pinning d768's ~7e8 attention batch to
+    // the GPU is a net loss (encode/flush > the small gemms' savings), while
+    // pinning d1024's ~1.2e9 attention batch is a large win (8.73→5.6 ms/iter).
+    // Sit the threshold between them; env TL_BATCH_MATMUL_BIAS re-calibrates.
+    return 800'000'000;
+#endif
+  }();
+  return v;
 }
 
 }  // namespace tl
