@@ -542,65 +542,60 @@ __global__ void tl_gemv_bf16_row(const float* __restrict__ a,
 // (out×in) layout so the K-axis quantization groups are contiguous (GGUF/GPTQ
 // convention). Decode is bandwidth-bound, and int4 reads ~0.625 bytes/weight
 // (0.5 packed + one f32 scale per group) vs bf16's 2 — the biggest remaining
-// decode lever. One WARP per output row n; its 32 lanes split K (each lane one
-// uint32 = 8 packed int4 per step, coalesced within the warp), dequantize in
-// registers (w = scale·(nibble-8)), MAC into an F32 accumulator, then warp-
-// shuffle-reduce. Requires K % group == 0 and group % 8 == 0 (every transformer
-// dim; group=32). The last partial 256-block (when K % 256 != 0, e.g. Qwen's
-// K=896 = 3×256+128) is handled by the per-lane k0 < K guard — tail lanes skip,
-// exactly as tl_gemv_bf16_row does — so no K % 256 requirement.
-// Per-warp int4 dot over a lane's K-slice, into acc (macro so both the global-a
-// and shared-a kernels share the body — a template can't live in extern "C").
-#define TL_Q4_DOT(AEXPR)                                                    \
-  float acc = 0.0f;                                                         \
-  for (unsigned base = 0; base < K; base += 256u) {                         \
-    const unsigned k0 = base + lane * 8u;                                   \
-    if (k0 < K) {                                                           \
-      unsigned w = qrow[k0 >> 3];                                           \
-      float sc = srow[k0 / G];                                              \
-      _Pragma("unroll") for (int j = 0; j < 8; j++) {                       \
-        int q = (int)((w >> (j * 4)) & 0xFu) - 8;                           \
-        acc += (AEXPR) * (sc * (float)q);                                   \
-      }                                                                     \
-    }                                                                       \
-  }                                                                         \
-  _Pragma("unroll") for (int off = 16; off > 0; off >>= 1) acc +=           \
-      __shfl_down_sync(0xffffffffu, acc, off);
-
-// Global-a variant (general; the activation is L2/read-only-cache resident).
+// decode lever.
+//
+// ONE BLOCK per output row n (grid.x == N), block size K-adaptive (same
+// gemv_row_block_size search as tl_gemv_bf16_row — llama.cpp's mul_mat_vec_f
+// strategy): each thread dequantizes one uint32 (8 packed int4) per step,
+// strided by blockDim.x across K, MACs into an F32 accumulator, then warp-
+// shuffle-reduce + (when >1 warp) a shared-mem cross-warp reduce. Every thread
+// in the block reads a DISJOINT slice of K, so — unlike the old fixed-32-lane/
+// 8-rows-per-block layout — there's no redundant re-read of `a` for a shared-
+// memory staging pass to amortize; one kernel replaces the former global-a/
+// shared-a pair. Requires K % group == 0 and group % 8 == 0 (every transformer
+// dim; group=32); the per-thread k0 < K guard handles the tail (e.g. Qwen's
+// K=896) — no K % 256 requirement.
 __global__ void tl_gemv_q4(const float* __restrict__ a,
                            const unsigned* __restrict__ qw,   // [N][K/8] words
                            const float* __restrict__ scales,  // [N][K/G]
                            float* __restrict__ y, unsigned N, unsigned K,
                            unsigned G) {
-  const unsigned n = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const unsigned lane = threadIdx.x & 31u;
+  const unsigned n = blockIdx.x;
   if (n >= N) return;
+  const unsigned tid = threadIdx.x;
+  const unsigned lane = tid & 31u;
+  const unsigned warp_id = tid >> 5;
+  const unsigned nwarps = blockDim.x >> 5;
   const unsigned* qrow = qw + (size_t)n * (K >> 3);
   const float* srow = scales + (size_t)n * (K / G);
-  TL_Q4_DOT(a[k0 + j])
-  if (lane == 0) y[n] = acc;
-}
-
-// Shared-a variant: stage a[K] once per block so the block's output warps reuse
-// it (small K only — large K's shared footprint collapses occupancy; host gates).
-__global__ void tl_gemv_q4s(const float* __restrict__ a,
-                            const unsigned* __restrict__ qw,
-                            const float* __restrict__ scales,
-                            float* __restrict__ y, unsigned N, unsigned K,
-                            unsigned G) {
-  extern __shared__ float a_sh[];
-  for (unsigned i = threadIdx.x; i < K; i += blockDim.x) a_sh[i] = a[i];
+  float acc = 0.0f;
+  for (unsigned k0 = tid * 8u; k0 < K; k0 += blockDim.x * 8u) {
+    unsigned w = qrow[k0 >> 3];
+    float sc = srow[k0 / G];
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      int q = (int)((w >> (j * 4)) & 0xFu) - 8;
+      acc += a[k0 + j] * (sc * (float)q);
+    }
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  if (nwarps == 1) {
+    if (lane == 0) y[n] = acc;
+    return;
+  }
+  extern __shared__ float gemv_q4_sdata[];
+  if (lane == 0) gemv_q4_sdata[warp_id] = acc;
   __syncthreads();
-  const unsigned n = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const unsigned lane = threadIdx.x & 31u;
-  if (n >= N) return;
-  const unsigned* qrow = qw + (size_t)n * (K >> 3);
-  const float* srow = scales + (size_t)n * (K / G);
-  TL_Q4_DOT(a_sh[k0 + j])
-  if (lane == 0) y[n] = acc;
+  if (warp_id == 0) {
+    acc = (lane < nwarps) ? gemv_q4_sdata[lane] : 0.0f;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if (lane == 0) y[n] = acc;
+  }
 }
-#undef TL_Q4_DOT
 
 // ---- M9 fused decode attention (flash-attention, one query row per head) ----
 // out(h,:) = softmax(scale * q(h,:) · K(h)^T) · V(h), computed in ONE pass with

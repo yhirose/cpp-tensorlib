@@ -360,15 +360,11 @@ struct context {
     return gemv_bf16_row_fn;
   }
 
-  // M8 int4-weight decode GEMV (global-a + shared-a variants).
-  CUfunction gemv_q4_fn = nullptr, gemv_q4s_fn = nullptr;
+  // M8 int4-weight decode GEMV.
+  CUfunction gemv_q4_fn = nullptr;
   CUfunction gemv_q4_() {
     if (!gemv_q4_fn) d.ModuleGetFunction(&gemv_q4_fn, mod, "tl_gemv_q4");
     return gemv_q4_fn;
-  }
-  CUfunction gemv_q4s_() {
-    if (!gemv_q4s_fn) d.ModuleGetFunction(&gemv_q4s_fn, mod, "tl_gemv_q4s");
-    return gemv_q4s_fn;
   }
 
   // M9 fused decode attention (single-pass + split-KV two-pass).
@@ -768,9 +764,10 @@ inline bool gemv_bf16_row(void* a, void* B, void* y, int64_t n, int64_t k) {
 }
 
 // M8 int4-weight decode GEMV: y(N) = a(1,K) @ dequant(Wq[N,K]), F32 accumulate.
-// qw = packed int4 [N][K/8] words, scales = f32 [N][K/group]. One warp/output.
-// K % group == 0, group % 8 == 0 (host-gated); the kernel's per-lane tail guard
-// lifts the old K % 256 requirement (Qwen K=896 = 3×256+128 works).
+// qw = packed int4 [N][K/8] words, scales = f32 [N][K/group]. ONE BLOCK per
+// output row (grid.x == N), K-adaptive block size — see gemv_bf16_row.
+// K % group == 0, group % 8 == 0 (host-gated); the kernel's per-thread tail
+// guard lifts the old K % 256 requirement (Qwen K=896 = 3×256+128 works).
 inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
                     int64_t K, int64_t group) {
   auto& c = context::get();
@@ -786,18 +783,11 @@ inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
   float* py = context::off_(y, 0);
   unsigned uN = (unsigned)N, uK = (unsigned)K, uG = (unsigned)group;
   void* args[] = {&pa, &pq, &ps, &py, &uN, &uK, &uG};
-  unsigned grid = (unsigned)((N + 7) / 8);  // 8 warps/block, 1 output/warp
-  // Stage a[K] in shared when it's small enough to keep occupancy up; above
-  // ~24KB the shared footprint collapses to ~1 block/SM, so use the global-a
-  // kernel (activation stays L2-resident) instead.
+  unsigned block = gemv_row_block_size(K);
+  unsigned smem = block > 32 ? (block >> 5) * sizeof(float) : 0u;
   c.pending = true;
-  if (K * 4 <= 24576) {
-    unsigned shared = (unsigned)(K * 4);
-    return c.d.LaunchKernel(c.gemv_q4s_(), grid, 1, 1, 256, 1, 1, shared,
-                            c.stream, args, nullptr) == 0;
-  }
-  return c.d.LaunchKernel(c.gemv_q4_(), grid, 1, 1, 256, 1, 1, 0, c.stream, args,
-                          nullptr) == 0;
+  return c.d.LaunchKernel(c.gemv_q4_(), uN, 1, 1, block, 1, 1, smem, c.stream,
+                          args, nullptr) == 0;
 }
 
 // M9 fused decode attention: out(h,:) = softmax(scale·q(h,:)·K(kv,:)^T)·V(kv) in
