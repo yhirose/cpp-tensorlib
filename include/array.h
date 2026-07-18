@@ -180,6 +180,9 @@ struct graph;
 // Evaluation hook (TL_RUNTIME_HOOKS; see storage.h). Installed alongside
 // the storage/barrier hooks by tl::install_runtime_hooks().
 inline void (*run_hook)(const std::vector<node_ptr>&) = nullptr;
+// No-sync variant (graph::run_noflush) for view construction: kernels stay
+// in flight; a later host read barriers. Null falls back to run_hook.
+inline void (*run_noflush_hook)(const std::vector<node_ptr>&) = nullptr;
 
 // Monotonic stamp for graph::run's visited marking (O(1), allocation-free;
 // nodes are single-threaded like the rest of evaluation).
@@ -226,7 +229,9 @@ class array {
   // eval() first, then pass native() as the q/k/v pointer. Contiguous, offset 0.
   void* native() const { return storage_.native; }
 
-  // Views (zero-copy on the materialized result) and copies
+  // Views (zero-copy on the materialized result) and copies. View
+  // construction realizes the source without a sync — pending GPU kernels
+  // stay in flight, so a mid-graph view costs no pipeline drain.
   array transpose() const;                       // reverse all axes
   array transpose(std::vector<int> axes) const;  // permutation
   array reshape(shape_t shape) const;  // view when contiguous, else copy
@@ -515,7 +520,7 @@ inline array array::transpose(std::vector<int> axes) const {
   if (axes.size() != rank()) {
     throw std::invalid_argument("tl::transpose: bad axes");
   }
-  ensure_();
+  realize_();
   shape_t shape(rank());
   std::vector<int64_t> strides(rank());
   for (size_t i = 0; i < rank(); i++) {
@@ -529,7 +534,7 @@ inline array array::reshape(shape_t shape) const {
   if (detail::num_elements(shape) != size()) {
     throw std::invalid_argument("tl::reshape: size mismatch");
   }
-  ensure_();
+  realize_();
   if (!contiguous()) return clone().reshape(std::move(shape));
   auto strides = detail::contiguous_strides(shape);
   return make_view_(*this, std::move(shape), std::move(strides), offset_);
@@ -539,7 +544,7 @@ inline array array::slice(int64_t start, int64_t count) const {
   if (rank() == 0 || start < 0 || start + count > shape_[0]) {
     throw std::invalid_argument("tl::slice: out of range");
   }
-  ensure_();
+  realize_();
   auto shape = shape_;
   shape[0] = count;
   return make_view_(*this, std::move(shape), strides_,
@@ -2158,11 +2163,11 @@ inline void array::materialize_(bool do_flush) const {
     // workloads; an initializer-list vector per call adds up.
     thread_local std::vector<detail::node_ptr> root;
     root.assign(1, node_);
-    // The run_hook is the flushing engine; a no-flush realize falls back to a
-    // full eval under hooks (unused in this project — hooks are off here).
-    detail::run_hook(root);
+    if (do_flush || !detail::run_noflush_hook)
+      detail::run_hook(root);
+    else
+      detail::run_noflush_hook(root);
     root.clear();
-    (void)do_flush;
 #else
     thread_local std::vector<detail::node_ptr> root;
     root.assign(1, node_);
@@ -2436,6 +2441,7 @@ inline void install_runtime_hooks() {
   detail::host_sync_hook = &gpu::sync_to_host;
   detail::gpu_pending_hook = &gpu::pending;
   detail::run_hook = &detail::graph::run;
+  detail::run_noflush_hook = &detail::graph::run_noflush;
 }
 
 inline bool array_equal(const array& a, const array& b) {
