@@ -76,13 +76,40 @@ enum class kernel_class {
 // auto_-mode size thresholds: the measured CPU vs GPU-total (single op +
 // flush) standalone crossover per family — the size where GPU-total first
 // beats CPU. The GPU backend is fixed at build time by the gpu:: facade
-// (CUDA off-Apple when TENSORLIB_CUDA, else Metal on Apple), so the crossover
-// is a compile-time property too and the thresholds branch on the same macro.
+// (WebGPU when TENSORLIB_WEBGPU, CUDA off-Apple when TENSORLIB_CUDA, else
+// Metal on Apple), so the crossover is a compile-time property too and the
+// thresholds branch on the same macros, in the same order as gpu.h.
 // These are the conservative standalone values; pipelined graphs amortize the
 // flush, so the effective crossover is lower. Re-measure per target with
-// misc/census.cpp.
+// misc/census.cpp — or, for WebGPU, its browser port
+// test/wasm/census_wasm.cpp, since that backend only exists in a page.
 inline int64_t auto_threshold_(kernel_class kc) {
-#if defined(TENSORLIB_CUDA)
+#if defined(TENSORLIB_WEBGPU)
+  // WebGPU / Chrome on an M1 Pro (apple/metal-3), census 2026-07-20 via
+  // test/wasm/census_wasm.cpp. Two facts shape this arm, and only one of them
+  // is about the GPU:
+  //   - There is a ~0.3-0.6 ms floor per dispatch+flush, orders of magnitude
+  //     above Metal's, so nothing small can ever win.
+  //   - The wasm CPU rival is scalar and single-threaded (~8 GF/s measured at
+  //     512^3), roughly 30x weaker than the Accelerate/AMX path the Metal arm
+  //     below is calibrated against.
+  // Those pull in opposite directions and, for the memory-bound families,
+  // cancel almost exactly — elementwise and reduction land on the same numbers
+  // as Metal. Matmul does not: the CPU side loses its AMX rival while the WGSL
+  // sgemm still reaches ~160 GF/s, so the crossover falls two orders of
+  // magnitude, from 5e8 to 4e6.
+  //   matmul      128^3=2.1e6 cpu, 160^3=4.1e6 a tie in both runs,
+  //               192^3=7.1e6 GPU clearly (1.9 vs 1.1 ms) -> ~4e6.
+  //   elementwise 1M cpu/tie (0.5 vs 0.5-0.7 ms), 4M GPU (2.0 vs 1.4)
+  //               -> ~2e6.
+  //   reduction   softmax 65536 cpu at all three row widths, 262144 GPU at all
+  //               three (1.3 vs 0.8 ms) -> ~2e5.
+  switch (kc) {
+    case kernel_class::matmul: return 4'000'000;        // ~160^3
+    case kernel_class::elementwise: return 2'000'000;   // 2M elements
+    case kernel_class::reduction: return 200'000;       // ~2e5 elements
+  }
+#elif defined(TENSORLIB_CUDA)
   // RTX 3090 (sm_86) census 2026-07-04, misc/census.cpp. No AMX rival on the
   // CPU side (own BLIS), so the GPU wins far earlier than on Apple's Metal:
   //   matmul      64^3=2.6e5 already GPU (0.038 vs cpu 0.152 ms) — crossover
@@ -138,7 +165,17 @@ inline int64_t batch_matmul_bias_threshold_() {
       long long x = std::strtoll(e, &end, 10);
       if (end != e && x > 0) return static_cast<int64_t>(x);
     }
-#if defined(TENSORLIB_CUDA)
+#if defined(TENSORLIB_WEBGPU)
+    // WebGPU / Chrome on an M1 Pro, census 2026-07-20. Measured directly with
+    // a transformer-shaped eval batch (qkv + attention + FFN in one graph),
+    // which is what this threshold is actually about — the Metal arm below had
+    // to infer it from a separate pipelined bench. Sum of M*N*K over the block:
+    // d=32 (2.5e6) cpu, d=48 (4.8e6) a tie across runs, d=64 (7.9e6) GPU in
+    // both (2.8 vs 1.8 ms) -> 8e6. It sits just above the per-op matmul
+    // crossover, as expected: the block's FFN gemm dominates it, so a batch
+    // earns the GPU at roughly the size its largest gemm does.
+    return 8'000'000;
+#elif defined(TENSORLIB_CUDA)
     return 4'000'000;             // GPU wins early; a couple of small gemms
 #else
     // Metal / M1 Pro, calibrated 2026-07-18 on the pipelined transformer bench

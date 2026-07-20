@@ -27,14 +27,21 @@ extern "C" {
 
 // Called from JS with {async: true}: under JSPI this returns a promise,
 // because any GPU wait beneath it suspends. Nothing in C++ is async.
-EMSCRIPTEN_KEEPALIVE int run_tests(int gpu_mode) {
-  if (gpu_mode) {
+// mode: 0 = cpu, 1 = gpu, 2 = auto. auto is here because the TENSORLIB_WEBGPU
+// arm of auto_threshold_() (types.h) is unreachable from native ctest, so this
+// is the only place its size-based routing gets exercised against the oracle.
+EMSCRIPTEN_KEEPALIVE int run_tests(int mode) {
+  const bool gpu_mode = mode != 0;
+  const char* name = mode == 0 ? "cpu" : (mode == 1 ? "gpu" : "auto");
+  if (mode == 0) {
+    tl::use_cpu();
+  } else if (mode == 1) {
     tl::use_gpu();
   } else {
-    tl::use_cpu();
+    tl::use_auto();
   }
-  std::printf("[tensorlib_wasm] mode=%s gpu_available=%d\n",
-              gpu_mode ? "gpu" : "cpu", tl::gpu_available() ? 1 : 0);
+  std::printf("[tensorlib_wasm] mode=%s gpu_available=%d\n", name,
+              tl::gpu_available() ? 1 : 0);
 
   // gpu_available() false in gpu mode means the device or JSPI is missing and
   // every GPU assertion would trivially pass — report that rather than a green
@@ -44,13 +51,21 @@ EMSCRIPTEN_KEEPALIVE int run_tests(int gpu_mode) {
     return 0;
   }
 
+  // dispatch_counts is cumulative for the life of the module, so snapshot it:
+  // with more than one mode run per page load, the raw totals would credit
+  // this run with the previous one's dispatches.
+  auto before = tl::webgpu::context::get().dispatch_counts;
+
   doctest::Context ctx;
   int failed = ctx.run();
   // A green suite does not prove the backend ran — unported ops fall back to
   // CPU and pass either way. Report which kernels actually dispatched.
-  for (auto& kv : tl::webgpu::context::get().dispatch_counts)
-    std::printf("[tensorlib_wasm] dispatch %s=%ld\n", kv.first.c_str(), kv.second);
-  std::printf("[tensorlib_wasm] %s\n", failed ? "FAIL" : "OK");
+  for (auto& kv : tl::webgpu::context::get().dispatch_counts) {
+    auto it = before.find(kv.first);
+    long n = kv.second - (it == before.end() ? 0 : it->second);
+    if (n) std::printf("[tensorlib_wasm] dispatch %s=%ld\n", kv.first.c_str(), n);
+  }
+  std::printf("[tensorlib_wasm] %s %s\n", name, failed ? "FAIL" : "OK");
   return failed ? 0 : 1;
 }
 
