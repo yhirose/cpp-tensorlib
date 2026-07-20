@@ -1400,18 +1400,4 @@ inline void cpu_barrier() {
 
 }  // namespace cuda
 
-// The GPU-backend facade: array.h and storage.h dispatch through tl::gpu, which
-// is Metal on Apple and CUDA elsewhere (the CUDA path only does real work when
-// TENSORLIB_CUDA is set; otherwise cuda:: is stubs, matching metal:: off-Apple).
-// One alias here is the single place the platform choice lives, so the eval
-// seam carries no #ifdefs. Both namespaces expose the identical API and share
-// tl::metal::kop, so the alias is a drop-in.
-#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
-namespace gpu = cuda;
-#else
-namespace gpu = metal;
-#endif
-
-inline bool gpu_available() { return gpu::available(); }
-
 }  // namespace tl
