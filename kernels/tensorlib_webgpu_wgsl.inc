@@ -245,6 +245,29 @@ fn ew_bcast(@builtin(global_invocation_id) gid : vec3<u32>) {
 const T : u32 = 256u;
 var<workgroup> scratch : array<f32, 256>;
 
+fn reduce_op(op : u32, acc : f32, v : f32) -> f32 {
+  if (op == OP_ROW_MAX) { return max(acc, v); }
+  return acc + v;
+}
+
+// Tree-reduce one value per invocation through `scratch` and broadcast the
+// result to the whole workgroup. Call only from uniform control flow — it
+// barriers. The trailing barrier is what makes `scratch` safe to reuse for a
+// second reduction in the same entry point (softmax's max phase, then its sum
+// phase): without it, a fast invocation could overwrite scratch[0] before a
+// slow one has read it.
+fn tree_reduce(op : u32, lid : u32, v : f32) -> f32 {
+  scratch[lid] = v;
+  workgroupBarrier();
+  for (var s : u32 = T / 2u; s > 0u; s = s >> 1u) {
+    if (lid < s) { scratch[lid] = reduce_op(op, scratch[lid], scratch[lid + s]); }
+    workgroupBarrier();
+  }
+  let r = scratch[0];
+  workgroupBarrier();
+  return r;
+}
+
 // Numerically stable softmax (subtract the row max). Applying an affine
 // epilogue to a softmax is not meaningful, so scale/offset are ignored here,
 // as they are on Metal.
@@ -257,32 +280,15 @@ fn softmax(@builtin(workgroup_id) wg : vec3<u32>,
 
   var m = NEG_HUGE;
   for (var c : u32 = lid; c < p.N; c = c + T) { m = max(m, A[src + c]); }
-  scratch[lid] = m;
-  workgroupBarrier();
-  for (var s : u32 = T / 2u; s > 0u; s = s >> 1u) {
-    if (lid < s) { scratch[lid] = max(scratch[lid], scratch[lid + s]); }
-    workgroupBarrier();
-  }
-  let row_max = scratch[0];
-  workgroupBarrier();
+  let row_max = tree_reduce(OP_ROW_MAX, lid, m);
 
   var sum = 0.0;
   for (var c : u32 = lid; c < p.N; c = c + T) { sum = sum + exp(A[src + c] - row_max); }
-  scratch[lid] = sum;
-  workgroupBarrier();
-  for (var s : u32 = T / 2u; s > 0u; s = s >> 1u) {
-    if (lid < s) { scratch[lid] = scratch[lid] + scratch[lid + s]; }
-    workgroupBarrier();
-  }
-  let inv = 1.0 / scratch[0];
+  let inv = 1.0 / tree_reduce(OP_ROW_SUM, lid, sum);
+
   for (var c : u32 = lid; c < p.N; c = c + T) {
     C[dst + c] = exp(A[src + c] - row_max) * inv;
   }
-}
-
-fn reduce_op(op : u32, acc : f32, v : f32) -> f32 {
-  if (op == OP_ROW_MAX) { return max(acc, v); }
-  return acc + v;
 }
 
 // One value per row, with the affine epilogue.
@@ -296,12 +302,7 @@ fn row_reduce(@builtin(workgroup_id) wg : vec3<u32>,
   for (var c : u32 = lid; c < p.N; c = c + T) {
     acc = reduce_op(p.op, acc, A[src + c]);
   }
-  scratch[lid] = acc;
-  workgroupBarrier();
-  for (var s : u32 = T / 2u; s > 0u; s = s >> 1u) {
-    if (lid < s) { scratch[lid] = reduce_op(p.op, scratch[lid], scratch[lid + s]); }
-    workgroupBarrier();
-  }
-  if (lid == 0u) { C[p.c_off + row] = scratch[0] * p.scale + p.offset; }
+  let r = tree_reduce(p.op, lid, acc);
+  if (lid == 0u) { C[p.c_off + row] = r * p.scale + p.offset; }
 }
 )WGSL"
