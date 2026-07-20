@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>cpp-tensorlib WebGPU spike</title>
+<style>
+  body { font: 14px ui-monospace, Menlo, monospace; margin: 2rem; max-width: 70rem; }
+  pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; white-space: pre-wrap; }
+  #status { font-weight: bold; }
+</style>
+<h1>cpp-tensorlib WebGPU spike</h1>
+<p id="status">booting…</p>
+<p id="adapter"></p>
+<pre id="out"></pre>
+<script type="module">
+  const status = document.getElementById("status");
+  const out = document.getElementById("out");
+  const adapter = document.getElementById("adapter");
+
+  const w = new Worker("./worker.js", { type: "module" });
+  w.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === "fail") {
+      status.textContent = "FAILED";
+      out.textContent = m.msg;
+      console.error("[spike] fail:", m.msg);
+    } else if (m.type === "ready") {
+      status.textContent = "running benchmark…";
+      adapter.textContent = "adapter: " + m.adapter;
+      console.log("[spike] adapter:", m.adapter);
+      w.postMessage("go");
+    } else if (m.type === "done") {
+      status.textContent = m.ok ? "OK" : "FAILED";
+      out.textContent = m.log;
+      console.log("[spike] " + (m.ok ? "OK" : "FAILED") + " in " + Math.round(m.ms) + "ms\n" + m.log);
+      console.log("[spike] DONE");
+    }
+  };
+  w.onerror = (e) => {
+    status.textContent = "FAILED";
+    out.textContent = "worker error: " + e.message;
+    console.error("[spike] worker error:", e.message);
+  };
+</script>
