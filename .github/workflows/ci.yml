@@ -60,25 +60,29 @@ jobs:
       - name: Test (CPU fallback — no driver on hosted runners)
         run: ctest --test-dir build -C Release --output-on-failure
 
-  # Build verification for the WebGPU (wasm) backend. Same standing as
-  # cuda-build: hosted runners have nowhere to run it — no WebGPU-capable
-  # browser, no GPU — so this compiles and links only. What it protects is the
-  # C++ side of the TENSORLIB_WEBGPU path: include/webgpu.h, the alias chain in
-  # gpu.h, the threshold arm in types.h, none of which an unrelated refactor
-  # should be free to rot.
+  # WebGPU (wasm) backend. Unlike cuda-build this does not stop at building —
+  # it runs the suite.
   #
-  # One thing it cannot protect, and it is the only place CUDA has the better
-  # deal: WGSL is compiled by the browser at run time, so unlike nvcc -ptx the
-  # build sees nothing wrong with a broken shader (kernels/*.inc is just a C
-  # string). WGSL regressions surface only in the manual browser run below.
+  # It can, because what needs verifying is the WGSL and the C++, not Chrome:
+  # any runtime with navigator.gpu and JSPI will do. Deno has both, and on a
+  # GPU-less runner it still returns an adapter, through lavapipe (Mesa's
+  # software Vulkan). Headless Chrome under the same conditions does not expose
+  # navigator.gpu at all, across three attempts — including with a current
+  # Chrome and that same lavapipe working. So the obstacle was Chrome's own GPU
+  # gating, not the runner.
   #
-  # Numerical regression is a manual run of test/wasm/site/index.html in Chrome
-  # — the same arrangement as CUDA's manual ctest on real hardware. That run
-  # checks gpu and auto against the ref oracle, and asserts each kernel family
-  # dispatched at least once, since the suite goes green even when every op
-  # falls back to CPU.
-  wasm-build:
-    name: wasm build (webgpu) / ubuntu-latest
+  # This leaves WebGPU better covered than CUDA rather than worse. nvcc -ptx
+  # checks CUDA kernels at build time; WGSL is compiled at run time by the
+  # browser or runtime, so until now a shader error was invisible to the build.
+  # Running the suite compiles them.
+  #
+  # Both gpu and auto run against the ref oracle. auto is included because the
+  # TENSORLIB_WEBGPU arm of types.h's auto_threshold_() is unreachable from
+  # native ctest. Note the suite stays green even if every op falls back to
+  # CPU, so main_wasm.cpp asserts that each kernel family dispatched at least
+  # once and fails the run otherwise.
+  wasm:
+    name: wasm run (webgpu) / ubuntu-latest
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -88,8 +92,19 @@ jobs:
           # pulls a Dawn tied to the emsdk version, so moving this moves
           # behaviour.
           version: 6.0.3
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Install a software Vulkan driver (lavapipe)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mesa-vulkan-drivers
+      # Build the census too, though nothing here runs it (it measures for
+      # minutes and is a local tool) — that it still compiles is the point.
       - name: Build (tests + census)
         run: ./test/wasm/build.sh
+      - name: Run the suite (gpu / auto)
+        run: deno run --allow-all test/wasm/deno_run.js
 
   # Running the tests on a real CUDA GPU is deliberately out of CI (2026-07):
   # paid GPU runners need an Org and bill per minute, and a self-hosted one is
