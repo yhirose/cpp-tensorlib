@@ -485,8 +485,7 @@ inline void sync_to_host(void*, bool) {}
 
 }  // namespace metal
 
-// tl::gpu_available() and the tl::gpu facade (metal on Apple, cuda elsewhere)
-// are defined in cuda.h, which includes this header — so the choice of GPU
-// backend lives in one place and array.h's eval seam stays #ifdef-free.
+// tl::gpu_available() and the tl::gpu facade (which backend this build uses)
+// live in gpu.h — one place, so array.h's eval seam stays #ifdef-free.
 
 }  // namespace tl

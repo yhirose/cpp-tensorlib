@@ -1,6 +1,6 @@
 #pragma once
 
-#include <cuda.h>
+#include <gpu.h>
 #include <types.h>
 
 #include <cstdint>
