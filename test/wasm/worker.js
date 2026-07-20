@@ -41,8 +41,9 @@ async function main() {
     adapter: `${info.vendor ?? "?"} / ${info.architecture ?? "?"} / ${info.description ?? ""}`,
   });
 
+  const MODES = { cpu: 0, gpu: 1, auto: 2 };
   onmessage = async (e) => {
-    const gpuMode = e.data === "gpu" ? 1 : 0;
+    const gpuMode = MODES[e.data] ?? 0;
     log = "";
     const t0 = performance.now();
     let ok = 0;

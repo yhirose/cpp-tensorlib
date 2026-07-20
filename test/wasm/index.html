@@ -11,12 +11,17 @@
 <p id="adapter"></p>
 <pre id="out"></pre>
 <script type="module">
-  // Only gpu mode runs here: the cpu path is already covered by native ctest,
-  // and what this page exists to prove is that the WebGPU backend agrees with
-  // the ref oracle.
+  // gpu and auto run here; cpu is already covered by native ctest. gpu proves
+  // the WebGPU kernels agree with the ref oracle, auto proves the size-based
+  // routing in types.h's TENSORLIB_WEBGPU arm does too — native ctest cannot
+  // reach that arm at all.
   const status = document.getElementById("status");
   const out = document.getElementById("out");
   const adapter = document.getElementById("adapter");
+
+  const MODES = ["gpu", "auto"];
+  let next = 0;
+  let allOk = true;
 
   const w = new Worker("./worker.js", { type: "module" });
   w.onmessage = (e) => {
@@ -29,15 +34,22 @@
       status.textContent = "running tests…";
       adapter.textContent = "adapter: " + m.adapter;
       console.log("[tltest] adapter:", m.adapter);
-      w.postMessage("gpu");
+      w.postMessage(MODES[next++]);
     } else if (m.type === "done") {
-      status.textContent = m.ok ? "OK" : "FAILED";
-      out.textContent = m.log;
-      // Console gets a compact one-liner (the full report is in the page):
-      // a browser-automation check reads the verdict, not the transcript.
+      allOk = allOk && m.ok;
+      out.textContent += "===== mode=" + m.mode + " =====\n" + m.log + "\n";
+      // Console gets a compact one-liner per mode (the full report is in the
+      // page): a browser-automation check reads the verdict, not the transcript.
       const tail = m.log.split("\n").filter((l) => /test cases:|assertions:|dispatch |FAIL:|WEBGPU|ERROR:.*validat|is invalid|DEVICE LOST/.test(l));
-      console.log("[tltest] " + (m.ok ? "OK" : "FAILED") + " in " + Math.round(m.ms) + "ms | " + tail.join(" | ").replace(/\u001b\[[0-9;]*m/g, ""));
-      console.log("[tltest] DONE");
+      console.log("[tltest] " + m.mode + " " + (m.ok ? "OK" : "FAILED") + " in " + Math.round(m.ms) + "ms | " + tail.join(" | ").replace(/\u001b\[[0-9;]*m/g, ""));
+      if (next < MODES.length) {
+        status.textContent = "running tests… (" + MODES[next] + ")";
+        w.postMessage(MODES[next++]);
+      } else {
+        status.textContent = allOk ? "OK" : "FAILED";
+        console.log("[tltest] " + (allOk ? "OK" : "FAILED"));
+        console.log("[tltest] DONE");
+      }
     }
   };
   w.onerror = (e) => {
