@@ -61,6 +61,134 @@ auto e = a.dot(b);
 tl::use_auto();                    // CPU or GPU per op, by measured size
 ```
 
+API reference
+-------------
+
+`#include <tensorlib.h>` pulls in the whole library; everything lives in
+namespace `tl`. The CMake target is `INTERFACE`, so it deliberately does not
+impose a standard on you — set C++17 or newer yourself.
+
+`tokenizer.h` and `gguf.h` are *not* in the umbrella header; include them
+directly if you want them.
+
+### Creating arrays
+
+Shapes are `tl::shape_t` (= `std::vector<int64_t>`), so braced literals work.
+`{}` is a valid shape — it makes a rank-0 scalar.
+
+| | |
+|---|---|
+| `array::zeros(shape)` / `ones(shape)` | filled with 0 / 1 |
+| `array::full(shape, v)` | filled with `v` |
+| `array::empty(shape)` | allocated, uninitialized |
+| `array::from(vector<float> v)` | 1-d from host data (copies) |
+| `array::from(vector<float> v, shape)` | same, reshaped; throws if the count mismatches |
+| `array()` | undefined array (`defined()` is false) |
+| `tl::concat(vector<array>)` | join along axis 0; other dims must match |
+
+### Inspecting
+
+`shape()`, `strides()`, `rank()`, `size()`, `contiguous()`, `defined()`,
+`dt()`. Note it is **`rank()`, not `ndim()`**.
+
+Reading elements: `at({i, j})` (no bounds checking), `item()` for a
+single-element array, `raw()` for a `const float*`, `data()` for a mutable
+`float*`. All of these evaluate the graph first, and flush any pending GPU
+work — mixing them with lazy ops is safe.
+
+**There is no printing.** No `operator<<`, no `to_string` — format arrays
+yourself from `raw()`.
+
+For tests: `allclose(a, b, rtol = 1e-5f, atol = 1e-6f)` and `array_equal(a, b)`
+(the same thing with zero tolerance). Both return false on a shape mismatch.
+
+### Operations
+
+Everything below is lazy unless noted.
+
+| Group | API |
+|---|---|
+| Arithmetic | `+ - * /` in array⊗array, array⊗float and float⊗array forms; `pow(a, b)`, `pow(a, s)` |
+| Comparison | `> < >= <= == !=`, same three forms — result is an f32 mask of 1.0/0.0; `where(cond, a, b)` |
+| Unary | `.exp() .log() .sqrt() .sigmoid() .relu()` |
+| Softmax | `.softmax()` — **last axis only**, numerically stable, throws on rank 0 |
+| Matmul | `a.dot(b)` — **rank 1 or 2 only**. 2d@2d→`{M,N}`, 2d@1d→`{M}`, 1d@2d→`{N}`, 1d@1d→scalar |
+| Axis reductions | `.sum(axis, keepdims=false)`, `.mean(...)`, `.max(...)`, `.argmax(...)` — any axis, negatives count from the end; `argmax` returns indices as f32 |
+| Scalar reductions | `float sum()`, `float max()`, `float mean()`, `int64_t argmax()` — **eager**, return host values |
+| Views | `.transpose()`, `.transpose({axes})`, `.reshape(shape)`, `.slice(start, count)` (**axis 0 only**), `.clone()` |
+| Broadcast VJP | `.sum_to(shape)` — reduce back to a shape that broadcasts to this one |
+| In-place | `.add_(b)` — **eager**, mutates shared storage |
+| Model ops | `array::attn_decode(q, K, V, scale)`, `array::rope(x, pos, base=10000.0f)`, `array::rmsnorm(x, weight, eps=1e-5f)`, `array::silu(x)`, `array::swiglu(gate, up)` |
+
+Broadcasting follows numpy's trailing-dimension rules; an incompatible pair
+throws. `attn_decode` takes q `[H,D]`, K/V `[H,ctx,D]` and returns `[H,D]`.
+
+### Lazy evaluation
+
+Ops build a graph. Nothing runs until something forces it:
+
+```cpp
+auto c = (a.dot(b) * 0.5f + 1.0f).relu();   // nothing computed yet
+c.eval();                                    // now it runs
+tl::eval(c, d, e);                           // or: several roots, one pass
+```
+
+`.eval()` (member) is the idiomatic form; the free `tl::eval(...)` is
+variadic and evaluates multiple roots in a single topological pass, which is
+what you want when their graphs share subexpressions.
+
+Evaluation also happens implicitly on `data()`, `raw()`, `item()`, `at()`,
+the scalar reductions, `add_()`, and when a view is taken of a lazy source.
+
+### Choosing a backend
+
+```cpp
+tl::use_cpu();    // default
+tl::use_gpu();    // Metal / CUDA / WebGPU, per platform
+tl::use_auto();   // per op, by measured size thresholds
+bool ok = tl::gpu_available();   // compiled in AND a device is present
+```
+
+Selection is a process-wide switch, and which GPU backend you get is decided
+at compile time. When no device is present, `use_gpu()` and `use_auto()`
+silently run on the CPU. The `auto` thresholds are measured per kernel class
+and per backend; `TL_BATCH_MATMUL_BIAS` overrides the batched-matmul one at
+runtime.
+
+### Storage dtypes
+
+Compute and results are **always f32**. `bf16` and `q4` are weight-container
+formats for the bandwidth-bound decode path, not general dtypes:
+
+```cpp
+auto w = weights.to_bf16();   // f32 -> bf16 (round-to-nearest-even)
+auto q = weights.to_q4();     // f32 [K,N] -> grouped int4; needs K % 32 == 0
+auto f = q.to_f32();          // back to f32 (a no-op if already f32)
+```
+
+Ops other than the native decode GEMV widen transparently. **Direct element
+access requires f32** — `raw()`, `data()`, `at()` and `item()` throw on a
+bf16/q4 array, so call `to_f32()` first.
+
+### Things that will bite you
+
+* **`data()` requires a contiguous array; `raw()` does not.** Calling `data()`
+  on a transposed view throws — `clone()` it first.
+* **Views alias their base.** `transpose`/`reshape`/`slice` share storage, so a
+  write through `data()` is visible through every view of it — including from
+  unevaluated graphs still holding that array.
+* **`add_()` mutates shared storage** and is not safe on an array that is still
+  feeding a lazy graph.
+* **Evaluation is single-threaded** by design. There is no documented support
+  for sharing an array across threads.
+
+### Opt-in headers
+
+`#include <tokenizer.h>` gives `tl::tokenizer(gguf_path)` with `encode()`,
+`decode()`, `bos_id()`, `eos_id()`. `#include <gguf.h>` gives
+`tl::gguf::model(path)` — an mmap'd reader with `tensor(name)`, `tensors()`,
+`kv(key)`, `metadata()`. Both are used by the LLM pipeline below.
+
 Backends
 --------
 
