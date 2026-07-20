@@ -19,7 +19,13 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 OUT="$HERE/site"
 WHAT="${1:-all}"
 
-source "${EMSDK_DIR:-$HOME/Projects/emsdk}/emsdk_env.sh" >/dev/null 2>&1
+# Local dev sources emsdk from a checkout; CI (setup-emsdk) already has emcc on
+# PATH and has no emsdk_env.sh to source, so this must not be fatal there.
+EMSDK_ENV="${EMSDK_DIR:-$HOME/Projects/emsdk}/emsdk_env.sh"
+if [[ -f "$EMSDK_ENV" ]]; then
+  source "$EMSDK_ENV" >/dev/null 2>&1
+fi
+command -v emcc >/dev/null || { echo "emcc not found (set EMSDK_DIR or activate emsdk)" >&2; exit 1; }
 
 mkdir -p "$OUT"
 
