@@ -5,8 +5,8 @@ cpp-tensorlib
 
 A C++17 **header-only, cross-platform** tensor library with **zero
 third-party dependencies** — CPU (own SIMD kernels) and GPU (own Metal /
-CUDA kernels) on macOS, Linux, and Windows, from a single `#include
-<tensorlib.h>`. No BLAS, no cuBLAS/cuDNN, no CUTLASS: every accelerated
+CUDA / WGSL kernels) on macOS, Linux, Windows and the browser, from a single
+`#include <tensorlib.h>`. No BLAS, no cuBLAS/cuDNN, no CUTLASS: every accelerated
 kernel — GEMM, GEMV, attention, quantized (int4) matmul — is hand-written
 in this repo, so the only thing a consumer links against is the OS itself
 (and the CUDA *driver*, which is `dlopen`'d at runtime, not linked).
@@ -19,8 +19,9 @@ all on the same own-kernel, zero-dependency foundation (see
 * **Header-only, C++17 minimum** (builds cleanly through C++23) —
   `#include <tensorlib.h>`, nothing to link or build separately.
 * **Cross-platform**: macOS (Accelerate + Metal), Linux/Windows (own
-  BLIS-style CPU microkernels — scalar/AVX2/NEON — and own CUDA kernels).
-  One dispatch seam, no platform `#ifdef`s in consumer code.
+  BLIS-style CPU microkernels — scalar/AVX2/NEON — and own CUDA kernels),
+  and WebAssembly (own WGSL kernels over WebGPU). One dispatch seam, no
+  platform `#ifdef`s in consumer code.
 * **Zero third-party dependencies**: no OpenBLAS, cuBLAS, cuDNN, or
   CUTLASS anywhere in the accelerated paths (see
   [Dependency policy](#dependency-policy)).
@@ -55,7 +56,7 @@ auto d = (a + b).relu();           // also lazy
 
 tl::eval(c, d);                    // evaluate both in one pass
 
-tl::use_gpu();                     // route to Metal (macOS) or CUDA (Linux/Windows)
+tl::use_gpu();                     // Metal (macOS), CUDA (Linux/Windows), WebGPU (wasm)
 auto e = a.dot(b);
 tl::use_auto();                    // CPU or GPU per op, by measured size
 ```
@@ -67,12 +68,38 @@ Backends
 |----------|-----|-----|
 | macOS | Accelerate (vDSP / vForce / CBLAS) ✅ | Metal / MSL (`#embed` JIT), STEEL SGEMM ✅ |
 | Linux / Windows | own BLIS-style microkernels (scalar / AVX2 / NEON, runtime-dispatched) ✅ | own CUDA kernels, PTX JIT'd by a `dlopen`'d driver ✅ |
+| WebAssembly | own scalar microkernels ✅ | own WGSL kernels over WebGPU ✅ |
 | any | reference strided implementation (oracle + fallback) ✅ | — |
 
 Everything reduces to strides through one index walker, so views, broadcast
 and transposed operands share a single code path. Accelerated backends
 replace it per-op at the `graph::eval_one` dispatch seam; the seam carries
 no platform `#ifdef`s (non-Apple builds get inline stubs).
+
+All three GPU backends cover the array surface — GEMM, elementwise
+unary/binary, rank-2 broadcast, row reductions (softmax / row sum / row max)
+— each with the same fused affine epilogue, and each validated against the
+reference implementation as an oracle. The LLM decode kernels (GEMV,
+attention, RoPE, int4 dequant-matmul) are CUDA-only; on Metal and WebGPU
+those ops decline at the seam and run on the CPU.
+
+**The WebGPU backend** is built with `emcc --use-port=emdawnwebgpu
+-DTENSORLIB_WEBGPU`, and differs from the native two in two ways worth
+knowing before you target it:
+
+* **Chrome in practice.** It needs JSPI to keep `flush()` and `sync_to_host()`
+  synchronous. Firefox has it behind a flag and Safari has not shipped it;
+  there, device acquisition fails, `available()` stays false, and every op
+  routes to CPU — correct, just not accelerated. That is also the fallback if
+  the page hands in no device.
+* **No STEEL-equivalent tiling.** The auto-mode thresholds are calibrated
+  against measurements, but the WGSL SGEMM is a straightforward tiled kernel;
+  macOS gets a considerably more tuned one.
+
+CI runs the wasm suite on every push — `test/wasm/` builds the same oracle
+suite as the native backends and runs it headless via Deno (a browser is not
+required, locally either), asserting a per-kernel dispatch census so a silent
+all-CPU fallback fails the build rather than passing green.
 
 Dependency policy
 ------------------
@@ -90,6 +117,10 @@ platform links against:
   the CUDA driver is `dlopen`'d (`LoadLibrary` on Windows) at *run* time, so
   a binary built with `-DTENSORLIB_CUDA=ON` still runs — falling back to
   CPU — on a machine with no NVIDIA driver at all.
+* **WebAssembly** — nothing linked. The WGSL kernels are committed as a C
+  string and the WebGPU entry points come from Emscripten's bundled
+  `emdawnwebgpu` port, so the toolchain is the only requirement and it is a
+  build-time one.
 * **Tests only** — `doctest` is vendored (not a runtime dependency of the
   library itself).
 
@@ -118,7 +149,15 @@ Requires **C++17 or newer** — the headers use inline variables,
 compiles the tests at C++23, but consuming the headers only needs C++17.
 Exception: the **macOS/Metal** backend `#embed`s its shader source, so
 *building on macOS* additionally needs a `#embed`-capable compiler (Clang 19+);
-non-Apple builds never reach that `#embed`.
+non-Apple builds never reach that `#embed`. The WebGPU backend has the same
+problem and solves it the other way — its WGSL is committed as a generated C
+string (`kernels/tensorlib_webgpu_wgsl.inc`, regenerated by
+`kernels/gen_wgsl_inc.sh` when the `.wgsl` changes), so it needs no `#embed`
+and no build step.
+
+For a WebAssembly build, see `test/wasm/build.sh` — a flat `emcc` line with
+`--use-port=emdawnwebgpu -DTENSORLIB_WEBGPU`, plus `-sJSPI=1`, which is what
+lets `flush()` keep a synchronous signature.
 
 LLM inference
 -------------
