@@ -7,5 +7,9 @@ compile_commands.json
 docs/record.md
 docs/record.ja.md
 
+# Internal design notes — kept on disk under docs/_internal, not tracked.
+# docs/ is being reserved for user-facing documentation.
+docs/_*
+
 # Downloaded MNIST cache for the convergence gate (bench/check_mnist.cpp)
 mnist-data/
