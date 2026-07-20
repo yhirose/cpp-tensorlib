@@ -1,0 +1,130 @@
+// WebGPU compute kernels for cpp-tensorlib (M10). Hand-written WGSL, no
+// vendor library — the same stance the Metal and CUDA backends take.
+//
+// Compiled at first use from the C string in tensorlib_webgpu_wgsl.inc, which
+// kernels/gen_wgsl_inc.sh generates from this file. The generated .inc is
+// committed because the wasm build is a flat emcc line that never runs CMake
+// (the CUDA backend's PTX goes through bin2c for the same reason).
+//
+// View offsets arrive as ELEMENT offsets in the params block and are folded
+// into the indexing here, rather than as bind-group binding offsets: WebGPU
+// requires those to be 256-byte aligned, which an arbitrary view offset is
+// not. So every binding covers its whole buffer. (CUDA instead folds offsets
+// host-side into the pointer it passes, which WebGPU has no equivalent of.)
+
+struct Params {
+  M : u32,
+  N : u32,
+  K : u32,
+  lda : u32,
+  ldb : u32,
+  ldc : u32,
+  a_off : u32,
+  b_off : u32,
+  c_off : u32,
+  ta : u32,
+  tb : u32,
+  scale : f32,
+  offset : f32,
+  _pad0 : u32,
+  _pad1 : u32,
+  _pad2 : u32,
+};
+
+@group(0) @binding(0) var<storage, read>       A : array<f32>;
+@group(0) @binding(1) var<storage, read>       B : array<f32>;
+@group(0) @binding(2) var<storage, read_write> C : array<f32>;
+@group(0) @binding(3) var<uniform>             p : Params;
+
+// ---- sgemm: C(M,N) = op(A)(M,K) @ op(B)(K,N) * scale + offset
+//
+// 64x64 workgroup tile, 16x16 = 256 invocations, each holding a 4x4 register
+// accumulator. Mirrors the shape of the Metal sgemm_64_ kernel; MMA intrinsics
+// have no WGSL equivalent, so the inner product is plain FMA over registers.
+// Measured at ~580-630 GF/s for n=1024 on an M1 Pro (see spike/webgpu).
+
+const BM : u32 = 64u;
+const BN : u32 = 64u;
+const BK : u32 = 16u;
+const TM : u32 = 4u;
+const TN : u32 = 4u;
+const THREADS : u32 = 256u;
+
+var<workgroup> As : array<f32, 1024>;  // BM * BK
+var<workgroup> Bs : array<f32, 1024>;  // BK * BN
+
+// Row/column strides for a possibly-transposed operand: transposing swaps
+// which axis walks by the leading dimension (cf. metal_kernels.metal:119-120).
+fn a_index(m : u32, k : u32) -> u32 {
+  let rs = select(p.lda, 1u, p.ta == 1u);
+  let cs = select(1u, p.lda, p.ta == 1u);
+  return p.a_off + m * rs + k * cs;
+}
+
+fn b_index(k : u32, n : u32) -> u32 {
+  let rs = select(p.ldb, 1u, p.tb == 1u);
+  let cs = select(1u, p.ldb, p.tb == 1u);
+  return p.b_off + k * rs + n * cs;
+}
+
+@compute @workgroup_size(16, 16, 1)
+fn sgemm(@builtin(workgroup_id) wg : vec3<u32>,
+         @builtin(local_invocation_id) lid : vec3<u32>) {
+  let m_base = wg.y * BM;
+  let n_base = wg.x * BN;
+  let tid = lid.y * 16u + lid.x;
+
+  var acc : array<f32, 16>;  // TM * TN, zero-initialized
+
+  let n_tiles = (p.K + BK - 1u) / BK;
+  for (var kt : u32 = 0u; kt < n_tiles; kt = kt + 1u) {
+    let k0 = kt * BK;
+
+    // Stage A tile (BM x BK) and B tile (BK x BN), 4 elements per invocation
+    // each. Out-of-range reads are zero-filled so the tail tile needs no
+    // special case in the inner loop.
+    for (var s : u32 = 0u; s < 4u; s = s + 1u) {
+      let i = tid + s * THREADS;
+
+      let am = m_base + i / BK;
+      let ak = k0 + i % BK;
+      let a_ok = am < p.M && ak < p.K;
+      As[i] = select(0.0, A[a_index(am, ak)], a_ok);
+
+      let bk = k0 + i / BN;
+      let bn = n_base + i % BN;
+      let b_ok = bk < p.K && bn < p.N;
+      Bs[i] = select(0.0, B[b_index(bk, bn)], b_ok);
+    }
+
+    workgroupBarrier();
+
+    for (var kk : u32 = 0u; kk < BK; kk = kk + 1u) {
+      var av : array<f32, 4>;
+      var bv : array<f32, 4>;
+      for (var i : u32 = 0u; i < TM; i = i + 1u) {
+        av[i] = As[(lid.y * TM + i) * BK + kk];
+      }
+      for (var j : u32 = 0u; j < TN; j = j + 1u) {
+        bv[j] = Bs[kk * BN + lid.x * TN + j];
+      }
+      for (var i : u32 = 0u; i < TM; i = i + 1u) {
+        for (var j : u32 = 0u; j < TN; j = j + 1u) {
+          acc[i * TN + j] = fma(av[i], bv[j], acc[i * TN + j]);
+        }
+      }
+    }
+
+    workgroupBarrier();
+  }
+
+  for (var i : u32 = 0u; i < TM; i = i + 1u) {
+    let m = m_base + lid.y * TM + i;
+    if (m >= p.M) { continue; }
+    for (var j : u32 = 0u; j < TN; j = j + 1u) {
+      let n = n_base + lid.x * TN + j;
+      if (n >= p.N) { continue; }
+      C[p.c_off + m * p.ldc + n] = acc[i * TN + j] * p.scale + p.offset;
+    }
+  }
+}
