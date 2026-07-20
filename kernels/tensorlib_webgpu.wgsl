@@ -12,9 +12,16 @@
 // not. So every binding covers its whole buffer. (CUDA instead folds offsets
 // host-side into the pointer it passes, which WebGPU has no equivalent of.)
 
+// One Params struct and one bind group layout serve every kernel here, rather
+// than the per-family structs metal_kernels.metal uses. WebGPU's bind group
+// ceremony is heavy enough that a second layout would buy nothing: the fields
+// each family ignores cost 4 bytes of a 256-byte uniform slot. Kernels that
+// take one input (unary, the row reductions) get A bound to B as well — two
+// read-only bindings may alias, and the output is always a fresh allocation,
+// so no writable binding ever aliases a readable one.
 struct Params {
-  M : u32,
-  N : u32,
+  M : u32,        // gemm rows | elementwise element count | reduce rows
+  N : u32,        // gemm cols | reduce cols
   K : u32,
   lda : u32,
   ldb : u32,
@@ -24,11 +31,23 @@ struct Params {
   c_off : u32,
   ta : u32,
   tb : u32,
+  ars : u32,      // broadcast: per-operand row/col strides, in elements
+  acs : u32,
+  brs : u32,
+  bcs : u32,
+  op : u32,       // which operation, within the entry point's family
   scale : f32,
   offset : f32,
+  // A uniform-address-space struct has align 16, so its size rounds up to a
+  // multiple of 16. Pad explicitly to 96 bytes so the host struct (which the
+  // bind group's minBindingSize comes from) matches exactly — a short
+  // minBindingSize fails bind group validation for every dispatch.
   _pad0 : u32,
   _pad1 : u32,
   _pad2 : u32,
+  _pad3 : u32,
+  _pad4 : u32,
+  _pad5 : u32,
 };
 
 @group(0) @binding(0) var<storage, read>       A : array<f32>;
@@ -127,4 +146,159 @@ fn sgemm(@builtin(workgroup_id) wg : vec3<u32>,
       C[p.c_off + m * p.ldc + n] = acc[i * TN + j] * p.scale + p.offset;
     }
   }
+}
+
+// ---- Elementwise, broadcast and row reductions
+//
+// WGSL has neither templates nor a preprocessor, so the per-op variants that
+// metal_kernels.metal generates from a macro would have to be copy-pasted
+// here — exactly the edge-tile bug class that file's header warns against.
+// Instead the operation is a uniform field and each family is ONE entry point
+// that switches on it. The branch is uniform across the dispatch and these
+// kernels are memory-bound, so it costs nothing measurable; what it buys is a
+// single copy of every bounds check and epilogue.
+//
+// Op codes are assigned by kernel_op_() in webgpu.h.
+const OP_ADD : u32 = 0u;
+const OP_SUB : u32 = 1u;
+const OP_MUL : u32 = 2u;
+const OP_DIV : u32 = 3u;
+const OP_POW : u32 = 4u;
+
+const OP_EXP     : u32 = 0u;
+const OP_LOG     : u32 = 1u;
+const OP_SQRT    : u32 = 2u;
+const OP_SIGMOID : u32 = 3u;
+const OP_RELU    : u32 = 4u;
+const OP_AFFINE  : u32 = 5u;
+
+const OP_ROW_SUM : u32 = 0u;
+const OP_ROW_MAX : u32 = 1u;
+
+// Identity for a max reduction. WGSL has no -inf literal, and the decimal
+// spelling of f32::lowest rounds just past the representable range ("cannot be
+// represented as 'f32'"), so this is the largest round number safely inside
+// it. Threads whose row is shorter than the workgroup contribute this.
+const NEG_HUGE : f32 = -3.4e38;
+
+// Shared by the contiguous and the broadcast binary: same five operations,
+// only the addressing differs.
+fn binary_op(op : u32, av : f32, bv : f32) -> f32 {
+  switch (op) {
+    case 1u: { return av - bv; }
+    case 2u: { return av * bv; }
+    case 3u: { return av / bv; }
+    case 4u: { return pow(av, bv); }
+    default: { return av + bv; }
+  }
+}
+
+fn unary_op(op : u32, v : f32) -> f32 {
+  switch (op) {
+    case 1u: { return log(v); }
+    case 2u: { return sqrt(v); }
+    case 3u: { return 1.0 / (1.0 + exp(-v)); }
+    case 4u: { return max(v, 0.0); }
+    case 5u: { return v; }
+    default: { return exp(v); }
+  }
+}
+
+// Contiguous elementwise binary over p.M elements.
+@compute @workgroup_size(256, 1, 1)
+fn ew_binary(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.M) { return; }
+  let v = binary_op(p.op, A[p.a_off + i], B[p.b_off + i]);
+  C[p.c_off + i] = fma(v, p.scale, p.offset);
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn ew_unary(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.M) { return; }
+  let v = unary_op(p.op, A[p.a_off + i]);
+  C[p.c_off + i] = fma(v, p.scale, p.offset);
+}
+
+// Rank-2 broadcast binary: out[r,c] = f(a[r*ars + c*acs], b[r*brs + c*bcs])
+// into a contiguous [M,N] output. Per-operand strides express every rank-2
+// broadcast (row vector, column vector, scalar) in one kernel, which keeps
+// bias/gamma/beta chains on the GPU — a CPU fallback mid-graph costs a full
+// submit-and-wait, and that is dearer here than on Metal.
+@compute @workgroup_size(32, 8, 1)
+fn ew_bcast(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let c = gid.x;
+  let r = gid.y;
+  if (c >= p.N || r >= p.M) { return; }
+  let av = A[p.a_off + r * p.ars + c * p.acs];
+  let bv = B[p.b_off + r * p.brs + c * p.bcs];
+  C[p.c_off + r * p.N + c] = fma(binary_op(p.op, av, bv), p.scale, p.offset);
+}
+
+// ---- Row reductions over the last axis: one workgroup per row, 256
+// invocations, workgroup-scratch tree reduction. p.N (cols) may exceed the
+// invocation count, so each thread strides over the row first.
+
+const T : u32 = 256u;
+var<workgroup> scratch : array<f32, 256>;
+
+// Numerically stable softmax (subtract the row max). Applying an affine
+// epilogue to a softmax is not meaningful, so scale/offset are ignored here,
+// as they are on Metal.
+@compute @workgroup_size(256, 1, 1)
+fn softmax(@builtin(workgroup_id) wg : vec3<u32>,
+           @builtin(local_invocation_index) lid : u32) {
+  let row = wg.x;
+  let src = p.a_off + row * p.N;
+  let dst = p.c_off + row * p.N;
+
+  var m = NEG_HUGE;
+  for (var c : u32 = lid; c < p.N; c = c + T) { m = max(m, A[src + c]); }
+  scratch[lid] = m;
+  workgroupBarrier();
+  for (var s : u32 = T / 2u; s > 0u; s = s >> 1u) {
+    if (lid < s) { scratch[lid] = max(scratch[lid], scratch[lid + s]); }
+    workgroupBarrier();
+  }
+  let row_max = scratch[0];
+  workgroupBarrier();
+
+  var sum = 0.0;
+  for (var c : u32 = lid; c < p.N; c = c + T) { sum = sum + exp(A[src + c] - row_max); }
+  scratch[lid] = sum;
+  workgroupBarrier();
+  for (var s : u32 = T / 2u; s > 0u; s = s >> 1u) {
+    if (lid < s) { scratch[lid] = scratch[lid] + scratch[lid + s]; }
+    workgroupBarrier();
+  }
+  let inv = 1.0 / scratch[0];
+  for (var c : u32 = lid; c < p.N; c = c + T) {
+    C[dst + c] = exp(A[src + c] - row_max) * inv;
+  }
+}
+
+fn reduce_op(op : u32, acc : f32, v : f32) -> f32 {
+  if (op == OP_ROW_MAX) { return max(acc, v); }
+  return acc + v;
+}
+
+// One value per row, with the affine epilogue.
+@compute @workgroup_size(256, 1, 1)
+fn row_reduce(@builtin(workgroup_id) wg : vec3<u32>,
+              @builtin(local_invocation_index) lid : u32) {
+  let row = wg.x;
+  let src = p.a_off + row * p.N;
+
+  var acc = select(0.0, NEG_HUGE, p.op == OP_ROW_MAX);
+  for (var c : u32 = lid; c < p.N; c = c + T) {
+    acc = reduce_op(p.op, acc, A[src + c]);
+  }
+  scratch[lid] = acc;
+  workgroupBarrier();
+  for (var s : u32 = T / 2u; s > 0u; s = s >> 1u) {
+    if (lid < s) { scratch[lid] = reduce_op(p.op, scratch[lid], scratch[lid + s]); }
+    workgroupBarrier();
+  }
+  if (lid == 0u) { C[p.c_off + row] = scratch[0] * p.scale + p.offset; }
 }

@@ -16,6 +16,16 @@ async function main() {
     return;
   }
   const device = await adapter.requestDevice();
+
+  // Surface WebGPU validation errors. Without this they are only warnings in
+  // the worker console, and a single invalid dispatch silently discards the
+  // whole command buffer it was batched into — which reads as "every op
+  // returned zeros", pointing nowhere near the actual mistake.
+  const gpuErrors = [];
+  device.onuncapturederror = (e) => {
+    if (gpuErrors.length < 5) gpuErrors.push(String(e.error.message).split("\n")[0]);
+  };
+  device.lost.then((info) => gpuErrors.push("DEVICE LOST: " + info.message));
   const info = adapter.info ?? {};
 
   // doctest writes its report to stdout; capture it rather than let it vanish
@@ -43,6 +53,7 @@ async function main() {
     } catch (err) {
       log += "exception: " + String(err && err.stack || err) + "\n";
     }
+    if (gpuErrors.length) log = "WEBGPU ERRORS:\n" + gpuErrors.join("\n") + "\n\n" + log;
     postMessage({ type: "done", mode: e.data, ok: !!ok, log, ms: performance.now() - t0 });
   };
 }
