@@ -54,7 +54,7 @@ if [[ "$WHAT" == all || "$WHAT" == tests ]]; then
     -o "$OUT/tests.js"
   set +x
   cp "$HERE/index.html" "$HERE/worker.js" "$OUT/"
-  echo "tests.wasm:  $(stat -f%z "$OUT/tests.wasm") bytes"
+  echo "tests.wasm:  $(wc -c < "$OUT/tests.wasm") bytes"
 fi
 
 if [[ "$WHAT" == all || "$WHAT" == census ]]; then
@@ -67,5 +67,5 @@ if [[ "$WHAT" == all || "$WHAT" == census ]]; then
     -o "$OUT/census.js"
   set +x
   cp "$HERE/census.html" "$HERE/census-worker.js" "$OUT/"
-  echo "census.wasm: $(stat -f%z "$OUT/census.wasm") bytes"
+  echo "census.wasm: $(wc -c < "$OUT/census.wasm") bytes"
 fi

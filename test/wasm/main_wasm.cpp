@@ -68,25 +68,17 @@ EMSCRIPTEN_KEEPALIVE int run_tests(int mode) {
   //
   // gpu mode only. auto routes by size, so a family legitimately reaching zero
   // there is a threshold decision, not a regression.
-  static const char* kFamilies[] = {"sgemm",    "ew_unary", "ew_binary",
-                                    "ew_bcast", "softmax",  "row_reduce"};
   auto& counts = tl::webgpu::context::get().dispatch_counts;
-  for (auto& kv : counts) {
-    auto it = before.find(kv.first);
-    long n = kv.second - (it == before.end() ? 0 : it->second);
-    if (n) std::printf("[tensorlib_wasm] dispatch %s=%ld\n", kv.first.c_str(), n);
-  }
-  if (mode == 1) {
-    for (const char* f : kFamilies) {
-      auto now = counts.find(f);
-      auto was = before.find(f);
-      long n = (now == counts.end() ? 0 : now->second) -
-               (was == before.end() ? 0 : was->second);
-      if (n <= 0) {
-        std::printf("[tensorlib_wasm] FAIL: no %s dispatch — the backend "
-                    "declined every op in this family\n", f);
-        failed = 1;
-      }
+  for (const char* f : tl::webgpu::kEntryPoints) {
+    auto now = counts.find(f);
+    auto was = before.find(f);
+    long n = (now == counts.end() ? 0 : now->second) -
+             (was == before.end() ? 0 : was->second);
+    if (n) std::printf("[tensorlib_wasm] dispatch %s=%ld\n", f, n);
+    if (mode == 1 && n <= 0) {
+      std::printf("[tensorlib_wasm] FAIL: no %s dispatch — the backend "
+                  "declined every op in this family\n", f);
+      failed = 1;
     }
   }
 

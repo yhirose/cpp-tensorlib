@@ -117,8 +117,18 @@ constexpr int64_t kMaxWorkgroups = 65535;
 
 // Dynamic uniform offsets must be a multiple of the adapter's
 // minUniformBufferOffsetAlignment; 256 is the spec's guaranteed-safe maximum.
-constexpr uint64_t kUniformSlot = 256;
-constexpr uint32_t kUniformSlots = 256;  // one flush can batch this many
+constexpr uint64_t kUniformSlotBytes = 256;
+// One flush can batch this many dispatches; past it, encode_ forces a blocking
+// flush mid-graph. At 96 bytes of payload per 256-byte slot the ring is pure
+// device memory (1 MB here) with no binding-size implication, so it is sized to
+// put that forced stall well beyond any graph the backend is aimed at.
+constexpr uint32_t kUniformSlotCount = 4096;
+
+// Every WGSL entry point. The context prebuilds a pipeline for each and the
+// browser harness asserts each one dispatched — both need the same list, and a
+// new kernel missing from either loses a guarantee silently.
+inline constexpr const char* kEntryPoints[] = {
+    "sgemm", "ew_binary", "ew_unary", "ew_bcast", "softmax", "row_reduce"};
 
 struct context {
   wgpu::Instance instance;
@@ -131,9 +141,14 @@ struct context {
   bool ready = false;
   bool pending = false;
 
-  // The open encoder. Created lazily on the first dispatch after a flush, so
-  // an idle backend submits nothing.
+  // The open encoder and its compute pass. Created lazily on the first
+  // dispatch after a flush, so an idle backend submits nothing. One pass spans
+  // the whole batch, as metal.h keeps one MTLComputeCommandEncoder: WebGPU
+  // orders dispatches within a pass and makes each one's writes visible to the
+  // next, so chained ops stay correct, while a pass boundary per dispatch would
+  // serialize independent ones and give back what the batching is for.
   wgpu::CommandEncoder enc;
+  wgpu::ComputePassEncoder pass;
   uint32_t slot = 0;  // next free uniform ring slot
 
   // Host/device mirror per allocation, keyed by the opaque handle alloc()
@@ -154,9 +169,9 @@ struct context {
   std::unordered_map<size_t, std::vector<std::pair<wgpu::Buffer, float*>>> pool;
   std::unordered_map<size_t, std::vector<wgpu::Buffer>> staging_pool;
 
-  // Compute pipelines, built on first use and keyed by WGSL entry point.
-  // Pipeline creation is not free, and every entry point shares one layout,
-  // so this is a pure cache.
+  // Compute pipelines, keyed by WGSL entry point. Every one is built in the
+  // constructor and they all share a layout, so by the time encode_ runs this
+  // is a pure lookup and pipeline_'s create branch is unreachable.
   std::unordered_map<std::string, wgpu::ComputePipeline> pipelines;
   // Per-entry-point dispatch census. Unlike the native backends, this one has
   // no test runner that fails when it is absent: the browser suite passes
@@ -246,7 +261,7 @@ struct context {
     if (!play) return;
 
     wgpu::BufferDescriptor ud = {};
-    ud.size = kUniformSlot * kUniformSlots;
+    ud.size = kUniformSlotBytes * kUniformSlotCount;
     ud.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
     uniforms = device.CreateBuffer(&ud);
     if (!uniforms) return;
@@ -254,8 +269,7 @@ struct context {
     // Build every pipeline up front rather than on first use. Lazily, a WGSL
     // error would surface as an op quietly falling back to CPU forever; here
     // it makes available() false, which the harness reports.
-    for (const char* ep : {"sgemm", "ew_binary", "ew_unary", "ew_bcast",
-                           "softmax", "row_reduce"}) {
+    for (const char* ep : kEntryPoints) {
       if (!pipeline_(ep)) return;
     }
 
@@ -318,9 +332,9 @@ struct context {
     if (gx > kMaxWorkgroups || gy > kMaxWorkgroups) return false;
     wgpu::ComputePipeline pipe = pipeline_(entry);
     if (!pipe) return false;
-    if (slot >= kUniformSlots) flush_();  // ring exhausted; start a new batch
+    if (slot >= kUniformSlotCount) flush_();  // ring exhausted; new batch
 
-    const uint32_t off = slot++ * (uint32_t)kUniformSlot;
+    const uint32_t off = slot++ * (uint32_t)kUniformSlotBytes;
     queue.WriteBuffer(uniforms, off, &p, sizeof(p));
 
     wgpu::BindGroupEntry e[4] = {};
@@ -334,12 +348,13 @@ struct context {
     bgd.entries = e;
     wgpu::BindGroup bg = device.CreateBindGroup(&bgd);
 
-    if (!enc) enc = device.CreateCommandEncoder();
-    wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+    if (!enc) {
+      enc = device.CreateCommandEncoder();
+      pass = enc.BeginComputePass();
+    }
     pass.SetPipeline(pipe);
     pass.SetBindGroup(0, bg, 1, &off);
     pass.DispatchWorkgroups((uint32_t)gx, (uint32_t)gy, 1);
-    pass.End();
 
     pending = true;
     dispatch_counts[entry]++;
@@ -373,6 +388,8 @@ inline void flush() {
   c.pending = false;
   c.slot = 0;
   if (!c.enc) return;
+  c.pass.End();
+  c.pass = nullptr;
   wgpu::CommandBuffer cmds = c.enc.Finish();
   c.enc = nullptr;
   c.queue.Submit(1, &cmds);
@@ -454,10 +471,19 @@ inline void sync_to_host(void* native, bool for_write) {
                               ok = (s == wgpu::MapAsyncStatus::Success);
                             })) &&
         ok) {
-      if (const void* src = stg.GetConstMappedRange(0, m->bytes))
+      if (const void* src = stg.GetConstMappedRange(0, m->bytes)) {
         std::memcpy(m->host, src, m->bytes);
+        m->where = context::BOTH;
+      }
       stg.Unmap();
-      m->where = context::BOTH;
+    }
+    // Only a completed memcpy makes the host copy current. Declaring BOTH on a
+    // failed readback would leave stale bytes permanently believed live, and no
+    // later sync_to_host would retry — so say so loudly instead, as the WGSL
+    // compile failure above does.
+    if (m->where == context::DEVICE) {
+      std::fprintf(stderr, "tensorlib webgpu: readback of %zu bytes failed\n",
+                   m->bytes);
     }
     c.staging_pool[m->bytes].push_back(stg);
   }
