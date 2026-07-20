@@ -51,7 +51,9 @@ using kop = tl::metal::kop;
 #include <webgpu/webgpu_cpp.h>
 
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -65,15 +67,53 @@ inline const char* wgsl_source_() {
   return src;
 }
 
-// Uniform params, laid out to match the WGSL Params struct (16 x 4 bytes).
-struct gemm_params {
+// Uniform params, laid out to match the WGSL Params struct. One struct serves
+// every kernel family (see the comment on Params in the .wgsl): unused fields
+// cost a few bytes of a 256-byte slot, and it keeps one uniform ring and one
+// bind group layout for the whole backend.
+struct params {
   uint32_t M, N, K;
   uint32_t lda, ldb, ldc;
   uint32_t a_off, b_off, c_off;
   uint32_t ta, tb;
+  uint32_t ars, acs, brs, bcs;
+  uint32_t op;
   float scale, offset;
-  uint32_t pad0, pad1, pad2;
+  uint32_t pad0, pad1, pad2, pad3, pad4, pad5;
 };
+
+// WGSL gives a uniform-address-space struct align 16, so Params is 96 bytes
+// there. This must agree: the bind group's minBindingSize comes from sizeof
+// here, and a short one fails validation on every dispatch.
+static_assert(sizeof(params) == 96, "params must match the WGSL Params size");
+
+// Which operation within a family, matching the OP_* constants in the WGSL.
+// Families have separate numbering, so this is only meaningful alongside the
+// entry point it is passed to.
+inline uint32_t kernel_op_(kop op) {
+  switch (op) {
+    case kop::add: case kop::badd: return 0;
+    case kop::sub: case kop::bsub: return 1;
+    case kop::mul: case kop::bmul: return 2;
+    case kop::div: case kop::bdiv: return 3;
+    case kop::pow_: case kop::bpow: return 4;
+
+    case kop::exp_: return 0;
+    case kop::log_: return 1;
+    case kop::sqrt_: return 2;
+    case kop::sigmoid: return 3;
+    case kop::relu: return 4;
+    case kop::affine: return 5;
+
+    case kop::row_sum: return 0;
+    case kop::row_max: return 1;
+    default: return 0;
+  }
+}
+
+// WebGPU guarantees maxComputeWorkgroupsPerDimension >= 65535. Anything past
+// that returns false and falls to CPU rather than silently truncating.
+constexpr int64_t kMaxWorkgroups = 65535;
 
 // Dynamic uniform offsets must be a multiple of the adapter's
 // minUniformBufferOffsetAlignment; 256 is the spec's guaranteed-safe maximum.
@@ -85,7 +125,8 @@ struct context {
   wgpu::Device device;
   wgpu::Queue queue;
   wgpu::BindGroupLayout bgl;
-  wgpu::ComputePipeline sgemm;
+  wgpu::PipelineLayout play;
+  wgpu::ShaderModule mod;
   wgpu::Buffer uniforms;  // ring of kUniformSlots x kUniformSlot bytes
   bool ready = false;
   bool pending = false;
@@ -112,6 +153,17 @@ struct context {
   // allocation would compound the fixed dispatch floor.
   std::unordered_map<size_t, std::vector<std::pair<wgpu::Buffer, float*>>> pool;
   std::unordered_map<size_t, std::vector<wgpu::Buffer>> staging_pool;
+
+  // Compute pipelines, built on first use and keyed by WGSL entry point.
+  // Pipeline creation is not free, and every entry point shares one layout,
+  // so this is a pure cache.
+  std::unordered_map<std::string, wgpu::ComputePipeline> pipelines;
+  // Per-entry-point dispatch census. Unlike the native backends, this one has
+  // no test runner that fails when it is absent: the browser suite passes
+  // whether or not the GPU engages, because every unported op falls back to
+  // CPU. So the harness reports these counts, and a family reading zero means
+  // the backend quietly stopped doing the work. Cheap enough to always keep.
+  std::unordered_map<std::string, long> dispatch_counts;
 
   static context& get() {
     static auto* c = new context();  // leaked: outlives all storage deleters
@@ -140,8 +192,32 @@ struct context {
     wgsl.code = wgsl_source_();
     wgpu::ShaderModuleDescriptor smd = {};
     smd.nextInChain = &wgsl;
-    wgpu::ShaderModule mod = device.CreateShaderModule(&smd);
-    if (!mod) return;
+    mod = device.CreateShaderModule(&smd);
+    // CreateShaderModule hands back an INVALID object, not null, when the WGSL
+    // fails to compile — and so does every pipeline built from it, and every
+    // dispatch then silently does nothing. (That cost a debugging session: one
+    // bad literal made the whole suite read zeros, including ops that had been
+    // working.) Ask for the compilation log and refuse to come up ready.
+    bool compiled = false;
+    if (mod) {
+      wait(mod.GetCompilationInfo(
+          wgpu::CallbackMode::WaitAnyOnly,
+          [&compiled](wgpu::CompilationInfoRequestStatus st,
+                      const wgpu::CompilationInfo* info) {
+            compiled = st == wgpu::CompilationInfoRequestStatus::Success;
+            if (!info) return;
+            for (size_t i = 0; i < info->messageCount; ++i) {
+              const auto& m = info->messages[i];
+              if (m.type != wgpu::CompilationMessageType::Error) continue;
+              compiled = false;
+              std::fprintf(stderr, "tensorlib webgpu: WGSL error at %llu:%llu: %.*s\n",
+                           (unsigned long long)m.lineNum,
+                           (unsigned long long)m.linePos,
+                           (int)m.message.length, m.message.data);
+            }
+          }));
+    }
+    if (!compiled) return;
 
     // Explicit layout rather than GetBindGroupLayout(0): the auto-generated
     // one has no dynamic offset on the uniform binding, which the ring needs.
@@ -156,23 +232,18 @@ struct context {
     be[3].visibility = wgpu::ShaderStage::Compute;
     be[3].buffer.type = wgpu::BufferBindingType::Uniform;
     be[3].buffer.hasDynamicOffset = true;
-    be[3].buffer.minBindingSize = sizeof(gemm_params);
+    be[3].buffer.minBindingSize = sizeof(params);
     wgpu::BindGroupLayoutDescriptor bgld = {};
     bgld.entryCount = 4;
     bgld.entries = be;
     bgl = device.CreateBindGroupLayout(&bgld);
+    if (!bgl) return;
 
     wgpu::PipelineLayoutDescriptor pld = {};
     pld.bindGroupLayoutCount = 1;
     pld.bindGroupLayouts = &bgl;
-    wgpu::PipelineLayout pl = device.CreatePipelineLayout(&pld);
-
-    wgpu::ComputePipelineDescriptor pd = {};
-    pd.layout = pl;
-    pd.compute.module = mod;
-    pd.compute.entryPoint = "sgemm";
-    sgemm = device.CreateComputePipeline(&pd);
-    if (!sgemm) return;
+    play = device.CreatePipelineLayout(&pld);
+    if (!play) return;
 
     wgpu::BufferDescriptor ud = {};
     ud.size = kUniformSlot * kUniformSlots;
@@ -180,7 +251,27 @@ struct context {
     uniforms = device.CreateBuffer(&ud);
     if (!uniforms) return;
 
+    // Build every pipeline up front rather than on first use. Lazily, a WGSL
+    // error would surface as an op quietly falling back to CPU forever; here
+    // it makes available() false, which the harness reports.
+    for (const char* ep : {"sgemm", "ew_binary", "ew_unary", "ew_bcast",
+                           "softmax", "row_reduce"}) {
+      if (!pipeline_(ep)) return;
+    }
+
     ready = true;
+  }
+
+  wgpu::ComputePipeline pipeline_(const char* entry) {
+    auto it = pipelines.find(entry);
+    if (it != pipelines.end()) return it->second;
+    wgpu::ComputePipelineDescriptor pd = {};
+    pd.layout = play;
+    pd.compute.module = mod;
+    pd.compute.entryPoint = entry;
+    wgpu::ComputePipeline p = device.CreateComputePipeline(&pd);
+    if (p) pipelines[entry] = p;
+    return p;
   }
 
   // Blocking wait on a single future — the one place anything suspends.
@@ -212,6 +303,50 @@ struct context {
   void device_write_(void* native) {
     if (mirror* m = mirror_(native)) m->where = DEVICE;
   }
+
+  // The one place a dispatch is encoded. Every op differs only in which
+  // pipeline, which params and what grid — keeping the bind group, uniform
+  // ring and encoder bookkeeping in a single copy is the same discipline
+  // metal_kernels.metal applies to its kernel bodies.
+  //
+  // `b` may be the same mirror as `a` (a unary or reduce kernel binds its one
+  // input twice): two read-only bindings may alias. `out` is always a fresh
+  // allocation from the evaluator, so a writable binding never does.
+  bool encode_(const char* entry, mirror* a, mirror* b, mirror* out,
+               const params& p, int64_t gx, int64_t gy) {
+    if (gx <= 0 || gy <= 0) return false;
+    if (gx > kMaxWorkgroups || gy > kMaxWorkgroups) return false;
+    wgpu::ComputePipeline pipe = pipeline_(entry);
+    if (!pipe) return false;
+    if (slot >= kUniformSlots) flush_();  // ring exhausted; start a new batch
+
+    const uint32_t off = slot++ * (uint32_t)kUniformSlot;
+    queue.WriteBuffer(uniforms, off, &p, sizeof(p));
+
+    wgpu::BindGroupEntry e[4] = {};
+    e[0].binding = 0; e[0].buffer = a->dev;   e[0].size = a->bytes;
+    e[1].binding = 1; e[1].buffer = b->dev;   e[1].size = b->bytes;
+    e[2].binding = 2; e[2].buffer = out->dev; e[2].size = out->bytes;
+    e[3].binding = 3; e[3].buffer = uniforms; e[3].size = sizeof(params);
+    wgpu::BindGroupDescriptor bgd = {};
+    bgd.layout = bgl;
+    bgd.entryCount = 4;
+    bgd.entries = e;
+    wgpu::BindGroup bg = device.CreateBindGroup(&bgd);
+
+    if (!enc) enc = device.CreateCommandEncoder();
+    wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+    pass.SetPipeline(pipe);
+    pass.SetBindGroup(0, bg, 1, &off);
+    pass.DispatchWorkgroups((uint32_t)gx, (uint32_t)gy, 1);
+    pass.End();
+
+    pending = true;
+    dispatch_counts[entry]++;
+    return true;
+  }
+
+  void flush_();  // defined below, once flush() is in scope
 
   wgpu::Buffer staging_(size_t bytes) {
     auto it = staging_pool.find(bytes);
@@ -245,6 +380,8 @@ inline void flush() {
       wgpu::CallbackMode::WaitAnyOnly,
       [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {}));
 }
+
+inline void context::flush_() { flush(); }
 
 // Mirror allocation: a device buffer paired with a host buffer (returned via
 // `contents`). They are DISTINCT memory — the dirty state copies between them
@@ -327,87 +464,152 @@ inline void sync_to_host(void* native, bool for_write) {
   if (for_write) m->where = context::HOST;
 }
 
-// out = op(a) @ op(b) * scale + offset. Offsets are BYTE offsets into the
-// storage; the kernel wants elements, so they must be 4-aligned (they always
-// are for f32 views).
+// Shared host-side prologue for every op: resolve the operand mirrors and
+// stage the lazy copies. Returns false when any operand is untracked — that
+// means a heap storage with no device buffer, so the op belongs on the CPU.
+// `b` may be null for one-input kernels, which then bind `a` twice.
+inline bool operands_(context& c, void* a, void* b, void* out,
+                      context::mirror** ma, context::mirror** mb,
+                      context::mirror** mo) {
+  *ma = c.mirror_(a);
+  *mb = b ? c.mirror_(b) : *ma;
+  *mo = c.mirror_(out);
+  if (!*ma || !*mb || !*mo) return false;
+  c.device_read_(a);
+  if (b) c.device_read_(b);
+  c.device_write_(out);
+  return true;
+}
+
+// Byte offsets must be 4-aligned to convert to the element offsets the
+// kernels index with. They always are for f32 views; anything else falls to
+// the CPU rather than silently truncating.
+inline bool elem_off_(int64_t byte_off, uint32_t* out) {
+  if (byte_off % 4) return false;
+  *out = (uint32_t)(byte_off / 4);
+  return true;
+}
+
+// out = op(a) @ op(b) * scale + offset.
 inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
                  int64_t ldb, bool tb, void* out, int64_t oo, int64_t m,
                  int64_t n, int64_t k, float scale, float offset) {
   auto& c = context::get();
-  if (!c.ready) return false;
-  if (m <= 0 || n <= 0 || k <= 0) return false;
-  if ((ao % 4) || (bo % 4) || (oo % 4)) return false;
-  // Every operand must be a tracked mirror: an untracked pointer is a heap
-  // storage with no device buffer to bind, so this op belongs on the CPU.
-  context::mirror* ma = c.mirror_(a);
-  context::mirror* mb = c.mirror_(b);
-  context::mirror* mo = c.mirror_(out);
-  if (!ma || !mb || !mo) return false;
-  if (c.slot >= kUniformSlots) flush();  // ring exhausted; start a new batch
+  if (!c.ready || m <= 0 || n <= 0 || k <= 0) return false;
+  params p = {};
+  if (!elem_off_(ao, &p.a_off) || !elem_off_(bo, &p.b_off) ||
+      !elem_off_(oo, &p.c_off)) {
+    return false;
+  }
+  context::mirror *ma, *mb, *mo;
+  if (!operands_(c, a, b, out, &ma, &mb, &mo)) return false;
 
-  c.device_read_(a);
-  c.device_read_(b);
-  c.device_write_(out);
-
-  gemm_params p = {};
   p.M = (uint32_t)m;
   p.N = (uint32_t)n;
   p.K = (uint32_t)k;
   p.lda = (uint32_t)lda;
   p.ldb = (uint32_t)ldb;
   p.ldc = (uint32_t)n;  // the eval seam always hands us a contiguous output
-  p.a_off = (uint32_t)(ao / 4);
-  p.b_off = (uint32_t)(bo / 4);
-  p.c_off = (uint32_t)(oo / 4);
   p.ta = ta ? 1u : 0u;
   p.tb = tb ? 1u : 0u;
   p.scale = scale;
   p.offset = offset;
-
-  const uint32_t off = c.slot++ * (uint32_t)kUniformSlot;
-  c.queue.WriteBuffer(c.uniforms, off, &p, sizeof(p));
-
-  wgpu::BindGroupEntry e[4] = {};
-  e[0].binding = 0; e[0].buffer = ma->dev; e[0].size = ma->bytes;
-  e[1].binding = 1; e[1].buffer = mb->dev; e[1].size = mb->bytes;
-  e[2].binding = 2; e[2].buffer = mo->dev; e[2].size = mo->bytes;
-  e[3].binding = 3; e[3].buffer = c.uniforms; e[3].size = sizeof(gemm_params);
-  wgpu::BindGroupDescriptor bgd = {};
-  bgd.layout = c.bgl;
-  bgd.entryCount = 4;
-  bgd.entries = e;
-  wgpu::BindGroup bg = c.device.CreateBindGroup(&bgd);
-
-  if (!c.enc) c.enc = c.device.CreateCommandEncoder();
-  wgpu::ComputePassEncoder pass = c.enc.BeginComputePass();
-  pass.SetPipeline(c.sgemm);
-  pass.SetBindGroup(0, bg, 1, &off);
-  pass.DispatchWorkgroups((uint32_t)((n + 63) / 64), (uint32_t)((m + 63) / 64),
-                          1);
-  pass.End();
-
-  c.pending = true;
-  return true;
+  return c.encode_("sgemm", ma, mb, mo, p, (n + 63) / 64, (m + 63) / 64);
 }
 
-// ---- Not ported yet (Phase 3+). Returning false routes the op to CPU, which
-// is why each phase lands in a working state.
-inline bool binary(kop, void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
-                   float, float) {
-  return false;
+// Contiguous elementwise binary over n elements.
+inline bool binary(kop op, void* a, int64_t ao, void* b, int64_t bo, void* out,
+                   int64_t oo, int64_t n, float scale, float offset) {
+  auto& c = context::get();
+  if (!c.ready || n <= 0) return false;
+  params p = {};
+  if (!elem_off_(ao, &p.a_off) || !elem_off_(bo, &p.b_off) ||
+      !elem_off_(oo, &p.c_off)) {
+    return false;
+  }
+  context::mirror *ma, *mb, *mo;
+  if (!operands_(c, a, b, out, &ma, &mb, &mo)) return false;
+
+  p.M = (uint32_t)n;
+  p.op = kernel_op_(op);
+  p.scale = scale;
+  p.offset = offset;
+  return c.encode_("ew_binary", ma, mb, mo, p, (n + 255) / 256, 1);
 }
-inline bool binary_bcast(kop, void*, int64_t, int64_t, int64_t, void*, int64_t,
-                         int64_t, int64_t, void*, int64_t, int64_t, int64_t,
-                         float, float) {
-  return false;
+
+inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo, int64_t n,
+                  float scale, float offset) {
+  auto& c = context::get();
+  if (!c.ready || n <= 0) return false;
+  params p = {};
+  if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
+  context::mirror *ma, *mb, *mo;
+  if (!operands_(c, a, nullptr, out, &ma, &mb, &mo)) return false;
+
+  p.b_off = p.a_off;  // the kernel binds its one input twice
+  p.M = (uint32_t)n;
+  p.op = kernel_op_(op);
+  p.scale = scale;
+  p.offset = offset;
+  return c.encode_("ew_unary", ma, mb, mo, p, (n + 255) / 256, 1);
 }
-inline bool unary(kop, void*, int64_t, void*, int64_t, int64_t, float, float) {
-  return false;
+
+// Rank-2 broadcast binary: out[r,c] = f(a[r*ars + c*acs], b[r*brs + c*bcs])
+// into a contiguous [m,n] output. One stride-parameterized kernel covers every
+// rank-2 broadcast, which keeps bias/gamma/beta chains on the GPU — falling
+// back mid-graph would cost a full submit-and-wait.
+inline bool binary_bcast(kop op, void* a, int64_t ao, int64_t ars, int64_t acs,
+                         void* b, int64_t bo, int64_t brs, int64_t bcs,
+                         void* out, int64_t oo, int64_t m, int64_t n,
+                         float scale, float offset) {
+  auto& c = context::get();
+  if (!c.ready || m <= 0 || n <= 0) return false;
+  // Broadcast strides are non-negative here (broadcast_strides only ever
+  // zeroes an axis); a negative one would wrap as u32 in the kernel.
+  if (ars < 0 || acs < 0 || brs < 0 || bcs < 0) return false;
+  params p = {};
+  if (!elem_off_(ao, &p.a_off) || !elem_off_(bo, &p.b_off) ||
+      !elem_off_(oo, &p.c_off)) {
+    return false;
+  }
+  context::mirror *ma, *mb, *mo;
+  if (!operands_(c, a, b, out, &ma, &mb, &mo)) return false;
+
+  p.M = (uint32_t)m;
+  p.N = (uint32_t)n;
+  p.ars = (uint32_t)ars;
+  p.acs = (uint32_t)acs;
+  p.brs = (uint32_t)brs;
+  p.bcs = (uint32_t)bcs;
+  p.op = kernel_op_(op);
+  p.scale = scale;
+  p.offset = offset;
+  return c.encode_("ew_bcast", ma, mb, mo, p, (n + 31) / 32, (m + 7) / 8);
 }
-inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
-                   float) {
-  return false;
+
+// Row-wise op over the last axis: softmax writes rows x cols; row_sum/row_max
+// write one value per row, with the affine epilogue. One workgroup per row.
+inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
+                   int64_t rows, int64_t cols, float scale, float offset) {
+  auto& c = context::get();
+  if (!c.ready || rows <= 0 || cols <= 0) return false;
+  params p = {};
+  if (!elem_off_(io, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
+  context::mirror *ma, *mb, *mo;
+  if (!operands_(c, in, nullptr, out, &ma, &mb, &mo)) return false;
+
+  p.b_off = p.a_off;
+  p.M = (uint32_t)rows;
+  p.N = (uint32_t)cols;
+  p.op = kernel_op_(op);
+  p.scale = scale;
+  p.offset = offset;
+  const char* entry = op == kop::softmax ? "softmax" : "row_reduce";
+  return c.encode_(entry, ma, mb, mo, p, rows, 1);
 }
+
+// ---- Not ported yet. Returning false routes the op to CPU, which is why each
+// phase lands in a working state.
 inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,

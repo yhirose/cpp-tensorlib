@@ -33,7 +33,10 @@
     } else if (m.type === "done") {
       status.textContent = m.ok ? "OK" : "FAILED";
       out.textContent = m.log;
-      console.log("[tltest] " + (m.ok ? "OK" : "FAILED") + " in " + Math.round(m.ms) + "ms\n" + m.log);
+      // Console gets a compact one-liner (the full report is in the page):
+      // a browser-automation check reads the verdict, not the transcript.
+      const tail = m.log.split("\n").filter((l) => /test cases:|assertions:|dispatch |FAIL:|WEBGPU|ERROR:.*validat|is invalid|DEVICE LOST/.test(l));
+      console.log("[tltest] " + (m.ok ? "OK" : "FAILED") + " in " + Math.round(m.ms) + "ms | " + tail.join(" | ").replace(/\u001b\[[0-9;]*m/g, ""));
       console.log("[tltest] DONE");
     }
   };

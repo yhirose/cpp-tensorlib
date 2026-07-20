@@ -46,6 +46,10 @@ EMSCRIPTEN_KEEPALIVE int run_tests(int gpu_mode) {
 
   doctest::Context ctx;
   int failed = ctx.run();
+  // A green suite does not prove the backend ran — unported ops fall back to
+  // CPU and pass either way. Report which kernels actually dispatched.
+  for (auto& kv : tl::webgpu::context::get().dispatch_counts)
+    std::printf("[tensorlib_wasm] dispatch %s=%ld\n", kv.first.c_str(), kv.second);
   std::printf("[tensorlib_wasm] %s\n", failed ? "FAIL" : "OK");
   return failed ? 0 : 1;
 }
