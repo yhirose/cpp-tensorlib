@@ -60,6 +60,37 @@ jobs:
       - name: Test (CPU fallback — no driver on hosted runners)
         run: ctest --test-dir build -C Release --output-on-failure
 
+  # Build verification for the WebGPU (wasm) backend. Same standing as
+  # cuda-build: hosted runners have nowhere to run it — no WebGPU-capable
+  # browser, no GPU — so this compiles and links only. What it protects is the
+  # C++ side of the TENSORLIB_WEBGPU path: include/webgpu.h, the alias chain in
+  # gpu.h, the threshold arm in types.h, none of which an unrelated refactor
+  # should be free to rot.
+  #
+  # One thing it cannot protect, and it is the only place CUDA has the better
+  # deal: WGSL is compiled by the browser at run time, so unlike nvcc -ptx the
+  # build sees nothing wrong with a broken shader (kernels/*.inc is just a C
+  # string). WGSL regressions surface only in the manual browser run below.
+  #
+  # Numerical regression is a manual run of test/wasm/site/index.html in Chrome
+  # — the same arrangement as CUDA's manual ctest on real hardware. That run
+  # checks gpu and auto against the ref oracle, and asserts each kernel family
+  # dispatched at least once, since the suite goes green even when every op
+  # falls back to CPU.
+  wasm-build:
+    name: wasm build (webgpu) / ubuntu-latest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          # Match the machine this was validated on: --use-port=emdawnwebgpu
+          # pulls a Dawn tied to the emsdk version, so moving this moves
+          # behaviour.
+          version: 6.0.3
+      - name: Build (tests + census)
+        run: ./test/wasm/build.sh
+
   # Running the tests on a real CUDA GPU is deliberately out of CI (2026-07):
   # paid GPU runners need an Org and bill per minute, and a self-hosted one is
   # upkeep we chose not to take on. CUDA's numerical regression is instead a

@@ -58,13 +58,38 @@ EMSCRIPTEN_KEEPALIVE int run_tests(int mode) {
 
   doctest::Context ctx;
   int failed = ctx.run();
-  // A green suite does not prove the backend ran — unported ops fall back to
-  // CPU and pass either way. Report which kernels actually dispatched.
-  for (auto& kv : tl::webgpu::context::get().dispatch_counts) {
+
+  // A green suite does not prove the backend ran: an op the backend declines
+  // falls to CPU and its assertions pass either way. So the dispatch census is
+  // not just reported, it is asserted — every family that has a kernel must
+  // have dispatched at least once. Without this the whole suite stays green
+  // when the WGSL fails to compile, which is precisely the Phase 3 failure
+  // mode (a bad shader module makes every kernel decline, silently).
+  //
+  // gpu mode only. auto routes by size, so a family legitimately reaching zero
+  // there is a threshold decision, not a regression.
+  static const char* kFamilies[] = {"sgemm",    "ew_unary", "ew_binary",
+                                    "ew_bcast", "softmax",  "row_reduce"};
+  auto& counts = tl::webgpu::context::get().dispatch_counts;
+  for (auto& kv : counts) {
     auto it = before.find(kv.first);
     long n = kv.second - (it == before.end() ? 0 : it->second);
     if (n) std::printf("[tensorlib_wasm] dispatch %s=%ld\n", kv.first.c_str(), n);
   }
+  if (mode == 1) {
+    for (const char* f : kFamilies) {
+      auto now = counts.find(f);
+      auto was = before.find(f);
+      long n = (now == counts.end() ? 0 : now->second) -
+               (was == before.end() ? 0 : was->second);
+      if (n <= 0) {
+        std::printf("[tensorlib_wasm] FAIL: no %s dispatch — the backend "
+                    "declined every op in this family\n", f);
+        failed = 1;
+      }
+    }
+  }
+
   std::printf("[tensorlib_wasm] %s %s\n", name, failed ? "FAIL" : "OK");
   return failed ? 0 : 1;
 }
