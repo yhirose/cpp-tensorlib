@@ -309,17 +309,6 @@ shape. See `bench/cuda/speed/bench_qwen_decode.cpp` and
 [docs/performance-notes.md](docs/performance-notes.md) for the measurement
 methodology and the full tuning history.
 
-Documentation
--------------
-
-* [docs/architecture.md](docs/architecture.md) — layer map, dispatch seam,
-  current state, conventions.
-* [docs/roadmap.md](docs/roadmap.md) — milestone scope + status, environment
-  constraints, per-milestone approach, open decisions.
-* [docs/performance-notes.md](docs/performance-notes.md) — measurement
-  methodology, gate results, the silarray comparison, and refuted approaches
-  (read before any performance work).
-
 License
 -------
 
