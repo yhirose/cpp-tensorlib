@@ -46,6 +46,8 @@ using kop = tl::metal::kop;
 }  // namespace webgpu
 }  // namespace tl
 
+#include <emscripten/em_js.h>
+
 // emdawnwebgpu declares emscripten_webgpu_get_device() in webgpu.h itself,
 // not in emscripten/html5_webgpu.h (that is the old built-in binding's home).
 #include <webgpu/webgpu_cpp.h>
@@ -130,6 +132,20 @@ constexpr uint32_t kUniformSlotCount = 4096;
 inline constexpr const char* kEntryPoints[] = {
     "sgemm", "ew_binary", "ew_unary", "ew_bcast", "softmax", "row_reduce"};
 
+// emscripten_webgpu_get_device() does not report "no device" — it hands
+// Module.preinitializedWebGPUDevice straight to importJsDevice, which reads
+// .queue off it (library_webgpu.js), so an absent device leaves as a JS
+// TypeError on the first dispatch instead of as a null return. Its assert()
+// says as much, and a release link compiles that assert out. Ask JS directly,
+// so the case the header documents — JS handed in no device, available()
+// stays false, every op routes to CPU — is the one that actually happens.
+//
+// Named for global reach, not for this namespace: EM_JS is extern "C", so the
+// symbol and the generated JS function land outside tl::webgpu either way.
+EM_JS(int, tl_webgpu_has_preinitialized_device, (), {
+  return Module["preinitializedWebGPUDevice"] ? 1 : 0;
+});
+
 struct context {
   wgpu::Instance instance;
   wgpu::Device device;
@@ -199,6 +215,7 @@ struct context {
 
     // No adapter/device round-trip on this side: JS already did it and passed
     // the result as Module.preinitializedWebGPUDevice.
+    if (!tl_webgpu_has_preinitialized_device()) return;
     device = wgpu::Device::Acquire(emscripten_webgpu_get_device());
     if (!device) return;
     queue = device.GetQueue();
