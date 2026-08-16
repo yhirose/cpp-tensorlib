@@ -571,7 +571,9 @@ inline void set_cache_pos(Model& M, int64_t p) {
 // counter d_pos, which a captured tl_incr_u32 advances each replay. embed staging
 // + argmax stay on the host side of each step (cheap; see bench census). Falls
 // back gracefully: ok()==false when graph support is missing or capture failed,
-// and the caller should use step_imperative instead. f32 KV, S=1 attn (Qwen).
+// and the caller should use step_imperative instead. f32 KV; attention is
+// split-KV on a capacity-static grid (pos-independent, so capturable; flat in
+// ctx like the host path — see cuda.h attn_decode_dpos).
 struct captured_decoder {
   void* d_pos = nullptr;
   tl::cuda::CUgraphExec exec = nullptr;  // opaque handle; non-null == captured
@@ -627,6 +629,10 @@ inline std::string default_path() {
   const char* home = std::getenv("HOME");
   return std::string(home ? home : ".") + "/models/qwen2.5-0.5b-instruct-fp16.gguf";
 }
+
+// Deterministic short-prefill fixture shared by the decode benches (arbitrary
+// valid token ids — enough to make the cache/pos realistic without a tokenizer).
+constexpr int PREFILL_IDS[4] = {40, 2610, 264, 3974};
 
 // Assert the GGUF metadata matches our compile-time constants (this driver is
 // hard-coded for Qwen2.5-0.5B). Returns false on mismatch.

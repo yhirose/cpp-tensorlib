@@ -4,7 +4,10 @@
 // from-scratch CPU references that validate D=128 in bench_attn_decode. Covers
 // every head-dim-specific kernel at D=64: kv_append, decode attention (both the
 // single-block and the split-KV path, straddling the ctx>=256 boundary), kv_fill,
-// causal prefill, and the prefill->decode handoff. Correctness-only (no timing);
+// causal prefill, and the prefill->decode handoff. Also the model-free lockstep
+// guard for the CUDA-graph attention: attn_dpos (capacity-static split grid,
+// in-kernel chunk twin) is memcmp'd bit-equal against attn at every checkpoint.
+// Correctness-only (no timing);
 // returns nonzero on any mismatch, so it gates the generalization as a ctest.
 //
 // GQA shape 14 q / 2 kv (group 7) mirrors the real first target Qwen2.5-0.5B.
@@ -18,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 using namespace tl::cuda;
@@ -49,13 +53,21 @@ int main() {
     void* vn = alloc(HKV * D * 4, &hvn);
     void* q = alloc(HQ * D * 4, &hq);
     void* o = alloc(HQ * D * 4, &ho);
+    // Second output + device pos for the host-vs-dpos bit-equality sweep.
+    float* ho2 = nullptr;
+    void* o2 = alloc(HQ * D * 4, &ho2);
+    void* dp = alloc(4, nullptr);
+    bool dpos_eq = true;
     std::vector<float> Khist((size_t)HKV * MAXC * D), Vhist((size_t)HKV * MAXC * D);
 
-    const int64_t checks[] = {1, 2, 63, 64, 127, 128, 255, 256, 257, 512, 600};
+    // Checkpoints straddle the split-KV boundary (256) and reach max capacity
+    // so the dpos sweep exercises several live-split depths of the chunk twin.
+    const int64_t checks[] = {1,   2,   63,  64,   127, 128, 255,
+                              256, 257, 512, 1024, 2047};
     size_t ci = 0;
     double maxrel = 0;
     std::vector<float> scores(MAXC);
-    const int64_t STEPS = 600;
+    const int64_t STEPS = 2047;
     for (int64_t step = 1; step <= STEPS; step++) {
       int64_t pos = step - 1;
       for (int64_t i = 0; i < HKV * D; i++) {
@@ -76,6 +88,18 @@ int main() {
         cache.attn(q, o, HQ, scale);
         flush();
         sync_to_host(o, false);
+        // Lockstep guard: attn_dpos (split-KV on the capacity-static grid,
+        // *d_pos = pos so ctx matches) must be BIT-identical to attn — the
+        // device attn_dpos_chunk twins the host attn_split_count/attn_split_chunk
+        // heuristic, and the capacity grid's empty splits combine as exact zeros.
+        upload_u32(dp, (unsigned)pos);
+        cache.attn_dpos(q, o2, HQ, dp, scale);
+        flush();
+        sync_to_host(o2, false);
+        if (std::memcmp(ho, ho2, (size_t)HQ * D * 4) != 0) {
+          dpos_eq = false;
+          std::printf("  attn_dpos != attn at ctx %lld\n", (long long)step);
+        }
         int64_t L = step;
         for (int64_t qh = 0; qh < HQ; qh++) {
           int64_t kvh = qh / group;
@@ -104,9 +128,13 @@ int main() {
     std::printf("  kv cache grow to %lld tokens (%zu checkpoints, split-KV @>=256) "
                 "— maxrel %.1e %s\n", (long long)cache.pos,
                 sizeof(checks) / sizeof(checks[0]), maxrel, maxrel < 1e-4 ? "OK" : "FAIL");
+    ok &= dpos_eq;
+    std::printf("  attn_dpos (capacity-grid split) vs attn — bit-equal at every "
+                "checkpoint %s\n", dpos_eq ? "OK" : "FAIL");
     cache.destroy();
     release(kn, 0, nullptr); release(vn, 0, nullptr);
     release(q, 0, nullptr);  release(o, 0, nullptr);
+    release(o2, 0, nullptr); release(dp, 0, nullptr);
   }
 
   // ---- Causal prefill at D=64 + prefill->decode handoff. ----

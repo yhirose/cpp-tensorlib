@@ -52,10 +52,9 @@ int main(int argc, char** argv) {
   // Short deterministic prefill so the cache/pos are realistic, then time a
   // fixed run of decode steps. A few warmup steps first (module load, fn cache,
   // first-touch allocs) so the census reflects steady state.
-  const int prompt[] = {40, 2610, 264, 3974};  // arbitrary valid ids
   int64_t pos = 0;
   std::vector<float> logits;
-  for (int i = 0; i < 4; i++) logits = qm::step(M, prompt[i], pos++);
+  for (int id : qm::PREFILL_IDS) logits = qm::step(M, id, pos++);
 
   int64_t next = qm::argmax(logits);
   for (int i = 0; i < 16; i++) next = qm::step_greedy(M, next, pos++);  // warmup

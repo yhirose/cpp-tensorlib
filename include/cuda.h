@@ -421,8 +421,8 @@ struct context {
   // Device-pos variants (CUDA-graph capture): pos/ctx read from a device scalar
   // so one instantiated graph replays correctly as the decode position advances.
   CUfunction rope_dpos_fn = nullptr, incr_u32_fn = nullptr,
-             kv_append_dpos_fn = nullptr, attn_decode_dpos_fn = nullptr,
-             attn_decode_dpos_64_fn = nullptr;
+             kv_append_dpos_fn = nullptr, attn_split_dpos_fn = nullptr,
+             attn_split_dpos_64_fn = nullptr;
   CUfunction rope_dpos_() {
     if (!rope_dpos_fn) d.ModuleGetFunction(&rope_dpos_fn, mod, "tl_rope_dpos");
     return rope_dpos_fn;
@@ -436,12 +436,12 @@ struct context {
       d.ModuleGetFunction(&kv_append_dpos_fn, mod, "tl_kv_append_dpos");
     return kv_append_dpos_fn;
   }
-  CUfunction attn_decode_dpos_(int64_t D) {
-    CUfunction* slot = D == 64 ? &attn_decode_dpos_64_fn : &attn_decode_dpos_fn;
+  CUfunction attn_split_dpos_(int64_t D) {
+    CUfunction* slot = D == 64 ? &attn_split_dpos_64_fn : &attn_split_dpos_fn;
     if (!*slot)
       d.ModuleGetFunction(slot, mod,
-                          D == 64 ? "tl_attn_decode_f32_64_dpos"
-                                  : "tl_attn_decode_f32_dpos");
+                          D == 64 ? "tl_attn_decode_split_64_dpos"
+                                  : "tl_attn_decode_split_dpos");
     return *slot;
   }
 
@@ -843,6 +843,50 @@ inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
                           gemv_row_smem(block), c.stream, args, nullptr) == 0;
 }
 
+// Split-KV split-count heuristic: how many ctx-splits make grid = heads×S fill
+// the SMs (heads alone is ~32 blocks « 82 SMs; target ~4 blocks/SM, and each
+// split needs >=128 keys to amortize its fixed cost). Shared by attn_decode
+// (evaluated at the live ctx) and attn_decode_dpos (evaluated at max_ctx, so
+// the CUDA-graph grid is pos-independent).
+inline unsigned attn_split_count(unsigned n_heads, int64_t ctx) {
+  const long target = 328;  // ~4 * 82 SMs
+  if (n_heads == 0 || (long)n_heads >= target || ctx < 256) return 1;
+  unsigned want = static_cast<unsigned>((target + n_heads - 1) / n_heads);
+  unsigned max_s = static_cast<unsigned>(ctx / 128);  // >=128 keys/split
+  if (want > max_s) want = max_s;
+  return want > 1 ? want : 1;
+}
+
+// Keys per split for the split-KV kernels: ceil(ctx / attn_split_count), rounded
+// up to a multiple of 4 warps. The device-side attn_dpos_chunk in
+// tensorlib_cuda.cu is the twin of attn_split_count + this rounding and MUST
+// stay in lockstep — the host/dpos bit-identity rests on it. Guarded by the
+// attn64 ctest's host-vs-dpos bit-equality sweep.
+inline unsigned attn_split_chunk(unsigned n_heads, int64_t ctx) {
+  unsigned S = attn_split_count(n_heads, ctx);
+  unsigned chunk = (static_cast<unsigned>(ctx) + S - 1) / S;
+  chunk = (chunk + 3u) & ~3u;
+  return chunk ? chunk : 4u;
+}
+
+// Split-KV partials scratch: ONE buffer laid out pm[H*S] | pl[H*S] | pacc[H*S*D]
+// (hs = H*S). bytes/the carve constructor/combine() keep that layout contract in
+// a single place — attn_decode's split branch and attn_decode_dpos both bake
+// these pointers into launches (the dpos ones into a captured graph).
+struct attn_partials {
+  float *pm, *pl, *pacc;
+  attn_partials(float* base, size_t hs) : pm(base), pl(pm + hs), pacc(pl + hs) {}
+  static size_t bytes(size_t hs, int64_t D) {
+    return (hs * 2 + hs * static_cast<size_t>(D)) * sizeof(float);
+  }
+  // Merge the S per-head partials into out [H, D] (tl_attn_combine).
+  bool combine(context& c, float* out, unsigned uh, unsigned uD, unsigned S) {
+    void* args[] = {&pm, &pl, &pacc, &out, &S};
+    return c.d.LaunchKernel(c.attn_combine_(), uh, 1, 1, uD, 1, 1, 0, c.stream,
+                            args, nullptr) == 0;
+  }
+};
+
 // M9 fused decode attention: out(h,:) = softmax(scale·q(h,:)·K(kv,:)^T)·V(kv) in
 // one pass. q [n_q_heads,D], out [n_q_heads,D]; K/V are a [n_kv_heads,kv_max,D]
 // cache read over its valid prefix [0,ctx) (kv_max==ctx is the no-cache case).
@@ -865,19 +909,9 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
   unsigned kv_stride = static_cast<unsigned>(kv_max * D);
   unsigned group = static_cast<unsigned>(n_q_heads / n_kv_heads);
 
-  // Split ctx over gridDim.y so grid = heads×S fills the SMs (heads alone is
-  // ~32 blocks « 82 SMs). Target ~4 blocks/SM; each split needs enough keys
-  // (>=128, multiple of 4 warps) to amortize its fixed cost.
-  unsigned S = 1;
-  {
-    const long target = 328;  // ~4 * 82 SMs
-    if (uh > 0 && (long)uh < target && ctx >= 256) {
-      unsigned want = static_cast<unsigned>((target + uh - 1) / uh);
-      unsigned max_s = static_cast<unsigned>(ctx / 128);  // >=128 keys/split
-      if (want > max_s) want = max_s;
-      if (want > 1) S = want;
-    }
-  }
+  // Split ctx over gridDim.y so grid = heads×S fills the SMs (see
+  // attn_split_count; chunk below is rounded to a multiple of 4 warps).
+  unsigned S = attn_split_count(uh, ctx);
   unsigned uD = static_cast<unsigned>(D);
   if (S == 1) {
     void* args[] = {&pq, &pk, &pv, &po, &uctx, &kv_stride, &group, &scale};
@@ -886,34 +920,27 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
                             nullptr, args, nullptr) == 0;
   }
 
-  unsigned chunk = (uctx + S - 1) / S;
-  chunk = (chunk + 3u) & ~3u;  // multiple of the warp count (4 for D=128, 2 for 64)
-  if (chunk == 0) chunk = 4;
+  unsigned chunk = attn_split_chunk(uh, ctx);
   S = (uctx + chunk - 1) / chunk;  // recompute after rounding
-  // scratch: pm[H*S] , pl[H*S] , pacc[H*S*D]
   size_t hs = (size_t)uh * S;
-  size_t bytes = (hs * 2 + hs * (size_t)D) * sizeof(float);
-  CUdeviceptr scr = c.attn_scratch_(bytes);
+  CUdeviceptr scr = c.attn_scratch_(attn_partials::bytes(hs, D));
   if (!scr) return false;
-  float* pm = reinterpret_cast<float*>(scr);
-  float* pl = pm + hs;
-  float* pacc = pl + hs;
+  attn_partials p(reinterpret_cast<float*>(scr), hs);
   c.pending = true;
-  void* a1[] = {&pq,     &pk,        &pv,    &pm,    &pl,
-                &pacc,   &uctx,      &kv_stride, &group, &chunk,
+  void* a1[] = {&pq,    &pk,   &pv,        &p.pm,  &p.pl,
+                &p.pacc, &uctx, &kv_stride, &group, &chunk,
                 &scale};
   if (c.d.LaunchKernel(c.attn_split_(D, kv_bf16), uh, S, 1, uD, 1, 1, 0,
                        c.stream, a1, nullptr) != 0)
     return false;
-  void* a2[] = {&pm, &pl, &pacc, &po, &S};
-  return c.d.LaunchKernel(c.attn_combine_(), uh, 1, 1, uD, 1, 1, 0, c.stream, a2,
-                          nullptr) == 0;
+  return p.combine(c, po, uh, uD, S);
 }
 
 // ---- CUDA-graph-capture device-pos launchers (A-min). Each mirrors its
 // by-value sibling but sources pos/ctx from a device scalar `d_pos` (a 4-byte
 // device buffer the caller owns) and launches on c.stream so the op is captured.
-// attn_decode_dpos is single-block-per-head (S=1) only — pos-independent grid.
+// Grids are pos-independent throughout: attn_decode_dpos gets its split grid
+// from the cache CAPACITY (max_ctx) and lets the kernel bound the work by pos.
 
 // RoPE reading pos from *d_pos (else identical to rope()).
 inline bool rope_dpos(void* x, void* out, int64_t rows, int64_t T, int64_t D,
@@ -970,29 +997,48 @@ inline bool kv_append_dpos(void* Kc, void* Vc, void* k_new, void* v_new,
                           (unsigned)D, 1, 1, 0, c.stream, args, nullptr) == 0;
 }
 
-// Decode attention with ctx = *d_pos + 1, single-block-per-head (S=1). f32 KV.
+// Decode attention with ctx = *d_pos + 1, split-KV on a capacity-static grid:
+// gridDim.y = S_max = attn_split_count(H, max_ctx), a constant for the cache's
+// lifetime — so the launch is capturable — while each block derives its live
+// split bounds from *d_pos (attn_dpos_chunk, the device twin of
+// attn_split_count + attn_split_chunk). Splits past the live count write
+// neutral partials that combine as exact zeros, so the output is bit-identical
+// to the host attn_decode at every pos, and the captured path stays
+// split-KV-flat at long ctx (the S=1 pin it replaces was linear in ctx).
+// `partials` is a caller-OWNED device buffer of attn_partials::bytes(H*S_max, D)
+// — like d_pos, it is graph-lifetime state (a captured graph bakes its address
+// in), so it must not be a shared growable scratch; kv_cache owns one per
+// cache. f32 KV.
 inline bool attn_decode_dpos(void* q, void* K, void* V, void* out,
                              int64_t n_q_heads, int64_t n_kv_heads, void* d_pos,
-                             int64_t kv_max, int64_t D, float scale) {
+                             int64_t kv_max, int64_t D, float scale,
+                             void* partials) {
   auto& c = context::get();
-  if (!c.ready || (D != 128 && D != 64)) return false;
+  if (!c.ready || (D != 128 && D != 64) || !partials) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
   c.device_read_(q);
   c.device_read_(K);
   c.device_read_(V);
   c.device_read_(d_pos);
   c.device_write_(out);
+  c.device_write_(partials);
   float* pq = context::off_(q, 0);
   float* pk = context::off_(K, 0);
   float* pv = context::off_(V, 0);
   float* po = context::off_(out, 0);
   float* pp = context::off_(d_pos, 0);
+  unsigned uh = (unsigned)n_q_heads, uD = (unsigned)D;
   unsigned kv_stride = (unsigned)(kv_max * D);
   unsigned group = (unsigned)(n_q_heads / n_kv_heads);
-  void* args[] = {&pq, &pk, &pv, &po, &pp, &kv_stride, &group, &scale};
+  unsigned S = attn_split_count(uh, kv_max);
+  attn_partials p(context::off_(partials, 0), (size_t)uh * S);
   c.pending = true;
-  return c.d.LaunchKernel(c.attn_decode_dpos_(D), (unsigned)n_q_heads, 1, 1,
-                          (unsigned)D, 1, 1, 0, c.stream, args, nullptr) == 0;
+  void* a1[] = {&pq,    &pk,  &pv,        &p.pm,  &p.pl,
+                &p.pacc, &pp, &kv_stride, &group, &scale};
+  if (c.d.LaunchKernel(c.attn_split_dpos_(D), uh, S, 1, uD, 1, 1, 0, c.stream,
+                       a1, nullptr) != 0)
+    return false;
+  return p.combine(c, po, uh, uD, S);
 }
 
 // M9 KV cache append: scatter one decode step's k,v (each [n_kv_heads,D] device
@@ -1229,9 +1275,20 @@ struct kv_cache {
   bool append_dpos(void* k_new, void* v_new, void* d_pos) {
     return kv_append_dpos(K, V, k_new, v_new, d_pos, max_ctx, n_kv_heads, D);
   }
+  // The split partials for attn_dpos are graph-lifetime state (a captured graph
+  // bakes their address in), so each cache OWNS its buffer rather than sharing
+  // the growable attn_scratch_ — an unrelated bigger attn call can then never
+  // free memory a live graph still points at. Sized once from the capacity
+  // (attn_split_count at max_ctx) on the first — warm, pre-capture — call.
+  void* dpos_partials = nullptr;
   bool attn_dpos(void* q, void* out, int64_t n_q_heads, void* d_pos, float scale) {
+    if (!dpos_partials) {
+      unsigned S = attn_split_count((unsigned)n_q_heads, max_ctx);
+      size_t hs = (size_t)n_q_heads * S;
+      dpos_partials = alloc((int64_t)attn_partials::bytes(hs, D), nullptr);
+    }
     return attn_decode_dpos(q, K, V, out, n_q_heads, n_kv_heads, d_pos, max_ctx,
-                            D, scale);
+                            D, scale, dpos_partials);
   }
   // Prefill a T-token prompt: bulk-fill the cache from k_src/v_src
   // ([n_kv_heads,T,D]) and run causal attention (q/out [n_q_heads,T,D]). Leaves
@@ -1248,7 +1305,8 @@ struct kv_cache {
   void destroy() {
     if (K) release(K, 0, nullptr);
     if (V) release(V, 0, nullptr);
-    K = V = nullptr;
+    if (dpos_partials) release(dpos_partials, 0, nullptr);
+    K = V = dpos_partials = nullptr;
   }
 };
 

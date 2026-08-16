@@ -709,24 +709,6 @@ extern "C" __global__ void tl_attn_decode_f32_64(const float* q, const float* K,
     unsigned group, float scale) {
   attn_decode_core<64>(q, K, V, out, ctx, kv_stride, group, scale);
 }
-// Device-pos variants (CUDA-graph capture): ctx = *d_pos + 1 (the decode step
-// attends the cached prefix [0, pos] after this step's k,v were appended at row
-// pos). Single-block-per-head (S=1) only — its grid is (H,1,1), pos-independent,
-// so one instantiated graph replays at any pos; the split-KV path's grid is
-// ctx-derived and not capturable this way. Body is attn_decode_core, byte-
-// identical to the by-value kernels. f32 KV (Qwen decode).
-extern "C" __global__ void tl_attn_decode_f32_dpos(const float* q,
-    const float* K, const float* V, float* out,
-    const unsigned* __restrict__ d_pos, unsigned kv_stride, unsigned group,
-    float scale) {
-  attn_decode_core<128>(q, K, V, out, *d_pos + 1u, kv_stride, group, scale);
-}
-extern "C" __global__ void tl_attn_decode_f32_64_dpos(const float* q,
-    const float* K, const float* V, float* out,
-    const unsigned* __restrict__ d_pos, unsigned kv_stride, unsigned group,
-    float scale) {
-  attn_decode_core<64>(q, K, V, out, *d_pos + 1u, kv_stride, group, scale);
-}
 extern "C" __global__ void tl_attn_decode_bf16(const float* q,
     const __nv_bfloat16* K, const __nv_bfloat16* V, float* out, unsigned ctx,
     unsigned kv_stride, unsigned group, float scale) {
@@ -842,6 +824,54 @@ extern "C" __global__ void tl_attn_decode_split_bf16_64(const float* q,
     unsigned chunk, float scale) {
   attn_decode_split_core<64, __nv_bfloat16>(q, K, V, pm, pl, pacc, ctx,
                                             kv_stride, group, chunk, scale);
+}
+
+// Device-pos split-KV decode attention (CUDA-graph capture): ctx = *d_pos + 1
+// (the decode step attends the cached prefix [0, pos] after this step's k,v
+// were appended at row pos). Grid dims come from the STATIC cache capacity
+// (the launcher sets gridDim.y = S_max from max_ctx), work bounds from the
+// DYNAMIC position: each block recomputes the host launcher's split heuristic
+// from *d_pos, so one instantiated graph replays correctly at every pos AND
+// stays split-KV-flat at long ctx (the earlier S=1 pin was linear in ctx).
+// Splits past ceil(ctx/chunk) see k0 >= ctx, fall through the core's loop
+// empty, and write the neutral partial (m=-1e30, l=0, acc=0) that contributes
+// exact zeros in tl_attn_combine — so the output is bit-identical to the host
+// path (single-block or split) at the same pos. Body is attn_decode_split_core,
+// byte-identical to the by-value kernels. f32 KV (Qwen decode).
+//
+// attn_dpos_chunk is the device twin of cuda.h's attn_split_count +
+// attn_split_chunk and MUST stay in lockstep with them — that equality is what
+// the host/dpos bit-identity rests on (guarded by the attn64 ctest's
+// host-vs-dpos bit-equality sweep). ctx <= max_ctx is a cache invariant, so the
+// live split count never exceeds the launched gridDim.y (attn_split_count is
+// monotone in ctx).
+__device__ __forceinline__ unsigned attn_dpos_chunk(unsigned ctx, unsigned H) {
+  unsigned S = 1;
+  if (H < 328u && ctx >= 256u) {  // target ~4 blocks/SM (328 = 4 * 82 SMs)
+    unsigned want = (328u + H - 1u) / H;
+    unsigned max_s = ctx / 128u;  // >=128 keys per split
+    if (want > max_s) want = max_s;
+    if (want > 1u) S = want;
+  }
+  unsigned chunk = (ctx + S - 1u) / S;
+  chunk = (chunk + 3u) & ~3u;  // multiple of the warp count
+  return chunk ? chunk : 4u;
+}
+extern "C" __global__ void tl_attn_decode_split_dpos(const float* q,
+    const float* K, const float* V, float* pm, float* pl, float* pacc,
+    const unsigned* __restrict__ d_pos, unsigned kv_stride, unsigned group,
+    float scale) {
+  const unsigned ctx = *d_pos + 1u;
+  attn_decode_split_core<128>(q, K, V, pm, pl, pacc, ctx, kv_stride, group,
+                              attn_dpos_chunk(ctx, gridDim.x), scale);
+}
+extern "C" __global__ void tl_attn_decode_split_64_dpos(const float* q,
+    const float* K, const float* V, float* pm, float* pl, float* pacc,
+    const unsigned* __restrict__ d_pos, unsigned kv_stride, unsigned group,
+    float scale) {
+  const unsigned ctx = *d_pos + 1u;
+  attn_decode_split_core<64>(q, K, V, pm, pl, pacc, ctx, kv_stride, group,
+                             attn_dpos_chunk(ctx, gridDim.x), scale);
 }
 
 // Merge the S per-head partials (each already at its local max) into out. Not

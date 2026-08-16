@@ -175,6 +175,15 @@ if(TENSORLIB_CUDA)
   target_link_libraries(tensorlib_bench_qwen_decode PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_bench_qwen_decode)
 
+  # M9 decode ctx-scaling census: per-token cost as the KV cache grows, for the
+  # imperative and CUDA-graph paths, plus the isolated per-layer attention cost
+  # (split-KV vs the graph's pinned S=1 grid). Not a ctest (external model).
+  add_executable(tensorlib_bench_qwen_ctx bench/cuda/speed/bench_qwen_ctx.cpp)
+  target_include_directories(tensorlib_bench_qwen_ctx BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench/cuda)
+  target_link_libraries(tensorlib_bench_qwen_ctx PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_bench_qwen_ctx)
+
   # M8 int4-weight decode GEMV bench (Path-B style). Direct cuda:: API.
   add_executable(tensorlib_bench_q4 bench/cuda/speed/bench_q4_gemv.cpp)
   target_include_directories(tensorlib_bench_q4 BEFORE PRIVATE
