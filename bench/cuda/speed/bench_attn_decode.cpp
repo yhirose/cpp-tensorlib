@@ -324,7 +324,10 @@ int main() {
   // ---- Causal prefill: process a T-token prompt at once (query p attends keys
   // 0..p), fill the cache, then verify a decode step continues from pos=T. ----
   {
-    const int64_t HQ = 32, HKV = 8, D = 128, MAXC = 2048, T = 512;
+    // T deliberately NOT a multiple of the prefill kernel's query tile (32 at
+    // D=128), so the ragged last tile — masked rows, partial store — is checked
+    // here; check_attn64 covers the same edge at D=64 with T=300.
+    const int64_t HQ = 32, HKV = 8, D = 128, MAXC = 2048, T = 500;
     const int64_t group = HQ / HKV;
     const float scale = 1.0f / std::sqrt((float)D);
     std::printf(

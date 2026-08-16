@@ -1247,166 +1247,192 @@ __device__ void attn_prefill_core(const float* __restrict__ q,
 // D=64 each key costs 2 useful FMAs and ~7 reduction ops. Measured 1.67 TFLOP/s
 // at T=2048 — 5% of peak — and the KV it streams (2 MB for 2 KV heads) sits in
 // L2 the whole time, so this was never a bandwidth problem. Tiling fixes the
-// arithmetic instead: a block owns BQ queries, streams K/V through shared memory
-// in TK-key tiles, and holds each score as a plain register dot product with no
-// cross-lane reduction at all.
+// arithmetic instead: a block owns a tile of queries, streams K/V through shared
+// memory in TK-key tiles, and holds each score as a plain register dot product
+// with no cross-lane reduction at all.
 //
-// Layout: BQ*8 threads = BQ rows x 8 lanes. Lane `dg` of row `qr` owns dims
-// [dg*DG, dg*DG+DG) of that query's accumulator and computes SPT of its scores,
-// so the 8 lanes of a row are 8 consecutive lanes of one warp and the row's
-// softmax max/sum are __shfl_xor reductions over 3 steps, once per tile, rather
-// than once per key. Online softmax (running max/sum, rescale on the fly) is the
-// same recurrence the decode kernels use, so no T x T score matrix exists.
+// Layout: 128 threads = ROWS(16) row slots x LANES(8). Lane `dg` of row slot
+// `qr0` owns QPT queries (qr0, qr0+ROWS, ...) and, of each, dims {d*LANES+dg}
+// of the accumulator plus SPT of its scores. Two consequences:
+//   - a row's 8 lanes are 8 consecutive lanes of one warp, so its online-softmax
+//     max/sum are __shfl_xor reductions over 3 steps once per TILE, not per key;
+//   - the accumulator dims are INTERLEAVED across lanes, so the PV loop's
+//     Vs[kk][d*LANES+dg] and the final store are consecutive across lanes
+//     (a lane-blocked dg*DG+d ownership makes both 2-way conflicted).
+// Online softmax (running max/sum, rescale in flight) is the same recurrence the
+// decode kernels use, so no T x T score matrix ever exists.
 //
-// BQ=16 measured against 8 and 32 at the real shapes: bigger tiles reuse the K/V
-// tile across more queries but leave the GPU short of blocks (at T=512, BQ=32 is
-// 224 blocks and BQ=16 is 448), and the causal triangle makes the last block of
-// a prompt do all the work while the first does almost none.
+// QPT — queries per thread — is the lever that makes the tiling pay. At QPT=1
+// every shared word feeds exactly one FMA and the kernel is shared-load-issue
+// bound (measured ~5x oversubscribed against its own math, 9-11% of FP32 peak);
+// each extra query reuses the same K/V word for another FMA. Measured at T=512:
+// QPT=2 is 1.6-1.8x and QPT=4 is 2.2-2.5x QPT=1, bit-identical output. D=64
+// takes QPT=4; D=128 takes 2 because Qs alone would otherwise exceed the 48 KB
+// static shared limit. Occupancy is a red herring here — QPT=4 runs at 16.7%
+// and is twice as fast as a 58% variant.
 //
-// Causal: query row qr is at absolute position pos0 + qtile + qr and attends
-// keys 0..that. Whole tiles past the block's last row are never loaded.
-template <int AD, typename KT = float>
+// Causal: row slot qr0's q-th query is at absolute position pos0 + qbase +
+// qr0 + q*ROWS and attends keys 0..that. Whole tiles past the block's last row
+// are never loaded. Blocks are also mapped to query tiles in REVERSE, because
+// work grows with the tile index and blocks dispatch in order: launching the
+// expensive tiles first leaves a cheap tail instead of a maximally expensive one
+// (+9% at pos0=0, neutral once pos0 dominates).
+
+// Widen four consecutive cached elements. The rows are AD-contiguous and AD % 4
+// == 0, so the address is 16-byte aligned for f32 and 8-byte for bf16 — one
+// vector load per four elements instead of four scalar ones (+9% on the staging).
+__device__ __forceinline__ void kv_ld4(const float* p, float* o) {
+  const float4 v = *reinterpret_cast<const float4*>(p);
+  o[0] = v.x; o[1] = v.y; o[2] = v.z; o[3] = v.w;
+}
+__device__ __forceinline__ void kv_ld4(const __nv_bfloat16* p, float* o) {
+  const uint2 raw = *reinterpret_cast<const uint2*>(p);
+  const float2 f0 = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(raw.x));
+  const float2 f1 = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(raw.y));
+  o[0] = f0.x; o[1] = f0.y; o[2] = f1.x; o[3] = f1.y;
+}
+
+template <int AD, int QPT, typename KT = float>
 __device__ void attn_prefill_tiled_core(const float* __restrict__ q,
                                         const KT* __restrict__ K,
                                         const KT* __restrict__ V,
                                         float* __restrict__ out, unsigned T,
                                         unsigned kv_stride, unsigned group,
                                         float scale, unsigned pos0) {
-  constexpr int BQ = 16;                    // queries per block (16 x 8 lanes = 128 threads)
+  constexpr int NT = 128, LANES = 8, ROWS = NT / LANES;
+  constexpr int BQ = ROWS * QPT;            // queries per block
   constexpr int TK = (AD == 64) ? 32 : 16;  // keys per tile (shared budget)
-  constexpr int DG = AD / 8;                // accumulator dims per lane
-  constexpr int SPT = TK / 8;               // scores per lane per tile
-  // +1 of row padding on every tile. Without it each of these is read down a
-  // column by lanes that differ only in the ROW index, and the row strides (AD,
-  // TK) are multiples of 32, so all those lanes land in one bank: 8-way on the
-  // score loop's Ks, 4-way on Qs and Ps. An odd stride spreads them.
+  constexpr int DG = AD / LANES;            // accumulator dims per lane
+  constexpr int SPT = TK / LANES;           // scores per lane per tile
+  // +1 of row padding on Qs, Ks and Ps: each is read down a column by lanes that
+  // differ only in the ROW index, and the row strides (AD, TK) are multiples of
+  // 32, so without it all those lanes land in one bank — 8-way on the score
+  // loop's Ks, 4-way on Qs and Ps. (Vs is read across its row, and the
+  // interleaved dim ownership already spreads that.)
   __shared__ float Qs[BQ][AD + 1];
   __shared__ float Ks[TK][AD + 1];
-  __shared__ float Vs[TK][AD + 1];
+  __shared__ float Vs[TK][AD];
   __shared__ float Ps[BQ][TK + 1];
 
-  const unsigned h = blockIdx.x, qtile = blockIdx.y * BQ;
+  const unsigned h = blockIdx.x;
+  const unsigned qbase = (gridDim.y - 1u - blockIdx.y) * BQ;  // reversed order
   const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
   const KT* Kh = K + (size_t)kv_h * kv_stride;
   const KT* Vh = V + (size_t)kv_h * kv_stride;
   const unsigned tid = threadIdx.x;
-  const unsigned qr = tid >> 3, dg = tid & 7u;
-  const unsigned qi = qtile + qr;
-  const bool live = qi < T;
-  const unsigned pabs = pos0 + (live ? qi : 0u);  // causal bound for this row
+  const unsigned qr0 = tid >> 3, dg = tid & 7u;
 
-  for (unsigned i = tid; i < BQ * AD; i += BQ * 8) {
+  for (unsigned i = tid; i < BQ * AD; i += NT) {
     const unsigned r = i / AD, c = i % AD;
-    Qs[r][c] = (qtile + r < T) ? q[((size_t)h * T + qtile + r) * AD + c] : 0.f;
+    Qs[r][c] = (qbase + r < T) ? q[((size_t)h * T + qbase + r) * AD + c] : 0.f;
   }
   // Last key any row of this block can need.
-  const unsigned last = qtile + BQ - 1 < T ? qtile + BQ - 1 : T - 1;
+  const unsigned last = qbase + BQ - 1 < T ? qbase + BQ - 1 : T - 1;
   const unsigned kmax = pos0 + last;
 
-  float acc[DG] = {};
-  float m = -1e30f, l = 0.0f;
+  float acc[QPT][DG] = {};
+  float m[QPT], l[QPT];
+#pragma unroll
+  for (int u = 0; u < QPT; u++) { m[u] = -1e30f; l[u] = 0.0f; }
 
   for (unsigned kt = 0; kt <= kmax; kt += TK) {
     __syncthreads();  // previous tile's Ks/Vs are done being read
-    for (unsigned i = tid; i < TK * AD; i += BQ * 8) {
-      const unsigned r = i / AD, c = i % AD;
+    for (unsigned i = tid; i < TK * AD / 4; i += NT) {
+      const unsigned r = i / (AD / 4), c4 = (i % (AD / 4)) * 4;
       const unsigned kk = kt + r;
-      const bool in = kk <= kmax;
-      Ks[r][c] = in ? kv_ld(Kh[(size_t)kk * AD + c]) : 0.f;
-      Vs[r][c] = in ? kv_ld(Vh[(size_t)kk * AD + c]) : 0.f;
+      float kb[4] = {0, 0, 0, 0}, vb[4] = {0, 0, 0, 0};
+      if (kk <= kmax) {
+        kv_ld4(Kh + (size_t)kk * AD + c4, kb);
+        kv_ld4(Vh + (size_t)kk * AD + c4, vb);
+      }
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        Ks[r][c4 + e] = kb[e];
+        Vs[r][c4 + e] = vb[e];
+      }
     }
     __syncthreads();
 
-    float sc[SPT], mt = -1e30f;
 #pragma unroll
-    for (int t2 = 0; t2 < SPT; t2++) {
-      const unsigned kk = kt + dg * SPT + t2;
-      float dot = 0.0f;
+    for (int u = 0; u < QPT; u++) {
+      const unsigned row = qr0 + u * ROWS;
+      const unsigned pabs = pos0 + qbase + row;
+      float sc[SPT], mt = -1e30f;
 #pragma unroll
-      for (int d = 0; d < AD; d++) dot += Qs[qr][d] * Ks[dg * SPT + t2][d];
-      sc[t2] = (kk <= pabs) ? dot * scale : -1e30f;  // causal mask
-      mt = fmaxf(mt, sc[t2]);
+      for (int t2 = 0; t2 < SPT; t2++) {
+        const unsigned kk = kt + dg * SPT + t2;
+        float dot = 0.0f;
+#pragma unroll
+        for (int d = 0; d < AD; d++) dot += Qs[row][d] * Ks[dg * SPT + t2][d];
+        sc[t2] = (kk <= pabs) ? dot * scale : -1e30f;  // causal mask
+        mt = fmaxf(mt, sc[t2]);
+      }
+#pragma unroll
+      for (int off = 4; off > 0; off >>= 1)
+        mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, off));
+      const float m_new = fmaxf(m[u], mt);
+      const float corr = __expf(m[u] - m_new);
+      float ls = 0.0f;
+#pragma unroll
+      for (int t2 = 0; t2 < SPT; t2++) {
+        const float p = __expf(sc[t2] - m_new);
+        Ps[row][dg * SPT + t2] = p;
+        ls += p;
+      }
+#pragma unroll
+      for (int off = 4; off > 0; off >>= 1)
+        ls += __shfl_xor_sync(0xffffffffu, ls, off);
+      l[u] = l[u] * corr + ls;
+      m[u] = m_new;
+#pragma unroll
+      for (int d = 0; d < DG; d++) acc[u][d] *= corr;
     }
-    // Row reductions across the 8 lanes that share this query (3 shuffle steps
-    // per TILE, where the per-query kernel needed one reduction per KEY).
-#pragma unroll
-    for (int off = 4; off > 0; off >>= 1)
-      mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, off));
-    const float m_new = fmaxf(m, mt);
-    const float corr = __expf(m - m_new);
-    float ls = 0.0f;
-#pragma unroll
-    for (int t2 = 0; t2 < SPT; t2++) {
-      const float p = __expf(sc[t2] - m_new);
-      Ps[qr][dg * SPT + t2] = p;
-      ls += p;
-    }
-#pragma unroll
-    for (int off = 4; off > 0; off >>= 1) ls += __shfl_xor_sync(0xffffffffu, ls, off);
-    l = l * corr + ls;
-    m = m_new;
-#pragma unroll
-    for (int d = 0; d < DG; d++) acc[d] *= corr;
     __syncthreads();  // Ps complete
 #pragma unroll
     for (int kk = 0; kk < TK; kk++) {
-      const float pv = Ps[qr][kk];
 #pragma unroll
-      for (int d = 0; d < DG; d++) acc[d] += pv * Vs[kk][dg * DG + d];
+      for (int u = 0; u < QPT; u++) {
+        const float pv = Ps[qr0 + u * ROWS][kk];
+#pragma unroll
+        for (int d = 0; d < DG; d++)
+          acc[u][d] += pv * Vs[kk][d * LANES + dg];
+      }
     }
   }
 
-  if (!live) return;
-  const float inv = 1.0f / l;
 #pragma unroll
-  for (int d = 0; d < DG; d++)
-    out[((size_t)h * T + qi) * AD + dg * DG + d] = acc[d] * inv;
+  for (int u = 0; u < QPT; u++) {
+    const unsigned qi = qbase + qr0 + u * ROWS;
+    if (qi >= T) continue;
+    const float inv = 1.0f / l[u];
+#pragma unroll
+    for (int d = 0; d < DG; d++)
+      out[((size_t)h * T + qi) * AD + d * LANES + dg] = acc[u][d] * inv;
+  }
 }
 extern "C" __global__ void tl_attn_prefill_tiled_f32(const float* q,
     const float* K, const float* V, float* out, unsigned T, unsigned kv_stride,
     unsigned group, float scale, unsigned pos0) {
-  attn_prefill_tiled_core<128>(q, K, V, out, T, kv_stride, group, scale, pos0);
+  attn_prefill_tiled_core<128, 2>(q, K, V, out, T, kv_stride, group, scale, pos0);
 }
 extern "C" __global__ void tl_attn_prefill_tiled_f32_64(const float* q,
     const float* K, const float* V, float* out, unsigned T, unsigned kv_stride,
     unsigned group, float scale, unsigned pos0) {
-  attn_prefill_tiled_core<64>(q, K, V, out, T, kv_stride, group, scale, pos0);
+  attn_prefill_tiled_core<64, 4>(q, K, V, out, T, kv_stride, group, scale, pos0);
 }
 extern "C" __global__ void tl_attn_prefill_tiled_bf16(const float* q,
     const __nv_bfloat16* K, const __nv_bfloat16* V, float* out, unsigned T,
     unsigned kv_stride, unsigned group, float scale, unsigned pos0) {
-  attn_prefill_tiled_core<128, __nv_bfloat16>(q, K, V, out, T, kv_stride, group,
-                                              scale, pos0);
+  attn_prefill_tiled_core<128, 2, __nv_bfloat16>(q, K, V, out, T, kv_stride,
+                                                 group, scale, pos0);
 }
 extern "C" __global__ void tl_attn_prefill_tiled_bf16_64(const float* q,
     const __nv_bfloat16* K, const __nv_bfloat16* V, float* out, unsigned T,
     unsigned kv_stride, unsigned group, float scale, unsigned pos0) {
-  attn_prefill_tiled_core<64, __nv_bfloat16>(q, K, V, out, T, kv_stride, group,
-                                             scale, pos0);
+  attn_prefill_tiled_core<64, 4, __nv_bfloat16>(q, K, V, out, T, kv_stride,
+                                                group, scale, pos0);
 }
 
-extern "C" __global__ void tl_attn_prefill_f32(const float* q, const float* K,
-    const float* V, float* out, unsigned T, unsigned kv_stride, unsigned group,
-    float scale, unsigned pos0) {
-  attn_prefill_core<128>(q, K, V, out, T, kv_stride, group, scale, pos0);
-}
-extern "C" __global__ void tl_attn_prefill_f32_64(const float* q,
-    const float* K, const float* V, float* out, unsigned T, unsigned kv_stride,
-    unsigned group, float scale, unsigned pos0) {
-  attn_prefill_core<64>(q, K, V, out, T, kv_stride, group, scale, pos0);
-}
-extern "C" __global__ void tl_attn_prefill_bf16(const float* q,
-    const __nv_bfloat16* K, const __nv_bfloat16* V, float* out, unsigned T,
-    unsigned kv_stride, unsigned group, float scale, unsigned pos0) {
-  attn_prefill_core<128, __nv_bfloat16>(q, K, V, out, T, kv_stride, group, scale,
-                                        pos0);
-}
-extern "C" __global__ void tl_attn_prefill_bf16_64(const float* q,
-    const __nv_bfloat16* K, const __nv_bfloat16* V, float* out, unsigned T,
-    unsigned kv_stride, unsigned group, float scale, unsigned pos0) {
-  attn_prefill_core<64, __nv_bfloat16>(q, K, V, out, T, kv_stride, group, scale,
-                                       pos0);
-}
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 
 // RoPE (rotary position embedding), half-split (GPT-NeoX / HF-llama) convention.

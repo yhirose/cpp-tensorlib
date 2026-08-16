@@ -505,16 +505,13 @@ struct context {
   }
 
   // M9 prefill: bulk cache fill + causal prefill attention.
-  CUfunction kv_fill_fn = nullptr, kv_fill_bf16_fn = nullptr,
-             attn_prefill_fn = nullptr;
+  CUfunction kv_fill_fn = nullptr, kv_fill_bf16_fn = nullptr;
   CUfunction kv_fill_(bool bf16 = false) {
     CUfunction* slot = bf16 ? &kv_fill_bf16_fn : &kv_fill_fn;
     if (!*slot)
       d.ModuleGetFunction(slot, mod, bf16 ? "tl_kv_fill_bf16" : "tl_kv_fill");
     return *slot;
   }
-  CUfunction attn_prefill_64_fn = nullptr;
-  CUfunction attn_prefill_bf16_fn = nullptr, attn_prefill_bf16_64_fn = nullptr;
   CUfunction attn_prefill_tiled_fn = nullptr, attn_prefill_tiled_64_fn = nullptr,
              attn_prefill_tiled_bf16_fn = nullptr,
              attn_prefill_tiled_bf16_64_fn = nullptr;
@@ -529,15 +526,7 @@ struct context {
                : (D == 64 ? "tl_attn_prefill_tiled_f32_64" : "tl_attn_prefill_tiled_f32"));
     return *slot;
   }
-  CUfunction attn_prefill_(int64_t D, bool bf16 = false) {
-    CUfunction* slot = bf16 ? (D == 64 ? &attn_prefill_bf16_64_fn : &attn_prefill_bf16_fn)
-                            : (D == 64 ? &attn_prefill_64_fn : &attn_prefill_fn);
-    if (!*slot)
-      d.ModuleGetFunction(slot, mod,
-                          bf16 ? (D == 64 ? "tl_attn_prefill_bf16_64" : "tl_attn_prefill_bf16")
-                               : (D == 64 ? "tl_attn_prefill_f32_64" : "tl_attn_prefill_f32"));
-    return *slot;
-  }
+
 
   // Reusable device scratch for split-KV partials. Grown as needed, reused
   // across attention calls (sequential on the null stream), freed at teardown.
@@ -998,6 +987,17 @@ inline unsigned attn_split_count(unsigned n_heads, int64_t ctx) {
   return want > 1 ? want : 1;
 }
 
+// Launch shape of the tiled prefill attention — the ONE place it lives. It is
+// ABI, not a tuning knob: the kernel derives its query tile from the same
+// numbers, and a mismatch would silently compute the wrong rows rather than fail
+// to launch, so tl_attn_prefill_tiled_* names this as its device twin (cf.
+// attn_dpos_chunk and attn_split_chunk below). A block is always 128 threads
+// (16 row slots x 8 lanes); how many queries each thread carries is what varies,
+// and D=128 carries fewer only because its Q tile would otherwise blow the 48 KB
+// static shared limit. See the kernel for the measurements behind both.
+inline constexpr unsigned attn_tile_threads = 128;
+inline constexpr unsigned attn_tile_queries(int64_t D) { return D == 64 ? 64 : 32; }
+
 // Keys per split for the split-KV kernels: ceil(ctx / attn_split_count), rounded
 // up to a multiple of 4 warps. The device-side attn_dpos_chunk in
 // tensorlib_cuda.cu is the twin of attn_split_count + this rounding and MUST
@@ -1236,14 +1236,14 @@ inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
 // cache read over [0,pos0+T). Query p is at absolute position pos0+p and attends
 // keys 0..pos0+p, so a long prompt can be run in chunks (and a later turn
 // appended to a live cache). GQA via group. D∈{64,128}.
-// One block per (head, query pos); grid=(n_q_heads,T) (T <= 65535 gridDim.y).
+// One block per (head, query tile); grid = (n_q_heads, ceil(T/tile)).
 inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads,
                          int64_t n_kv_heads, int64_t T, int64_t kv_max, int64_t D,
                          float scale, bool kv_bf16 = false, int64_t pos0 = 0) {
   auto& c = context::get();
   if (!c.ready || (D != 128 && D != 64)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
-  if (T <= 0 || T > 65535) return false;  // gridDim.y limit (chunk beyond)
+  if (T <= 0 || T > 65535) return false;  // one call is one prompt chunk
   c.device_read_(q);
   c.device_read_(K);
   c.device_read_(V);
@@ -1258,13 +1258,15 @@ inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads
   unsigned up0 = static_cast<unsigned>(pos0);
   void* args[] = {&pq, &pk, &pv, &po, &uT, &kv_stride, &group, &scale, &up0};
   c.pending = true;
-  // Tiled by default: a block takes 32 queries and streams K/V through shared
-  // memory, so each score is a register dot product instead of a per-key
-  // warp-shuffle reduction. Same online softmax, same causal rule.
-  constexpr unsigned BQ = 16;
+  // A block takes a tile of queries and streams K/V through shared memory, so
+  // each score is a register dot product instead of a per-key warp-shuffle
+  // reduction. Same online softmax, same causal rule. See
+  // tl_attn_prefill_tiled_*.
+  const unsigned tile = attn_tile_queries(D);
   return c.d.LaunchKernel(c.attn_prefill_tiled_(D, kv_bf16),
-                          static_cast<unsigned>(n_q_heads), (uT + BQ - 1) / BQ, 1,
-                          BQ * 8, 1, 1, 0, c.stream, args, nullptr) == 0;
+                          static_cast<unsigned>(n_q_heads), (uT + tile - 1) / tile,
+                          1, attn_tile_threads, 1, 1, 0, c.stream, args,
+                          nullptr) == 0;
 }
 
 // RoPE: rotate a contiguous [rows, D] buffer (rows = H*T). Row r's position is
