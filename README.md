@@ -294,8 +294,8 @@ LLM inference
 zero-dependency, cross-platform claims above: it loads a real
 Qwen2.5-Instruct GGUF model and chats, using nothing but this library's own
 kernels — own GGUF v3 reader (`include/gguf.h`), own GPT-2-byte-BPE
-tokenizer (`include/tokenizer.h`), and own CUDA decode kernels. No GGML, no
-llama.cpp, no third-party inference runtime anywhere in the path.
+tokenizer (`include/tokenizer.h`), and own CUDA prefill/decode kernels. No
+GGML, no llama.cpp, no third-party inference runtime anywhere in the path.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DTENSORLIB_CUDA=ON
@@ -303,11 +303,32 @@ cmake --build build --target tensorlib_chat_qwen
 ./build/tensorlib_chat_qwen path/to/qwen2.5-0.5b-instruct.gguf "What is the capital of France?"
 ```
 
-Decode throughput on an RTX 3090 has gone from 3.5 to ~330 tok/s over the
-course of the CUDA decode-path work — about 1.35x off llama.cpp on the same
-shape. See `bench/cuda/speed/bench_qwen_decode.cpp` and
-[docs/performance-notes.md](docs/performance-notes.md) for the measurement
-methodology and the full tuning history.
+On an RTX 3090, Qwen2.5-0.5B (F16 GGUF, bf16 weight storage):
+
+| Path | tok/s |
+|---|---|
+| decode, CUDA-graph replay | ~430 |
+| decode, imperative (no graph capture) | ~305 |
+| prefill, 512-token chunk | ~19500 |
+| prefill, 2048-token prompt | ~15200 |
+
+Decode started at 3.5 tok/s and reached ~430 by removing host-side graph
+construction, then per-launch overhead, then GEMV inefficiency — the last of
+which turned out to be the whole remaining gap to llama.cpp, which this box
+measured at 413 tok/s on the same model and shape.
+
+Prefill is a different regime and was slower than decode for a long time,
+because the prompt was fed through the decode path one token at a time. Its
+tokens share one set of weights, so batching turns the projections into GEMMs
+rather than GEMVs and the attention into one tiled causal pass — worth ~50x over
+replaying the decode graph per prompt token, and ~170x over the array-graph
+path chat used originally.
+
+`bench/cuda/speed/bench_qwen_decode.cpp` and `bench_qwen_prefill.cpp` produce
+these numbers and also guard them: every prefill path is checked against the
+array-graph reference for the same first generated token, and the decode
+comparison is greedy-exact. Measure with min-of-rounds — a single run on WSL2
+swings ±20 tok/s with clock ramp.
 
 License
 -------
