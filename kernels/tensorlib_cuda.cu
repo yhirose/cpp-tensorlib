@@ -447,24 +447,38 @@ __global__ void tl_sgemm_rb(const float* __restrict__ A,
 // the epilogue predicate.
 // The block tile is templated: 256 threads always, tile BM x BM, K-slab
 // BK = 1024/BM (so each thread stages exactly one 4-wide chunk of each operand),
-// microtile (BM/16) x (BM/16). Two instantiations, picked host-side by which one
-// actually FILLS the GPU at the shape in hand:
+// microtile (BM/16) x (BM/16) held as G = BM/64 float4 GROUPS per axis, 64 apart.
+// Grouping matters at BM=128: a contiguous 8-wide microtile makes each warp's
+// LDS.128 span 8-float strides and serialize 2-way, while two 4-wide groups read
+// consecutive float4s. At BM=64 there is one group, i.e. the plain map.
+// Two instantiations, picked host-side by which one actually FILLS the GPU at
+// the shape in hand:
 //   128 -> 8x8 microtile, 64 FMA per 16 shared floats — the most efficient, but
-//          a [256, 896] projection is only 2x7 = 14 blocks on 82 SMs.
-//   64  -> 4x4 microtile, half the arithmetic intensity, 4x the blocks.
+//          a [512, 896] projection is only 4x7 = 28 blocks on 82 SMs.
+//   64  -> 4x4, half the arithmetic intensity, 4x the blocks.
 // Prefill chunks are a few hundred tokens, so the small tile is what the narrow
-// attention projections (N=896) need; the wide MLP ones (N=9728) fill either way
-// and keep the efficient tile.
+// attention projections (N=896) need; the wide MLP one (N=9728) fills either way
+// and keeps the efficient tile.
+//
+// SPLITK slices K over gridDim.z and combines with atomicAdd (the caller zeroes
+// C first) — the lever for the narrow shapes, whose 112-block grid is 1.4 waves
+// of the 82 SMs and leaves most of the tail idle. Measured at M=512: wd
+// (N=896,K=4864) 506 -> 312 us, wo 92 -> 75. It costs exact reproducibility
+// (float adds land in arrival order), so it is opt-in per launch, not the
+// default.
+//
+// The K slab is prefetched into registers while the current one computes
+// (tl_sgemm_rb's trick): gateup 547 -> 461 us.
 }  // close extern "C": the __device__ core template below can't have C linkage;
    // each __global__ wrapper re-declares its own for a stable symbol.
-template <int BM>
+template <int BM, bool SPLITK>
 __device__ __forceinline__ void gemm_bf16_nt_core(const float* __restrict__ A,
                                                   const __nv_bfloat16* __restrict__ B,
                                                   float* __restrict__ C,
                                                   unsigned M, unsigned N,
-                                                  unsigned K) {
+                                                  unsigned K, unsigned ksplit) {
   constexpr int BK = 1024 / BM;   // BM*BK == 1024 == 256 threads x 4 elements
-  constexpr int TM = BM / 16;     // 16x16 threads, one TMxTM microtile each
+  constexpr int G = BM / 64;      // float4 microtile groups per axis
   // +4 floats of row padding: the staging stores walk a whole tile row per
   // thread, which at stride BM lands every warp on 8-16 banks (4- resp. 2-way
   // conflicts). Padding by 4 breaks that while keeping the stride a multiple of
@@ -475,75 +489,109 @@ __device__ __forceinline__ void gemm_bf16_nt_core(const float* __restrict__ A,
   const unsigned blockCol = blockIdx.x * BM;
   const unsigned tid = threadIdx.x;
 
+  const unsigned k0 = SPLITK ? blockIdx.z * ksplit : 0u;
+  if (SPLITK && k0 >= K) return;
+  const unsigned k1 = SPLITK ? (k0 + ksplit < K ? k0 + ksplit : K) : K;
+
   // Global-load map: each thread stages 4 contiguous K-elements of one row —
   // of A (one float4) and of B (4 bf16 = one 8-byte uint2).
   const unsigned ldRow = tid / (BK / 4);         // M index for A, N index for B
   const unsigned ldK = (tid % (BK / 4)) * 4u;
   const unsigned gA = blockRow + ldRow;
   const unsigned gB = blockCol + ldRow;
-  const unsigned tr = (tid >> 4) * TM;
-  const unsigned tc = (tid & 15u) * TM;
+  const unsigned tr4 = (tid >> 4) * 4u;   // this thread's group-local row base
+  const unsigned tc4 = (tid & 15u) * 4u;  // ... and column base
 
-  float acc[TM][TM] = {};
-  for (unsigned kt = 0; kt < K; kt += BK) {
-    float4 a4 = make_float4(0.f, 0.f, 0.f, 0.f);
-    if (gA < M)
-      a4 = *reinterpret_cast<const float4*>(&A[(size_t)gA * K + kt + ldK]);
-    As[ldK + 0][ldRow] = a4.x;
-    As[ldK + 1][ldRow] = a4.y;
-    As[ldK + 2][ldRow] = a4.z;
-    As[ldK + 3][ldRow] = a4.w;
-
-    float2 f0 = make_float2(0.f, 0.f), f1 = make_float2(0.f, 0.f);
+  float acc[G][4][G][4] = {};
+  float4 pa;
+  float2 p0, p1;
+  // Stage the K slab at `kt` into registers (global -> reg), then into shared.
+  auto load = [&](unsigned kt) {
+    pa = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (gA < M) pa = *reinterpret_cast<const float4*>(&A[(size_t)gA * K + kt + ldK]);
+    p0 = make_float2(0.f, 0.f);
+    p1 = make_float2(0.f, 0.f);
     if (gB < N) {
       uint2 raw = *reinterpret_cast<const uint2*>(&B[(size_t)gB * K + kt + ldK]);
-      f0 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.x));
-      f1 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.y));
+      p0 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.x));
+      p1 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.y));
     }
-    Bs[ldK + 0][ldRow] = f0.x;
-    Bs[ldK + 1][ldRow] = f0.y;
-    Bs[ldK + 2][ldRow] = f1.x;
-    Bs[ldK + 3][ldRow] = f1.y;
-    __syncthreads();
+  };
+  auto store = [&]() {
+    As[ldK + 0][ldRow] = pa.x;
+    As[ldK + 1][ldRow] = pa.y;
+    As[ldK + 2][ldRow] = pa.z;
+    As[ldK + 3][ldRow] = pa.w;
+    Bs[ldK + 0][ldRow] = p0.x;
+    Bs[ldK + 1][ldRow] = p0.y;
+    Bs[ldK + 2][ldRow] = p1.x;
+    Bs[ldK + 3][ldRow] = p1.y;
+  };
 
+  load(k0);
+  store();
+  __syncthreads();
+  for (unsigned kt = k0; kt < k1; kt += BK) {
+    const bool more = kt + BK < k1;
+    if (more) load(kt + BK);  // prefetch: overlaps the global read with compute
 #pragma unroll
     for (int kk = 0; kk < BK; kk++) {
-      float regM[TM], regN[TM];
+      float regM[G][4], regN[G][4];
 #pragma unroll
-      for (int q = 0; q < TM; q += 4) {
-        *reinterpret_cast<float4*>(&regM[q]) =
-            *reinterpret_cast<const float4*>(&As[kk][tr + q]);
-        *reinterpret_cast<float4*>(&regN[q]) =
-            *reinterpret_cast<const float4*>(&Bs[kk][tc + q]);
+      for (int g = 0; g < G; g++) {
+        *reinterpret_cast<float4*>(regM[g]) =
+            *reinterpret_cast<const float4*>(&As[kk][g * 64 + tr4]);
+        *reinterpret_cast<float4*>(regN[g]) =
+            *reinterpret_cast<const float4*>(&Bs[kk][g * 64 + tc4]);
       }
 #pragma unroll
-      for (int i = 0; i < TM; i++)
+      for (int gi = 0; gi < G; gi++)
 #pragma unroll
-        for (int j = 0; j < TM; j++) acc[i][j] += regM[i] * regN[j];
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+          for (int gj = 0; gj < G; gj++)
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+              acc[gi][i][gj][j] += regM[gi][i] * regN[gj][j];
     }
     __syncthreads();
+    if (more) {
+      store();
+      __syncthreads();
+    }
   }
 
 #pragma unroll
-  for (int i = 0; i < TM; i++) {
-    const unsigned r = blockRow + tr + i;
-    if (r >= M) continue;
+  for (int gi = 0; gi < G; gi++)
 #pragma unroll
-    for (int j = 0; j < TM; j++) {
-      const unsigned c = blockCol + tc + j;
-      if (c < N) C[(size_t)r * N + c] = acc[i][j];
+    for (int i = 0; i < 4; i++) {
+      const unsigned r = blockRow + gi * 64 + tr4 + i;
+      if (r >= M) continue;
+#pragma unroll
+      for (int gj = 0; gj < G; gj++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+          const unsigned c = blockCol + gj * 64 + tc4 + j;
+          if (c >= N) continue;
+          if (SPLITK) atomicAdd(&C[(size_t)r * N + c], acc[gi][i][gj][j]);
+          else C[(size_t)r * N + c] = acc[gi][i][gj][j];
+        }
     }
-  }
 }
 extern "C" __global__ void tl_gemm_bf16_nt(const float* __restrict__ A,
     const __nv_bfloat16* __restrict__ B, float* __restrict__ C, unsigned M,
     unsigned N, unsigned K) {
-  gemm_bf16_nt_core<128>(A, B, C, M, N, K);
+  gemm_bf16_nt_core<128, false>(A, B, C, M, N, K, 0);
 }
 extern "C" __global__ void tl_gemm_bf16_nt_s(const float* __restrict__ A,
     const __nv_bfloat16* __restrict__ B, float* __restrict__ C, unsigned M,
     unsigned N, unsigned K) {
-  gemm_bf16_nt_core<64>(A, B, C, M, N, K);
+  gemm_bf16_nt_core<64, false>(A, B, C, M, N, K, 0);
+}
+extern "C" __global__ void tl_gemm_bf16_nt_sk(const float* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B, float* __restrict__ C, unsigned M,
+    unsigned N, unsigned K, unsigned ksplit) {
+  gemm_bf16_nt_core<64, true>(A, B, C, M, N, K, ksplit);
 }
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 

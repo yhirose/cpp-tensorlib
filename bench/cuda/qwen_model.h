@@ -170,6 +170,20 @@ inline array load_f32(const gg::model& m, const std::string& n, int64_t len) {
   return array::from(std::vector<float>(raw, raw + len), {1, len});
 }
 
+// Several F32 1-D tensors laid end to end -> array [1, sum(len)]. The q|k|v
+// biases in that order match the fused QKV projection's column layout, so the
+// batched path adds all of them in one pass over all heads.
+inline array load_f32_cat(const gg::model& m,
+                          const std::vector<std::pair<std::string, int64_t>>& parts) {
+  std::vector<float> v;
+  for (const auto& p : parts) {
+    const auto* raw = reinterpret_cast<const float*>(need(m, p.first)->data);
+    v.insert(v.end(), raw, raw + p.second);
+  }
+  int64_t len = (int64_t)v.size();
+  return array::from(std::move(v), {1, len});
+}
+
 struct Layer {
   array wq, bq, wk, bk, wv, bv, wo, wg, wu, wd, an, fn;
   // Fused decode weights (imperative path only): wqkv = [wq|wk|wv], wgu = [wg|wu]
@@ -182,7 +196,9 @@ struct Layer {
   // the two shared weights (wo/wd stay [K,N] for the array oracle). In f32 mode
   // wqkv/wgu hold column-major [K,N] for the split-K path and wo_row/wd_row are
   // empty. lm_head stays split-K [K,N] in both (neutral + saves the [N,K] copy).
-  array wqkv, wgu, wo_row, wd_row;
+  // bqkv = [bq|bk|bv] — the fused QKV projection's own column order, so the
+  // batched prefill splits all NH+2*NKV heads (and adds their bias) in one pass.
+  array wqkv, wgu, bqkv, wo_row, wd_row;
   // q4 (group-symmetric int4, group=32) copies of the large bandwidth-bound MLP
   // weights (imperative bf16 path, when Model.q4_mlp). ~0.625 B/wt vs bf16's 2 →
   // wgu 1.74×, wd 1.38× in the isolated bench. These REPLACE wgu/wd_row (the row
@@ -251,9 +267,10 @@ struct PrefillScratch {
   void* h = nullptr;                  // input-norm out [cap, NE]
   void* h2 = nullptr;                 // post-attn norm out [cap, NE]
   void* qkv = nullptr;                // fused QKV out [cap, (NH+2*NKV)*HD]
-  void* qh = nullptr;                 // q head-major [NH, cap, HD]
-  void* kh = nullptr;                 // k head-major [NKV, cap, HD]
-  void* vh = nullptr;                 // v head-major [NKV, cap, HD]
+  // q|k|v head-major in ONE buffer [NH+2*NKV, cap, HD]: the fused projection
+  // already emits them contiguously per token, so one split_heads pass covers
+  // every head, and k/v are just mid-buffer pointers into it.
+  void* qkvh = nullptr;
   void* ah = nullptr;                 // attn out head-major [NH, cap, HD]
   void* at = nullptr;                 // attn out token-major [cap, NH*HD]
   void* gu = nullptr;                 // fused gate|up [cap, 2*FF]
@@ -272,9 +289,7 @@ struct PrefillScratch {
     h = A(cap * NE);
     h2 = A(cap * NE);
     qkv = A(cap * (NH + 2 * NKV) * HD);
-    qh = A(NH * cap * HD);
-    kh = A(NKV * cap * HD);
-    vh = A(NKV * cap * HD);
+    qkvh = A((NH + 2 * NKV) * cap * HD);
     ah = A(NH * cap * HD);
     at = A(cap * NH * HD);
     gu = A(cap * 2 * FF);
@@ -283,8 +298,8 @@ struct PrefillScratch {
     return md != nullptr;
   }
   void destroy() {
-    for (void** p : {&emb, &res[0], &res[1], &h, &h2, &qkv, &qh, &kh, &vh, &ah,
-                     &at, &gu, &mb, &md}) {
+    for (void** p : {&emb, &res[0], &res[1], &h, &h2, &qkv, &qkvh, &ah, &at,
+                     &gu, &mb, &md}) {
       if (*p) tl::cuda::release(*p, 0, nullptr);
       *p = nullptr;
     }
@@ -361,15 +376,16 @@ inline void prefill_chunk_(Model& M, int64_t T) {
     Layer& L = M.layers[l];
     void* ro = P.res[l & 1];
     cu::gemm_bf16_nt(P.h, L.wqkv.native(), P.qkv, T, QKVN, NE);
-    // Slice the fused output into head-major q/k/v, folding in the q/k/v bias
-    // (rope's fused-bias form only indexes correctly at T == 1).
-    cu::split_heads(P.qkv, L.bq.native(), P.qh, T, QKVN, 0, NH, HD);
-    cu::split_heads(P.qkv, L.bk.native(), P.kh, T, QKVN, NH * HD, NKV, HD);
-    cu::split_heads(P.qkv, L.bv.native(), P.vh, T, QKVN, (NH + NKV) * HD, NKV, HD);
+    // One pass turns the fused [T, q|k|v] output into head-major [18, T, D] and
+    // adds the fused bias — rope's own fused-bias form only indexes correctly at
+    // T == 1, so the bias rides along here instead.
+    cu::split_heads(P.qkv, L.bqkv.native(), P.qkvh, T, QKVN, 0, NH + 2 * NKV, HD);
+    void* kh = off_f32(P.qkvh, NH * T * HD);
+    void* vh = off_f32(P.qkvh, (NH + NKV) * T * HD);
     // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
-    cu::rope(P.qh, P.qh, NH * T, T, HD, pos0, ROPE_BASE);
-    cu::rope(P.kh, P.kh, NKV * T, T, HD, pos0, ROPE_BASE);
-    L.cache.prefill(P.qh, P.kh, P.vh, P.ah, T, NH, SCALE);
+    cu::rope(P.qkvh, P.qkvh, NH * T, T, HD, pos0, ROPE_BASE);
+    cu::rope(kh, kh, NKV * T, T, HD, pos0, ROPE_BASE);
+    L.cache.prefill(P.qkvh, kh, vh, P.ah, T, NH, SCALE);
     cu::merge_heads(P.ah, P.at, T, NH, HD);
     cu::gemm_bf16_nt(P.at, L.wo_row.native(), ro, T, NE, NH * HD);
     cu::rmsnorm_res(ro, x, L.fn.native(), ro, P.h2, NE, EPS, T);
@@ -486,6 +502,11 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
             : row ? array{}
                   : load_w_T_cat(m, {{p + "ffn_gate.weight", FF},
                                      {p + "ffn_up.weight", FF}}, NE, wdt),
+            // bqkv = [bq|bk|bv], matching wqkv's column order (batched path).
+            row ? load_f32_cat(m, {{p + "attn_q.bias", NH * HD},
+                                   {p + "attn_k.bias", NKV * HD},
+                                   {p + "attn_v.bias", NKV * HD}})
+                : array{},
             row ? load_w_T_row(m, p + "attn_output.weight", NH * HD, NE) : array{},
             (row && !q4m) ? load_w_T_row(m, p + "ffn_down.weight", FF, NE) : array{},
             // q4 MLP (imperative, when q4m): quantize the f32 [K,N] fused/down.

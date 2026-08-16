@@ -381,13 +381,19 @@ struct context {
   }
 
   // M9 batched-prefill GEMM (bf16 [N,K] weights, the decode GEMV's own layout).
-  CUfunction gemm_bf16_nt_fn = nullptr, gemm_bf16_nt_s_fn = nullptr;
+  CUfunction gemm_bf16_nt_fn = nullptr, gemm_bf16_nt_s_fn = nullptr,
+             gemm_bf16_nt_sk_fn = nullptr;
   CUfunction gemm_bf16_nt_(bool big) {
     CUfunction* slot = big ? &gemm_bf16_nt_fn : &gemm_bf16_nt_s_fn;
     if (!*slot)
       d.ModuleGetFunction(slot, mod,
                           big ? "tl_gemm_bf16_nt" : "tl_gemm_bf16_nt_s");
     return *slot;
+  }
+  CUfunction gemm_bf16_nt_sk_() {
+    if (!gemm_bf16_nt_sk_fn)
+      d.ModuleGetFunction(&gemm_bf16_nt_sk_fn, mod, "tl_gemm_bf16_nt_sk");
+    return gemm_bf16_nt_sk_fn;
   }
 
   // M9 fused decode attention (single-pass + split-KV two-pass).
@@ -858,17 +864,44 @@ inline bool gemm_bf16_nt(void* a, void* B, void* out, int64_t m, int64_t n,
   float* pB = context::off_(B, 0);
   float* po = context::off_(out, 0);
   unsigned uM = (unsigned)m, uN = (unsigned)n, uK = (unsigned)k;
-  void* args[] = {&pa, &pB, &po, &uM, &uN, &uK};
   // Tile choice = whichever actually fills the GPU. The 128 tile is the more
   // arithmetically efficient one, but a prefill chunk is only a few hundred
-  // tokens, so a narrow projection (N=896, M=256) yields 14 blocks against 82
-  // SMs; the 64 tile turns that into 56 at half the FMA-per-shared-float. Take
+  // tokens, so a narrow projection (N=896, M=512) yields 28 blocks against 82
+  // SMs; the 64 tile turns that into 112 at half the FMA-per-shared-float. Take
   // the big tile only when it already keeps ~2 blocks per SM busy. It needs
   // K % 8 == 0; the small tile's deeper slab needs K % 16 == 0.
   bool big = ((n + 127) / 128) * ((m + 127) / 128) >= 164 || (k % 16) != 0;
   unsigned t = big ? 128u : 64u;
   unsigned gx = (unsigned)((n + t - 1) / t), gy = (unsigned)((m + t - 1) / t);
+  unsigned blocks = gx * gy;
+
+  // Even on the small tile a narrow projection is only ~1.4 waves of the 82 SMs,
+  // so the tail runs half-empty; slicing K over gridDim.z fills it. Two bounds
+  // decide how far: keep each slice long enough to amortize its own staging
+  // (>= 448 K-elements), and stop once the grid is comfortably several waves
+  // (~8 blocks/SM). Measured at M=512: wd 506 -> 312 us, wo 92 -> 75, while a
+  // grid that already fills (gateup, 1216 blocks) correctly declines to split.
+  unsigned z = 1;
+  if (blocks < 128 && c.d.MemsetD8Async) {
+    unsigned by_k = (unsigned)(k / 448);
+    unsigned by_fill = (656 + blocks - 1) / blocks;
+    z = by_k < by_fill ? by_k : by_fill;
+    if (z < 1) z = 1;
+  }
   c.pending = true;
+  if (z > 1) {
+    constexpr unsigned BK = 16;  // the 64 tile's K slab
+    unsigned ksplit = ((uK + z - 1) / z + BK - 1) / BK * BK;
+    z = (uK + ksplit - 1) / ksplit;  // recompute after rounding
+    // atomicAdd combine needs a zeroed C; async on the stream, so it is ordered
+    // before the launch without a host sync (and stays capturable).
+    c.d.MemsetD8Async(reinterpret_cast<CUdeviceptr>(po), 0,
+                      (size_t)m * n * sizeof(float), c.stream);
+    void* args[] = {&pa, &pB, &po, &uM, &uN, &uK, &ksplit};
+    return c.d.LaunchKernel(c.gemm_bf16_nt_sk_(), gx, gy, z, 256, 1, 1, 0,
+                            c.stream, args, nullptr) == 0;
+  }
+  void* args[] = {&pa, &pB, &po, &uM, &uN, &uK};
   return c.d.LaunchKernel(c.gemm_bf16_nt_(big), gx, gy, 1, 256, 1, 1, 0,
                           c.stream, args, nullptr) == 0;
 }
