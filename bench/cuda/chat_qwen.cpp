@@ -63,44 +63,37 @@ int main(int argc, char** argv) {
   std::printf("prompt: %s\n%zu prompt tokens; generating (greedy)...\n\n",
               user.c_str(), ids.size());
 
-  // Prefill: feed the prompt token by token (== causal prefill for the cache).
-  int64_t pos = 0;
-  std::vector<float> logits;
+  // The prompt and the generated tokens share one captured graph — see
+  // qm::captured_decoder. begin() consumes the prompt and returns the first
+  // generated token; step() self-bounds on the KV capacity and degrades to the
+  // imperative path on its own, so there is nothing to branch on here. Greedy
+  // throughout; capture is guarded argmax-equivalent to imperative in
+  // bench_qwen_decode.
+  qm::captured_decoder dec;
   auto t_prefill = clk::now();
-  for (size_t i = 0; i < ids.size(); i++) logits = qm::step(M, ids[i], pos++);
-  double prefill_ms = ms_since(t_prefill);
+  int64_t next = dec.begin(M, ids);
+  double prefill_ms = ms_since(t_prefill) - dec.capture_ms;  // prompt work only
+  std::printf("prefill+decode path: %s\n\n",
+              dec.ok() ? "CUDA-graph capture (one graph, prompt included)"
+                       : "imperative");
 
-  // Greedy generate until <|im_end|> or the budget. Prefer the CUDA-graph-
-  // captured decoder: it captures the device-pos forward once (after prefill)
-  // and replays it per token — collapsing ~360 kernel launches/token into one
-  // graph submit (~1.4x the imperative path on Qwen 0.5B). Correct across
-  // positions via the device pos counter. Falls back to step_imperative() (the
-  // C1 fast path: whole forward as direct cuda:: calls on persistent scratch,
-  // one sync/step) when graph capture is unavailable. Both are greedy; capture
-  // is guarded argmax-equivalent to imperative in bench_qwen_decode.
   std::vector<int> gen;
-  int64_t next = qm::argmax(logits);
-  qm::captured_decoder cap;
-  cap.init(M, next, pos);  // capture at the first decode position
-  std::printf("decode path: %s\n\n", cap.ok() ? "CUDA-graph capture" : "imperative");
   auto t_dec = clk::now();
-  for (int64_t i = 0; i < MAX_NEW && pos < qm::MAXC; i++) {
+  for (int64_t i = 0; i < MAX_NEW && next >= 0; i++) {
     if (next == tok.eos_id()) break;
     gen.push_back((int)next);
-    // captured_decoder::step self-bounds (returns -1 when the KV cache is full);
-    // step_imperative relies on the loop's pos < MAXC guard.
-    next = cap.ok() ? cap.step(M, next) : qm::step_imperative(M, next, pos);
-    if (next < 0) break;
-    pos++;
+    next = dec.step(M, next);
   }
   double dec_ms = ms_since(t_dec);
-  cap.destroy();
+  double capture_ms = dec.capture_ms;
+  dec.destroy();
 
   std::printf("=== assistant ===\n%s\n", tok.decode(gen).c_str());
   std::printf(
-      "\n(%zu tokens)  build %.0f ms | prefill %zu tok %.0f ms (%.1f tok/s) | "
-      "decode %zu tok %.0f ms (%.1f tok/s)\n",
-      gen.size(), build_ms, ids.size(), prefill_ms, ids.size() * 1000.0 / prefill_ms,
-      gen.size(), dec_ms, gen.size() * 1000.0 / dec_ms);
+      "\n(%zu tokens)  build %.0f ms | capture %.0f ms | prefill %zu tok %.0f ms "
+      "(%.1f tok/s) | decode %zu tok %.0f ms (%.1f tok/s)\n",
+      gen.size(), build_ms, capture_ms, ids.size(), prefill_ms,
+      ids.size() * 1000.0 / prefill_ms, gen.size(), dec_ms,
+      gen.size() * 1000.0 / dec_ms);
   return 0;
 }

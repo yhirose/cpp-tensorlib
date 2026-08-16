@@ -184,6 +184,15 @@ if(TENSORLIB_CUDA)
   target_link_libraries(tensorlib_bench_qwen_ctx PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_bench_qwen_ctx)
 
+  # M9 prefill census: which existing token-by-token path prefills fastest, and
+  # how much batching the prompt (M>1 projections + tiled attention) would buy.
+  # Not a ctest (external model).
+  add_executable(tensorlib_bench_qwen_prefill bench/cuda/speed/bench_qwen_prefill.cpp)
+  target_include_directories(tensorlib_bench_qwen_prefill BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench/cuda)
+  target_link_libraries(tensorlib_bench_qwen_prefill PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_bench_qwen_prefill)
+
   # M8 int4-weight decode GEMV bench (Path-B style). Direct cuda:: API.
   add_executable(tensorlib_bench_q4 bench/cuda/speed/bench_q4_gemv.cpp)
   target_include_directories(tensorlib_bench_q4 BEFORE PRIVATE

@@ -574,19 +574,30 @@ inline void set_cache_pos(Model& M, int64_t p) {
 // and the caller should use step_imperative instead. f32 KV; attention is
 // split-KV on a capacity-static grid (pos-independent, so capturable; flat in
 // ctx like the host path — see cuda.h attn_decode_dpos).
+// It owns the WHOLE prompt->generate lifecycle: begin() captures and consumes
+// the prompt, step() produces each generated token, and feed() degrades to the
+// imperative path by itself when capture is unavailable — so a caller never
+// branches on ok() (that is only a label) and never tracks a position of its
+// own. All position state lives in cur_pos here; the host cache pos is
+// reconciled at the phase boundary, the only point where a caller could switch
+// to a host-pos API.
 struct captured_decoder {
   void* d_pos = nullptr;
   tl::cuda::CUgraphExec exec = nullptr;  // opaque handle; non-null == captured
   int64_t cur_pos = 0, max_ctx = 0;      // capacity bound owned by the mechanism
+  double capture_ms = 0;  // one-time init cost (warm + record + instantiate)
 
-  // Capture the forward at `pos` (the first decode position; == prompt length),
-  // priming it with `first_id`'s embedding. Leaves d_pos = pos so the first
-  // step() processes position `pos`.
+  // Capture the forward at `pos` (the first position this decoder will process),
+  // priming it with `first_id`'s embedding. Leaves d_pos = pos, so the first
+  // feed()/step() processes position `pos`. Leaves exec null — and the object
+  // still usable, via feed()'s imperative fallback — when graph capture is
+  // unavailable.
   void init(Model& M, int64_t first_id, int64_t pos) {
     namespace cu = tl::cuda;
-    if (!cu::graph_available() || M.layers.empty()) return;
-    max_ctx = M.layers[0].cache.max_ctx;
+    if (M.layers.empty()) return;
+    max_ctx = M.layers[0].cache.max_ctx;  // bound applies to the fallback too
     cur_pos = pos;
+    if (!cu::graph_available()) return;
     d_pos = cu::alloc(4, nullptr);
     if (!d_pos) return;
     stage_embed(M, first_id);
@@ -599,20 +610,63 @@ struct captured_decoder {
     exec = cu::capture_end();
   }
 
-  // One captured step: feed token `id` at the current device position, replay,
-  // GPU-argmax the logits. d_pos auto-advances (captured tl_incr_u32), so the
-  // next step processes pos+1. Returns the greedy next token, or -1 once the KV
-  // cache is full (the bound lives here, not on the caller — kv_append_dpos has
-  // no OOB guard, unlike the host append()).
-  int64_t step(Model& M, int64_t id) {
+  // Consume a whole prompt and return the first generated token (the greedy
+  // argmax of the LAST prompt token's logits). Capture is taken at the cache's
+  // current position, so this also serves a second turn appended to a live
+  // cache — and ONE graph then serves both phases, since the device pos counter
+  // advances across the prefill/decode boundary (no re-capture).
+  //
+  // Prompt tokens other than the last go through feed() (no argmax; their
+  // greedy output is discarded). Returns -1 for an empty prompt. `capture_ms`
+  // is left holding init's one-time cost, which callers time-slicing the prompt
+  // should subtract. (ids[0]'s forward runs twice — once to warm/grow scratch
+  // before recording, once through the loop; one token out of T, and skipping
+  // it would change init's post-condition for the decode-only callers.)
+  int64_t begin(Model& M, const std::vector<int>& ids) {
+    if (ids.empty() || M.layers.empty()) return -1;
+    double t0 = StepProf::now_ms();
+    init(M, ids[0], M.layers[0].cache.pos);
+    capture_ms = StepProf::now_ms() - t0;  // fixed cost, not prompt throughput
+    for (size_t i = 0; i + 1 < ids.size(); i++) feed(M, ids[i]);
+    int64_t last = step(M, ids.back());  // only the last token's logits are read
+    sync_host_pos(M);
+    return last;
+  }
+
+  // Feed token `id` at the current position, WITHOUT reading a token back.
+  // Returns false once the KV cache is full (the bound lives here, not on the
+  // caller — kv_append_dpos has no OOB guard, unlike the host append()).
+  //
+  // Captured mode replays the graph; d_pos auto-advances (captured tl_incr_u32).
+  // Skipping argmax saves its 4-byte D2H *sync* per token (~6%, the replay-only
+  // vs replay+argmax gap in bench_qwen_decode) — safe because the next
+  // stage_embed's H2D is a blocking null-stream copy, so it cannot overwrite
+  // S.embedb while the previous replay still reads it. Without a graph this is
+  // step_imperative minus the argmax, on the same scratch and host cache pos.
+  bool feed(Model& M, int64_t id) {
     namespace cu = tl::cuda;
-    if (cur_pos >= max_ctx) return -1;
-    stage_embed(M, id);       // gather id's row -> S.embedb (host + blocking H2D)
-    cu::graph_launch(exec);   // replay: append@d_pos, attn, logits, incr d_pos
-    int64_t idx = 0;
-    cu::argmax(M.scratch.logitsb, VOCAB, &idx);
+    if (cur_pos >= max_ctx) return false;
+    stage_embed(M, id);  // gather id's row -> S.embedb (host + blocking H2D)
+    if (exec) cu::graph_launch(exec);  // replay: append@d_pos, attn, logits, incr
+    else run_layers_(M, M.scratch.embedb, cur_pos);  // host-pos imperative
     cur_pos++;
+    return true;
+  }
+  // Greedy token from the logits the most recent forward left in scratch.
+  int64_t argmax_last(Model& M) {
+    int64_t idx = 0;
+    tl::cuda::argmax(M.scratch.logitsb, VOCAB, &idx);
     return idx;
+  }
+  // One decode step: feed + read the greedy token (-1 when the cache is full).
+  int64_t step(Model& M, int64_t id) {
+    return feed(M, id) ? argmax_last(M) : -1;
+  }
+  // Reconcile the host cache pos with the device counter. Captured replays
+  // advance only d_pos, so the host pos would otherwise be stale for anyone
+  // switching to a host-pos path (the fallback keeps it current by itself).
+  void sync_host_pos(Model& M) const {
+    if (exec) set_cache_pos(M, cur_pos);
   }
 
   bool ok() const { return exec != nullptr; }
