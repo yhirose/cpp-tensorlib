@@ -515,6 +515,20 @@ struct context {
   }
   CUfunction attn_prefill_64_fn = nullptr;
   CUfunction attn_prefill_bf16_fn = nullptr, attn_prefill_bf16_64_fn = nullptr;
+  CUfunction attn_prefill_tiled_fn = nullptr, attn_prefill_tiled_64_fn = nullptr,
+             attn_prefill_tiled_bf16_fn = nullptr,
+             attn_prefill_tiled_bf16_64_fn = nullptr;
+  CUfunction attn_prefill_tiled_(int64_t D, bool bf16) {
+    CUfunction* slot =
+        bf16 ? (D == 64 ? &attn_prefill_tiled_bf16_64_fn : &attn_prefill_tiled_bf16_fn)
+             : (D == 64 ? &attn_prefill_tiled_64_fn : &attn_prefill_tiled_fn);
+    if (!*slot)
+      d.ModuleGetFunction(
+          slot, mod,
+          bf16 ? (D == 64 ? "tl_attn_prefill_tiled_bf16_64" : "tl_attn_prefill_tiled_bf16")
+               : (D == 64 ? "tl_attn_prefill_tiled_f32_64" : "tl_attn_prefill_tiled_f32"));
+    return *slot;
+  }
   CUfunction attn_prefill_(int64_t D, bool bf16 = false) {
     CUfunction* slot = bf16 ? (D == 64 ? &attn_prefill_bf16_64_fn : &attn_prefill_bf16_fn)
                             : (D == 64 ? &attn_prefill_64_fn : &attn_prefill_fn);
@@ -1244,10 +1258,13 @@ inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads
   unsigned up0 = static_cast<unsigned>(pos0);
   void* args[] = {&pq, &pk, &pv, &po, &uT, &kv_stride, &group, &scale, &up0};
   c.pending = true;
-  return c.d.LaunchKernel(c.attn_prefill_(D, kv_bf16),
-                          static_cast<unsigned>(n_q_heads), uT, 1,
-                          static_cast<unsigned>(D), 1, 1, 0, c.stream, args,
-                          nullptr) == 0;
+  // Tiled by default: a block takes 32 queries and streams K/V through shared
+  // memory, so each score is a register dot product instead of a per-key
+  // warp-shuffle reduction. Same online softmax, same causal rule.
+  constexpr unsigned BQ = 16;
+  return c.d.LaunchKernel(c.attn_prefill_tiled_(D, kv_bf16),
+                          static_cast<unsigned>(n_q_heads), (uT + BQ - 1) / BQ, 1,
+                          BQ * 8, 1, 1, 0, c.stream, args, nullptr) == 0;
 }
 
 // RoPE: rotate a contiguous [rows, D] buffer (rows = H*T). Row r's position is
