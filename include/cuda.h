@@ -367,6 +367,29 @@ struct context {
     return gemv_q4_fn;
   }
 
+  // M9 batched-prefill elementwise/layout kernels (the decode ones, per row).
+  CUfunction split_heads_fn = nullptr, merge_heads_fn = nullptr;
+  CUfunction split_heads_() {
+    if (!split_heads_fn)
+      d.ModuleGetFunction(&split_heads_fn, mod, "tl_split_heads");
+    return split_heads_fn;
+  }
+  CUfunction merge_heads_() {
+    if (!merge_heads_fn)
+      d.ModuleGetFunction(&merge_heads_fn, mod, "tl_merge_heads");
+    return merge_heads_fn;
+  }
+
+  // M9 batched-prefill GEMM (bf16 [N,K] weights, the decode GEMV's own layout).
+  CUfunction gemm_bf16_nt_fn = nullptr, gemm_bf16_nt_s_fn = nullptr;
+  CUfunction gemm_bf16_nt_(bool big) {
+    CUfunction* slot = big ? &gemm_bf16_nt_fn : &gemm_bf16_nt_s_fn;
+    if (!*slot)
+      d.ModuleGetFunction(slot, mod,
+                          big ? "tl_gemm_bf16_nt" : "tl_gemm_bf16_nt_s");
+    return *slot;
+  }
+
   // M9 fused decode attention (single-pass + split-KV two-pass).
   // head_dim {64,128} variants (M9): each templated instantiation has its own
   // symbol; the launchers pick by D. The unsuffixed name is the D=128 build.
@@ -587,16 +610,20 @@ inline void graph_destroy(CUgraphExec e) {
   if (e && c.d.GraphExecDestroy) c.d.GraphExecDestroy(e);
 }
 
-// Blocking H2D into a device buffer's mirror, marking it BOTH (device current).
-// Used to pre-stage inputs (e.g. the embedding row) before a capture, so the
-// captured region contains no blocking copy.
+// Blocking H2D of the buffer's first `n` floats, marking it BOTH (device
+// current). Used to pre-stage inputs (e.g. embedding rows) before a capture, so
+// the captured region contains no blocking copy. `src` may be the mirror's own
+// host buffer, in which case the memcpy is skipped — a caller that gathers
+// straight into the mirror pays only the transfer, and a partly-filled buffer
+// (a short prefill chunk) transfers only what it filled.
 inline void upload(void* native, const float* src, int64_t n) {
   auto& c = context::get();
   if (!c.ready || !native) return;
   context::mirror* m = c.mirror_(native);
   if (!m) return;
-  std::memcpy(m->host, src, (size_t)n * sizeof(float));
-  c.d.MemcpyHtoD(m->dev, m->host, m->bytes);
+  size_t bytes = std::min((size_t)n * sizeof(float), m->bytes);
+  if (src != m->host) std::memcpy(m->host, src, bytes);
+  c.d.MemcpyHtoD(m->dev, m->host, bytes);
   m->where = context::BOTH;
 }
 
@@ -815,6 +842,73 @@ inline bool gemv_bf16_row(void* a, void* B, void* y, int64_t n, int64_t k) {
   c.pending = true;
   return c.d.LaunchKernel(c.gemv_bf16_row_(), uN, 1, 1, block, 1, 1,
                           gemv_row_smem(block), c.stream, args, nullptr) == 0;
+}
+
+// M9 batched-prefill GEMM: C(M,N) = A(M,K) @ W[N,K]^T, W the same row-major
+// bf16 weight gemv_bf16_row consumes — so a batched prompt reuses the decode
+// weights as-is. Requires K % 8 == 0. See tl_gemm_bf16_nt.
+inline bool gemm_bf16_nt(void* a, void* B, void* out, int64_t m, int64_t n,
+                         int64_t k) {
+  auto& c = context::get();
+  if (!c.ready || (k % 8) != 0 || m <= 0 || n <= 0) return false;
+  c.device_read_(a);
+  c.device_read_(B);  // B reinterpreted as __nv_bfloat16* [N][K] in-kernel
+  c.device_write_(out);
+  float* pa = context::off_(a, 0);
+  float* pB = context::off_(B, 0);
+  float* po = context::off_(out, 0);
+  unsigned uM = (unsigned)m, uN = (unsigned)n, uK = (unsigned)k;
+  void* args[] = {&pa, &pB, &po, &uM, &uN, &uK};
+  // Tile choice = whichever actually fills the GPU. The 128 tile is the more
+  // arithmetically efficient one, but a prefill chunk is only a few hundred
+  // tokens, so a narrow projection (N=896, M=256) yields 14 blocks against 82
+  // SMs; the 64 tile turns that into 56 at half the FMA-per-shared-float. Take
+  // the big tile only when it already keeps ~2 blocks per SM busy. It needs
+  // K % 8 == 0; the small tile's deeper slab needs K % 16 == 0.
+  bool big = ((n + 127) / 128) * ((m + 127) / 128) >= 164 || (k % 16) != 0;
+  unsigned t = big ? 128u : 64u;
+  unsigned gx = (unsigned)((n + t - 1) / t), gy = (unsigned)((m + t - 1) / t);
+  c.pending = true;
+  return c.d.LaunchKernel(c.gemm_bf16_nt_(big), gx, gy, 1, 256, 1, 1, 0,
+                          c.stream, args, nullptr) == 0;
+}
+
+// ---- M9 batched-prefill layout moves between token-major projections and
+// head-major attention.
+
+// [T, ld] token-major -> [H, T, D] head-major, adding an optional [H*D] bias.
+// `off` picks a column block of a fused projection output (q|k|v from one GEMM).
+inline bool split_heads(void* src, void* bias, void* dst, int64_t T, int64_t ld,
+                        int64_t off, int64_t H, int64_t D) {
+  auto& c = context::get();
+  if (!c.ready || T <= 0 || H <= 0 || D <= 0) return false;
+  c.device_read_(src);
+  if (bias) c.device_read_(bias);
+  c.device_write_(dst);
+  float* ps = context::off_(src, 0);
+  float* pb = bias ? context::off_(bias, 0) : nullptr;
+  float* pd = context::off_(dst, 0);
+  unsigned uT = (unsigned)T, uld = (unsigned)ld, uoff = (unsigned)off,
+           uD = (unsigned)D;
+  void* args[] = {&ps, &pb, &pd, &uT, &uld, &uoff, &uD};
+  c.pending = true;
+  return c.d.LaunchKernel(c.split_heads_(), (unsigned)H, uT, 1, uD, 1, 1, 0,
+                          c.stream, args, nullptr) == 0;
+}
+
+// [H, T, D] head-major -> [T, H*D] token-major (inverse of split_heads).
+inline bool merge_heads(void* src, void* dst, int64_t T, int64_t H, int64_t D) {
+  auto& c = context::get();
+  if (!c.ready || T <= 0 || H <= 0 || D <= 0) return false;
+  c.device_read_(src);
+  c.device_write_(dst);
+  float* ps = context::off_(src, 0);
+  float* pd = context::off_(dst, 0);
+  unsigned uT = (unsigned)T, uH = (unsigned)H, uD = (unsigned)D;
+  void* args[] = {&ps, &pd, &uT, &uH, &uD};
+  c.pending = true;
+  return c.d.LaunchKernel(c.merge_heads_(), uH, uT, 1, uD, 1, 1, 0, c.stream,
+                          args, nullptr) == 0;
 }
 
 // M8 int4-weight decode GEMV: y(N) = a(1,K) @ dequant(Wq[N,K]), F32 accumulate.
@@ -1065,11 +1159,12 @@ inline bool kv_append(void* Kc, void* Vc, void* k_new, void* v_new, int64_t pos,
                           nullptr) == 0;
 }
 
-// M9 prefill: bulk-copy a prompt's k,v (each [n_kv_heads,T,D] device buffers)
-// into the cache (K,V each [n_kv_heads,kv_max,D]) rows [0,T). grid=(n_kv_heads,T).
+// M9 prefill: bulk-copy a block of k,v (each [n_kv_heads,T,D] device buffers)
+// into the cache (K,V each [n_kv_heads,kv_max,D]) rows [pos0, pos0+T), so a long
+// prompt can be filled in chunks. grid=(n_kv_heads,T).
 inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
                     int64_t kv_max, int64_t n_kv_heads, int64_t D,
-                    bool kv_bf16 = false) {
+                    bool kv_bf16 = false, int64_t pos0 = 0) {
   auto& c = context::get();
   if (!c.ready || (D != 128 && D != 64)) return false;
   c.device_read_(K);
@@ -1082,7 +1177,8 @@ inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
   float* pv = context::off_(V, 0);
   unsigned uT = static_cast<unsigned>(T);
   unsigned kv_stride = static_cast<unsigned>(kv_max * D);
-  void* args[] = {&pKc, &pVc, &pk, &pv, &uT, &kv_stride};
+  unsigned up0 = static_cast<unsigned>(pos0);
+  void* args[] = {&pKc, &pVc, &pk, &pv, &uT, &kv_stride, &up0};
   c.pending = true;
   return c.d.LaunchKernel(c.kv_fill_(kv_bf16), static_cast<unsigned>(n_kv_heads),
                           static_cast<unsigned>(T), 1, static_cast<unsigned>(D),
@@ -1090,11 +1186,13 @@ inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
 }
 
 // M9 causal prefill attention: q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D]
-// cache read over [0,T). Query p attends keys 0..p. GQA via group. D∈{64,128}.
+// cache read over [0,pos0+T). Query p is at absolute position pos0+p and attends
+// keys 0..pos0+p, so a long prompt can be run in chunks (and a later turn
+// appended to a live cache). GQA via group. D∈{64,128}.
 // One block per (head, query pos); grid=(n_q_heads,T) (T <= 65535 gridDim.y).
 inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads,
                          int64_t n_kv_heads, int64_t T, int64_t kv_max, int64_t D,
-                         float scale, bool kv_bf16 = false) {
+                         float scale, bool kv_bf16 = false, int64_t pos0 = 0) {
   auto& c = context::get();
   if (!c.ready || (D != 128 && D != 64)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
@@ -1110,7 +1208,8 @@ inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads
   unsigned uT = static_cast<unsigned>(T);
   unsigned kv_stride = static_cast<unsigned>(kv_max * D);
   unsigned group = static_cast<unsigned>(n_q_heads / n_kv_heads);
-  void* args[] = {&pq, &pk, &pv, &po, &uT, &kv_stride, &group, &scale};
+  unsigned up0 = static_cast<unsigned>(pos0);
+  void* args[] = {&pq, &pk, &pv, &po, &uT, &kv_stride, &group, &scale, &up0};
   c.pending = true;
   return c.d.LaunchKernel(c.attn_prefill_(D, kv_bf16),
                           static_cast<unsigned>(n_q_heads), uT, 1,
@@ -1139,27 +1238,33 @@ inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
                           nullptr) == 0;
 }
 
-// Fused residual-add + RMSNorm: xout = x + delta; hout = rmsnorm(xout)*w.
-// Writes both (xout is the next residual base, hout the normalized input).
+// ---- Row-wise fused RMSNorm / SwiGLU. `rows` defaults to 1 (a decode step); a
+// batched prefill chunk passes its token count. ONE kernel serves both, which is
+// what keeps the two paths from drifting numerically. Buffers are [rows, n]
+// contiguous; the weight is [n], shared by every row.
+
+// xout = x + delta; hout = rmsnorm(xout) * w, per row. xout may alias x. Folds a
+// layer's residual add into the following norm (the o-proj->norm and
+// mlp->next-input-norm seams), writing both the residual sum (the next residual
+// base) and its normalized form.
 inline bool rmsnorm_res(void* x, void* delta, void* w, void* xout, void* hout,
-                        int64_t n, float eps) {
+                        int64_t n, float eps, int64_t rows = 1) {
   auto& c = context::get();
-  if (!c.ready || n <= 0) return false;
+  if (!c.ready || n <= 0 || rows <= 0) return false;
   c.device_read_(x);
   c.device_read_(delta);
   c.device_read_(w);
   c.device_write_(xout);
   c.device_write_(hout);
-  float* px = context::off_(x, 0);
-  float* pd = context::off_(delta, 0);
+  float* pa = context::off_(x, 0);
+  float* pb = context::off_(delta, 0);
   float* pw = context::off_(w, 0);
-  float* pxo = context::off_(xout, 0);
-  float* pho = context::off_(hout, 0);
-  unsigned un = static_cast<unsigned>(n);
-  void* args[] = {&px, &pd, &pw, &pxo, &pho, &un, &eps};
-  unsigned block = 256;
+  float* px = context::off_(xout, 0);
+  float* ph = context::off_(hout, 0);
+  unsigned un = (unsigned)n, block = 256;
+  void* args[] = {&pa, &pb, &pw, &px, &ph, &un, &eps};
   c.pending = true;
-  return c.d.LaunchKernel(c.add_rmsnorm_(), 1, 1, 1, block, 1, 1,
+  return c.d.LaunchKernel(c.add_rmsnorm_(), (unsigned)rows, 1, 1, block, 1, 1,
                           block * sizeof(float), c.stream, args, nullptr) == 0;
 }
 
@@ -1196,36 +1301,38 @@ inline bool argmax(void* in, int64_t n, int64_t* out_idx) {
 // Fused RMSNorm over one length-n row: out = x * 1/sqrt(mean(x^2)+eps) * w.
 // x/w/out are native device handles (offset 0). One block; matches the array
 // composition numerically (see tl_rmsnorm). In-place safe (out may alias x).
-inline bool rmsnorm(void* x, void* w, void* out, int64_t n, float eps) {
+inline bool rmsnorm(void* x, void* w, void* out, int64_t n, float eps,
+                    int64_t rows = 1) {
   auto& c = context::get();
-  if (!c.ready || n <= 0) return false;
+  if (!c.ready || n <= 0 || rows <= 0) return false;
   c.device_read_(x);
   c.device_read_(w);
   c.device_write_(out);
   float* px = context::off_(x, 0);
   float* pw = context::off_(w, 0);
   float* po = context::off_(out, 0);
-  unsigned un = static_cast<unsigned>(n);
+  unsigned un = (unsigned)n, block = 256;
   void* args[] = {&px, &pw, &po, &un, &eps};
-  unsigned block = 256;
   c.pending = true;
-  return c.d.LaunchKernel(c.rmsnorm_(), 1, 1, 1, block, 1, 1,
+  return c.d.LaunchKernel(c.rmsnorm_(), (unsigned)rows, 1, 1, block, 1, 1,
                           block * sizeof(float), c.stream, args, nullptr) == 0;
 }
 
-// Fused SwiGLU: out = silu(gate) * up over n elements. Native handles, offset 0.
-inline bool swiglu(void* gate, void* up, void* out, int64_t n) {
+// out[rows, ff] = silu(gate) * up, read out of the FUSED gate|up buffer
+// gu[rows, 2*ff] that both paths already produce (up is gate + ff in each row).
+inline bool swiglu(void* gu, void* out, int64_t ff, int64_t rows = 1) {
   auto& c = context::get();
-  if (!c.ready || n <= 0) return false;
-  c.device_read_(gate);
-  c.device_read_(up);
+  if (!c.ready || ff <= 0 || rows <= 0) return false;
+  c.device_read_(gu);
   c.device_write_(out);
-  float* pg = context::off_(gate, 0);
-  float* pu = context::off_(up, 0);
+  float* pg = context::off_(gu, 0);
   float* po = context::off_(out, 0);
-  unsigned un = static_cast<unsigned>(n);
-  void* args[] = {&pg, &pu, &po, &un};
-  return c.launch1d_(c.swiglu_(), un, args);
+  unsigned uff = (unsigned)ff, block = 256;
+  void* args[] = {&pg, &po, &uff};
+  c.pending = true;
+  return c.d.LaunchKernel(c.swiglu_(), (unsigned)((ff + block - 1) / block),
+                          (unsigned)rows, 1, block, 1, 1, 0, c.stream, args,
+                          nullptr) == 0;
 }
 
 // Persistent, device-resident KV cache (roadmap M9, A-surface): K,V buffers
@@ -1290,17 +1397,21 @@ struct kv_cache {
     return attn_decode_dpos(q, K, V, out, n_q_heads, n_kv_heads, d_pos, max_ctx,
                             D, scale, dpos_partials);
   }
-  // Prefill a T-token prompt: bulk-fill the cache from k_src/v_src
-  // ([n_kv_heads,T,D]) and run causal attention (q/out [n_q_heads,T,D]). Leaves
-  // pos=T so decode continues from there. Overwrites the cache from row 0.
+  // Prefill T tokens: bulk-fill the cache from k_src/v_src ([n_kv_heads,T,D])
+  // and run causal attention (q/out [n_q_heads,T,D]). The block is APPENDED at
+  // the current pos and leaves pos advanced by T, so a long prompt can be run in
+  // chunks and a later turn can extend a live cache; queries attend everything
+  // already cached before them. Starting from pos=0 (a fresh cache) this is the
+  // original whole-prompt-from-row-0 fill.
   bool prefill(void* q, void* k_src, void* v_src, void* out, int64_t T,
                int64_t n_q_heads, float scale) {
-    if (T <= 0 || T > max_ctx) return false;
-    if (!kv_fill(K, V, k_src, v_src, T, max_ctx, n_kv_heads, D, kv_bf16))
+    if (T <= 0 || pos + T > max_ctx) return false;
+    if (!kv_fill(K, V, k_src, v_src, T, max_ctx, n_kv_heads, D, kv_bf16, pos))
       return false;
-    pos = T;
+    int64_t p0 = pos;
+    pos += T;
     return attn_prefill(q, K, V, out, n_q_heads, n_kv_heads, T, max_ctx, D,
-                        scale, kv_bf16);
+                        scale, kv_bf16, p0);
   }
   void destroy() {
     if (K) release(K, 0, nullptr);
@@ -1436,11 +1547,22 @@ inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
   return false;
 }
 inline bool argmax(void*, int64_t, int64_t*) { return false; }
-inline bool rmsnorm(void*, void*, void*, int64_t, float) { return false; }
-inline bool rmsnorm_res(void*, void*, void*, void*, void*, int64_t, float) {
+inline bool rmsnorm(void*, void*, void*, int64_t, float, int64_t = 1) {
   return false;
 }
-inline bool swiglu(void*, void*, void*, int64_t) { return false; }
+inline bool split_heads(void*, void*, void*, int64_t, int64_t, int64_t, int64_t,
+                        int64_t) {
+  return false;
+}
+inline bool merge_heads(void*, void*, int64_t, int64_t, int64_t) { return false; }
+inline bool gemm_bf16_nt(void*, void*, void*, int64_t, int64_t, int64_t) {
+  return false;
+}
+inline bool rmsnorm_res(void*, void*, void*, void*, void*, int64_t, float,
+                        int64_t = 1) {
+  return false;
+}
+inline bool swiglu(void*, void*, int64_t, int64_t = 1) { return false; }
 inline bool graph_available() { return false; }
 inline bool capture_begin() { return false; }
 inline void* capture_end() { return nullptr; }

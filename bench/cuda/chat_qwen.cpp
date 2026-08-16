@@ -63,19 +63,20 @@ int main(int argc, char** argv) {
   std::printf("prompt: %s\n%zu prompt tokens; generating (greedy)...\n\n",
               user.c_str(), ids.size());
 
-  // The prompt and the generated tokens share one captured graph — see
-  // qm::captured_decoder. begin() consumes the prompt and returns the first
-  // generated token; step() self-bounds on the KV capacity and degrades to the
-  // imperative path on its own, so there is nothing to branch on here. Greedy
+  // begin() consumes the prompt — batched as GEMMs when the weights allow it,
+  // else token-by-token — and returns the first generated token; step() then
+  // self-bounds on the KV capacity and degrades to the imperative path on its
+  // own, so there is nothing to branch on here. See qm::captured_decoder. Greedy
   // throughout; capture is guarded argmax-equivalent to imperative in
-  // bench_qwen_decode.
+  // bench_qwen_decode, and every prefill path against the array reference in
+  // bench_qwen_prefill.
   qm::captured_decoder dec;
   auto t_prefill = clk::now();
   int64_t next = dec.begin(M, ids);
   double prefill_ms = ms_since(t_prefill) - dec.capture_ms;  // prompt work only
-  std::printf("prefill+decode path: %s\n\n",
-              dec.ok() ? "CUDA-graph capture (one graph, prompt included)"
-                       : "imperative");
+  std::printf("prefill: %s | decode: %s\n\n",
+              dec.batched ? "batched GEMM" : "token-by-token",
+              dec.ok() ? "CUDA-graph capture" : "imperative");
 
   std::vector<int> gen;
   auto t_dec = clk::now();

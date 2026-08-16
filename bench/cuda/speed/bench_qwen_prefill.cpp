@@ -1,17 +1,20 @@
 // M9 prefill census — the prompt-side twin of bench_qwen_ctx (which measured
-// decode). chat_qwen currently prefills by feeding the prompt through the array
-// `step` path one token at a time, so a long prompt costs T full forwards of
-// the slowest path we have. Two questions, measured separately:
+// decode). A prompt is not a decode: its T tokens share one set of weights, so
+// feeding them one at a time throws away the batch dimension entirely. This
+// bench is what sized that (~25x on the projections, ~45x on attention) before
+// the batched path was built, and is now what guards and measures it:
 //
-//   1. Which of the three EXISTING token-by-token paths (array / imperative /
-//      CUDA-graph replay) prefills fastest, and does the answer hold as the
-//      prompt grows? Nothing new has to be built to take this win — it is the
-//      same forward chat_qwen already runs for decode.
-//   2. What is the ceiling above token-by-token, i.e. how much would BATCHING
-//      the prompt (M>1) buy? Sized in two isolated parts: the weight
-//      projections (M=1 GEMV per token vs one M=T GEMM) and the attention
-//      (T growing-ctx decode calls vs one tiled attn_prefill). This is the
-//      unbuilt lever — measure it before building it.
+//   0. Correctness. Every prefill path must produce the same first generated
+//      token as the array `step` reference, at several chunk sizes so the chunk
+//      seam (rope pos0, cache append offset, causal bound ACROSS chunks) is
+//      exercised rather than assumed.
+//   1. Throughput of each path at a range of prompt lengths: the array path
+//      chat_qwen used to run, token-by-token imperative, token-by-token
+//      CUDA-graph replay, and the shipped BATCHED path.
+//   2. Where the batched win comes from, isolated: (a) the projections, M=1
+//      GEMV vs one M=T GEMM on the SAME bf16 [N,K] weight — which doubles as
+//      the GEMM's correctness check against the validated GEMV; (b) attention,
+//      T growing-ctx decode calls vs one tiled causal attn_prefill.
 //
 // Usage: bench_qwen_prefill [model.gguf] [max_T]
 
@@ -28,7 +31,7 @@ namespace qm = qwenmodel;
 namespace cu = tl::cuda;
 static double now_ms() { return qm::StepProf::now_ms(); }
 
-enum class Path { Array, Imperative, Captured };
+enum class Path { Array, Imperative, Captured, Batched };
 
 // Zero-filled device buffer of `n` floats, marked host-live so the first kernel
 // that reads it uploads (dummy operands — only their shape drives the timing).
@@ -57,18 +60,26 @@ static double prefill_ms(qm::Model& M, int64_t T, Path p) {
   std::vector<int> ids = make_ids(T);
 
   if (p == Path::Captured) {
-    // The SHIPPED path (what chat_qwen runs), not a hand-rolled twin: one
-    // capture, feed() for every prompt token but the last. Its cost is excluded
-    // from the throughput — it is a fixed cost, not per-token work. Still an
-    // upper bound in one respect: every replay also runs lm_head, which prefill
-    // needs only for the last token.
+    // The COUNTERFACTUAL: what the prompt costs replayed one token at a time
+    // through the captured graph. captured_decoder::begin no longer does this
+    // (it batches), so drive feed/step directly; capture is excluded, being a
+    // fixed cost rather than per-token work. Also an upper bound in one respect:
+    // every replay runs lm_head, which a prompt needs only for its last token.
     qm::captured_decoder dec;
+    dec.init(M, ids[0], 0);
+    if (!dec.ok()) { dec.destroy(); return -1; }
     double t = now_ms();
-    dec.begin(M, ids);
-    double ms = now_ms() - t - dec.capture_ms;
-    bool ok = dec.ok();
+    for (int64_t i = 0; i + 1 < T; i++) dec.feed(M, ids[(size_t)i]);
+    dec.step(M, ids.back());
+    double ms = now_ms() - t;
     dec.destroy();
-    return ok ? ms : -1;
+    return ms;
+  }
+  if (p == Path::Batched) {
+    // The SHIPPED path: what captured_decoder::begin runs for the prompt.
+    double t = now_ms();
+    bool ok = qm::prefill_batched(M, ids) >= 0;
+    return ok ? now_ms() - t : -1;
   }
   double t = now_ms();
   for (int64_t i = 0; i < T; i++) {
@@ -103,10 +114,9 @@ int main(int argc, char** argv) {
   std::printf("model %s | bf16 row | prompt lengths up to %lld\n\n", path.c_str(),
               (long long)max_T);
 
-  // ---- 0. Correctness of the captured prefill: running the prompt through the
-  // graph captured at pos 0 must leave the same state as feeding it through the
-  // array `step` path — same first generated token, which is what lets
-  // chat_qwen prefill through the graph. The greedy token is the gate; the
+  // ---- 0. Correctness: every prefill path must leave the same state as feeding
+  // the prompt through the array `step` reference — same first generated token,
+  // which is the contract chat_qwen relies on. The greedy token is the gate; the
   // logits maxrel is informational and is larger here (~1e-5) than the
   // single-step dpos-vs-hostpos check (~1e-7) because the two paths' GEMV
   // reduction orders (split-K [K,N] vs warp-per-row [N,K]) differ slightly in
@@ -123,7 +133,7 @@ int main(int argc, char** argv) {
     // accumulated-reduction-order band (~1e-5). The bound is loose on purpose —
     // it catches a real numeric regression without pinning WSL2/driver noise.
     const double MAXREL_BOUND = 1e-3;
-    std::printf("=== 0. captured prefill vs array prefill (T=%lld) ===\n",
+    std::printf("=== 0. every prefill path vs the array reference (T=%lld) ===\n",
                 (long long)T);
     auto compare = [&](const char* name, int64_t got_tok) {
       cu::sync_to_host(M.scratch.logitsb, false);
@@ -143,7 +153,7 @@ int main(int argc, char** argv) {
 
     qm::reset_cache(M);
     qm::captured_decoder cap;
-    bool ok = compare("graph", cap.begin(M, ids));
+    bool ok = compare("begin", cap.begin(M, ids));
     cap.destroy();
 
     // Same check for feed()'s no-graph branch, which a box with CUDA-graph
@@ -156,41 +166,53 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i + 1 < ids.size(); i++) fb.feed(M, ids[i]);
     ok &= compare("fallback", fb.step(M, ids.back()));
     fb.destroy();
+
+    // And the BATCHED prefill, at a chunk small enough that the prompt spans
+    // several chunks — so the chunk seam (rope pos0, cache append offset, causal
+    // bound across chunks) is exercised, not just a single whole-prompt pass.
+    for (int64_t ch : {(int64_t)16, (int64_t)64, (int64_t)256}) {
+      qm::reset_cache(M);
+      char nm[24];
+      std::snprintf(nm, sizeof nm, "batch/%lld", (long long)ch);
+      ok &= compare(nm, qm::prefill_batched(M, ids, ch));
+    }
     std::printf("\n");
     if (!ok) return 1;
   }
 
-  // ---- 1. token-by-token prefill: which existing path, and does it hold up?
-  // The array path costs ~10ms/token, so sweeping it to max_T would dominate
-  // the bench's runtime for a number that is already flat by T=512; it is
-  // capped here and the cap is reported rather than silently applied.
+  // ---- 1. Throughput per path vs prompt length. The array path costs
+  // ~10ms/token, so sweeping it to max_T would dominate the bench's runtime for
+  // a number that is already flat by T=512; it is capped here and the cap is
+  // reported rather than silently applied.
   const int64_t ARRAY_MAX = 512;
-  std::printf("=== prefill: existing token-by-token paths ===\n");
-  std::printf("  %6s  %11s  %11s  %11s   (tok/s)\n", "T", "array", "imperative",
-              "graph");
+  std::printf("=== prefill throughput by path ===\n");
+  std::printf("  %6s  %11s  %11s  %11s  %11s   (tok/s)\n", "T", "array",
+              "imperative", "graph 1tok", "BATCHED");
   for (int64_t T : {(int64_t)32, (int64_t)128, (int64_t)512, (int64_t)1024,
                     (int64_t)2048}) {
     if (T > max_T) break;
     double a = T <= ARRAY_MAX ? prefill_ms(M, T, Path::Array) : -1;
     double i = prefill_ms(M, T, Path::Imperative);
     double g = prefill_ms(M, T, Path::Captured);
+    double b = prefill_ms(M, T, Path::Batched);
     char ab[32];
     if (a > 0) std::snprintf(ab, sizeof ab, "%.1f", T * 1000.0 / a);
     else std::snprintf(ab, sizeof ab, "(skipped)");
-    std::printf("  %6lld  %11s  %11.1f  %11.1f\n", (long long)T, ab,
-                T * 1000.0 / i, g > 0 ? T * 1000.0 / g : 0.0);
+    std::printf("  %6lld  %11s  %11.1f  %11.1f  %11.1f\n", (long long)T, ab,
+                T * 1000.0 / i, g > 0 ? T * 1000.0 / g : 0.0,
+                b > 0 ? T * 1000.0 / b : 0.0);
   }
   std::printf("  (array capped at T=%lld — ~10ms/token, and already flat there)\n\n",
               (long long)ARRAY_MAX);
 
-  // ---- 2a. Projection batching headroom: one M=1 GEMV per token (what every
-  // token-by-token path runs) vs one M=T GEMM for the whole prompt. The
-  // production GEMV is bf16 warp-per-row [N,K]; the batched proxy is the
-  // existing f32 sgemm_rb, which reads 2x the weight bytes — so it is a
-  // CONSERVATIVE stand-in for the bf16 GEMM a batched prefill would want.
-  std::printf("=== 2a. projection batching headroom (per prompt token) ===\n");
-  std::printf("  gemv = bf16 [N,K] M=1 (production); gemm = f32 M=T (proxy, 2x bytes)\n");
-  const int64_t MB = 512;  // batch used for the GEMM column
+  // ---- 2a. The projection lever, now real: one M=1 GEMV per prompt token
+  // (what every token-by-token path runs) vs one M=T bf16 GEMM for the chunk.
+  // Both consume the SAME [N,K] row-major bf16 weight, so this is a like-for-
+  // like comparison, not a proxy. gemv_bf16_row is the validated reference for
+  // the correctness column (reduction order differs, so agreement is to ~1e-6,
+  // not bit-exact).
+  std::printf("=== 2a. projection GEMV(M=1) vs batched GEMM (per prompt token) ===\n");
+  const int64_t MB = qm::PREFILL_CHUNK;  // the chunk production runs
   struct Shape { const char* name; int64_t K, N; const tl::array* w; };
   qm::Layer& L0 = M.layers[0];
   const Shape shapes[] = {
@@ -199,48 +221,63 @@ int main(int argc, char** argv) {
       {"gateup.fused", qm::NE, 2 * qm::FF, &L0.wgu},
       {"wd", qm::FF, qm::NE, &L0.wd_row},
   };
-  std::printf("  %14s  %6s %7s  %10s  %10s  %8s\n", "shape", "K", "N",
-              "gemv(us)", "gemm(us)", "speedup");
-  // One max-sized trio reused by every shape (a [MB,Kmax], wf [K*N]max, y
-  // [MB,Nmax]) — cu::release recycles into a size-keyed pool rather than
-  // returning memory to the driver, so per-shape buffers would stay committed
-  // for the whole run (~101 MB) on top of the model. ~65 MB peak this way, and
-  // one zero-fill/upload instead of four.
-  int64_t maxK = 0, maxN = 0, maxW = 0;
+  int64_t maxK = 0, maxN = 0;
   for (const Shape& s : shapes) {
     maxK = std::max(maxK, s.K);
     maxN = std::max(maxN, s.N);
-    maxW = std::max(maxW, s.K * s.N);
   }
-  void* a = zeros(MB * maxK);   // [M,K] activations
-  void* wf = zeros(maxW);       // [K,N] f32 dummy weights
-  void* y = zeros(MB * maxN);
-  if (!a || !wf || !y) { std::printf("  alloc failed\n"); return 1; }
+  // One max-sized trio reused by every shape — cu::release recycles into a
+  // size-keyed pool rather than returning memory to the driver, so per-shape
+  // buffers would stay committed for the whole run.
+  float *ha = nullptr, *hy = nullptr, *hy1 = nullptr;
+  void* a = cu::alloc(MB * maxK * 4, &ha);   // [M,K] activations
+  void* y = cu::alloc(MB * maxN * 4, &hy);
+  void* y1 = cu::alloc(maxN * 4, &hy1);      // GEMV reference row
+  if (!a || !y || !y1) { std::printf("  alloc failed\n"); return 1; }
+  uint32_t st = 20260816u;
+  for (int64_t i = 0; i < MB * maxK; i++) {  // deterministic non-zero input
+    st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+    ha[i] = (int32_t)st * (1.0f / 2147483648.0f);
+  }
+  cu::sync_to_host(a, true);
 
+  std::printf("  %14s  %6s %7s  %10s  %10s  %8s  %9s\n", "shape", "K", "N",
+              "gemv(us)", "gemm(us)", "speedup", "vs gemv");
   double sum_gemv = 0, sum_gemm = 0;
+  bool gemm_ok = true;
   for (const Shape& s : shapes) {
     // Warm both paths (module load, first-touch upload) outside the timing.
-    cu::gemv_bf16_row(a, s.w->native(), y, s.N, s.K);
-    cu::gemm(a, 0, s.K, false, wf, 0, s.N, false, y, 0, MB, s.N, s.K, 1.0f, 0.0f);
+    cu::gemv_bf16_row(a, s.w->native(), y1, s.N, s.K);
+    cu::gemm_bf16_nt(a, s.w->native(), y, MB, s.N, s.K);
     cu::flush();
+    // Correctness: GEMM row 0 must reproduce the GEMV of A's row 0.
+    cu::sync_to_host(y1, false);
+    cu::sync_to_host(y, false);
+    double maxrel = 0;
+    for (int64_t i = 0; i < s.N; i++)
+      maxrel = std::max(maxrel, (double)std::fabs(hy[i] - hy1[i]) /
+                                    (1.0 + std::fabs(hy1[i])));
+    bool ok = maxrel < 1e-5;
+    gemm_ok &= ok;
 
     double gemv_us = 1000.0 * min_ms(3, 20, [&] {
-      cu::gemv_bf16_row(a, s.w->native(), y, s.N, s.K);
+      cu::gemv_bf16_row(a, s.w->native(), y1, s.N, s.K);
     });
     double gemm_us = 1000.0 * min_ms(3, 5, [&] {
-      cu::gemm(a, 0, s.K, false, wf, 0, s.N, false, y, 0, MB, s.N, s.K, 1.0f, 0.0f);
+      cu::gemm_bf16_nt(a, s.w->native(), y, MB, s.N, s.K);
     }) / MB;  // per prompt token
     sum_gemv += gemv_us;
     sum_gemm += gemm_us;
-    std::printf("  %14s  %6lld %7lld  %10.2f  %10.2f  %7.1fx\n", s.name,
+    std::printf("  %14s  %6lld %7lld  %10.2f  %10.2f  %7.1fx  %.1e %s\n", s.name,
                 (long long)s.K, (long long)s.N, gemv_us, gemm_us,
-                gemv_us / gemm_us);
+                gemv_us / gemm_us, maxrel, ok ? "OK" : "FAIL");
   }
-  for (void* p : {a, wf, y}) cu::release(p, 0, nullptr);
+  for (void* p : {a, y, y1}) cu::release(p, 0, nullptr);
   std::printf("  %14s  %6s %7s  %10.2f  %10.2f  %7.1fx  (x24 layers)\n", "SUM/layer",
               "", "", sum_gemv, sum_gemm, sum_gemv / sum_gemm);
   std::printf("  (the gemv column repeats one shape back-to-back, so QKV/wo — "
               "whose weights fit L2 — read warm; their speedup is a floor)\n\n");
+  if (!gemm_ok) return 1;
 
   // ---- 2b. Attention batching headroom: T growing-ctx decode calls (what
   // token-by-token prefill runs) vs one tiled attn_prefill over the whole

@@ -118,19 +118,25 @@ extern "C" __global__ void tl_argmax(const float* __restrict__ in, int* out,
   if (t == 0) out[0] = sidx[0];
 }
 
-// ---- fused RMSNorm over a single length-n row: out = x * rsqrt(mean(x^2)+eps) * w
-// One block, grid-stride sum-of-squares reduction, then a normalize+scale pass.
-// Matches the array composition (x*x).mean(-1) -> 1/sqrt(ms+eps) -> *x *w exactly
-// (f32, 1/sqrtf not the approximate rsqrtf) so greedy output is unchanged. Kills
-// the ~7 array-op launches per RMSNorm (2/layer + 1 final) in the decode step.
+// ---- Row-wise fused RMSNorm / SwiGLU. One block per row (grid.x = rows), so
+// the SAME kernel serves a decode step (rows == 1) and a batched prefill chunk
+// (rows == prompt tokens). That identity is the point: prefill agreeing
+// numerically with decode is what bench_qwen_prefill's check 0 asserts, and it
+// would be a hand-maintained coincidence if these were two kernels. ----
+
+// out = x * rsqrt(mean(x^2)+eps) * w, per row. Matches the array composition
+// (x*x).mean(-1) -> 1/sqrt(ms+eps) -> *x *w exactly (f32, 1/sqrtf not the
+// approximate rsqrtf) so greedy output is unchanged; kills the ~7 array-op
+// launches per RMSNorm.
 extern "C" __global__ void tl_rmsnorm(const float* __restrict__ x,
                                       const float* __restrict__ w,
                                       float* __restrict__ out, unsigned n,
                                       float eps) {
   extern __shared__ float sm[];
+  const size_t base = (size_t)blockIdx.x * n;
   unsigned t = threadIdx.x, T = blockDim.x;
   float acc = 0.0f;
-  for (unsigned i = t; i < n; i += T) { float v = x[i]; acc += v * v; }
+  for (unsigned i = t; i < n; i += T) { float v = x[base + i]; acc += v * v; }
   sm[t] = acc;
   __syncthreads();
   for (unsigned s = T >> 1; s > 0; s >>= 1) {
@@ -138,15 +144,14 @@ extern "C" __global__ void tl_rmsnorm(const float* __restrict__ x,
     __syncthreads();
   }
   float inv = 1.0f / sqrtf(sm[0] / (float)n + eps);
-  for (unsigned i = t; i < n; i += T) out[i] = x[i] * inv * w[i];
+  for (unsigned i = t; i < n; i += T)
+    out[base + i] = x[base + i] * inv * w[i];
 }
 
-// ---- fused residual-add + RMSNorm: xout = a+b; hout = rmsnorm(xout,eps)*w ----
-// Folds a decode layer's residual add into the following norm (the o-proj->norm
-// and mlp->next-input-norm seams), writing BOTH the residual sum (needed
-// downstream as the next residual base) and the normalized+scaled output. One
-// block. xout may alias a (in-place residual). Removes 2 elementwise launches
-// per layer — pure per-kernel-latency wins on the launch-bound decode step.
+// Fused residual-add + RMSNorm, per row: xout = a+b; hout = rmsnorm(xout)*w.
+// Folds a layer's residual add into the following norm (the o-proj->norm and
+// mlp->next-input-norm seams), writing BOTH the residual sum (needed downstream
+// as the next residual base) and the normalized output. xout may alias a.
 extern "C" __global__ void tl_add_rmsnorm(const float* __restrict__ a,
                                           const float* __restrict__ b,
                                           const float* __restrict__ w,
@@ -154,11 +159,12 @@ extern "C" __global__ void tl_add_rmsnorm(const float* __restrict__ a,
                                           float* __restrict__ hout, unsigned n,
                                           float eps) {
   extern __shared__ float sm[];
+  const size_t base = (size_t)blockIdx.x * n;
   unsigned t = threadIdx.x, T = blockDim.x;
   float acc = 0.0f;
   for (unsigned i = t; i < n; i += T) {
-    float v = a[i] + b[i];
-    xout[i] = v;
+    float v = a[base + i] + b[base + i];
+    xout[base + i] = v;
     acc += v * v;
   }
   sm[t] = acc;
@@ -168,19 +174,47 @@ extern "C" __global__ void tl_add_rmsnorm(const float* __restrict__ a,
     __syncthreads();
   }
   float inv = 1.0f / sqrtf(sm[0] / (float)n + eps);
-  for (unsigned i = t; i < n; i += T) hout[i] = xout[i] * inv * w[i];
+  for (unsigned i = t; i < n; i += T)
+    hout[base + i] = xout[base + i] * inv * w[i];
 }
 
-// ---- fused SwiGLU: out = silu(gate) * up = (gate * sigmoid(gate)) * up ----
-// Elementwise over n (the FF dim). Matches array silu(gate)*up; replaces the
-// sigmoid+mul+mul launch chain with one kernel.
-extern "C" __global__ void tl_swiglu(const float* __restrict__ gate,
-                                     const float* __restrict__ up,
-                                     float* __restrict__ out, unsigned n) {
-  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  float g = gate[i];
-  out[i] = (g / (1.0f + expf(-g))) * up[i];
+// SwiGLU straight out of the FUSED gate|up projection: gu is [rows, 2*ff] (row r
+// holds gate(ff) then up(ff)), out is [rows, ff]. Both paths already produce
+// that fused layout, so neither has to split it into two projections.
+// out = silu(gate) * up; grid = (ceil(ff/256), rows).
+extern "C" __global__ void tl_swiglu(const float* __restrict__ gu,
+                                     float* __restrict__ out, unsigned ff) {
+  unsigned f = blockIdx.x * blockDim.x + threadIdx.x;
+  if (f >= ff) return;
+  const size_t src = (size_t)blockIdx.y * 2u * ff + f;
+  float g = gu[src];
+  out[(size_t)blockIdx.y * ff + f] = (g / (1.0f + expf(-g))) * gu[src + ff];
+}
+
+// Token-major [T, ld] -> head-major [H, T, D], adding an optional per-head bias.
+// The batched projections produce all heads of a token contiguously, while the
+// attention kernels want each head's token sequence contiguous; `off` selects a
+// column block of the fused QKV output, so q/k/v come from one GEMM. Folding the
+// bias in here is what lets the following rope run bias-free (its fused-bias form
+// only indexes correctly at T==1). grid = (H, T), block = D.
+extern "C" __global__ void tl_split_heads(const float* __restrict__ src,
+                                          const float* __restrict__ bias,
+                                          float* __restrict__ dst, unsigned T,
+                                          unsigned ld, unsigned off,
+                                          unsigned D) {
+  const unsigned h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+  float v = src[(size_t)t * ld + off + h * D + d];
+  if (bias) v += bias[(size_t)h * D + d];
+  dst[((size_t)h * T + t) * D + d] = v;
+}
+
+// Head-major [H, T, D] -> token-major [T, H*D], the inverse of tl_split_heads
+// (attention output back into the shape the o-projection GEMM reads).
+extern "C" __global__ void tl_merge_heads(const float* __restrict__ src,
+                                          float* __restrict__ dst, unsigned T,
+                                          unsigned H, unsigned D) {
+  const unsigned h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+  dst[(size_t)t * H * D + h * D + d] = src[((size_t)h * T + t) * D + d];
 }
 
 // ---- softmax over the last axis (rows×cols out); scale/offset ignored ----
@@ -394,6 +428,124 @@ __global__ void tl_sgemm_rb(const float* __restrict__ A,
 #undef TL_TM
 #undef TL_TN
 #undef TL_TNSUB
+
+// ---- M9 batched-prefill GEMM: C[M,N] f32 = A[M,K] f32 @ B[N,K]^T bf16 ----
+// Decode is a GEMV (M=1) and bandwidth-bound; PREFILL has M = the prompt chunk,
+// which makes the same weights compute-bound (at M=256, N=9728, K=896 the
+// arithmetic intensity is ~159 FLOP/byte vs the ~37 the HBM can feed). Feeding
+// the prompt one token at a time therefore leaves ~25x on the table — measured
+// in bench_qwen_prefill before this kernel existed.
+//
+// "NT": B is the SAME [N,K] row-major bf16 weight the decode GEMV already uses
+// (K contiguous per output row, GGML-native), so batching costs no extra weight
+// memory and no repacking — and both operands stream K contiguously, which is
+// the friendliest layout for tiling.
+//
+// A and B tiles are staged transposed in shared memory so the inner loop reads
+// each operand as float4s. Requires K % 8 == 0 (every transformer dim; the
+// launcher checks) — so there is no K tail, only M/N edges, which the loads and
+// the epilogue predicate.
+// The block tile is templated: 256 threads always, tile BM x BM, K-slab
+// BK = 1024/BM (so each thread stages exactly one 4-wide chunk of each operand),
+// microtile (BM/16) x (BM/16). Two instantiations, picked host-side by which one
+// actually FILLS the GPU at the shape in hand:
+//   128 -> 8x8 microtile, 64 FMA per 16 shared floats — the most efficient, but
+//          a [256, 896] projection is only 2x7 = 14 blocks on 82 SMs.
+//   64  -> 4x4 microtile, half the arithmetic intensity, 4x the blocks.
+// Prefill chunks are a few hundred tokens, so the small tile is what the narrow
+// attention projections (N=896) need; the wide MLP ones (N=9728) fill either way
+// and keep the efficient tile.
+}  // close extern "C": the __device__ core template below can't have C linkage;
+   // each __global__ wrapper re-declares its own for a stable symbol.
+template <int BM>
+__device__ __forceinline__ void gemm_bf16_nt_core(const float* __restrict__ A,
+                                                  const __nv_bfloat16* __restrict__ B,
+                                                  float* __restrict__ C,
+                                                  unsigned M, unsigned N,
+                                                  unsigned K) {
+  constexpr int BK = 1024 / BM;   // BM*BK == 1024 == 256 threads x 4 elements
+  constexpr int TM = BM / 16;     // 16x16 threads, one TMxTM microtile each
+  // +4 floats of row padding: the staging stores walk a whole tile row per
+  // thread, which at stride BM lands every warp on 8-16 banks (4- resp. 2-way
+  // conflicts). Padding by 4 breaks that while keeping the stride a multiple of
+  // 4 floats, so the microtile's float4 reads stay 16-byte aligned.
+  __shared__ float As[BK][BM + 4];
+  __shared__ float Bs[BK][BM + 4];
+  const unsigned blockRow = blockIdx.y * BM;
+  const unsigned blockCol = blockIdx.x * BM;
+  const unsigned tid = threadIdx.x;
+
+  // Global-load map: each thread stages 4 contiguous K-elements of one row —
+  // of A (one float4) and of B (4 bf16 = one 8-byte uint2).
+  const unsigned ldRow = tid / (BK / 4);         // M index for A, N index for B
+  const unsigned ldK = (tid % (BK / 4)) * 4u;
+  const unsigned gA = blockRow + ldRow;
+  const unsigned gB = blockCol + ldRow;
+  const unsigned tr = (tid >> 4) * TM;
+  const unsigned tc = (tid & 15u) * TM;
+
+  float acc[TM][TM] = {};
+  for (unsigned kt = 0; kt < K; kt += BK) {
+    float4 a4 = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (gA < M)
+      a4 = *reinterpret_cast<const float4*>(&A[(size_t)gA * K + kt + ldK]);
+    As[ldK + 0][ldRow] = a4.x;
+    As[ldK + 1][ldRow] = a4.y;
+    As[ldK + 2][ldRow] = a4.z;
+    As[ldK + 3][ldRow] = a4.w;
+
+    float2 f0 = make_float2(0.f, 0.f), f1 = make_float2(0.f, 0.f);
+    if (gB < N) {
+      uint2 raw = *reinterpret_cast<const uint2*>(&B[(size_t)gB * K + kt + ldK]);
+      f0 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.x));
+      f1 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.y));
+    }
+    Bs[ldK + 0][ldRow] = f0.x;
+    Bs[ldK + 1][ldRow] = f0.y;
+    Bs[ldK + 2][ldRow] = f1.x;
+    Bs[ldK + 3][ldRow] = f1.y;
+    __syncthreads();
+
+#pragma unroll
+    for (int kk = 0; kk < BK; kk++) {
+      float regM[TM], regN[TM];
+#pragma unroll
+      for (int q = 0; q < TM; q += 4) {
+        *reinterpret_cast<float4*>(&regM[q]) =
+            *reinterpret_cast<const float4*>(&As[kk][tr + q]);
+        *reinterpret_cast<float4*>(&regN[q]) =
+            *reinterpret_cast<const float4*>(&Bs[kk][tc + q]);
+      }
+#pragma unroll
+      for (int i = 0; i < TM; i++)
+#pragma unroll
+        for (int j = 0; j < TM; j++) acc[i][j] += regM[i] * regN[j];
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int i = 0; i < TM; i++) {
+    const unsigned r = blockRow + tr + i;
+    if (r >= M) continue;
+#pragma unroll
+    for (int j = 0; j < TM; j++) {
+      const unsigned c = blockCol + tc + j;
+      if (c < N) C[(size_t)r * N + c] = acc[i][j];
+    }
+  }
+}
+extern "C" __global__ void tl_gemm_bf16_nt(const float* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B, float* __restrict__ C, unsigned M,
+    unsigned N, unsigned K) {
+  gemm_bf16_nt_core<128>(A, B, C, M, N, K);
+}
+extern "C" __global__ void tl_gemm_bf16_nt_s(const float* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B, float* __restrict__ C, unsigned M,
+    unsigned N, unsigned K) {
+  gemm_bf16_nt_core<64>(A, B, C, M, N, K);
+}
+extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 
 // ---- M7 decode GEMV: y[n] = sum_k a[k] * B[k,n], F32 accumulate ----
 // The decode regime is batch~1, so the matmul is a GEMV and MEMORY-BANDWIDTH-
@@ -935,28 +1087,31 @@ extern "C" __global__ void tl_kv_append_bf16(__nv_bfloat16* Kc,
 }
 
 // Bulk-fill the cache from a prefill's k,v (each [H_kv, T, D] contiguous) into
-// the cache [H_kv, max_ctx, D] rows [0,T). The two differ only in the row stride
-// (T vs max_ctx), so this is a strided copy. D == blockDim.x. grid = (H_kv, T).
+// the cache [H_kv, max_ctx, D] rows [pos0, pos0+T) — pos0 lets a long prompt be
+// filled in chunks, and a later turn extend a live cache. The two layouts differ
+// only in the row stride (T vs max_ctx), so this is a strided copy.
+// D == blockDim.x. grid = (H_kv, T).
 template <typename KT>
 __device__ void kv_fill_core(KT* __restrict__ Kc, KT* __restrict__ Vc,
                              const float* __restrict__ K,
                              const float* __restrict__ V, unsigned T,
-                             unsigned kv_stride) {
+                             unsigned kv_stride, unsigned pos0) {
   const unsigned h = blockIdx.x, p = blockIdx.y, d = threadIdx.x, D = blockDim.x;
-  const size_t dst = (size_t)h * kv_stride + (size_t)p * D + d;
+  const size_t dst = (size_t)h * kv_stride + (size_t)(pos0 + p) * D + d;
   const size_t src = ((size_t)h * T + p) * D + d;
   kv_st(&Kc[dst], K[src]);  // narrow to KT (identity for f32)
   kv_st(&Vc[dst], V[src]);
 }
 extern "C" __global__ void tl_kv_fill(float* Kc, float* Vc, const float* K,
                                       const float* V, unsigned T,
-                                      unsigned kv_stride) {
-  kv_fill_core(Kc, Vc, K, V, T, kv_stride);
+                                      unsigned kv_stride, unsigned pos0) {
+  kv_fill_core(Kc, Vc, K, V, T, kv_stride, pos0);
 }
 extern "C" __global__ void tl_kv_fill_bf16(__nv_bfloat16* Kc, __nv_bfloat16* Vc,
                                            const float* K, const float* V,
-                                           unsigned T, unsigned kv_stride) {
-  kv_fill_core(Kc, Vc, K, V, T, kv_stride);
+                                           unsigned T, unsigned kv_stride,
+                                           unsigned pos0) {
+  kv_fill_core(Kc, Vc, K, V, T, kv_stride, pos0);
 }
 
 // Causal prefill attention: process all T query positions of a prompt at once.
@@ -973,7 +1128,7 @@ __device__ void attn_prefill_core(const float* __restrict__ q,
                                   const KT* __restrict__ V,
                                   float* __restrict__ out, unsigned T,
                                   unsigned kv_stride, unsigned group,
-                                  float scale) {
+                                  float scale, unsigned pos0) {
   constexpr int NW = AD / 32;
   const unsigned h = blockIdx.x;                // query head
   const unsigned p = blockIdx.y;                // query pos, attends keys 0..p
@@ -990,7 +1145,11 @@ __device__ void attn_prefill_core(const float* __restrict__ q,
 
   float m = -1e30f, l = 0.0f;
   float acc[NW] = {};
-  for (unsigned i = warp; i <= p; i += (unsigned)NW) {  // causal: keys 0..p only
+  // Absolute position of this query row: with pos0 > 0 (a later prompt chunk, or
+  // a turn appended to a live cache) the row still attends every key before it,
+  // including the ones already in the cache from earlier chunks.
+  const unsigned pabs = pos0 + p;
+  for (unsigned i = warp; i <= pabs; i += (unsigned)NW) {  // causal: keys 0..pabs
     const KT* Ki = Kh + (size_t)i * AD;
     float partial = 0.0f;
 #pragma unroll
@@ -1036,23 +1195,25 @@ __device__ void attn_prefill_core(const float* __restrict__ q,
 }
 extern "C" __global__ void tl_attn_prefill_f32(const float* q, const float* K,
     const float* V, float* out, unsigned T, unsigned kv_stride, unsigned group,
-    float scale) {
-  attn_prefill_core<128>(q, K, V, out, T, kv_stride, group, scale);
+    float scale, unsigned pos0) {
+  attn_prefill_core<128>(q, K, V, out, T, kv_stride, group, scale, pos0);
 }
 extern "C" __global__ void tl_attn_prefill_f32_64(const float* q,
     const float* K, const float* V, float* out, unsigned T, unsigned kv_stride,
-    unsigned group, float scale) {
-  attn_prefill_core<64>(q, K, V, out, T, kv_stride, group, scale);
+    unsigned group, float scale, unsigned pos0) {
+  attn_prefill_core<64>(q, K, V, out, T, kv_stride, group, scale, pos0);
 }
 extern "C" __global__ void tl_attn_prefill_bf16(const float* q,
     const __nv_bfloat16* K, const __nv_bfloat16* V, float* out, unsigned T,
-    unsigned kv_stride, unsigned group, float scale) {
-  attn_prefill_core<128, __nv_bfloat16>(q, K, V, out, T, kv_stride, group, scale);
+    unsigned kv_stride, unsigned group, float scale, unsigned pos0) {
+  attn_prefill_core<128, __nv_bfloat16>(q, K, V, out, T, kv_stride, group, scale,
+                                        pos0);
 }
 extern "C" __global__ void tl_attn_prefill_bf16_64(const float* q,
     const __nv_bfloat16* K, const __nv_bfloat16* V, float* out, unsigned T,
-    unsigned kv_stride, unsigned group, float scale) {
-  attn_prefill_core<64, __nv_bfloat16>(q, K, V, out, T, kv_stride, group, scale);
+    unsigned kv_stride, unsigned group, float scale, unsigned pos0) {
+  attn_prefill_core<64, __nv_bfloat16>(q, K, V, out, T, kv_stride, group, scale,
+                                       pos0);
 }
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 
