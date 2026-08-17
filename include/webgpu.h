@@ -46,7 +46,7 @@ using kop = tl::metal::kop;
 }  // namespace webgpu
 }  // namespace tl
 
-#include <emscripten/em_js.h>
+#include <emscripten/em_asm.h>
 
 // emdawnwebgpu declares emscripten_webgpu_get_device() in webgpu.h itself,
 // not in emscripten/html5_webgpu.h (that is the old built-in binding's home).
@@ -140,11 +140,16 @@ inline constexpr const char* kEntryPoints[] = {
 // so the case the header documents — JS handed in no device, available()
 // stays false, every op routes to CPU — is the one that actually happens.
 //
-// Named for global reach, not for this namespace: EM_JS is extern "C", so the
-// symbol and the generated JS function land outside tl::webgpu either way.
-EM_JS(int, tl_webgpu_has_preinitialized_device, (), {
-  return Module["preinitializedWebGPUDevice"] ? 1 : 0;
-});
+// EM_ASM_INT, not EM_JS: EM_JS defines a named extern "C" symbol, and in a
+// header-only library every translation unit that includes this file would
+// define it again — two TUs (the CI suite links main_wasm.cpp with
+// test_array.cpp) is a duplicate-symbol link error. EM_ASM's snippet is
+// per-call-site section data the linker accepts from any number of TUs, and
+// this runs once at context construction, where the JS-call overhead EM_JS
+// exists to avoid is irrelevant.
+inline bool has_preinitialized_device_() {
+  return EM_ASM_INT({ return Module["preinitializedWebGPUDevice"] ? 1 : 0; }) != 0;
+}
 
 struct context {
   wgpu::Instance instance;
@@ -215,7 +220,7 @@ struct context {
 
     // No adapter/device round-trip on this side: JS already did it and passed
     // the result as Module.preinitializedWebGPUDevice.
-    if (!tl_webgpu_has_preinitialized_device()) return;
+    if (!has_preinitialized_device_()) return;
     device = wgpu::Device::Acquire(emscripten_webgpu_get_device());
     if (!device) return;
     queue = device.GetQueue();
