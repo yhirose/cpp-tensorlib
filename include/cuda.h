@@ -330,70 +330,47 @@ struct context {
     return f;
   }
 
+  // Lazy per-symbol kernel lookup: every named-kernel getter below is this one
+  // line applied to its slot. The variant getters (D x bf16 etc.) just pick
+  // which (slot, name) pair to hand it.
+  CUfunction cached_(CUfunction& slot, const char* name) {
+    if (!slot) d.ModuleGetFunction(&slot, mod, name);
+    return slot;
+  }
+
   // The register-blocked SGEMM fast path (tl_sgemm_rb), cached separately from
   // the kop table since it has no kop of its own.
   CUfunction sgemm_rb_fn = nullptr;
-  CUfunction sgemm_rb_() {
-    if (!sgemm_rb_fn) d.ModuleGetFunction(&sgemm_rb_fn, mod, "tl_sgemm_rb");
-    return sgemm_rb_fn;
-  }
+  CUfunction sgemm_rb_() { return cached_(sgemm_rb_fn, "tl_sgemm_rb"); }
 
   // M7 decode GEMV (f32 and bf16-weight variants), cached like sgemm_rb.
   CUfunction gemv_f32_fn = nullptr, gemv_bf16_fn = nullptr, gemv_bf16v8_fn = nullptr;
-  CUfunction gemv_f32_() {
-    if (!gemv_f32_fn) d.ModuleGetFunction(&gemv_f32_fn, mod, "tl_gemv_f32");
-    return gemv_f32_fn;
-  }
-  CUfunction gemv_bf16_() {
-    if (!gemv_bf16_fn) d.ModuleGetFunction(&gemv_bf16_fn, mod, "tl_gemv_bf16");
-    return gemv_bf16_fn;
-  }
-  CUfunction gemv_bf16v8_() {
-    if (!gemv_bf16v8_fn)
-      d.ModuleGetFunction(&gemv_bf16v8_fn, mod, "tl_gemv_bf16v8");
-    return gemv_bf16v8_fn;
-  }
+  CUfunction gemv_f32_() { return cached_(gemv_f32_fn, "tl_gemv_f32"); }
+  CUfunction gemv_bf16_() { return cached_(gemv_bf16_fn, "tl_gemv_bf16"); }
+  CUfunction gemv_bf16v8_() { return cached_(gemv_bf16v8_fn, "tl_gemv_bf16v8"); }
   CUfunction gemv_bf16_row_fn = nullptr;
   CUfunction gemv_bf16_row_() {
-    if (!gemv_bf16_row_fn)
-      d.ModuleGetFunction(&gemv_bf16_row_fn, mod, "tl_gemv_bf16_row");
-    return gemv_bf16_row_fn;
+    return cached_(gemv_bf16_row_fn, "tl_gemv_bf16_row");
   }
 
   // M8 int4-weight decode GEMV.
   CUfunction gemv_q4_fn = nullptr;
-  CUfunction gemv_q4_() {
-    if (!gemv_q4_fn) d.ModuleGetFunction(&gemv_q4_fn, mod, "tl_gemv_q4");
-    return gemv_q4_fn;
-  }
+  CUfunction gemv_q4_() { return cached_(gemv_q4_fn, "tl_gemv_q4"); }
 
-  // M9 batched-prefill elementwise/layout kernels (the decode ones, per row).
+  // M9 batched-prefill layout kernels (token-major <-> head-major).
   CUfunction split_heads_fn = nullptr, merge_heads_fn = nullptr;
-  CUfunction split_heads_() {
-    if (!split_heads_fn)
-      d.ModuleGetFunction(&split_heads_fn, mod, "tl_split_heads");
-    return split_heads_fn;
-  }
-  CUfunction merge_heads_() {
-    if (!merge_heads_fn)
-      d.ModuleGetFunction(&merge_heads_fn, mod, "tl_merge_heads");
-    return merge_heads_fn;
-  }
+  CUfunction split_heads_() { return cached_(split_heads_fn, "tl_split_heads"); }
+  CUfunction merge_heads_() { return cached_(merge_heads_fn, "tl_merge_heads"); }
 
   // M9 batched-prefill GEMM (bf16 [N,K] weights, the decode GEMV's own layout).
   CUfunction gemm_bf16_nt_fn = nullptr, gemm_bf16_nt_s_fn = nullptr,
              gemm_bf16_nt_sk_fn = nullptr;
   CUfunction gemm_bf16_nt_(bool big) {
-    CUfunction* slot = big ? &gemm_bf16_nt_fn : &gemm_bf16_nt_s_fn;
-    if (!*slot)
-      d.ModuleGetFunction(slot, mod,
-                          big ? "tl_gemm_bf16_nt" : "tl_gemm_bf16_nt_s");
-    return *slot;
+    return big ? cached_(gemm_bf16_nt_fn, "tl_gemm_bf16_nt")
+               : cached_(gemm_bf16_nt_s_fn, "tl_gemm_bf16_nt_s");
   }
   CUfunction gemm_bf16_nt_sk_() {
-    if (!gemm_bf16_nt_sk_fn)
-      d.ModuleGetFunction(&gemm_bf16_nt_sk_fn, mod, "tl_gemm_bf16_nt_sk");
-    return gemm_bf16_nt_sk_fn;
+    return cached_(gemm_bf16_nt_sk_fn, "tl_gemm_bf16_nt_sk");
   }
 
   // M9 fused decode attention (single-pass + split-KV two-pass).
@@ -408,79 +385,51 @@ struct context {
   CUfunction attn_decode_bf16_fn = nullptr, attn_decode_bf16_64_fn = nullptr;
   CUfunction attn_split_bf16_fn = nullptr, attn_split_bf16_64_fn = nullptr;
   CUfunction attn_decode_(int64_t D, bool bf16 = false) {
-    CUfunction* slot = bf16 ? (D == 64 ? &attn_decode_bf16_64_fn : &attn_decode_bf16_fn)
-                            : (D == 64 ? &attn_decode_64_fn : &attn_decode_fn);
-    if (!*slot)
-      d.ModuleGetFunction(slot, mod,
-                          bf16 ? (D == 64 ? "tl_attn_decode_bf16_64" : "tl_attn_decode_bf16")
-                               : (D == 64 ? "tl_attn_decode_f32_64" : "tl_attn_decode_f32"));
-    return *slot;
+    return bf16 ? (D == 64 ? cached_(attn_decode_bf16_64_fn, "tl_attn_decode_bf16_64")
+                           : cached_(attn_decode_bf16_fn, "tl_attn_decode_bf16"))
+                : (D == 64 ? cached_(attn_decode_64_fn, "tl_attn_decode_f32_64")
+                           : cached_(attn_decode_fn, "tl_attn_decode_f32"));
   }
   CUfunction attn_split_(int64_t D, bool bf16 = false) {
-    CUfunction* slot = bf16 ? (D == 64 ? &attn_split_bf16_64_fn : &attn_split_bf16_fn)
-                            : (D == 64 ? &attn_split_64_fn : &attn_split_fn);
-    if (!*slot)
-      d.ModuleGetFunction(slot, mod,
-                          bf16 ? (D == 64 ? "tl_attn_decode_split_bf16_64" : "tl_attn_decode_split_bf16")
-                               : (D == 64 ? "tl_attn_decode_split_64" : "tl_attn_decode_split"));
-    return *slot;
+    return bf16 ? (D == 64 ? cached_(attn_split_bf16_64_fn, "tl_attn_decode_split_bf16_64")
+                           : cached_(attn_split_bf16_fn, "tl_attn_decode_split_bf16"))
+                : (D == 64 ? cached_(attn_split_64_fn, "tl_attn_decode_split_64")
+                           : cached_(attn_split_fn, "tl_attn_decode_split"));
   }
   CUfunction attn_combine_() {  // head_dim implicit (blockDim.x) — one symbol
-    if (!attn_combine_fn)
-      d.ModuleGetFunction(&attn_combine_fn, mod, "tl_attn_combine");
-    return attn_combine_fn;
+    return cached_(attn_combine_fn, "tl_attn_combine");
   }
 
   // M9 KV cache append (scatter one token's k,v into the persistent cache).
   CUfunction kv_append_fn = nullptr, kv_append_bf16_fn = nullptr;
   CUfunction kv_append_(bool bf16 = false) {
-    CUfunction* slot = bf16 ? &kv_append_bf16_fn : &kv_append_fn;
-    if (!*slot)
-      d.ModuleGetFunction(slot, mod, bf16 ? "tl_kv_append_bf16" : "tl_kv_append");
-    return *slot;
+    return bf16 ? cached_(kv_append_bf16_fn, "tl_kv_append_bf16")
+                : cached_(kv_append_fn, "tl_kv_append");
   }
 
   // RoPE (rotary position embedding) for q/k.
   CUfunction rope_fn = nullptr;
-  CUfunction rope_() {
-    if (!rope_fn) d.ModuleGetFunction(&rope_fn, mod, "tl_rope");
-    return rope_fn;
-  }
+  CUfunction rope_() { return cached_(rope_fn, "tl_rope"); }
 
   // Device-pos variants (CUDA-graph capture): pos/ctx read from a device scalar
   // so one instantiated graph replays correctly as the decode position advances.
   CUfunction rope_dpos_fn = nullptr, incr_u32_fn = nullptr,
              kv_append_dpos_fn = nullptr, attn_split_dpos_fn = nullptr,
              attn_split_dpos_64_fn = nullptr;
-  CUfunction rope_dpos_() {
-    if (!rope_dpos_fn) d.ModuleGetFunction(&rope_dpos_fn, mod, "tl_rope_dpos");
-    return rope_dpos_fn;
-  }
-  CUfunction incr_u32_() {
-    if (!incr_u32_fn) d.ModuleGetFunction(&incr_u32_fn, mod, "tl_incr_u32");
-    return incr_u32_fn;
-  }
+  CUfunction rope_dpos_() { return cached_(rope_dpos_fn, "tl_rope_dpos"); }
+  CUfunction incr_u32_() { return cached_(incr_u32_fn, "tl_incr_u32"); }
   CUfunction kv_append_dpos_() {
-    if (!kv_append_dpos_fn)
-      d.ModuleGetFunction(&kv_append_dpos_fn, mod, "tl_kv_append_dpos");
-    return kv_append_dpos_fn;
+    return cached_(kv_append_dpos_fn, "tl_kv_append_dpos");
   }
   CUfunction attn_split_dpos_(int64_t D) {
-    CUfunction* slot = D == 64 ? &attn_split_dpos_64_fn : &attn_split_dpos_fn;
-    if (!*slot)
-      d.ModuleGetFunction(slot, mod,
-                          D == 64 ? "tl_attn_decode_split_64_dpos"
-                                  : "tl_attn_decode_split_dpos");
-    return *slot;
+    return D == 64 ? cached_(attn_split_dpos_64_fn, "tl_attn_decode_split_64_dpos")
+                   : cached_(attn_split_dpos_fn, "tl_attn_decode_split_dpos");
   }
 
   // GPU argmax (greedy last-mile): kernel + a persistent 4-byte device result
   // buffer so the per-token result is a 4-byte D2H, not the 608KB logits copy.
   CUfunction argmax_fn = nullptr;
-  CUfunction argmax_() {
-    if (!argmax_fn) d.ModuleGetFunction(&argmax_fn, mod, "tl_argmax");
-    return argmax_fn;
-  }
+  CUfunction argmax_() { return cached_(argmax_fn, "tl_argmax"); }
   CUdeviceptr argmax_res = 0;
   CUdeviceptr argmax_res_() {
     if (!argmax_res && d.MemAlloc(&argmax_res, 16) != 0) argmax_res = 0;
@@ -489,44 +438,26 @@ struct context {
 
   // Fused decode-step ops (imperative path): RMSNorm + SwiGLU.
   CUfunction rmsnorm_fn = nullptr, swiglu_fn = nullptr;
-  CUfunction rmsnorm_() {
-    if (!rmsnorm_fn) d.ModuleGetFunction(&rmsnorm_fn, mod, "tl_rmsnorm");
-    return rmsnorm_fn;
-  }
-  CUfunction swiglu_() {
-    if (!swiglu_fn) d.ModuleGetFunction(&swiglu_fn, mod, "tl_swiglu");
-    return swiglu_fn;
-  }
+  CUfunction rmsnorm_() { return cached_(rmsnorm_fn, "tl_rmsnorm"); }
+  CUfunction swiglu_() { return cached_(swiglu_fn, "tl_swiglu"); }
   CUfunction add_rmsnorm_fn = nullptr;
-  CUfunction add_rmsnorm_() {
-    if (!add_rmsnorm_fn)
-      d.ModuleGetFunction(&add_rmsnorm_fn, mod, "tl_add_rmsnorm");
-    return add_rmsnorm_fn;
-  }
+  CUfunction add_rmsnorm_() { return cached_(add_rmsnorm_fn, "tl_add_rmsnorm"); }
 
   // M9 prefill: bulk cache fill + causal prefill attention.
   CUfunction kv_fill_fn = nullptr, kv_fill_bf16_fn = nullptr;
   CUfunction kv_fill_(bool bf16 = false) {
-    CUfunction* slot = bf16 ? &kv_fill_bf16_fn : &kv_fill_fn;
-    if (!*slot)
-      d.ModuleGetFunction(slot, mod, bf16 ? "tl_kv_fill_bf16" : "tl_kv_fill");
-    return *slot;
+    return bf16 ? cached_(kv_fill_bf16_fn, "tl_kv_fill_bf16")
+                : cached_(kv_fill_fn, "tl_kv_fill");
   }
   CUfunction attn_prefill_tiled_fn = nullptr, attn_prefill_tiled_64_fn = nullptr,
              attn_prefill_tiled_bf16_fn = nullptr,
              attn_prefill_tiled_bf16_64_fn = nullptr;
   CUfunction attn_prefill_tiled_(int64_t D, bool bf16) {
-    CUfunction* slot =
-        bf16 ? (D == 64 ? &attn_prefill_tiled_bf16_64_fn : &attn_prefill_tiled_bf16_fn)
-             : (D == 64 ? &attn_prefill_tiled_64_fn : &attn_prefill_tiled_fn);
-    if (!*slot)
-      d.ModuleGetFunction(
-          slot, mod,
-          bf16 ? (D == 64 ? "tl_attn_prefill_tiled_bf16_64" : "tl_attn_prefill_tiled_bf16")
-               : (D == 64 ? "tl_attn_prefill_tiled_f32_64" : "tl_attn_prefill_tiled_f32"));
-    return *slot;
+    return bf16 ? (D == 64 ? cached_(attn_prefill_tiled_bf16_64_fn, "tl_attn_prefill_tiled_bf16_64")
+                           : cached_(attn_prefill_tiled_bf16_fn, "tl_attn_prefill_tiled_bf16"))
+                : (D == 64 ? cached_(attn_prefill_tiled_64_fn, "tl_attn_prefill_tiled_f32_64")
+                           : cached_(attn_prefill_tiled_fn, "tl_attn_prefill_tiled_f32"));
   }
-
 
   // Reusable device scratch for split-KV partials. Grown as needed, reused
   // across attention calls (sequential on the null stream), freed at teardown.
@@ -1058,7 +989,7 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
     void* args[] = {&pq, &pk, &pv, &po, &uctx, &kv_stride, &group, &scale};
     c.pending = true;
     return c.d.LaunchKernel(c.attn_decode_(D, kv_bf16), uh, 1, 1, uD, 1, 1, 0,
-                            nullptr, args, nullptr) == 0;
+                            c.stream, args, nullptr) == 0;
   }
 
   unsigned chunk = attn_split_chunk(uh, ctx);

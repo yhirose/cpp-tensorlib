@@ -830,32 +830,30 @@ __device__ __forceinline__ float kv_ld(__nv_bfloat16 x) { return __bfloat162floa
 __device__ __forceinline__ void kv_st(float* p, float x) { *p = x; }
 __device__ __forceinline__ void kv_st(__nv_bfloat16* p, float x) { *p = __float2bfloat16(x); }
 
-template <int AD, typename KT = float>
-__device__ void attn_decode_core(const float* __restrict__ q,
-                                  const KT* __restrict__ K,
-                                  const KT* __restrict__ V,
-                                  float* __restrict__ out, unsigned ctx,
-                                  unsigned kv_stride, unsigned group,
-                                  float scale) {
-  constexpr int NW = AD / 32;                   // warps == dims-per-lane
-  const unsigned h = blockIdx.x;                // query head
-  const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
-  const unsigned tid = threadIdx.x;             // 0..AD-1
+// Shared middle of the decode-attention family. Stages the head's query into
+// shared memory, runs the online-softmax score loop over keys [k0, k1) (each
+// warp owns keys i = k0+warp, +NW, ...; its 32 lanes cooperatively reduce the
+// AD-long dot), then merges the NW warps' partial states. Leaves every thread
+// holding the block-level (gm, gl) and its dim's UN-normalized accumulator `o`:
+// the single-pass kernels normalize and store o/gl, the split kernel writes all
+// three as partials for tl_attn_combine. An empty range (k0 >= k1 — a dpos
+// split past the live count) yields the neutral partial (gm=-1e30, gl=0, o=0)
+// that combines as exact zeros.
+template <int AD, typename KT>
+__device__ __forceinline__ void attn_span_core(
+    const float* __restrict__ qh, const KT* __restrict__ Kh,
+    const KT* __restrict__ Vh, unsigned k0, unsigned k1, float scale,
+    float& gm_out, float& gl_out, float& o_out) {
+  constexpr int NW = AD / 32;                        // warps == dims-per-lane
+  const unsigned tid = threadIdx.x;                  // 0..AD-1
   const unsigned lane = tid & 31u, warp = tid >> 5;  // NW warps of 32
-  const float* qh = q + (size_t)h * AD;
-  // K,V are [H_kv, max_ctx, D]; kv_stride = max_ctx*D lets a persistent cache be
-  // read as its valid prefix [0,ctx) (kv_stride==ctx*AD is the no-cache case).
-  const KT* Kh = K + (size_t)kv_h * kv_stride;
-  const KT* Vh = V + (size_t)kv_h * kv_stride;
-
   __shared__ float q_sh[AD];
   q_sh[tid] = qh[tid];
   __syncthreads();
 
   float m = -1e30f, l = 0.0f;
   float acc[NW] = {};  // lane holds dims d = lane, lane+32, ..., lane+(NW-1)*32
-
-  for (unsigned i = warp; i < ctx; i += (unsigned)NW) {
+  for (unsigned i = k0 + warp; i < k1; i += (unsigned)NW) {
     const KT* Ki = Kh + (size_t)i * AD;
     float partial = 0.0f;
 #pragma unroll
@@ -864,11 +862,10 @@ __device__ void attn_decode_core(const float* __restrict__ q,
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
       partial += __shfl_down_sync(0xffffffffu, partial, off);
-    float s = __shfl_sync(0xffffffffu, partial, 0) * scale;  // lane0 has the sum
-
-    float m_new = fmaxf(m, s);
+    float sc = __shfl_sync(0xffffffffu, partial, 0) * scale;  // lane0's sum
+    float m_new = fmaxf(m, sc);
     float corr = __expf(m - m_new);
-    float p = __expf(s - m_new);
+    float p = __expf(sc - m_new);
     l = l * corr + p;
     const KT* Vi = Vh + (size_t)i * AD;
 #pragma unroll
@@ -877,7 +874,8 @@ __device__ void attn_decode_core(const float* __restrict__ q,
     m = m_new;
   }
 
-  // merge the NW warps' partial softmax states through shared memory
+  // Merge the NW warps' partial softmax states through shared memory (warps
+  // whose key range was empty carry m=-1e30, l=0 and contribute exp(-inf)=0).
   __shared__ float sm[NW], sl[NW], sacc[NW][AD];
   if (lane == 0) {
     sm[warp] = m;
@@ -897,7 +895,26 @@ __device__ void attn_decode_core(const float* __restrict__ q,
     gl += sl[w] * e;
     o += sacc[w][tid] * e;
   }
-  out[(size_t)h * AD + tid] = o / gl;
+  gm_out = gm;
+  gl_out = gl;
+  o_out = o;
+}
+
+template <int AD, typename KT = float>
+__device__ void attn_decode_core(const float* __restrict__ q,
+                                  const KT* __restrict__ K,
+                                  const KT* __restrict__ V,
+                                  float* __restrict__ out, unsigned ctx,
+                                  unsigned kv_stride, unsigned group,
+                                  float scale) {
+  const unsigned h = blockIdx.x;                // query head
+  const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
+  // K,V are [H_kv, max_ctx, D]; kv_stride = max_ctx*D lets a persistent cache be
+  // read as its valid prefix [0,ctx) (kv_stride==ctx*AD is the no-cache case).
+  float gm, gl, o;
+  attn_span_core<AD, KT>(q + (size_t)h * AD, K + (size_t)kv_h * kv_stride,
+                         V + (size_t)kv_h * kv_stride, 0, ctx, scale, gm, gl, o);
+  out[(size_t)h * AD + threadIdx.x] = o / gl;
 }
 extern "C" __global__ void tl_attn_decode_f32(const float* q, const float* K,
     const float* V, float* out, unsigned ctx, unsigned kv_stride,
@@ -934,69 +951,19 @@ __device__ void attn_decode_split_core(const float* __restrict__ q,
                                         float* __restrict__ pacc, unsigned ctx,
                                         unsigned kv_stride, unsigned group,
                                         unsigned chunk, float scale) {
-  constexpr int NW = AD / 32;
-  const unsigned h = blockIdx.x, s = blockIdx.y, S = gridDim.y;
+  const unsigned h = blockIdx.x, sp = blockIdx.y, S = gridDim.y;
   const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
-  const unsigned tid = threadIdx.x;
-  const unsigned lane = tid & 31u, warp = tid >> 5;
-  const float* qh = q + (size_t)h * AD;
-  const KT* Kh = K + (size_t)kv_h * kv_stride;
-  const KT* Vh = V + (size_t)kv_h * kv_stride;
-  const unsigned k0 = s * chunk;
+  const unsigned k0 = sp * chunk;
   const unsigned k1 = (k0 + chunk < ctx) ? (k0 + chunk) : ctx;
-
-  __shared__ float q_sh[AD];
-  q_sh[tid] = qh[tid];
-  __syncthreads();
-
-  float m = -1e30f, l = 0.0f;
-  float acc[NW] = {};
-  for (unsigned i = k0 + warp; i < k1; i += (unsigned)NW) {
-    const KT* Ki = Kh + (size_t)i * AD;
-    float partial = 0.0f;
-#pragma unroll
-    for (int r = 0; r < NW; r++)
-      partial += q_sh[lane + r * 32] * kv_ld(Ki[lane + r * 32]);
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-      partial += __shfl_down_sync(0xffffffffu, partial, off);
-    float sc = __shfl_sync(0xffffffffu, partial, 0) * scale;
-    float m_new = fmaxf(m, sc);
-    float corr = __expf(m - m_new);
-    float p = __expf(sc - m_new);
-    l = l * corr + p;
-    const KT* Vi = Vh + (size_t)i * AD;
-#pragma unroll
-    for (int r = 0; r < NW; r++)
-      acc[r] = acc[r] * corr + p * kv_ld(Vi[lane + r * 32]);
-    m = m_new;
-  }
-
-  __shared__ float sm[NW], sl[NW], sacc[NW][AD];
-  if (lane == 0) {
-    sm[warp] = m;
-    sl[warp] = l;
-  }
-#pragma unroll
-  for (int r = 0; r < NW; r++) sacc[warp][lane + r * 32] = acc[r];
-  __syncthreads();
-
-  float gm = -1e30f;
-#pragma unroll
-  for (int w = 0; w < NW; w++) gm = fmaxf(gm, sm[w]);
-  float gl = 0.0f, o = 0.0f;
-#pragma unroll
-  for (int w = 0; w < NW; w++) {
-    float e = __expf(sm[w] - gm);
-    gl += sl[w] * e;
-    o += sacc[w][tid] * e;
-  }
-  const size_t sidx = (size_t)h * S + s;
-  if (tid == 0) {
+  float gm, gl, o;
+  attn_span_core<AD, KT>(q + (size_t)h * AD, K + (size_t)kv_h * kv_stride,
+                         V + (size_t)kv_h * kv_stride, k0, k1, scale, gm, gl, o);
+  const size_t sidx = (size_t)h * S + sp;
+  if (threadIdx.x == 0) {
     pm[sidx] = gm;
     pl[sidx] = gl;
   }
-  pacc[sidx * AD + tid] = o;  // un-normalized accumulator at local max gm
+  pacc[sidx * AD + threadIdx.x] = o;  // un-normalized accumulator at local max
 }
 extern "C" __global__ void tl_attn_decode_split(const float* q, const float* K,
     const float* V, float* pm, float* pl, float* pacc, unsigned ctx,
@@ -1177,69 +1144,18 @@ __device__ void attn_prefill_core(const float* __restrict__ q,
                                   float* __restrict__ out, unsigned T,
                                   unsigned kv_stride, unsigned group,
                                   float scale, unsigned pos0) {
-  constexpr int NW = AD / 32;
   const unsigned h = blockIdx.x;                // query head
-  const unsigned p = blockIdx.y;                // query pos, attends keys 0..p
+  const unsigned p = blockIdx.y;                // query pos in this chunk
   const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
-  const unsigned tid = threadIdx.x;
-  const unsigned lane = tid & 31u, warp = tid >> 5;
-  const float* qh = q + ((size_t)h * T + p) * AD;  // q is [H_q, T, D]
-  const KT* Kh = K + (size_t)kv_h * kv_stride;
-  const KT* Vh = V + (size_t)kv_h * kv_stride;
-
-  __shared__ float q_sh[AD];
-  q_sh[tid] = qh[tid];
-  __syncthreads();
-
-  float m = -1e30f, l = 0.0f;
-  float acc[NW] = {};
-  // Absolute position of this query row: with pos0 > 0 (a later prompt chunk, or
-  // a turn appended to a live cache) the row still attends every key before it,
-  // including the ones already in the cache from earlier chunks.
-  const unsigned pabs = pos0 + p;
-  for (unsigned i = warp; i <= pabs; i += (unsigned)NW) {  // causal: keys 0..pabs
-    const KT* Ki = Kh + (size_t)i * AD;
-    float partial = 0.0f;
-#pragma unroll
-    for (int r = 0; r < NW; r++)
-      partial += q_sh[lane + r * 32] * kv_ld(Ki[lane + r * 32]);
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-      partial += __shfl_down_sync(0xffffffffu, partial, off);
-    float s = __shfl_sync(0xffffffffu, partial, 0) * scale;
-    float m_new = fmaxf(m, s);
-    float corr = __expf(m - m_new);
-    float pp = __expf(s - m_new);
-    l = l * corr + pp;
-    const KT* Vi = Vh + (size_t)i * AD;
-#pragma unroll
-    for (int r = 0; r < NW; r++)
-      acc[r] = acc[r] * corr + pp * kv_ld(Vi[lane + r * 32]);
-    m = m_new;
-  }
-
-  // merge the NW warps' partial softmax states (empty warps carry m=-1e30,l=0 →
-  // contribute exp(-inf)=0, correct for the short causal prefixes at small p)
-  __shared__ float sm[NW], sl[NW], sacc[NW][AD];
-  if (lane == 0) {
-    sm[warp] = m;
-    sl[warp] = l;
-  }
-#pragma unroll
-  for (int r = 0; r < NW; r++) sacc[warp][lane + r * 32] = acc[r];
-  __syncthreads();
-
-  float gm = -1e30f;
-#pragma unroll
-  for (int w = 0; w < NW; w++) gm = fmaxf(gm, sm[w]);
-  float gl = 0.0f, o = 0.0f;
-#pragma unroll
-  for (int w = 0; w < NW; w++) {
-    float e = __expf(sm[w] - gm);
-    gl += sl[w] * e;
-    o += sacc[w][tid] * e;
-  }
-  out[((size_t)h * T + p) * AD + tid] = o / gl;
+  // Causal: the row's absolute position is pos0 + p and it attends keys
+  // 0..pos0+p — with pos0 > 0 (a later chunk, or a turn appended to a live
+  // cache) that includes everything earlier chunks cached.
+  float gm, gl, o;
+  attn_span_core<AD, KT>(q + ((size_t)h * T + p) * AD,
+                         K + (size_t)kv_h * kv_stride,
+                         V + (size_t)kv_h * kv_stride, 0, pos0 + p + 1, scale,
+                         gm, gl, o);
+  out[((size_t)h * T + p) * AD + threadIdx.x] = o / gl;
 }
 // ---- Tiled causal prefill attention (flash-attention shape) ----
 // The per-query kernel above is correct but spends most of its instructions on

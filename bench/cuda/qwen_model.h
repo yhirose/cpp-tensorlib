@@ -36,7 +36,6 @@ constexpr int64_t PREFILL_CHUNK = 512;
 // once a chunk has enough rows to fill the SMs, and short prompts are dominated
 // by the fixed per-chunk staging anyway.
 constexpr int64_t PREFILL_MIN = 4;
-constexpr int64_t GROUP = NH / NKV;  // 7
 constexpr float EPS = 1e-6f, SCALE = 1.0f / 8.0f /* 1/sqrt(64) */, ROPE_BASE = 1e6f;
 
 // IEEE half -> float (GGUF F16 tensors). Handles subnormals/inf/nan.
@@ -72,16 +71,7 @@ inline const gg::tensor_info* need(const gg::model& m, const std::string& n) {
 // wdt selects the storage dtype: f32 (exact, ~2GB total → WSL2 cliff) or bf16
 // (~1GB, stays under the cliff; the decode GEMV consumes bf16 weights natively).
 inline array load_w_T(const gg::model& m, const std::string& n, int64_t in,
-                      int64_t out, tl::dtype wdt = tl::dtype::f32) {
-  const auto* t = need(m, n);
-  const auto* raw = reinterpret_cast<const uint16_t*>(t->data);
-  std::vector<float> v((size_t)in * out);
-  for (int64_t o = 0; o < out; o++)
-    for (int64_t i = 0; i < in; i++)
-      v[(size_t)i * out + o] = f16_to_f32(raw[(size_t)o * in + i]);
-  array a = array::from(std::move(v), {in, out});
-  return wdt == tl::dtype::bf16 ? a.to_bf16() : a;
-}
+                      int64_t out, tl::dtype wdt = tl::dtype::f32);
 
 // Column-concatenated fused weight: load several GGML [out,in] tensors that
 // share the same `in` (K) and stack them along the output (N) axis into one
@@ -111,22 +101,17 @@ inline array load_w_T_cat(const gg::model& m,
   array a = array::from(std::move(v), {in, Ntot});
   return wdt == tl::dtype::bf16 ? a.to_bf16() : a;
 }
+inline array load_w_T(const gg::model& m, const std::string& n, int64_t in,
+                      int64_t out, tl::dtype wdt) {
+  return load_w_T_cat(m, {{n, out}}, in, wdt);  // the single-part case
+}
 
 // Row-major weight for the warp-per-row decode GEMV (lever A): GGML physical
 // [out,in] widened straight to array [out,in] = [N,K] — NO transpose (K stays
 // contiguous per output row, the layout tl_gemv_bf16_row wants). The imperative
 // bf16 decode path uses this; the array path keeps the [K,N] load_w_T as oracle.
 inline array load_w_T_row(const gg::model& m, const std::string& n, int64_t in,
-                          int64_t out, tl::dtype wdt = tl::dtype::bf16) {
-  const auto* t = need(m, n);
-  const auto* raw = reinterpret_cast<const uint16_t*>(t->data);
-  std::vector<float> v((size_t)out * in);
-  for (int64_t o = 0; o < out; o++)
-    for (int64_t i = 0; i < in; i++)
-      v[(size_t)o * in + i] = f16_to_f32(raw[(size_t)o * in + i]);
-  array a = array::from(std::move(v), {out, in});
-  return wdt == tl::dtype::bf16 ? a.to_bf16() : a;
-}
+                          int64_t out, tl::dtype wdt = tl::dtype::bf16);
 
 // Row-concatenated fused weight for the warp-per-row GEMV: stack several GGML
 // [out,in] tensors that share `in` (K) along the OUTPUT (row) axis into one
@@ -155,6 +140,10 @@ inline array load_w_T_cat_row(
   array a = array::from(std::move(v), {Ntot, in});
   return wdt == tl::dtype::bf16 ? a.to_bf16() : a;
 }
+inline array load_w_T_row(const gg::model& m, const std::string& n, int64_t in,
+                          int64_t out, tl::dtype wdt) {
+  return load_w_T_cat_row(m, {{n, out}}, in, wdt);  // the single-part case
+}
 
 // Slice a device f32 buffer by element offset. The result is a mid-buffer
 // pointer: reads through it are stream-ordered after whatever wrote the base and
@@ -164,11 +153,7 @@ inline void* off_f32(void* p, int64_t nfloats) {
 }
 
 // F32 1-D tensor (norms, biases are stored F32 in the GGUF) -> array [1, len].
-inline array load_f32(const gg::model& m, const std::string& n, int64_t len) {
-  const auto* t = need(m, n);
-  const auto* raw = reinterpret_cast<const float*>(t->data);
-  return array::from(std::vector<float>(raw, raw + len), {1, len});
-}
+inline array load_f32(const gg::model& m, const std::string& n, int64_t len);
 
 // Several F32 1-D tensors laid end to end -> array [1, sum(len)]. The q|k|v
 // biases in that order match the fused QKV projection's column layout, so the
@@ -182,6 +167,9 @@ inline array load_f32_cat(const gg::model& m,
   }
   int64_t len = (int64_t)v.size();
   return array::from(std::move(v), {1, len});
+}
+inline array load_f32(const gg::model& m, const std::string& n, int64_t len) {
+  return load_f32_cat(m, {{n, len}});  // the single-part case
 }
 
 struct Layer {
@@ -211,18 +199,19 @@ struct Layer {
 // Persistent device scratch for the imperative decode step (C1): every per-step
 // intermediate is a device buffer allocated ONCE and reused each token, so the
 // step builds zero array nodes (no host graph construction) and does zero
-// per-step allocation (no WSL2 churn). res[2] ping-pong the residual stream; hb
-// doubles as h and h2 (h is fully consumed by the q/k/v gemvs before the MLP
-// reuses it).
+// per-step allocation (no WSL2 churn). res[2] ping-pong the residual stream;
+// q/k/v and gate/up live only as slices of their fused projection outputs
+// (qkvb, gub).
 struct Scratch {
   void* res[2] = {nullptr, nullptr};  // residual ping-pong [NE]
   void* hb = nullptr;                 // input-norm out [NE]
   void* h2b = nullptr;                // post-attn norm out [NE]
-  void* qb = nullptr;                 // [NH*HD]
-  void *kb = nullptr, *vb = nullptr;  // [NKV*HD]
+  void* qb = nullptr;                 // [NH*HD] query fixture (bench_qwen_ctx's
+                                      // isolated-attention timing; decode reads
+                                      // q as a slice of qkvb)
   void* qkvb = nullptr;               // fused QKV out [(NH+2*NKV)*HD] = [1152]
   void* ab = nullptr;                 // attn out [NH*HD]
-  void *gb = nullptr, *ub = nullptr, *mb = nullptr;  // gate/up/swiglu [FF]
+  void* mb = nullptr;                 // swiglu out [FF]
   void* gub = nullptr;                // fused gate|up out [2*FF] = [9728]
   void* mdb = nullptr;                // mlp-down out [NE]
   void* logitsb = nullptr;            // [VOCAB]
@@ -239,12 +228,8 @@ struct Scratch {
     hb = tl::cuda::alloc(NE * 4, nullptr);
     h2b = tl::cuda::alloc(NE * 4, nullptr);
     qb = tl::cuda::alloc(NH * HD * 4, nullptr);
-    kb = tl::cuda::alloc(NKV * HD * 4, nullptr);
-    vb = tl::cuda::alloc(NKV * HD * 4, nullptr);
     qkvb = tl::cuda::alloc((NH + 2 * NKV) * HD * 4, nullptr);
     ab = tl::cuda::alloc(NH * HD * 4, nullptr);
-    gb = tl::cuda::alloc(FF * 4, nullptr);
-    ub = tl::cuda::alloc(FF * 4, nullptr);
     mb = tl::cuda::alloc(FF * 4, nullptr);
     gub = tl::cuda::alloc(2 * FF * 4, nullptr);
     mdb = tl::cuda::alloc(NE * 4, nullptr);
@@ -329,6 +314,14 @@ inline bool gemv_w(const array& W, void* a, void* y, int64_t n, int64_t k) {
              : tl::cuda::gemv_f32(a, W.native(), y, n, k);
 }
 
+// Greedy token from the logits the most recent forward left in scratch (the one
+// terminal sync of a step lives inside cuda::argmax).
+inline int64_t argmax_logits(Model& M) {
+  int64_t idx = 0;
+  tl::cuda::argmax(M.scratch.logitsb, VOCAB, &idx);
+  return idx;
+}
+
 // Reset all KV caches to position 0 (replay from a fresh prefill). Used by the
 // bench's array-vs-imperative greedy-equivalence check.
 inline void reset_cache(Model& M) {
@@ -354,11 +347,10 @@ inline void set_cache_pos(Model& M, int64_t p) {
 // -> down, with the residual adds folded into the following RMSNorms exactly as
 // the decode seam does.
 //
-// `pos0` is the absolute position of the chunk's first token: rope reads it, and
-// kv_cache::prefill appends the block at the cache's current pos, so chunks (and
-// later turns) compose. Only the LAST row's logits are produced — a prompt needs
-// no others, which also keeps the 272 MB lm_head weight out of the per-token
-// cost entirely.
+// The chunk's absolute start position comes from the caches (kv_cache::prefill
+// appends there; rope reads the same source), so chunks — and later turns —
+// compose. No logits here: prefill_batched runs the lm_head once, on the final
+// chunk's last row, since a prompt needs no others.
 //
 // bf16 row-major weights only (the layout gemm_bf16_nt shares with the decode
 // GEMV); callers check Model.row and fall back to token-by-token otherwise.
@@ -423,7 +415,7 @@ inline void stage_embed_rows_(Model& M, const std::vector<int>& ids, int64_t fro
 // weights must be the bf16 row-major ones its GEMM consumes, the prompt must be
 // long enough to be worth a batched pass, and it must fit the cache. One place
 // answers it, so build(), begin() and prefill_batched() cannot disagree.
-inline bool can_prefill_batched(const Model& M, int64_t T = PREFILL_MIN) {
+inline bool can_prefill_batched(const Model& M, int64_t T) {
   return M.row && !M.q4_mlp && !M.layers.empty() && T >= PREFILL_MIN &&
          M.layers[0].cache.pos + T <= MAXC;
 }
@@ -446,9 +438,7 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
   // prompt rather than one per chunk.
   gemv_w(M.outwT, off_f32(M.pscratch.h, (last - 1) * NE), M.scratch.logitsb,
          VOCAB, NE);
-  int64_t idx = 0;
-  tl::cuda::argmax(M.scratch.logitsb, VOCAB, &idx);
-  return idx;
+  return argmax_logits(M);
 }
 
 // wdt = the linear-weight storage dtype (f32 exact, or bf16 for the <2GB/decode
@@ -524,12 +514,13 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
   // scratch allocation — ~90 ms, several times its own compute. Both are fixed
   // per-run costs, so they belong here beside the weight upload; the price is
   // that a decode-only consumer also carries the scratch (see PrefillScratch).
-  // It goes through prefill_batched, not prefill_chunk_, so every kernel the
-  // real entry point touches — the lm_head GEMV included — is loaded here. The warm pass dirties
-  // cache rows [0, PREFILL_MIN) of every layer, which the reset releases:
-  // attention only ever reads [0, pos), so the stale rows are unreachable.
-  if (can_prefill_batched(M) && M.pscratch.init(PREFILL_CHUNK)) {
-    prefill_batched(M, std::vector<int>((size_t)PREFILL_MIN, 0));
+  // It goes through prefill_batched — which owns the eligibility check and
+  // no-ops with -1 when the weights can't batch — so every kernel the real
+  // entry point touches, the lm_head GEMV included, is loaded here. The warm
+  // pass dirties cache rows [0, PREFILL_MIN) of every layer, which the reset
+  // releases: attention only ever reads [0, pos), so the stale rows are
+  // unreachable.
+  if (prefill_batched(M, std::vector<int>((size_t)PREFILL_MIN, 0)) >= 0) {
     tl::cuda::flush();
     reset_cache(M);
   }
@@ -757,9 +748,7 @@ inline int64_t step_imperative(Model& M, int64_t id, int64_t pos) {
   array e = embed_row(M, id);
   e.realize();  // embed on device (native valid; uploaded on first read)
   run_layers_(M, e.native(), pos);
-  int64_t idx = 0;
-  tl::cuda::argmax(M.scratch.logitsb, VOCAB, &idx);
-  return idx;
+  return argmax_logits(M);
 }
 
 // Run the imperative forward and return the logits [VOCAB] on the host (device
@@ -810,8 +799,14 @@ struct captured_decoder {
   // priming it with `first_id`'s embedding. Leaves d_pos = pos, so the first
   // feed()/step() processes position `pos`. Leaves exec null — and the object
   // still usable, via feed()'s imperative fallback — when graph capture is
-  // unavailable.
+  // unavailable. Records its own cost in capture_ms (warm + record +
+  // instantiate), which callers time-slicing a prompt subtract.
   void init(Model& M, int64_t first_id, int64_t pos) {
+    double t0 = StepProf::now_ms();
+    init_(M, first_id, pos);
+    capture_ms = StepProf::now_ms() - t0;
+  }
+  void init_(Model& M, int64_t first_id, int64_t pos) {
     namespace cu = tl::cuda;
     if (M.layers.empty()) return;
     max_ctx = M.layers[0].cache.max_ctx;  // bound applies to the fallback too
@@ -847,8 +842,6 @@ struct captured_decoder {
   //
   // Capture is taken at the cache's CURRENT position either way, so this also
   // serves a turn appended to a live cache. Returns -1 for an empty prompt.
-  // `capture_ms` holds init's one-time cost, which callers time-slicing the
-  // prompt should subtract.
   int64_t begin(Model& M, const std::vector<int>& ids) {
     if (ids.empty() || M.layers.empty()) return -1;
     // Batched first: a prompt is a GEMM regime, not a GEMV one, so running it
@@ -859,16 +852,12 @@ struct captured_decoder {
       int64_t next = prefill_batched(M, ids);
       if (next >= 0) {
         batched = true;
-        double t0 = StepProf::now_ms();
         init(M, next, M.layers[0].cache.pos);
-        capture_ms = StepProf::now_ms() - t0;
         return next;
       }
     }
     // Token-by-token: one capture serves prompt and decode alike.
-    double t0 = StepProf::now_ms();
     init(M, ids[0], M.layers[0].cache.pos);
-    capture_ms = StepProf::now_ms() - t0;  // fixed cost, not prompt throughput
     for (size_t i = 0; i + 1 < ids.size(); i++) feed(M, ids[i]);
     int64_t last = step(M, ids.back());  // only the last token's logits are read
     sync_host_pos(M);
@@ -894,15 +883,9 @@ struct captured_decoder {
     cur_pos++;
     return true;
   }
-  // Greedy token from the logits the most recent forward left in scratch.
-  int64_t argmax_last(Model& M) {
-    int64_t idx = 0;
-    tl::cuda::argmax(M.scratch.logitsb, VOCAB, &idx);
-    return idx;
-  }
   // One decode step: feed + read the greedy token (-1 when the cache is full).
   int64_t step(Model& M, int64_t id) {
-    return feed(M, id) ? argmax_last(M) : -1;
+    return feed(M, id) ? argmax_logits(M) : -1;
   }
   // Reconcile the host cache pos with the device counter. Captured replays
   // advance only d_pos, so the host pos would otherwise be stale for anyone
