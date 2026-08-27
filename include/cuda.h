@@ -55,6 +55,7 @@ using kop = tl::metal::kop;
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -481,13 +482,48 @@ struct context {
     return reinterpret_cast<float*>(static_cast<char*>(base) + byte_off);
   }
 
-  bool launch1d_(CUfunction f, unsigned n, void** args, unsigned shared = 0) {
+  // Grid / block extents for launch_. Brace-initialized with 1-3 values; the
+  // omitted trailing dims are 1, so a 1-D launch is just {n}.
+  struct dims {
+    unsigned x = 1, y = 1, z = 1;
+  };
+
+  // Every kernel launch goes through here. cuLaunchKernel takes void** — an
+  // array of POINTERS to the arguments — so each one must be an addressable
+  // lvalue that outlives the call; taking them BY VALUE makes each a named
+  // local of this frame, which is exactly that, and lets call sites pass
+  // expressions instead of a ladder of one-use locals.
+  //
+  // The kernel's parameter list is NOT visible to the compiler — kernels are
+  // looked up by name in the PTX at runtime, which is what keeps this backend
+  // free of the CUDA runtime — so nothing can check the pack against the kernel
+  // signature. What CAN be checked is the failure mode that actually bites:
+  // every parameter these kernels declare is a pointer (.u64) or a 4-byte
+  // scalar (.u32/.f32), so an int64_t/size_t/double — or a bare `nullptr`,
+  // whose type is nullptr_t, not a pointer — would write 8 bytes into a 4-byte
+  // slot and silently shift every argument after it. The static_assert below
+  // rejects exactly that, which is why call sites may pass pointer expressions
+  // inline but always name their scalars as `unsigned`/`float` locals.
+  template <typename... Ts>
+  bool launch_(CUfunction f, dims grid, dims block, unsigned smem, Ts... args) {
+    static_assert(sizeof...(Ts) > 0, "a kernel with no arguments?");
+    static_assert(((std::is_pointer_v<Ts> || sizeof(Ts) == 4) && ...),
+                  "kernel arg must be a pointer or a 4-byte scalar: an 8-byte "
+                  "one (int64_t/size_t/double/nullptr) shifts every arg after "
+                  "it. Cast to unsigned/float at the call site.");
     if (!f) return false;
+    void* argv[] = {&args...};
+    pending = true;
+    return d.LaunchKernel(f, grid.x, grid.y, grid.z, block.x, block.y, block.z,
+                          smem, stream, argv, nullptr) == 0;
+  }
+
+  // The 1-D elementwise shape: 256-thread blocks covering n elements.
+  template <typename... Ts>
+  bool launch1d_(CUfunction f, unsigned n, Ts... args) {
     unsigned block = 256, grid = (n + block - 1) / block;
     if (grid == 0) grid = 1;
-    pending = true;
-    return d.LaunchKernel(f, grid, 1, 1, block, 1, 1, shared, stream, args,
-                          nullptr) == 0;
+    return launch_(f, {grid}, {block}, 0, args...);
   }
 };
 
@@ -649,8 +685,7 @@ inline bool binary(kop op, void* a, int64_t ao, void* b, int64_t bo, void* out,
   float* pb = context::off_(b, bo);
   float* po = context::off_(out, oo);
   unsigned un = static_cast<unsigned>(n);
-  void* args[] = {&pa, &pb, &po, &un, &scale, &offset};
-  return c.launch1d_(c.fn_(op), un, args);
+  return c.launch1d_(c.fn_(op), un, pa, pb, po, un, scale, offset);
 }
 
 // Rank-2 broadcast binary — no CUDA kernel yet; false sends the evaluator
@@ -670,8 +705,7 @@ inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo, int64_t n,
   float* pa = context::off_(a, ao);
   float* po = context::off_(out, oo);
   unsigned un = static_cast<unsigned>(n);
-  void* args[] = {&pa, &po, &un, &scale, &offset};
-  return c.launch1d_(c.fn_(op), un, args);
+  return c.launch1d_(c.fn_(op), un, pa, po, un, scale, offset);
 }
 
 // M7 decode GEMV: y(n) = a(1,k) @ B(k,n), F32 accumulate. B is either f32 or
@@ -711,10 +745,7 @@ inline bool gemv_run_(CUfunction f, float* pa, float* pB, float* py,
     if (c.d.MemsetD8Async) c.d.MemsetD8Async(yd, 0, (size_t)un * 4, c.stream);
     else c.d.MemsetD8(yd, 0, (size_t)un * 4);
   }
-  void* args[] = {&pa, &pB, &py, &un, &uk, &ksplit};
-  c.pending = true;
-  return c.d.LaunchKernel(f, bx, gy, 1, 256, 1, 1, 0, c.stream, args, nullptr) ==
-         0;
+  return c.launch_(f, {bx, gy}, {256}, 0, pa, pB, py, un, uk, ksplit);
 }
 inline bool gemv_f32(void* a, void* B, void* y, int64_t n, int64_t k) {
   auto& c = context::get();
@@ -777,11 +808,9 @@ inline bool gemv_bf16_row(void* a, void* B, void* y, int64_t n, int64_t k) {
   float* pB = context::off_(B, 0);
   float* py = context::off_(y, 0);
   unsigned uN = static_cast<unsigned>(n), uK = static_cast<unsigned>(k);
-  void* args[] = {&pa, &pB, &py, &uN, &uK};
   unsigned block = gemv_row_block_size(k);
-  c.pending = true;
-  return c.d.LaunchKernel(c.gemv_bf16_row_(), uN, 1, 1, block, 1, 1,
-                          gemv_row_smem(block), c.stream, args, nullptr) == 0;
+  return c.launch_(c.gemv_bf16_row_(), {uN}, {block}, gemv_row_smem(block), pa,
+                   pB, py, uN, uK);
 }
 
 // M9 batched-prefill GEMM: C(M,N) = A(M,K) @ W[N,K]^T, W the same row-major
@@ -822,7 +851,6 @@ inline bool gemm_bf16_nt(void* a, void* B, void* out, int64_t m, int64_t n,
     z = by_k < by_fill ? by_k : by_fill;
     if (z < 1) z = 1;
   }
-  c.pending = true;
   if (z > 1) {
     constexpr unsigned BK = 16;  // the 64 tile's K slab
     unsigned ksplit = ((uK + z - 1) / z + BK - 1) / BK * BK;
@@ -831,13 +859,11 @@ inline bool gemm_bf16_nt(void* a, void* B, void* out, int64_t m, int64_t n,
     // before the launch without a host sync (and stays capturable).
     c.d.MemsetD8Async(reinterpret_cast<CUdeviceptr>(po), 0,
                       (size_t)m * n * sizeof(float), c.stream);
-    void* args[] = {&pa, &pB, &po, &uM, &uN, &uK, &ksplit};
-    return c.d.LaunchKernel(c.gemm_bf16_nt_sk_(), gx, gy, z, 256, 1, 1, 0,
-                            c.stream, args, nullptr) == 0;
+    return c.launch_(c.gemm_bf16_nt_sk_(), {gx, gy, z}, {256}, 0, pa, pB, po,
+                     uM, uN, uK, ksplit);
   }
-  void* args[] = {&pa, &pB, &po, &uM, &uN, &uK};
-  return c.d.LaunchKernel(c.gemm_bf16_nt_(big), gx, gy, 1, 256, 1, 1, 0,
-                          c.stream, args, nullptr) == 0;
+  return c.launch_(c.gemm_bf16_nt_(big), {gx, gy}, {256}, 0, pa, pB, po, uM, uN,
+                   uK);
 }
 
 // ---- M9 batched-prefill layout moves between token-major projections and
@@ -857,10 +883,8 @@ inline bool split_heads(void* src, void* bias, void* dst, int64_t T, int64_t ld,
   float* pd = context::off_(dst, 0);
   unsigned uT = (unsigned)T, uld = (unsigned)ld, uoff = (unsigned)off,
            uD = (unsigned)D;
-  void* args[] = {&ps, &pb, &pd, &uT, &uld, &uoff, &uD};
-  c.pending = true;
-  return c.d.LaunchKernel(c.split_heads_(), (unsigned)H, uT, 1, uD, 1, 1, 0,
-                          c.stream, args, nullptr) == 0;
+  return c.launch_(c.split_heads_(), {(unsigned)H, uT}, {uD}, 0, ps, pb, pd, uT,
+                   uld, uoff, uD);
 }
 
 // [H, T, D] head-major -> [T, H*D] token-major (inverse of split_heads).
@@ -872,10 +896,7 @@ inline bool merge_heads(void* src, void* dst, int64_t T, int64_t H, int64_t D) {
   float* ps = context::off_(src, 0);
   float* pd = context::off_(dst, 0);
   unsigned uT = (unsigned)T, uH = (unsigned)H, uD = (unsigned)D;
-  void* args[] = {&ps, &pd, &uT, &uH, &uD};
-  c.pending = true;
-  return c.d.LaunchKernel(c.merge_heads_(), uH, uT, 1, uD, 1, 1, 0, c.stream,
-                          args, nullptr) == 0;
+  return c.launch_(c.merge_heads_(), {uH, uT}, {uD}, 0, ps, pd, uT, uH, uD);
 }
 
 // M8 int4-weight decode GEMV: y(N) = a(1,K) @ dequant(Wq[N,K]), F32 accumulate.
@@ -897,11 +918,9 @@ inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
   float* ps = context::off_(scales, 0);
   float* py = context::off_(y, 0);
   unsigned uN = (unsigned)N, uK = (unsigned)K, uG = (unsigned)group;
-  void* args[] = {&pa, &pq, &ps, &py, &uN, &uK, &uG};
   unsigned block = gemv_row_block_size(K);
-  c.pending = true;
-  return c.d.LaunchKernel(c.gemv_q4_(), uN, 1, 1, block, 1, 1,
-                          gemv_row_smem(block), c.stream, args, nullptr) == 0;
+  return c.launch_(c.gemv_q4_(), {uN}, {block}, gemv_row_smem(block), pa, pq,
+                   ps, py, uN, uK, uG);
 }
 
 // Split-KV split-count heuristic: how many ctx-splits make grid = heads×S fill
@@ -953,9 +972,7 @@ struct attn_partials {
   }
   // Merge the S per-head partials into out [H, D] (tl_attn_combine).
   bool combine(context& c, float* out, unsigned uh, unsigned uD, unsigned S) {
-    void* args[] = {&pm, &pl, &pacc, &out, &S};
-    return c.d.LaunchKernel(c.attn_combine_(), uh, 1, 1, uD, 1, 1, 0, c.stream,
-                            args, nullptr) == 0;
+    return c.launch_(c.attn_combine_(), {uh}, {uD}, 0, pm, pl, pacc, out, S);
   }
 };
 
@@ -986,10 +1003,8 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
   unsigned S = attn_split_count(uh, ctx);
   unsigned uD = static_cast<unsigned>(D);
   if (S == 1) {
-    void* args[] = {&pq, &pk, &pv, &po, &uctx, &kv_stride, &group, &scale};
-    c.pending = true;
-    return c.d.LaunchKernel(c.attn_decode_(D, kv_bf16), uh, 1, 1, uD, 1, 1, 0,
-                            c.stream, args, nullptr) == 0;
+    return c.launch_(c.attn_decode_(D, kv_bf16), {uh}, {uD}, 0, pq, pk, pv, po,
+                     uctx, kv_stride, group, scale);
   }
 
   unsigned chunk = attn_split_chunk(uh, ctx);
@@ -998,13 +1013,10 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
   CUdeviceptr scr = c.attn_scratch_(attn_partials::bytes(hs, D));
   if (!scr) return false;
   attn_partials p(reinterpret_cast<float*>(scr), hs);
-  c.pending = true;
-  void* a1[] = {&pq,    &pk,   &pv,        &p.pm,  &p.pl,
-                &p.pacc, &uctx, &kv_stride, &group, &chunk,
-                &scale};
-  if (c.d.LaunchKernel(c.attn_split_(D, kv_bf16), uh, S, 1, uD, 1, 1, 0,
-                       c.stream, a1, nullptr) != 0)
+  if (!c.launch_(c.attn_split_(D, kv_bf16), {uh, S}, {uD}, 0, pq, pk, pv, p.pm,
+                 p.pl, p.pacc, uctx, kv_stride, group, chunk, scale)) {
     return false;
+  }
   return p.combine(c, po, uh, uD, S);
 }
 
@@ -1028,10 +1040,8 @@ inline bool rope_dpos(void* x, void* out, int64_t rows, int64_t T, int64_t D,
   float* po = context::off_(out, 0);
   float* pp = context::off_(d_pos, 0);
   unsigned uT = (unsigned)T, uD = (unsigned)D;
-  void* args[] = {&px, &pbias, &po, &uT, &uD, &pp, &base};
-  c.pending = true;
-  return c.d.LaunchKernel(c.rope_dpos_(), (unsigned)rows, 1, 1, (unsigned)(D / 2),
-                          1, 1, 0, c.stream, args, nullptr) == 0;
+  return c.launch_(c.rope_dpos_(), {(unsigned)rows}, {(unsigned)(D / 2)}, 0, px,
+                   pbias, po, uT, uD, pp, base);
 }
 
 // One-thread *d_pos += 1 (tail of a captured forward; advances the counter).
@@ -1040,10 +1050,7 @@ inline bool incr_u32(void* d_pos) {
   if (!c.ready) return false;
   c.device_write_(d_pos);
   float* pp = context::off_(d_pos, 0);
-  void* args[] = {&pp};
-  c.pending = true;
-  return c.d.LaunchKernel(c.incr_u32_(), 1, 1, 1, 1, 1, 1, 0, c.stream, args,
-                          nullptr) == 0;
+  return c.launch_(c.incr_u32_(), {1}, {1}, 0, pp);
 }
 
 // KV append with write-row = *d_pos (else identical to kv_append(); f32 KV).
@@ -1063,10 +1070,8 @@ inline bool kv_append_dpos(void* Kc, void* Vc, void* k_new, void* v_new,
   float* pv = context::off_(v_new, 0);
   float* pp = context::off_(d_pos, 0);
   unsigned kv_stride = (unsigned)(kv_max * D);
-  void* args[] = {&pKc, &pVc, &pk, &pv, &pp, &kv_stride};
-  c.pending = true;
-  return c.d.LaunchKernel(c.kv_append_dpos_(), (unsigned)n_kv_heads, 1, 1,
-                          (unsigned)D, 1, 1, 0, c.stream, args, nullptr) == 0;
+  return c.launch_(c.kv_append_dpos_(), {(unsigned)n_kv_heads}, {(unsigned)D},
+                   0, pKc, pVc, pk, pv, pp, kv_stride);
 }
 
 // Decode attention with ctx = *d_pos + 1, split-KV on a capacity-static grid:
@@ -1104,12 +1109,10 @@ inline bool attn_decode_dpos(void* q, void* K, void* V, void* out,
   unsigned group = (unsigned)(n_q_heads / n_kv_heads);
   unsigned S = attn_split_count(uh, kv_max);
   attn_partials p(context::off_(partials, 0), (size_t)uh * S);
-  c.pending = true;
-  void* a1[] = {&pq,    &pk,  &pv,        &p.pm,  &p.pl,
-                &p.pacc, &pp, &kv_stride, &group, &scale};
-  if (c.d.LaunchKernel(c.attn_split_dpos_(D), uh, S, 1, uD, 1, 1, 0, c.stream,
-                       a1, nullptr) != 0)
+  if (!c.launch_(c.attn_split_dpos_(D), {uh, S}, {uD}, 0, pq, pk, pv, p.pm,
+                 p.pl, p.pacc, pp, kv_stride, group, scale)) {
     return false;
+  }
   return p.combine(c, po, uh, uD, S);
 }
 
@@ -1130,11 +1133,9 @@ inline bool kv_append(void* Kc, void* Vc, void* k_new, void* v_new, int64_t pos,
   float* pv = context::off_(v_new, 0);
   unsigned upos = static_cast<unsigned>(pos);
   unsigned kv_stride = static_cast<unsigned>(kv_max * D);
-  void* args[] = {&pKc, &pVc, &pk, &pv, &upos, &kv_stride};
-  c.pending = true;
-  return c.d.LaunchKernel(c.kv_append_(kv_bf16), static_cast<unsigned>(n_kv_heads),
-                          1, 1, static_cast<unsigned>(D), 1, 1, 0, c.stream, args,
-                          nullptr) == 0;
+  return c.launch_(c.kv_append_(kv_bf16), {static_cast<unsigned>(n_kv_heads)},
+                   {static_cast<unsigned>(D)}, 0, pKc, pVc, pk, pv, upos,
+                   kv_stride);
 }
 
 // M9 prefill: bulk-copy a block of k,v (each [n_kv_heads,T,D] device buffers)
@@ -1156,11 +1157,9 @@ inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
   unsigned uT = static_cast<unsigned>(T);
   unsigned kv_stride = static_cast<unsigned>(kv_max * D);
   unsigned up0 = static_cast<unsigned>(pos0);
-  void* args[] = {&pKc, &pVc, &pk, &pv, &uT, &kv_stride, &up0};
-  c.pending = true;
-  return c.d.LaunchKernel(c.kv_fill_(kv_bf16), static_cast<unsigned>(n_kv_heads),
-                          static_cast<unsigned>(T), 1, static_cast<unsigned>(D),
-                          1, 1, 0, c.stream, args, nullptr) == 0;
+  return c.launch_(c.kv_fill_(kv_bf16), {static_cast<unsigned>(n_kv_heads), uT},
+                   {static_cast<unsigned>(D)}, 0, pKc, pVc, pk, pv, uT,
+                   kv_stride, up0);
 }
 
 // M9 causal prefill attention: q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D]
@@ -1187,17 +1186,16 @@ inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads
   unsigned kv_stride = static_cast<unsigned>(kv_max * D);
   unsigned group = static_cast<unsigned>(n_q_heads / n_kv_heads);
   unsigned up0 = static_cast<unsigned>(pos0);
-  void* args[] = {&pq, &pk, &pv, &po, &uT, &kv_stride, &group, &scale, &up0};
-  c.pending = true;
+
   // A block takes a tile of queries and streams K/V through shared memory, so
   // each score is a register dot product instead of a per-key warp-shuffle
   // reduction. Same online softmax, same causal rule. See
   // tl_attn_prefill_tiled_*.
   const unsigned tile = attn_tile_queries(D);
-  return c.d.LaunchKernel(c.attn_prefill_tiled_(D, kv_bf16),
-                          static_cast<unsigned>(n_q_heads), (uT + tile - 1) / tile,
-                          1, attn_tile_threads, 1, 1, 0, c.stream, args,
-                          nullptr) == 0;
+  return c.launch_(c.attn_prefill_tiled_(D, kv_bf16),
+                   {static_cast<unsigned>(n_q_heads), (uT + tile - 1) / tile},
+                   {attn_tile_threads}, 0, pq, pk, pv, po, uT, kv_stride, group,
+                   scale, up0);
 }
 
 // RoPE: rotate a contiguous [rows, D] buffer (rows = H*T). Row r's position is
@@ -1214,11 +1212,9 @@ inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
   float* po = context::off_(out, 0);
   unsigned uT = static_cast<unsigned>(T), uD = static_cast<unsigned>(D),
            upos = static_cast<unsigned>(pos);
-  void* args[] = {&px, &pbias, &po, &uT, &uD, &upos, &base};
-  c.pending = true;
-  return c.d.LaunchKernel(c.rope_(), static_cast<unsigned>(rows), 1, 1,
-                          static_cast<unsigned>(D / 2), 1, 1, 0, c.stream, args,
-                          nullptr) == 0;
+  return c.launch_(c.rope_(), {static_cast<unsigned>(rows)},
+                   {static_cast<unsigned>(D / 2)}, 0, px, pbias, po, uT, uD,
+                   upos, base);
 }
 
 // ---- Row-wise fused RMSNorm / SwiGLU. `rows` defaults to 1 (a decode step); a
@@ -1245,10 +1241,8 @@ inline bool rmsnorm_res(void* x, void* delta, void* w, void* xout, void* hout,
   float* px = context::off_(xout, 0);
   float* ph = context::off_(hout, 0);
   unsigned un = (unsigned)n, block = 256;
-  void* args[] = {&pa, &pb, &pw, &px, &ph, &un, &eps};
-  c.pending = true;
-  return c.d.LaunchKernel(c.add_rmsnorm_(), (unsigned)rows, 1, 1, block, 1, 1,
-                          block * sizeof(float), c.stream, args, nullptr) == 0;
+  return c.launch_(c.add_rmsnorm_(), {(unsigned)rows}, {block},
+                   block * sizeof(float), pa, pb, pw, px, ph, un, eps);
 }
 
 // GPU argmax over a length-n device vector (contiguous, offset 0). Reduces on
@@ -1267,13 +1261,11 @@ inline bool argmax(void* in, int64_t n, int64_t* out_idx) {
   if (!res) return false;
   int* pres = reinterpret_cast<int*>(res);
   unsigned un = static_cast<unsigned>(n);
-  void* args[] = {&pin, &pres, &un};
   unsigned block = 256;
-  c.pending = true;
-  if (c.d.LaunchKernel(c.argmax_(), 1, 1, 1, block, 1, 1,
-                       block * (sizeof(float) + sizeof(int)), c.stream, args,
-                       nullptr) != 0)
+  if (!c.launch_(c.argmax_(), {1}, {block},
+                 block * (sizeof(float) + sizeof(int)), pin, pres, un)) {
     return false;
+  }
   flush();  // the result index must be ready before the 4-byte D2H
   int h = 0;
   if (c.d.MemcpyDtoH(&h, res, sizeof(int)) != 0) return false;
@@ -1295,10 +1287,8 @@ inline bool rmsnorm(void* x, void* w, void* out, int64_t n, float eps,
   float* pw = context::off_(w, 0);
   float* po = context::off_(out, 0);
   unsigned un = (unsigned)n, block = 256;
-  void* args[] = {&px, &pw, &po, &un, &eps};
-  c.pending = true;
-  return c.d.LaunchKernel(c.rmsnorm_(), (unsigned)rows, 1, 1, block, 1, 1,
-                          block * sizeof(float), c.stream, args, nullptr) == 0;
+  return c.launch_(c.rmsnorm_(), {(unsigned)rows}, {block},
+                   block * sizeof(float), px, pw, po, un, eps);
 }
 
 // out[rows, ff] = silu(gate) * up, read out of the FUSED gate|up buffer
@@ -1311,11 +1301,8 @@ inline bool swiglu(void* gu, void* out, int64_t ff, int64_t rows = 1) {
   float* pg = context::off_(gu, 0);
   float* po = context::off_(out, 0);
   unsigned uff = (unsigned)ff, block = 256;
-  void* args[] = {&pg, &po, &uff};
-  c.pending = true;
-  return c.d.LaunchKernel(c.swiglu_(), (unsigned)((ff + block - 1) / block),
-                          (unsigned)rows, 1, block, 1, 1, 0, c.stream, args,
-                          nullptr) == 0;
+  unsigned gx = (uff + block - 1) / block;
+  return c.launch_(c.swiglu_(), {gx, (unsigned)rows}, {block}, 0, pg, po, uff);
 }
 
 // Persistent, device-resident KV cache (roadmap M9, A-surface): K,V buffers
@@ -1458,28 +1445,22 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
         }
       }
 
-      void* rb[] = {&pa, &pb, &po, &um, &un, &uk, &scale, &offset, &ksplit};
       if (S > 1) c.d.MemsetD8(reinterpret_cast<CUdeviceptr>(po), 0,
                               (size_t)m * n * 4);  // zero C for atomicAdd
-      c.pending = true;
-      return c.d.LaunchKernel(f, gx, gy, S, 256, 1, 1, 0, c.stream, rb,
-                              nullptr) == 0;
+      return c.launch_(f, {gx, gy, S}, {256}, 0, pa, pb, po, um, un, uk, scale,
+                       offset, ksplit);
     }
   }
 
   unsigned ula = (unsigned)lda, ulb = (unsigned)ldb;
   unsigned uta = ta ? 1u : 0u, utb = tb ? 1u : 0u;
-  void* args[] = {&pa,  &pb,  &po,  &um,  &un,    &uk,
-                  &ula, &ulb, &uta, &utb, &scale, &offset};
-  CUfunction sg = c.fn_(kop::sgemm32);  // routed to tl_sgemm by kernel_name_
-  if (!sg) return false;
   unsigned bx = 16, by = 16;
   unsigned gx = (un + bx - 1) / bx, gy = (um + by - 1) / by;
   if (gx == 0) gx = 1;
   if (gy == 0) gy = 1;
-  c.pending = true;
-  return c.d.LaunchKernel(sg, gx, gy, 1, bx, by, 1, 0, c.stream, args,
-                          nullptr) == 0;
+  // kop::sgemm32 is routed to tl_sgemm by kernel_name_.
+  return c.launch_(c.fn_(kop::sgemm32), {gx, gy}, {bx, by}, 0, pa, pb, po, um,
+                   un, uk, ula, ulb, uta, utb, scale, offset);
 }
 
 // Row op over the last axis: softmax writes rows×cols; row_sum/row_max write
@@ -1493,16 +1474,20 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
   float* pin = context::off_(in, io);
   float* po = context::off_(out, oo);
   unsigned ur = (unsigned)rows, uc = (unsigned)cols;
-  void* args[] = {&pin, &po, &ur, &uc, &scale, &offset};
-  CUfunction f = c.fn_(op);
-  if (!f) return false;
   unsigned block = 256;
-  c.pending = true;
-  return c.d.LaunchKernel(f, ur ? ur : 1, 1, 1, block, 1, 1,
-                          block * sizeof(float), c.stream, args, nullptr) == 0;
+  return c.launch_(c.fn_(op), {ur ? ur : 1}, {block}, block * sizeof(float),
+                   pin, po, ur, uc, scale, offset);
 }
 
 #else  // stubs (Apple, or a build without TENSORLIB_CUDA)
+
+// Only the gpu:: facade surface is stubbed — what array.h/storage.h dispatch
+// through, so a consumer can name tl::cuda:: unconditionally and get "no device
+// here". The LLM-path entry points (gemv/attention/kv_cache/graph capture/the
+// fused decode ops) deliberately have NO stubs: they are reachable only from
+// code that is itself CUDA-gated (bench/cuda/*, which needs kv_cache and the
+// capture types anyway), so a stub could never be linked — it would just be an
+// unreachable `return false` claiming an API that isn't really there.
 
 inline bool available() { return false; }
 inline bool pending() { return false; }
@@ -1529,29 +1514,6 @@ inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
                    float) {
   return false;
 }
-inline bool argmax(void*, int64_t, int64_t*) { return false; }
-inline bool rmsnorm(void*, void*, void*, int64_t, float, int64_t = 1) {
-  return false;
-}
-inline bool split_heads(void*, void*, void*, int64_t, int64_t, int64_t, int64_t,
-                        int64_t) {
-  return false;
-}
-inline bool merge_heads(void*, void*, int64_t, int64_t, int64_t) { return false; }
-inline bool gemm_bf16_nt(void*, void*, void*, int64_t, int64_t, int64_t) {
-  return false;
-}
-inline bool rmsnorm_res(void*, void*, void*, void*, void*, int64_t, float,
-                        int64_t = 1) {
-  return false;
-}
-inline bool swiglu(void*, void*, int64_t, int64_t = 1) { return false; }
-inline bool graph_available() { return false; }
-inline bool capture_begin() { return false; }
-inline void* capture_end() { return nullptr; }
-inline bool graph_launch(void*) { return false; }
-inline void graph_destroy(void*) {}
-inline void upload(void*, const float*, int64_t) {}
 inline void sync_to_host(void*, bool) {}
 
 #endif
