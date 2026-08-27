@@ -22,9 +22,9 @@
 using namespace tl::cpu;
 using namespace tl::cpu::detail;
 
-// Each kernel packs to its own tile (mrt×nrt) — 8×8 for scalar/NEON/AVX2-8×8,
-// 6×16 for AVX2-6×16 — so the harness takes the tile and lays panels out with
-// that stride, exactly as cpu::sgemm's driver does per descriptor.
+// Each kernel packs to its own tile (mrt×nrt) — 8×8 for scalar/NEON, 6×16 for
+// AVX2 — so the harness takes the tile and lays panels out with that stride,
+// exactly as cpu::sgemm's driver does per descriptor.
 static bool test_uk(ukernel_fn uk, int mrt, int nrt, const char* name) {
   std::mt19937 g(123);
   std::uniform_real_distribution<float> d(-1, 1);
@@ -59,14 +59,16 @@ static bool test_uk(ukernel_fn uk, int mrt, int nrt, const char* name) {
 }
 
 int main() {
+  // The scalar kernel is the oracle: always compiled, always callable, and the
+  // one every vector kernel is checked against.
   bool ok = test_uk(&ukernel_scalar, MR, NR, "scalar");
-#ifdef TL_CPU_NEON
-  ok &= test_uk(&ukernel_neon, MR, NR, "neon");
-#endif
-#ifdef TL_CPU_X86
-  ok &= test_uk(&ukernel_avx2, MR, NR, "avx2-8x8");
-  ok &= test_uk(&ukernel_avx2_6x16, 6, 16, "avx2-6x16");
-#endif
+  // Then whatever dispatch ACTUALLY picks here, on its own descriptor. Asking
+  // select_ukernel rather than re-deriving the choice from ISA macros keeps the
+  // harness honest in two ways: it exercises the CPUID gate itself (calling an
+  // AVX2 kernel unguarded would fault on an older CPU rather than test
+  // anything), and a new kernel or a new register tile needs no edit here.
+  const ukernel_desc sel = select_ukernel();
+  ok &= test_uk(sel.fn, sel.mr, sel.nr, "selected");
   std::printf(ok ? "ALL OK\n" : "FAILED\n");
   return ok ? 0 : 1;
 }

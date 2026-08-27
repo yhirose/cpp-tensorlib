@@ -20,8 +20,9 @@
 // granular parallelism — see performance-notes.md); AVX2 microkernel (x86),
 // executed and tuned on the i7-12700KF box (2026-07-03): the 6×16 tile (12
 // ymm accumulators) reaches ~91% of single-P-core AVX2 peak and ~106% of
-// OpenBLAS at 2048³, beating the original 8×8 (kept, `-DTL_CPU_AVX2_8X8`, for
-// A/B). Each kernel packs to its OWN tile — 8×8 for scalar/NEON, 6×16 for
+// OpenBLAS at 2048³, which settled its A/B against the original 8×8 tile (that
+// kernel is gone; see the 6×16 comment for what it was and why it lost).
+// Each kernel packs to its OWN tile — 8×8 for scalar/NEON, 6×16 for
 // AVX2 — carried in the ukernel_desc the driver reads (no longer one shared
 // layout). AVX-512 (also NR=16) reuses the 6×16 pack layout and is deferred;
 // see docs/roadmap.md and docs/performance-notes.md.
@@ -223,65 +224,19 @@ inline void ukernel_neon(int64_t kc, const float* ap, const float* bp,
 #endif  // TL_CPU_NEON
 
 #ifdef TL_CPU_X86
-// AVX2 8×8: NR=8 = one __m256 per row, so 8 accumulators (of 16 ymm). Per
-// k-step: one B load (8 floats) broadcast-multiplied by each of the 8 A
-// values — the x86 analogue of the NEON lane-FMA kernel. K-unrolled ×4 with
-// prefetch, matching NEON. TL_TARGET("avx2,fma") lets this compile and be
-// called from a baseline-x86 TU; select_ukernel guards it behind CPUID.
-// NOTE: this is the correct-and-compile-checked first cut, register-tuned on
-// the x86 box (Rosetta stops at SSE4.2, so it cannot execute on Apple). A
-// wider AVX-512 kernel wants NR=16 (a second packing layout) and is deferred
-// to that box — see docs/roadmap.md.
-TL_TARGET("avx2,fma") inline void ukernel_avx2(
-    int64_t kc, const float* ap, const float* bp, float* c, int64_t ldc,
-    int mr, int nr) {
-  __m256 ab[MR];
-  for (int i = 0; i < MR; i++) ab[i] = _mm256_setzero_ps();
-#define TL_CPU_KSTEP(p)                                          \
-  {                                                              \
-    __m256 b0 = _mm256_loadu_ps(bp + (p)*NR);                    \
-    const float* a = ap + (p)*MR;                                \
-    ab[0] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 0), b0, ab[0]); \
-    ab[1] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 1), b0, ab[1]); \
-    ab[2] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 2), b0, ab[2]); \
-    ab[3] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 3), b0, ab[3]); \
-    ab[4] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 4), b0, ab[4]); \
-    ab[5] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 5), b0, ab[5]); \
-    ab[6] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 6), b0, ab[6]); \
-    ab[7] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 7), b0, ab[7]); \
-  }
-  int64_t p = 0;
-  for (; p + 4 <= kc; p += 4) {
-    TL_PREFETCH(ap + (p + 16) * MR);
-    TL_PREFETCH(bp + (p + 16) * NR);
-    TL_CPU_KSTEP(p);
-    TL_CPU_KSTEP(p + 1);
-    TL_CPU_KSTEP(p + 2);
-    TL_CPU_KSTEP(p + 3);
-  }
-  for (; p < kc; p++) TL_CPU_KSTEP(p);
-#undef TL_CPU_KSTEP
-  if (mr == MR && nr == NR) {
-    for (int i = 0; i < MR; i++)
-      _mm256_storeu_ps(c + i * ldc,
-                       _mm256_add_ps(_mm256_loadu_ps(c + i * ldc), ab[i]));
-  } else {
-    float tmp[MR][NR];
-    for (int i = 0; i < MR; i++) _mm256_storeu_ps(tmp[i], ab[i]);
-    for (int i = 0; i < mr; i++)
-      for (int j = 0; j < nr; j++) c[i * ldc + j] += tmp[i][j];
-  }
-}
-
 // AVX2 6×16: 6 rows × 2 ymm columns = 12 accumulators, the canonical Haswell+
 // register blocking (BLIS/OpenBLAS haswell use it). Per k-step: two B loads
 // (16 floats) each FMA'd against a broadcast of the 6 A values → 12 FMA on 12
 // accumulators, using 12 + 2(B) + 1(broadcast) = 15 of the 16 ymm registers.
-// The 8×8 kernel above uses only 8 accumulators (half the file), so it reloads
-// B relative to compute; 6×16 raises in-register reuse — the reason it is the
-// standard AVX2 GEMM tile. Packs to MR=6/NR=16 (a distinct layout from the
-// 8×8 kernels; the driver picks it via the descriptor). K-unrolled ×4 with
-// prefetch, mirroring the 8×8 kernel. TL_TARGET("avx2,fma") + CPUID-guarded.
+// The first cut was an 8×8 tile (the direct x86 analogue of the NEON lane-FMA
+// kernel): only 8 accumulators, half the register file, so it reloaded B
+// relative to compute. 6×16 raises in-register reuse — the reason it is the
+// standard AVX2 GEMM tile — and measured ~1.2x it on the i7-12700KF, so the
+// A/B ended there and only this kernel remains. Packs to MR=6/NR=16, a layout
+// distinct from the 8×8 scalar/NEON one; the driver picks it via the
+// descriptor. K-unrolled ×4 with prefetch, like the NEON kernel.
+// TL_TARGET("avx2,fma") lets it compile in a baseline-x86 TU and be reached
+// only after select_ukernel's CPUID check.
 TL_TARGET("avx2,fma") inline void ukernel_avx2_6x16(
     int64_t kc, const float* ap, const float* bp, float* c, int64_t ldc,
     int mr, int nr) {
@@ -372,13 +327,7 @@ inline ukernel_desc select_ukernel() {
 #if defined(TL_CPU_NEON)
   return {&ukernel_neon, MR, NR};
 #elif defined(TL_CPU_X86)
-  if (cpu_has_avx2_fma()) {
-#ifdef TL_CPU_AVX2_8X8
-    return {&ukernel_avx2, MR, NR};  // A/B: the original 8×8 tile
-#else
-    return {&ukernel_avx2_6x16, 6, 16};  // default: 6×16 register blocking
-#endif
-  }
+  if (cpu_has_avx2_fma()) return {&ukernel_avx2_6x16, 6, 16};
   return {&ukernel_scalar, MR, NR};
 #else
   return {&ukernel_scalar, MR, NR};
