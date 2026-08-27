@@ -185,6 +185,62 @@ struct node {
 
 using node_ptr = std::shared_ptr<node>;
 
+// The scalar math of each elementwise op, written ONCE — every site that has to
+// compute one of these on the CPU (the eager-tiny builder, the tiny-tensor fast
+// path, eval_one's fallback) names the functor from here, so no two can drift.
+// Comparisons yield F32 masks (1.0 / 0.0). `affine` is deliberately absent: it
+// is the epilogue carrier (scale/offset), not a fixed scalar function.
+inline constexpr auto ew_pow = [](float x, float y) { return std::pow(x, y); };
+inline constexpr auto ew_gt = [](float x, float y) { return x > y ? 1.0f : 0.0f; };
+inline constexpr auto ew_lt = [](float x, float y) { return x < y ? 1.0f : 0.0f; };
+inline constexpr auto ew_ge = [](float x, float y) { return x >= y ? 1.0f : 0.0f; };
+inline constexpr auto ew_le = [](float x, float y) { return x <= y ? 1.0f : 0.0f; };
+inline constexpr auto ew_eq = [](float x, float y) { return x == y ? 1.0f : 0.0f; };
+inline constexpr auto ew_ne = [](float x, float y) { return x != y ? 1.0f : 0.0f; };
+inline constexpr auto ew_recip = [](float x) { return 1.0f / x; };
+inline constexpr auto ew_exp = [](float x) { return std::exp(x); };
+inline constexpr auto ew_log = [](float x) { return std::log(x); };
+inline constexpr auto ew_sqrt = [](float x) { return std::sqrt(x); };
+inline constexpr auto ew_sigmoid = [](float x) { return 1.0f / (1.0f + std::exp(-x)); };
+inline constexpr auto ew_relu = [](float x) { return x > 0 ? x : 0.0f; };
+
+// Dispatch helper for the sites that write their result into an EXISTING array
+// (they pay nothing for the callback, unlike the eager builders — see
+// graph::binary). Calls f(functor) for a matching op and returns true; false for
+// anything else, so the caller can fall through to its own path.
+template <typename F>
+bool visit_binary_op(node::op_t op, F&& f) {
+  using op_t = node::op_t;
+  switch (op) {
+    case op_t::add: f(std::plus<float>()); return true;
+    case op_t::sub: f(std::minus<float>()); return true;
+    case op_t::mul: f(std::multiplies<float>()); return true;
+    case op_t::div: f(std::divides<float>()); return true;
+    case op_t::pow_: f(ew_pow); return true;
+    case op_t::gt: f(ew_gt); return true;
+    case op_t::lt: f(ew_lt); return true;
+    case op_t::ge: f(ew_ge); return true;
+    case op_t::le: f(ew_le); return true;
+    case op_t::eq: f(ew_eq); return true;
+    case op_t::ne: f(ew_ne); return true;
+    default: return false;
+  }
+}
+
+template <typename F>
+bool visit_unary_op(node::op_t op, F&& f) {
+  using op_t = node::op_t;
+  switch (op) {
+    case op_t::recip: f(ew_recip); return true;
+    case op_t::exp_: f(ew_exp); return true;
+    case op_t::log_: f(ew_log); return true;
+    case op_t::sqrt_: f(ew_sqrt); return true;
+    case op_t::sigmoid: f(ew_sigmoid); return true;
+    case op_t::relu: f(ew_relu); return true;
+    default: return false;
+  }
+}
+
 struct graph;
 
 // Evaluation hook (TL_RUNTIME_HOOKS; see storage.h). Installed alongside
@@ -1049,6 +1105,27 @@ inline array sum_to(const array& a, const shape_t& target) {
 // no platform conditionals. Graduates to its own header alongside the Metal
 // backend (M3b).
 
+namespace detail {
+
+// Classify a 2-d operand's layout for the GEMM loaders: row-major contiguous
+// rows -> (trans=false, ld=row stride); its transpose -> (trans=true, ld=col
+// stride). nullopt = not GEMM-mappable (needs materialization; the caller falls
+// back to ref::). Shared by accel::gemm (CBLAS) and graph::gpu_gemm — reading
+// the same test twice is how the two would drift.
+struct gemm_layout {
+  bool trans;
+  int64_t ld;
+};
+inline std::optional<gemm_layout> gemm_classify_(const array& x) {
+  int64_t r = x.shape()[0], c = x.shape()[1];
+  int64_t s0 = x.strides()[0], s1 = x.strides()[1];
+  if (s1 == 1 && s0 >= std::max<int64_t>(c, 1)) return gemm_layout{false, s0};
+  if (s0 == 1 && s1 >= std::max<int64_t>(r, 1)) return gemm_layout{true, s1};
+  return std::nullopt;
+}
+
+}  // namespace detail
+
 namespace accel {
 
 inline bool enabled_() {
@@ -1136,20 +1213,9 @@ inline std::optional<array> affine(const array& a, float s, float o) {
 inline bool gemm(const array& a, const array& b, array& out, float alpha) {
 #ifdef __APPLE__
   if (!enabled_()) return false;
-  struct layout { CBLAS_TRANSPOSE trans; int ld; };
-  auto classify = [](const array& x) -> std::optional<layout> {
-    int64_t r = x.shape()[0], c = x.shape()[1];
-    int64_t s0 = x.strides()[0], s1 = x.strides()[1];
-    if (s1 == 1 && s0 >= std::max<int64_t>(c, 1)) {
-      return layout{CblasNoTrans, static_cast<int>(s0)};
-    }
-    if (s0 == 1 && s1 >= std::max<int64_t>(r, 1)) {
-      return layout{CblasTrans, static_cast<int>(s1)};
-    }
-    return std::nullopt;
-  };
-  auto la = classify(a), lb = classify(b);
+  auto la = detail::gemm_classify_(a), lb = detail::gemm_classify_(b);
   if (!la || !lb) return false;
+  auto cb = [](bool t) { return t ? CblasTrans : CblasNoTrans; };
   int64_t m = a.shape()[0], k = a.shape()[1], n = b.shape()[1];
   if (m == 0 || n == 0) return true;  // out has no elements
   if (k == 0) {
@@ -1157,10 +1223,10 @@ inline bool gemm(const array& a, const array& b, array& out, float alpha) {
     for (int64_t i = 0; i < m * n; i++) po[i] = 0.0f;
     return true;
   }
-  cblas_sgemm(CblasRowMajor, la->trans, lb->trans, static_cast<int>(m),
+  cblas_sgemm(CblasRowMajor, cb(la->trans), cb(lb->trans), static_cast<int>(m),
               static_cast<int>(n), static_cast<int>(k), alpha, a.raw(),
-              la->ld, b.raw(), lb->ld, 0.0f, out.data(),
-              static_cast<int>(n));
+              static_cast<int>(la->ld), b.raw(), static_cast<int>(lb->ld), 0.0f,
+              out.data(), static_cast<int>(n));
   return true;
 #else
   (void)a; (void)b; (void)out; (void)alpha;
@@ -1233,34 +1299,25 @@ struct graph {
   static array binary(op_t op, const array& a, const array& b) {
     if (a.shape() == b.shape() && num_elements(a.shape()) <= kEagerTiny &&
         eager_operand_(a) && eager_operand_(b) && eager_cpu_ok_()) {
+      // A direct switch, NOT visit_binary_op: the visitor's callback returns
+      // void, so the result has to land in a named `array` and be moved out,
+      // which measures ~7% on this path (16-element operands) — and per-op
+      // allocation count is exactly what the eager-tiny path exists to save.
+      // The visitor is used at the sites that assign into an existing result.
       switch (op) {
         case op_t::add: return map_binary(a, b, std::plus<float>());
         case op_t::sub: return map_binary(a, b, std::minus<float>());
         case op_t::mul: return map_binary(a, b, std::multiplies<float>());
         case op_t::div: return map_binary(a, b, std::divides<float>());
         case op_t::pow_:
-          return map_binary(a, b,
-                            [](float x, float y) { return std::pow(x, y); });
-        case op_t::gt:
-          return map_binary(
-              a, b, [](float x, float y) { return x > y ? 1.0f : 0.0f; });
-        case op_t::lt:
-          return map_binary(
-              a, b, [](float x, float y) { return x < y ? 1.0f : 0.0f; });
-        case op_t::ge:
-          return map_binary(
-              a, b, [](float x, float y) { return x >= y ? 1.0f : 0.0f; });
-        case op_t::le:
-          return map_binary(
-              a, b, [](float x, float y) { return x <= y ? 1.0f : 0.0f; });
-        case op_t::eq:
-          return map_binary(
-              a, b, [](float x, float y) { return x == y ? 1.0f : 0.0f; });
-        case op_t::ne:
-          return map_binary(
-              a, b, [](float x, float y) { return x != y ? 1.0f : 0.0f; });
-        default:
-          break;  // not an elementwise binary — fall through to lazy
+          return map_binary(a, b, ew_pow);
+        case op_t::gt: return map_binary(a, b, ew_gt);
+        case op_t::lt: return map_binary(a, b, ew_lt);
+        case op_t::ge: return map_binary(a, b, ew_ge);
+        case op_t::le: return map_binary(a, b, ew_le);
+        case op_t::eq: return map_binary(a, b, ew_eq);
+        case op_t::ne: return map_binary(a, b, ew_ne);
+        default: break;  // not an elementwise binary — fall through to lazy
       }
     }
     auto n = std::make_shared<node>();
@@ -1273,22 +1330,14 @@ struct graph {
   static array unary(op_t op, const array& a) {
     if (num_elements(a.shape()) <= kEagerTiny && eager_operand_(a) &&
         eager_cpu_ok_()) {
-      switch (op) {
-        case op_t::recip:
-          return map_unary(a, [](float x) { return 1.0f / x; });
-        case op_t::exp_:
-          return map_unary(a, [](float x) { return std::exp(x); });
-        case op_t::log_:
-          return map_unary(a, [](float x) { return std::log(x); });
-        case op_t::sqrt_:
-          return map_unary(a, [](float x) { return std::sqrt(x); });
-        case op_t::sigmoid:
-          return map_unary(
-              a, [](float x) { return 1.0f / (1.0f + std::exp(-x)); });
-        case op_t::relu:
-          return map_unary(a, [](float x) { return x > 0 ? x : 0.0f; });
-        default:
-          break;  // softmax etc. — fall through to lazy
+      switch (op) {  // direct switch, see graph::binary
+        case op_t::recip: return map_unary(a, ew_recip);
+        case op_t::exp_: return map_unary(a, ew_exp);
+        case op_t::log_: return map_unary(a, ew_log);
+        case op_t::sqrt_: return map_unary(a, ew_sqrt);
+        case op_t::sigmoid: return map_unary(a, ew_sigmoid);
+        case op_t::relu: return map_unary(a, ew_relu);
+        default: break;  // softmax / affine etc. — fall through to lazy
       }
     }
     auto n = std::make_shared<node>();
@@ -1438,7 +1487,10 @@ struct graph {
     return n >= auto_threshold_(kc);
   }
 
-  static gpu::kop to_kop_(op_t op) {
+  // The GPU kernel for an op, or nullopt when the backend has none (masks,
+  // recip). nullopt is the honest answer: an "affine" fallback here would run
+  // the identity kernel and silently return the input.
+  static std::optional<gpu::kop> to_kop_(op_t op) {
     switch (op) {
       case op_t::add: return gpu::kop::add;
       case op_t::sub: return gpu::kop::sub;
@@ -1450,7 +1502,7 @@ struct graph {
       case op_t::sqrt_: return gpu::kop::sqrt_;
       case op_t::sigmoid: return gpu::kop::sigmoid;
       case op_t::relu: return gpu::kop::relu;
-      default: return gpu::kop::affine;
+      default: return std::nullopt;
     }
   }
 
@@ -1473,11 +1525,12 @@ struct graph {
       return std::nullopt;
     }
     if (!a.storage_.native || !b.storage_.native) return std::nullopt;
-    if (a.contiguous() && b.contiguous() && a.shape() == b.shape()) {
+    auto k = to_kop_(n.op);
+    if (k && a.contiguous() && b.contiguous() && a.shape() == b.shape()) {
       auto out = array::empty(n.shape);
       if (out.size() == 0) return out;
       if (!out.storage_.native) return std::nullopt;
-      if (!gpu::binary(to_kop_(n.op), a.storage_.native, a.offset_ * 4,
+      if (!gpu::binary(*k, a.storage_.native, a.offset_ * 4,
                          b.storage_.native, b.offset_ * 4, out.storage_.native,
                          out.offset_ * 4, out.size(), n.scale, n.offset)) {
         return std::nullopt;
@@ -1490,14 +1543,14 @@ struct graph {
     if (n.shape.size() != 2 || !a.contiguous() || !b.contiguous()) {
       return std::nullopt;
     }
-    auto k = to_bcast_kop_(n.op);
-    if (!k) return std::nullopt;
+    auto bk = to_bcast_kop_(n.op);
+    if (!bk) return std::nullopt;
     auto ra = broadcast_strides(a.shape(), a.strides(), n.shape);
     auto rb = broadcast_strides(b.shape(), b.strides(), n.shape);
     auto out = array::empty(n.shape);
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
-    if (!gpu::binary_bcast(*k, a.storage_.native, a.offset_ * 4, ra[0], ra[1],
+    if (!gpu::binary_bcast(*bk, a.storage_.native, a.offset_ * 4, ra[0], ra[1],
                            b.storage_.native, b.offset_ * 4, rb[0], rb[1],
                            out.storage_.native, out.offset_ * 4, n.shape[0],
                            n.shape[1], n.scale, n.offset)) {
@@ -1530,19 +1583,6 @@ struct graph {
     return true;
   }
 
-  // Classify a 2-d operand's layout for the GEMM loaders: row-major
-  // contiguous rows → (trans=false, ld=row stride); its transpose →
-  // (trans=true, ld=col stride). Same test as accel::gemm. nullopt = not
-  // GEMM-mappable (needs materialization, handled by falling to ref/accel).
-  struct gemm_layout { bool trans; int64_t ld; };
-  static std::optional<gemm_layout> gemm_classify_(const array& x) {
-    int64_t r = x.shape()[0], c = x.shape()[1];
-    int64_t s0 = x.strides()[0], s1 = x.strides()[1];
-    if (s1 == 1 && s0 >= std::max<int64_t>(c, 1)) return gemm_layout{false, s0};
-    if (s0 == 1 && s1 >= std::max<int64_t>(r, 1)) return gemm_layout{true, s1};
-    return std::nullopt;
-  }
-
   static std::optional<array> gpu_gemm(const node& n, const array& a_in,
                                          const array& b_in) {
     int64_t k_dim = a_in.shape().back();
@@ -1568,33 +1608,43 @@ struct graph {
     return out.reshape(n.shape);
   }
 
+  // The decode-shape gate the three weight dtypes share: the activation must be
+  // a materialized, GPU-resident, contiguous [1,K] F32 row, and the op must be
+  // GPU-eligible at N·K. Returns the promoted [1,K] activation, or nullopt when
+  // this isn't a decode GEMV (the caller then falls through to the GEMM path).
+  static std::optional<array> gemv_act_(const array& a_in, int64_t K,
+                                        int64_t N) {
+    array a = a_in.rank() == 1 ? a_in.reshape({1, a_in.size()}) : a_in;
+    if (a.storage_.dt != tl::dtype::f32 || a.rank() != 2 || a.shape()[0] != 1)
+      return std::nullopt;
+    if (!gpu_mode_(N * (K > 0 ? K : 1), kernel_class::matmul))
+      return std::nullopt;
+    if (!a.contiguous() || a.offset_ != 0 || !a.storage_.native)
+      return std::nullopt;
+    return a;
+  }
+
   // M7 decode GEMV: a(1,K)f32 @ B(K,N) -> (1,N)f32, B either f32 or bf16
   // weights. bf16 is the one op consuming bf16 storage natively; the f32
   // variant matters too — the 128×128-tile gemm wastes 127 rows at M=1, the
   // GEMV is the right kernel for decode on both dtypes (CUDA; Metal returns
-  // false). Gated to the exact decode shape — batch row 1, contiguous
-  // zero-offset operands. The kernel has no epilogue; scale/offset apply in
-  // the generic tail (identity on the plain a.dot(W) decode path).
+  // false). The kernel has no epilogue; scale/offset apply in the generic tail
+  // (identity on the plain a.dot(W) decode path).
   static std::optional<array> gpu_gemv(const node& n, const array& a_in,
                                        const array& b) {
     if (b.rank() != 2) return std::nullopt;
     const bool bf16 = b.storage_.dt == tl::dtype::bf16;
     if (!bf16 && b.storage_.dt != tl::dtype::f32) return std::nullopt;
-    array a = a_in.rank() == 1 ? a_in.reshape({1, a_in.size()}) : a_in;
-    if (a.storage_.dt != tl::dtype::f32 || a.rank() != 2 || a.shape()[0] != 1)
+    int64_t k = b.shape()[0], nn = b.shape()[1];  // b is [K,N] (dot checked it)
+    auto a = gemv_act_(a_in, k, nn);
+    if (!a || !b.contiguous() || b.offset_ != 0 || !b.storage_.native)
       return std::nullopt;
-    int64_t k = a.shape()[1], nn = b.shape()[1];
-    if (!gpu_mode_(nn * (k > 0 ? k : 1), kernel_class::matmul))
-      return std::nullopt;
-    if (!a.contiguous() || a.offset_ != 0 || !b.contiguous() || b.offset_ != 0)
-      return std::nullopt;
-    if (!a.storage_.native || !b.storage_.native) return std::nullopt;
     array out = array::empty({int64_t{1}, nn});
     if (!out.storage_.native) return std::nullopt;
     if (nn == 0) return out.reshape(n.shape);
-    bool ok = bf16 ? gpu::gemv_bf16(a.storage_.native, b.storage_.native,
+    bool ok = bf16 ? gpu::gemv_bf16(a->storage_.native, b.storage_.native,
                                     out.storage_.native, nn, k)
-                   : gpu::gemv_f32(a.storage_.native, b.storage_.native,
+                   : gpu::gemv_f32(a->storage_.native, b.storage_.native,
                                    out.storage_.native, nn, k);
     if (!ok) return std::nullopt;
     return out.reshape(n.shape);
@@ -1607,20 +1657,17 @@ struct graph {
   static std::optional<array> gpu_gemv_q4(const node& n, const array& a_in,
                                           const array& Wq) {
     if (Wq.storage_.dt != tl::dtype::q4 || Wq.rank() != 2) return std::nullopt;
-    array a = a_in.rank() == 1 ? a_in.reshape({1, a_in.size()}) : a_in;
-    if (a.storage_.dt != tl::dtype::f32 || a.rank() != 2 || a.shape()[0] != 1)
-      return std::nullopt;
     int64_t K = Wq.shape()[0], N = Wq.shape()[1];  // logical [K,N]
-    if (!gpu_mode_(N * (K > 0 ? K : 1), kernel_class::matmul))
-      return std::nullopt;
-    if (!a.contiguous() || a.offset_ != 0 || Wq.offset_ != 0) return std::nullopt;
-    if (!a.storage_.native || !Wq.storage_.native) return std::nullopt;
+    auto a = gemv_act_(a_in, K, N);
+    // No contiguity test on Wq: q4 bytes aren't elems×width, so its strides are
+    // nominal — the zero offset is what says the packed buffer starts at base.
+    if (!a || Wq.offset_ != 0 || !Wq.storage_.native) return std::nullopt;
     array out = array::empty({int64_t{1}, N});
     if (!out.storage_.native) return std::nullopt;
     if (N == 0) return out.reshape(n.shape);
     void* scales = reinterpret_cast<void*>(
         reinterpret_cast<char*>(Wq.storage_.native) + N * K / 2);
-    if (!gpu::gemv_q4(a.storage_.native, Wq.storage_.native, scales,
+    if (!gpu::gemv_q4(a->storage_.native, Wq.storage_.native, scales,
                       out.storage_.native, N, K, tl::kQ4Group)) {
       return std::nullopt;
     }
@@ -1733,11 +1780,12 @@ struct graph {
     return out;
   }
 
-  // Row op over the last axis of a contiguous input. `out_cols` is cols for
-  // softmax (rows×cols out) or 1 for reductions (rows out).
+  // Row op over the last axis of a contiguous input. `out_shape` is the input
+  // shape for softmax (rows×cols out) or the reduced shape for row_sum/row_max
+  // (one value per row) — the kop already says which, so nothing more is needed.
   static std::optional<array> gpu_row(gpu::kop k, const array& a,
-                                        shape_t out_shape, bool reduce,
-                                        float scale, float offset) {
+                                      shape_t out_shape, float scale,
+                                      float offset) {
     if (!gpu_mode_(a.size(), kernel_class::reduction) || !a.contiguous() ||
         a.rank() == 0) {
       return std::nullopt;
@@ -1752,12 +1800,13 @@ struct graph {
                        out.offset_ * 4, rows, cols, scale, offset)) {
       return std::nullopt;
     }
-    (void)reduce;
     return out;
   }
 
-  static std::optional<array> gpu_unary(gpu::kop k, const array& a,
-                                          float scale, float offset) {
+  static std::optional<array> gpu_unary(std::optional<gpu::kop> k,
+                                        const array& a, float scale,
+                                        float offset) {
+    if (!k) return std::nullopt;  // no kernel for this op on this backend
     if (!gpu_mode_(a.size(), kernel_class::elementwise) || !a.contiguous()) {
       return std::nullopt;
     }
@@ -1765,7 +1814,7 @@ struct graph {
     auto out = array::empty(a.shape());
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
-    if (!gpu::unary(k, a.storage_.native, a.offset_ * 4, out.storage_.native,
+    if (!gpu::unary(*k, a.storage_.native, a.offset_ * 4, out.storage_.native,
                       out.offset_ * 4, out.size(), scale, offset)) {
       return std::nullopt;
     }
@@ -1881,7 +1930,6 @@ struct graph {
         for (int64_t i = 0; i < numel; i++) po[i] = f(pa[i]);
       }
       store_raw_(n, std::move(out));
-      return true;
     };
 
     switch (n.op) {
@@ -1889,7 +1937,13 @@ struct graph {
       case op_t::sub:
       case op_t::mul:
       case op_t::div:
-      case op_t::pow_: {
+      case op_t::pow_:
+      case op_t::gt:  // masks too: same same-shape contiguous flat loop
+      case op_t::lt:
+      case op_t::ge:
+      case op_t::le:
+      case op_t::eq:
+      case op_t::ne: {
         const node& b = *n.inputs[1];
         if (b.shape != n.shape || !node_contig_(b)) return false;
         const float* pb = b.stor.data() + b.soffset;
@@ -1903,35 +1957,14 @@ struct graph {
             for (int64_t i = 0; i < numel; i++) po[i] = f(pa[i], pb[i]);
           }
           store_raw_(n, std::move(out));
-          return true;
         };
-        switch (n.op) {
-          case op_t::add: return binary_loop(std::plus<float>());
-          case op_t::sub: return binary_loop(std::minus<float>());
-          case op_t::mul: return binary_loop(std::multiplies<float>());
-          case op_t::div: return binary_loop(std::divides<float>());
-          default:
-            return binary_loop(
-                [](float x, float y) { return std::pow(x, y); });
-        }
+        return visit_binary_op(n.op, binary_loop);
       }
-      case op_t::affine:
-        return unary_loop([](float x) { return x; });
-      case op_t::recip:
-        return unary_loop([](float x) { return 1.0f / x; });
-      case op_t::exp_:
-        return unary_loop([](float x) { return std::exp(x); });
-      case op_t::log_:
-        return unary_loop([](float x) { return std::log(x); });
-      case op_t::sqrt_:
-        return unary_loop([](float x) { return std::sqrt(x); });
-      case op_t::sigmoid:
-        return unary_loop(
-            [](float x) { return 1.0f / (1.0f + std::exp(-x)); });
-      case op_t::relu:
-        return unary_loop([](float x) { return x > 0 ? x : 0.0f; });
-      default:
-        return false;
+      case op_t::affine:  // the epilogue IS the op here (identity f)
+        unary_loop([](float x) { return x; });
+        return true;
+      default:  // unary ops the table knows; everything else declines
+        return visit_unary_op(n.op, unary_loop);
     }
   }
 
@@ -1990,59 +2023,29 @@ struct graph {
       case op_t::add:
       case op_t::sub:
       case op_t::mul:
-      case op_t::div: {
+      case op_t::div:
+      case op_t::pow_:
+      case op_t::gt:   // comparisons yield F32 masks
+      case op_t::lt:
+      case op_t::ge:
+      case op_t::le:
+      case op_t::eq:
+      case op_t::ne: {
+        // ONE chain for every elementwise binary: each stage declines the ops it
+        // has no kernel for (gpu_binary via to_kop_, accel::binary via its own
+        // switch), so pow_ and the masks fall through to the CPU table without
+        // needing an arm of their own.
         auto a = in(0), b = in(1);
         if (auto g = gpu_binary(n, a, b)) {
           r = std::move(*g);
           epi_done = true;  // kernels apply the epilogue in the store
         } else if (auto o = accel::binary(n.op, a, b)) {
           r = std::move(*o);
-        } else if (n.op == op_t::add) {
-          r = map_binary(a, b, std::plus<float>());
-        } else if (n.op == op_t::sub) {
-          r = map_binary(a, b, std::minus<float>());
-        } else if (n.op == op_t::mul) {
-          r = map_binary(a, b, std::multiplies<float>());
         } else {
-          r = map_binary(a, b, std::divides<float>());
+          visit_binary_op(n.op, [&](auto f) { r = map_binary(a, b, f); });
         }
         break;
       }
-      case op_t::pow_: {
-        auto a = in(0), b = in(1);
-        if (auto g = gpu_binary(n, a, b)) {
-          r = std::move(*g);
-          epi_done = true;  // kernel applies the epilogue in the store
-        } else {
-          r = map_binary(a, b,
-                         [](float x, float y) { return std::pow(x, y); });
-        }
-        break;
-      }
-      case op_t::gt:
-        r = map_binary(in(0), in(1),
-                       [](float x, float y) { return x > y ? 1.0f : 0.0f; });
-        break;
-      case op_t::lt:
-        r = map_binary(in(0), in(1),
-                       [](float x, float y) { return x < y ? 1.0f : 0.0f; });
-        break;
-      case op_t::ge:
-        r = map_binary(in(0), in(1),
-                       [](float x, float y) { return x >= y ? 1.0f : 0.0f; });
-        break;
-      case op_t::le:
-        r = map_binary(in(0), in(1),
-                       [](float x, float y) { return x <= y ? 1.0f : 0.0f; });
-        break;
-      case op_t::eq:
-        r = map_binary(in(0), in(1),
-                       [](float x, float y) { return x == y ? 1.0f : 0.0f; });
-        break;
-      case op_t::ne:
-        r = map_binary(in(0), in(1),
-                       [](float x, float y) { return x != y ? 1.0f : 0.0f; });
-        break;
       case op_t::where_:
         r = map_ternary(in(0), in(1), in(2), [](float c, float x, float y) {
           return c != 0.0f ? x : y;
@@ -2062,44 +2065,27 @@ struct graph {
         break;
       }
       case op_t::recip:
-        r = map_unary(in(0), [](float x) { return 1.0f / x; });
-        break;
       case op_t::exp_:
       case op_t::log_:
       case op_t::sqrt_:
-      case op_t::relu: {
+      case op_t::relu:
+      case op_t::sigmoid: {
+        // Same one-chain shape as the binary arm above: recip has no kernel on
+        // any backend and sigmoid none in accel, and both stages say so.
         auto a = in(0);
         if (auto g = gpu_unary(to_kop_(n.op), a, n.scale, n.offset)) {
           r = std::move(*g);
           epi_done = true;
         } else if (auto o = accel::unary(n.op, a)) {
           r = std::move(*o);
-        } else if (n.op == op_t::exp_) {
-          r = map_unary(a, [](float x) { return std::exp(x); });
-        } else if (n.op == op_t::log_) {
-          r = map_unary(a, [](float x) { return std::log(x); });
-        } else if (n.op == op_t::sqrt_) {
-          r = map_unary(a, [](float x) { return std::sqrt(x); });
         } else {
-          r = map_unary(a, [](float x) { return x > 0 ? x : 0.0f; });
-        }
-        break;
-      }
-      case op_t::sigmoid: {
-        auto a = in(0);
-        if (auto g = gpu_unary(gpu::kop::sigmoid, a, n.scale, n.offset)) {
-          r = std::move(*g);
-          epi_done = true;
-        } else {
-          r = map_unary(a,
-                        [](float x) { return 1.0f / (1.0f + std::exp(-x)); });
+          visit_unary_op(n.op, [&](auto f) { r = map_unary(a, f); });
         }
         break;
       }
       case op_t::softmax: {
         auto a = in(0);
-        if (auto g = gpu_row(gpu::kop::softmax, a, a.shape(), false, 1.0f,
-                               0.0f)) {
+        if (auto g = gpu_row(gpu::kop::softmax, a, a.shape(), 1.0f, 0.0f)) {
           r = std::move(*g);
         } else {
           r = ref::softmax(a);
@@ -2165,7 +2151,7 @@ struct graph {
         gpu::kop k =
             n.op == op_t::sum_ax ? gpu::kop::row_sum : gpu::kop::row_max;
         if (n.axis == static_cast<int>(a.rank()) - 1) {
-          if (auto g = gpu_row(k, a, n.shape, true, n.scale, n.offset)) {
+          if (auto g = gpu_row(k, a, n.shape, n.scale, n.offset)) {
             r = std::move(*g);
             epi_done = true;
             break;
@@ -2183,8 +2169,8 @@ struct graph {
         if (n.axis == static_cast<int>(a.rank()) - 1 &&
             a.shape().back() > 0) {
           float inv = 1.0f / static_cast<float>(a.shape().back());
-          if (auto g = gpu_row(gpu::kop::row_sum, a, n.shape, true,
-                               n.scale * inv, n.offset)) {
+          if (auto g = gpu_row(gpu::kop::row_sum, a, n.shape, n.scale * inv,
+                               n.offset)) {
             r = std::move(*g);
             epi_done = true;
             break;

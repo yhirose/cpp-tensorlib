@@ -66,84 +66,78 @@ inline const gg::tensor_info* need(const gg::model& m, const std::string& n) {
   return t;
 }
 
-// F16 weight, GGML physical [out,in] (ne dims [in,out]) -> array logical
-// [in,out] = [K,N] (our dot's expected layout): out[i*out+o] = f16(raw[o*in+i]).
-// wdt selects the storage dtype: f32 (exact, ~2GB total → WSL2 cliff) or bf16
-// (~1GB, stays under the cliff; the decode GEMV consumes bf16 weights natively).
-inline array load_w_T(const gg::model& m, const std::string& n, int64_t in,
-                      int64_t out, tl::dtype wdt = tl::dtype::f32);
-
-// Column-concatenated fused weight: load several GGML [out,in] tensors that
-// share the same `in` (K) and stack them along the output (N) axis into one
-// [in, Ntot] = [K, Ntot] array, so a single decode GEMV produces all their
-// outputs contiguously (q|k|v or gate|up). Column block b occupies
-// [col_base, col_base+out_b); v[i*Ntot + col_base+o] = f16(raw_b[o*in+i]).
-// Bit-identical per column to loading each separately (same widen, same layout),
-// so the fused GEMV's per-column result matches the separate GEMVs — the M9
-// decode fusion (fewer kernels → amortize the ~14us per-launch floor). Imperative
-// path only; the array path keeps the separate loads as the numeric oracle.
-inline array load_w_T_cat(const gg::model& m,
-                          const std::vector<std::pair<std::string, int64_t>>& parts,
-                          int64_t in, tl::dtype wdt = tl::dtype::f32) {
+// Fused weight load: widen several GGML [out,in] F16 tensors that share the same
+// `in` (K) and stack them into ONE array, so a single GEMV/GEMM produces all
+// their outputs contiguously (q|k|v or gate|up). Block b occupies output slots
+// [base, base+out_b), and the fused output [Ntot] is q|k|v (or gate|up) laid end
+// to end whichever layout is used — the downstream slices never change. Fusing
+// is the M9 decode lever: fewer kernels amortize the ~14us per-launch floor.
+// Imperative path only; the array path keeps the separate loads as its oracle.
+//
+// `row` picks the destination layout, which is the ONLY difference between the
+// two forms — one place to read, so they cannot drift:
+//   false: [in, Ntot] = [K,N] column-major, what the split-K GEMV and .dot()
+//          expect. Bit-identical per column to loading each part separately
+//          (same widen, same layout).
+//   true:  [Ntot, in] = [N,K] row-major = GGML's own layout, so this drops the
+//          transpose entirely — the warp-per-row GEMV (lever A) and the prefill
+//          GEMM both read it. Its reduction order differs from split-K, so it is
+//          greedy-equivalent to the array oracle, not bit-identical.
+inline array load_w_cat_(const gg::model& m,
+                         const std::vector<std::pair<std::string, int64_t>>& parts,
+                         int64_t in, tl::dtype wdt, bool row) {
   int64_t Ntot = 0;
   for (const auto& p : parts) Ntot += p.second;
   std::vector<float> v((size_t)in * Ntot);
-  int64_t col_base = 0;
+  int64_t base = 0;
   for (const auto& p : parts) {
-    const auto* t = need(m, p.first);
-    const auto* raw = reinterpret_cast<const uint16_t*>(t->data);
+    const auto* raw = reinterpret_cast<const uint16_t*>(need(m, p.first)->data);
     const int64_t out = p.second;
-    for (int64_t o = 0; o < out; o++)
-      for (int64_t i = 0; i < in; i++)
-        v[(size_t)i * Ntot + (col_base + o)] = f16_to_f32(raw[(size_t)o * in + i]);
-    col_base += out;
+    // Split on the layout OUTSIDE the element loops: this runs over every weight
+    // byte in the model, so the destination index must stay branch-free.
+    if (row) {
+      for (int64_t o = 0; o < out; o++)
+        for (int64_t i = 0; i < in; i++)
+          v[(size_t)(base + o) * in + i] = f16_to_f32(raw[(size_t)o * in + i]);
+    } else {
+      for (int64_t o = 0; o < out; o++)
+        for (int64_t i = 0; i < in; i++)
+          v[(size_t)i * Ntot + (base + o)] = f16_to_f32(raw[(size_t)o * in + i]);
+    }
+    base += out;
   }
-  array a = array::from(std::move(v), {in, Ntot});
+  array a = array::from(std::move(v),
+                        row ? tl::shape_t{Ntot, in} : tl::shape_t{in, Ntot});
   return wdt == tl::dtype::bf16 ? a.to_bf16() : a;
+}
+
+// The four named entry points: {single, concatenated} x {[K,N], [N,K]}. The
+// [K,N] pair takes the storage dtype — f32 (exact, ~2GB total -> WSL2 cliff) or
+// bf16 (~1GB, stays under it; the decode GEMV consumes bf16 natively). The [N,K]
+// pair does not: row-major weights exist only to feed the warp-per-row GEMV and
+// the prefill GEMM, and both are bf16-only.
+inline array load_w_T_cat(const gg::model& m,
+                          const std::vector<std::pair<std::string, int64_t>>& parts,
+                          int64_t in, tl::dtype wdt) {
+  return load_w_cat_(m, parts, in, wdt, /*row=*/false);
+}
+inline array load_w_T_cat_row(
+    const gg::model& m,
+    const std::vector<std::pair<std::string, int64_t>>& parts, int64_t in) {
+  return load_w_cat_(m, parts, in, tl::dtype::bf16, /*row=*/true);
 }
 inline array load_w_T(const gg::model& m, const std::string& n, int64_t in,
                       int64_t out, tl::dtype wdt) {
-  return load_w_T_cat(m, {{n, out}}, in, wdt);  // the single-part case
-}
-
-// Row-major weight for the warp-per-row decode GEMV (lever A): GGML physical
-// [out,in] widened straight to array [out,in] = [N,K] — NO transpose (K stays
-// contiguous per output row, the layout tl_gemv_bf16_row wants). The imperative
-// bf16 decode path uses this; the array path keeps the [K,N] load_w_T as oracle.
-inline array load_w_T_row(const gg::model& m, const std::string& n, int64_t in,
-                          int64_t out, tl::dtype wdt = tl::dtype::bf16);
-
-// Row-concatenated fused weight for the warp-per-row GEMV: stack several GGML
-// [out,in] tensors that share `in` (K) along the OUTPUT (row) axis into one
-// [Ntot, in] = [N,K] array (q|k|v or gate|up). Row block b occupies rows
-// [row_base, row_base+out_b); the fused GEMV's output [Ntot] is q|k|v (or
-// gate|up) contiguous — same output layout as the separate/column-cat GEMVs, so
-// the downstream slices are unchanged. Reduction order differs from split-K, so
-// it is greedy-equivalent (not bit-identical) to the array oracle.
-inline array load_w_T_cat_row(
-    const gg::model& m,
-    const std::vector<std::pair<std::string, int64_t>>& parts, int64_t in,
-    tl::dtype wdt = tl::dtype::bf16) {
-  int64_t Ntot = 0;
-  for (const auto& p : parts) Ntot += p.second;
-  std::vector<float> v((size_t)Ntot * in);
-  int64_t row_base = 0;
-  for (const auto& p : parts) {
-    const auto* t = need(m, p.first);
-    const auto* raw = reinterpret_cast<const uint16_t*>(t->data);
-    const int64_t out = p.second;
-    for (int64_t o = 0; o < out; o++)
-      for (int64_t i = 0; i < in; i++)
-        v[(size_t)(row_base + o) * in + i] = f16_to_f32(raw[(size_t)o * in + i]);
-    row_base += out;
-  }
-  array a = array::from(std::move(v), {Ntot, in});
-  return wdt == tl::dtype::bf16 ? a.to_bf16() : a;
+  return load_w_T_cat(m, {{n, out}}, in, wdt);
 }
 inline array load_w_T_row(const gg::model& m, const std::string& n, int64_t in,
-                          int64_t out, tl::dtype wdt) {
-  return load_w_T_cat_row(m, {{n, out}}, in, wdt);  // the single-part case
+                          int64_t out) {
+  return load_w_T_cat_row(m, {{n, out}}, in);
 }
+
+// Allocate `n` f32 of device scratch (no host mirror — these buffers are only
+// ever read by kernels). The scratch structs below are lists of these.
+inline void* alloc_f32(int64_t n) { return tl::cuda::alloc(n * 4, nullptr); }
 
 // Slice a device f32 buffer by element offset. The result is a mid-buffer
 // pointer: reads through it are stream-ordered after whatever wrote the base and
@@ -152,12 +146,11 @@ inline void* off_f32(void* p, int64_t nfloats) {
   return static_cast<char*>(p) + nfloats * 4;
 }
 
-// F32 1-D tensor (norms, biases are stored F32 in the GGUF) -> array [1, len].
-inline array load_f32(const gg::model& m, const std::string& n, int64_t len);
-
 // Several F32 1-D tensors laid end to end -> array [1, sum(len)]. The q|k|v
 // biases in that order match the fused QKV projection's column layout, so the
 // batched path adds all of them in one pass over all heads.
+// F32 1-D tensors (norms and biases are stored F32 in the GGUF) -> array
+// [1, sum(len)]; load_f32 below is the single-tensor case.
 inline array load_f32_cat(const gg::model& m,
                           const std::vector<std::pair<std::string, int64_t>>& parts) {
   std::vector<float> v;
@@ -220,22 +213,20 @@ struct Scratch {
   float* logits_host = nullptr;       // host mirror of logitsb (divergence checks)
   void* embedb = nullptr;             // staged embedding row [NE] (capture input)
   float* embed_host = nullptr;        // embedb's own host mirror (gather target)
-  bool ready = false;
   void init() {
-    embedb = tl::cuda::alloc(NE * 4, &embed_host);
-    res[0] = tl::cuda::alloc(NE * 4, nullptr);
-    res[1] = tl::cuda::alloc(NE * 4, nullptr);
-    hb = tl::cuda::alloc(NE * 4, nullptr);
-    h2b = tl::cuda::alloc(NE * 4, nullptr);
-    qb = tl::cuda::alloc(NH * HD * 4, nullptr);
-    qkvb = tl::cuda::alloc((NH + 2 * NKV) * HD * 4, nullptr);
-    ab = tl::cuda::alloc(NH * HD * 4, nullptr);
-    mb = tl::cuda::alloc(FF * 4, nullptr);
-    gub = tl::cuda::alloc(2 * FF * 4, nullptr);
-    mdb = tl::cuda::alloc(NE * 4, nullptr);
+    embedb = tl::cuda::alloc(NE * 4, &embed_host);  // host mirror: gather target
     logitsb = tl::cuda::alloc(VOCAB * 4, &logits_host);
-    logits_scratch = tl::cuda::alloc(VOCAB * 4, nullptr);
-    ready = logitsb != nullptr && logits_scratch != nullptr;
+    res[0] = alloc_f32(NE);
+    res[1] = alloc_f32(NE);
+    hb = alloc_f32(NE);
+    h2b = alloc_f32(NE);
+    qb = alloc_f32(NH * HD);
+    qkvb = alloc_f32((NH + 2 * NKV) * HD);
+    ab = alloc_f32(NH * HD);
+    mb = alloc_f32(FF);
+    gub = alloc_f32(2 * FF);
+    mdb = alloc_f32(NE);
+    logits_scratch = alloc_f32(VOCAB);
   }
 };
 
@@ -267,19 +258,18 @@ struct PrefillScratch {
     if (cap >= chunk) return true;  // already big enough
     destroy();
     cap = chunk;
-    auto A = [&](int64_t n) { return tl::cuda::alloc(n * 4, nullptr); };
     emb = tl::cuda::alloc(cap * NE * 4, &emb_host);
-    res[0] = A(cap * NE);
-    res[1] = A(cap * NE);
-    h = A(cap * NE);
-    h2 = A(cap * NE);
-    qkv = A(cap * (NH + 2 * NKV) * HD);
-    qkvh = A((NH + 2 * NKV) * cap * HD);
-    ah = A(NH * cap * HD);
-    at = A(cap * NH * HD);
-    gu = A(cap * 2 * FF);
-    mb = A(cap * FF);
-    md = A(cap * NE);
+    res[0] = alloc_f32(cap * NE);
+    res[1] = alloc_f32(cap * NE);
+    h = alloc_f32(cap * NE);
+    h2 = alloc_f32(cap * NE);
+    qkv = alloc_f32(cap * (NH + 2 * NKV) * HD);
+    qkvh = alloc_f32((NH + 2 * NKV) * cap * HD);
+    ah = alloc_f32(NH * cap * HD);
+    at = alloc_f32(cap * NH * HD);
+    gu = alloc_f32(cap * 2 * FF);
+    mb = alloc_f32(cap * FF);
+    md = alloc_f32(cap * NE);
     return md != nullptr;
   }
   void destroy() {
@@ -452,59 +442,67 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
   const bool q4m = q4_mlp && row;             // q4 requires the bf16/row base
   const bool q4lm = q4_lmhead && row;
   const tl::dtype f32 = tl::dtype::f32;
-  Model M{reinterpret_cast<const uint16_t*>(need(m, "token_embd.weight")->data),
-          load_w_T(m, "output.weight", NE, VOCAB, wdt),  // lm_head stays [K,N]
-          load_f32(m, "output_norm.weight", NE),
-          // q4 lm_head (imperative): quantize the f32 [K,VOCAB] then keep only q4.
-          q4lm ? load_w_T(m, "output.weight", NE, VOCAB, f32).to_q4() : array{}};
-  M.row = row;
-  M.q4_mlp = q4m;
-  M.q4_lmhead = q4lm;
+  Model M{
+      .embed_f16 =
+          reinterpret_cast<const uint16_t*>(need(m, "token_embd.weight")->data),
+      .outwT = load_w_T(m, "output.weight", NE, VOCAB, wdt),  // stays [K,N]
+      .onorm = load_f32(m, "output_norm.weight", NE),
+      // q4 lm_head (imperative): quantize the f32 [K,VOCAB], keep only the q4.
+      .outwT_q4 =
+          q4lm ? load_w_T(m, "output.weight", NE, VOCAB, f32).to_q4() : array{},
+      .row = row,
+      .q4_mlp = q4m,
+      .q4_lmhead = q4lm};
   for (int64_t l = 0; l < NL; l++) {
     std::string p = "blk." + std::to_string(l) + ".";
-    Layer L{load_w_T(m, p + "attn_q.weight", NE, NH * HD, wdt),
-            load_f32(m, p + "attn_q.bias", NH * HD),
-            load_w_T(m, p + "attn_k.weight", NE, NKV * HD, wdt),
-            load_f32(m, p + "attn_k.bias", NKV * HD),
-            load_w_T(m, p + "attn_v.weight", NE, NKV * HD, wdt),
-            load_f32(m, p + "attn_v.bias", NKV * HD),
-            load_w_T(m, p + "attn_output.weight", NH * HD, NE, wdt),
-            load_w_T(m, p + "ffn_gate.weight", NE, FF, wdt),
-            load_w_T(m, p + "ffn_up.weight", NE, FF, wdt),
-            load_w_T(m, p + "ffn_down.weight", FF, NE, wdt),
-            load_f32(m, p + "attn_norm.weight", NE),
-            load_f32(m, p + "ffn_norm.weight", NE),
-            // Fused QKV and gate|up (imperative decode path). In bf16 mode: ROW
-            // [N,K] for the warp-per-row gemv (lever A). In f32: column [K,N] for
-            // split-K. +466MB over 24 layers either way. wo_row/wd_row (bf16 only)
-            // are the row copies of the two shared weights (+247MB), keeping the
-            // total under the WSL2 ~2GB cliff (lm_head deliberately not copied).
-            row ? load_w_T_cat_row(m, {{p + "attn_q.weight", NH * HD},
-                                       {p + "attn_k.weight", NKV * HD},
-                                       {p + "attn_v.weight", NKV * HD}}, NE)
-                : load_w_T_cat(m, {{p + "attn_q.weight", NH * HD},
-                                   {p + "attn_k.weight", NKV * HD},
-                                   {p + "attn_v.weight", NKV * HD}}, NE, wdt),
-            // wgu: bf16-row when row & !q4; column [K,N] in f32; empty when q4m
-            // (replaced by wgu_q4). wd_row likewise.
-            (row && !q4m) ? load_w_T_cat_row(m, {{p + "ffn_gate.weight", FF},
-                                                 {p + "ffn_up.weight", FF}}, NE)
-            : row ? array{}
-                  : load_w_T_cat(m, {{p + "ffn_gate.weight", FF},
-                                     {p + "ffn_up.weight", FF}}, NE, wdt),
-            // bqkv = [bq|bk|bv], matching wqkv's column order (batched path).
-            row ? load_f32_cat(m, {{p + "attn_q.bias", NH * HD},
-                                   {p + "attn_k.bias", NKV * HD},
-                                   {p + "attn_v.bias", NKV * HD}})
-                : array{},
+    // Named per field: the ternaries below decide LAYOUT, and a positional list
+    // of 17 same-typed arrays is one transposed line away from a silent
+    // wrong-weight bug that only shows up as slightly-off logits.
+    const std::vector<std::pair<std::string, int64_t>> qkv_parts = {
+        {p + "attn_q.weight", NH * HD},
+        {p + "attn_k.weight", NKV * HD},
+        {p + "attn_v.weight", NKV * HD}};
+    const std::vector<std::pair<std::string, int64_t>> gu_parts = {
+        {p + "ffn_gate.weight", FF}, {p + "ffn_up.weight", FF}};
+    Layer L{
+        // The array path's own weights ([K,N], the .dot() layout) — the oracle.
+        .wq = load_w_T(m, p + "attn_q.weight", NE, NH * HD, wdt),
+        .bq = load_f32(m, p + "attn_q.bias", NH * HD),
+        .wk = load_w_T(m, p + "attn_k.weight", NE, NKV * HD, wdt),
+        .bk = load_f32(m, p + "attn_k.bias", NKV * HD),
+        .wv = load_w_T(m, p + "attn_v.weight", NE, NKV * HD, wdt),
+        .bv = load_f32(m, p + "attn_v.bias", NKV * HD),
+        .wo = load_w_T(m, p + "attn_output.weight", NH * HD, NE, wdt),
+        .wg = load_w_T(m, p + "ffn_gate.weight", NE, FF, wdt),
+        .wu = load_w_T(m, p + "ffn_up.weight", NE, FF, wdt),
+        .wd = load_w_T(m, p + "ffn_down.weight", FF, NE, wdt),
+        .an = load_f32(m, p + "attn_norm.weight", NE),
+        .fn = load_f32(m, p + "ffn_norm.weight", NE),
+        // Fused QKV and gate|up (imperative decode path). In bf16 mode: ROW
+        // [N,K] for the warp-per-row gemv (lever A). In f32: column [K,N] for
+        // split-K. +466MB over 24 layers either way. wo_row/wd_row (bf16 only)
+        // are the row copies of the two shared weights (+247MB), keeping the
+        // total under the WSL2 ~2GB cliff (lm_head deliberately not copied).
+        .wqkv = row ? load_w_T_cat_row(m, qkv_parts, NE)
+                    : load_w_T_cat(m, qkv_parts, NE, wdt),
+        // wgu: bf16-row when row & !q4m; column [K,N] in f32; empty when q4m
+        // (replaced by wgu_q4). wd_row likewise.
+        .wgu = row ? (q4m ? array{} : load_w_T_cat_row(m, gu_parts, NE))
+                   : load_w_T_cat(m, gu_parts, NE, wdt),
+        // bqkv = [bq|bk|bv], matching wqkv's column order (batched path).
+        .bqkv = row ? load_f32_cat(m, {{p + "attn_q.bias", NH * HD},
+                                       {p + "attn_k.bias", NKV * HD},
+                                       {p + "attn_v.bias", NKV * HD}})
+                    : array{},
+        .wo_row =
             row ? load_w_T_row(m, p + "attn_output.weight", NH * HD, NE) : array{},
-            (row && !q4m) ? load_w_T_row(m, p + "ffn_down.weight", FF, NE) : array{},
-            // q4 MLP (imperative, when q4m): quantize the f32 [K,N] fused/down.
-            q4m ? load_w_T_cat(m, {{p + "ffn_gate.weight", FF},
-                                   {p + "ffn_up.weight", FF}}, NE, f32).to_q4()
-                : array{},
-            q4m ? load_w_T(m, p + "ffn_down.weight", FF, NE, f32).to_q4() : array{},
-            {}};
+        .wd_row = row ? (q4m ? array{}
+                             : load_w_T_row(m, p + "ffn_down.weight", FF, NE))
+                      : array{},
+        // q4 MLP (imperative, when q4m): quantize the f32 [K,N] fused/down.
+        .wgu_q4 = q4m ? load_w_T_cat(m, gu_parts, NE, f32).to_q4() : array{},
+        .wd_q4 =
+            q4m ? load_w_T(m, p + "ffn_down.weight", FF, NE, f32).to_q4() : array{}};
     L.cache.init(NKV, MAXC, HD);
     M.layers.push_back(std::move(L));
   }
@@ -529,8 +527,8 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
 
 inline array embed_row(const Model& M, int64_t id) {
   std::vector<float> v(NE);
-  const uint16_t* r = M.embed_f16 + (size_t)id * NE;
-  for (int64_t i = 0; i < NE; i++) v[i] = f16_to_f32(r[i]);
+  const int one = (int)id;
+  gather_embed_rows_(M, &one, 1, v.data());
   return array::from(std::move(v), {1, NE});
 }
 
@@ -591,7 +589,6 @@ inline array forward(Model& M, int64_t id, int64_t pos,
     if (prof) { prof->x2_eval += StepProf::now_ms() - t; }
     if (l == 0 && l0_out) { const float* p = x2.raw(); l0_out->assign(p, p + NE); }
     x = x2;
-    (void)q; (void)k; (void)v; (void)a_out;
   }
   array xf = array::rmsnorm(x, M.onorm, EPS);
   if (fnorm_out) { xf.eval(); const float* p = xf.raw(); fnorm_out->assign(p, p + NE); }
@@ -680,14 +677,15 @@ inline void run_layers_(Model& M, void* x0, int64_t pos, void* d_pos = nullptr,
   // via rmsnorm_res (writes the residual sum AND its norm). The layer input's
   // norm is therefore produced by the *previous* layer's mlp seam — so precompute
   // layer 0's here, and carry each layer's next-input norm in hb.
-  // Decode GEMV: warp-per-row [N,K] (lever A, bf16 imperative) when Wrow is
-  // populated, else the split-K [K,N] path on Wcol. y layout is identical either
-  // way (contiguous [n]), so the fused-output slices below are unchanged.
+  // Decode GEMV: warp-per-row [N,K] (lever A, bf16 imperative) in row mode, else
+  // the split-K [K,N] path — so `W` must be the weight in THIS mode's layout
+  // (the fused wqkv/wgu already are; wo/wd have a separate row copy). The y
+  // layout is identical either way (contiguous [n]), so the fused-output slices
+  // below are unchanged.
   const bool row = M.row;
-  auto gv = [&](const array& Wrow, const array& Wcol, void* a, void* y, int64_t n,
-                int64_t k) {
-    if (row) tl::cuda::gemv_bf16_row(a, Wrow.native(), y, n, k);
-    else gemv_w(Wcol, a, y, n, k);
+  auto gv = [&](const array& W, void* a, void* y, int64_t n, int64_t k) {
+    if (row) tl::cuda::gemv_bf16_row(a, W.native(), y, n, k);
+    else gemv_w(W, a, y, n, k);
   };
   void* x = x0;
   cu::rmsnorm(x, M.layers[0].an.native(), S.hb, NE, EPS);
@@ -697,7 +695,7 @@ inline void run_layers_(Model& M, void* x0, int64_t pos, void* d_pos = nullptr,
     // Fused QKV: one GEMV -> [q(NH*HD) | k(NKV*HD) | v(NKV*HD)] in S.qkvb, then
     // slice: rope q & k in place, bias-add v. Same per-column split-K as the
     // separate wq/wk/wv GEMVs (bx=1, chunk=32), so bit-identical per column.
-    gv(L.wqkv, L.wqkv, S.hb, S.qkvb, (NH + 2 * NKV) * HD, NE);
+    gv(L.wqkv, S.hb, S.qkvb, (NH + 2 * NKV) * HD, NE);
     void* qp = S.qkvb;
     void* kp = off_f32(S.qkvb, NH * HD);
     void* vp = off_f32(S.qkvb, (NH + NKV) * HD);
@@ -716,15 +714,15 @@ inline void run_layers_(Model& M, void* x0, int64_t pos, void* d_pos = nullptr,
       L.cache.append(kp, vp);
       L.cache.attn(qp, S.ab, NH, SCALE);
     }
-    gv(L.wo_row, L.wo, S.ab, ro, NE, NH * HD);            // ro = attn @ wo
+    gv(row ? L.wo_row : L.wo, S.ab, ro, NE, NH * HD);  // ro = attn @ wo
     // x1 = x + (attn@wo); h2 = rmsnorm(x1, fn) — fused.
     cu::rmsnorm_res(ro, x, L.fn.native(), ro, S.h2b, NE, EPS);
     // Fused gate|up: one GEMV -> [gate(FF) | up(FF)] in S.gub; swiglu reads both.
     if (M.q4_mlp) gemv_q4_w(L.wgu_q4, S.h2b, S.gub);  // [K=NE, N=2*FF]
-    else gv(L.wgu, L.wgu, S.h2b, S.gub, 2 * FF, NE);
+    else gv(L.wgu, S.h2b, S.gub, 2 * FF, NE);
     cu::swiglu(S.gub, S.mb, FF);
     if (M.q4_mlp) gemv_q4_w(L.wd_q4, S.mb, S.mdb);    // [K=FF, N=NE]
-    else gv(L.wd_row, L.wd, S.mb, S.mdb, NE, FF);
+    else gv(row ? L.wd_row : L.wd, S.mb, S.mdb, NE, FF);
     // x2 = x1 + mlp; next input norm = rmsnorm(x2, next an | final onorm) — fused.
     void* nextw = (l + 1 < NL) ? M.layers[l + 1].an.native() : M.onorm.native();
     cu::rmsnorm_res(ro, S.mdb, nextw, ro, S.hb, NE, EPS);

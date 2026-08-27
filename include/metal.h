@@ -413,22 +413,6 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
   return true;
 }
 
-// M7 decode GEMV (f32 / bf16 weights). No MSL kernel yet — returning false
-// sends the evaluator down the widen-to-F32 fallback; keeps the gpu:: facade
-// symmetric with CUDA (the one platform #ifdef stays the namespace alias).
-inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
-inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
-inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
-                        int64_t, int64_t, float) {
-  return false;
-}
-inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
-  return false;
-}
-inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
-  return false;
-}
-
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals
 
 inline bool available() { return false; }
@@ -456,6 +440,14 @@ inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t,
                    float, float) {
   return false;
 }
+
+#endif
+
+// ---- LLM decode ops with no MSL kernel yet (M7/M8/M9) -----------------------
+// Outside the #if/#else on purpose: both branches would define them identically,
+// and returning false is the whole implementation either way — it sends the
+// evaluator down the widen-to-F32 CPU fallback. Keeps the gpu:: facade
+// symmetric with CUDA, so the one platform #ifdef stays the namespace alias.
 inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
@@ -468,8 +460,6 @@ inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
 inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
   return false;
 }
-
-#endif
 
 // Every CPU-side buffer read funnels through array::raw()/data(), which call
 // this: one choke point makes mixed CPU/GPU graphs safe.

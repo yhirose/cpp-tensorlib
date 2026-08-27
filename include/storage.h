@@ -35,59 +35,52 @@ struct storage {
 
   static storage make(int64_t n, dtype dt = dtype::f32);
 
-  // Device-preferred allocation (Metal pool with heap fallback). Referenced
-  // directly in the default build; only via the installed hook under
-  // TL_RUNTIME_HOOKS.
-  static storage make_device_(int64_t n, dtype dt = dtype::f32) {
-    storage s;
-    s.size = n;
-    s.dt = dt;
-    int64_t bytes = n > 0 ? n * dtype_size(dt) : 4;  // device length nonzero
-    float* contents = nullptr;
-    if (void* mb = gpu::alloc(bytes, &contents)) {
-      s.native = mb;
-      s.ptr = contents;
-      s.buf = std::shared_ptr<void>(mb, [bytes, contents](void* p) {
-        gpu::release(p, bytes, contents);
-      });
-    } else {
-      return make_heap_(n, dt);
-    }
-    return s;
-  }
-
-  static storage make_heap_(int64_t n, dtype dt = dtype::f32) {
-    storage s;
-    s.size = n;
-    s.dt = dt;
-    size_t bytes = static_cast<size_t>(n > 0 ? n * dtype_size(dt) : 4);
-    auto* p = new unsigned char[bytes];
-    s.ptr = reinterpret_cast<float*>(p);
-    s.buf = std::shared_ptr<void>(
-        p, [](void* q) { delete[] static_cast<unsigned char*>(q); });
-    return s;
-  }
-
-  // Explicit-byte allocation (q4, whose bytes aren't elems×width). `elems` is
-  // the logical element count; `bytes` the physical buffer size. Device-
-  // preferred with heap fallback, like make_device_.
+  // Explicit-byte allocation: device-preferred (Metal/CUDA pool) with a heap
+  // fallback. `elems` is the logical element count, `bytes` the physical buffer
+  // size — they differ only for q4, whose bytes aren't elems x width. The two
+  // named entry points below are this one with the byte count filled in.
   static storage make_bytes_(int64_t elems, int64_t bytes, dtype dt) {
     storage s;
     s.size = elems;
     s.dt = dt;
-    int64_t nb = bytes > 0 ? bytes : 4;
+    int64_t nb = nonzero_(bytes);
     float* contents = nullptr;
     if (void* mb = gpu::alloc(nb, &contents)) {
       s.native = mb;
       s.ptr = contents;
       s.buf = std::shared_ptr<void>(
           mb, [nb, contents](void* p) { gpu::release(p, nb, contents); });
-    } else {
-      auto* p = new unsigned char[static_cast<size_t>(nb)];
-      s.ptr = reinterpret_cast<float*>(p);
-      s.buf = std::shared_ptr<void>(
-          p, [](void* q) { delete[] static_cast<unsigned char*>(q); });
+      return s;
     }
+    return heap_bytes_(elems, nb, dt);
+  }
+
+  // Plain elems x width in bytes; the allocators clamp the empty case.
+  static int64_t plain_bytes_(int64_t n, dtype dt) { return n * dtype_size(dt); }
+
+  // Device-preferred allocation. Referenced directly in the default build; only
+  // via the installed hook under TL_RUNTIME_HOOKS.
+  static storage make_device_(int64_t n, dtype dt = dtype::f32) {
+    return make_bytes_(n, plain_bytes_(n, dt), dt);
+  }
+
+  static storage make_heap_(int64_t n, dtype dt = dtype::f32) {
+    return heap_bytes_(n, plain_bytes_(n, dt), dt);
+  }
+
+ private:
+  // A zero-length allocation still needs a distinct, dereferenceable address —
+  // and a device buffer of length 0 is invalid — so both allocators floor at 4.
+  static int64_t nonzero_(int64_t bytes) { return bytes > 0 ? bytes : 4; }
+
+  static storage heap_bytes_(int64_t elems, int64_t bytes, dtype dt) {
+    storage s;
+    s.size = elems;
+    s.dt = dt;
+    auto* p = new unsigned char[static_cast<size_t>(nonzero_(bytes))];
+    s.ptr = reinterpret_cast<float*>(p);
+    s.buf = std::shared_ptr<void>(
+        p, [](void* q) { delete[] static_cast<unsigned char*>(q); });
     return s;
   }
 };

@@ -124,47 +124,35 @@ extern "C" __global__ void tl_argmax(const float* __restrict__ in, int* out,
 // numerically with decode is what bench_qwen_prefill's check 0 asserts, and it
 // would be a hand-maintained coincidence if these were two kernels. ----
 
-// out = x * rsqrt(mean(x^2)+eps) * w, per row. Matches the array composition
-// (x*x).mean(-1) -> 1/sqrt(ms+eps) -> *x *w exactly (f32, 1/sqrtf not the
-// approximate rsqrtf) so greedy output is unchanged; kills the ~7 array-op
-// launches per RMSNorm.
-extern "C" __global__ void tl_rmsnorm(const float* __restrict__ x,
-                                      const float* __restrict__ w,
-                                      float* __restrict__ out, unsigned n,
-                                      float eps) {
-  extern __shared__ float sm[];
-  const size_t base = (size_t)blockIdx.x * n;
-  unsigned t = threadIdx.x, T = blockDim.x;
-  float acc = 0.0f;
-  for (unsigned i = t; i < n; i += T) { float v = x[base + i]; acc += v * v; }
-  sm[t] = acc;
-  __syncthreads();
-  for (unsigned s = T >> 1; s > 0; s >>= 1) {
-    if (t < s) sm[t] += sm[t + s];
-    __syncthreads();
-  }
-  float inv = 1.0f / sqrtf(sm[0] / (float)n + eps);
-  for (unsigned i = t; i < n; i += T)
-    out[base + i] = x[base + i] * inv * w[i];
-}
-
-// Fused residual-add + RMSNorm, per row: xout = a+b; hout = rmsnorm(xout)*w.
-// Folds a layer's residual add into the following norm (the o-proj->norm and
-// mlp->next-input-norm seams), writing BOTH the residual sum (needed downstream
-// as the next residual base) and the normalized output. xout may alias a.
-extern "C" __global__ void tl_add_rmsnorm(const float* __restrict__ a,
-                                          const float* __restrict__ b,
-                                          const float* __restrict__ w,
-                                          float* __restrict__ xout,
-                                          float* __restrict__ hout, unsigned n,
-                                          float eps) {
+// hout = xout * rsqrt(mean(xout^2)+eps) * w, per row, where xout is either x
+// itself (tl_rmsnorm) or the residual sum a+b written back on the way through
+// (tl_add_rmsnorm). Matches the array composition (x*x).mean(-1) ->
+// 1/sqrt(ms+eps) -> *x *w exactly (f32, 1/sqrtf not the approximate rsqrtf) so
+// greedy output is unchanged; kills the ~7 array-op launches per RMSNorm.
+//
+// The fused-add form folds a layer's residual add into the following norm (the
+// o-proj->norm and mlp->next-input-norm seams), writing BOTH the residual sum
+// (the next residual base) and its normalized form; xout may alias a. It is the
+// same reduction either way, so ONE core serves both, with ADD a template
+// parameter so the fused-add path compiles out of the plain kernel by
+// construction rather than by trusting constant propagation.
+}  // close extern "C": the __device__ core template below can't have C linkage;
+   // each __global__ wrapper re-declares its own for a stable symbol.
+template <bool ADD>
+__device__ __forceinline__ void rmsnorm_core(
+    const float* __restrict__ a, const float* __restrict__ b,
+    const float* __restrict__ w, float* __restrict__ xout,
+    float* __restrict__ hout, unsigned n, float eps) {
   extern __shared__ float sm[];
   const size_t base = (size_t)blockIdx.x * n;
   unsigned t = threadIdx.x, T = blockDim.x;
   float acc = 0.0f;
   for (unsigned i = t; i < n; i += T) {
-    float v = a[base + i] + b[base + i];
-    xout[base + i] = v;
+    float v = a[base + i];
+    if constexpr (ADD) {
+      v += b[base + i];
+      xout[base + i] = v;
+    }
     acc += v * v;
   }
   sm[t] = acc;
@@ -175,8 +163,23 @@ extern "C" __global__ void tl_add_rmsnorm(const float* __restrict__ a,
   }
   float inv = 1.0f / sqrtf(sm[0] / (float)n + eps);
   for (unsigned i = t; i < n; i += T)
-    hout[base + i] = xout[base + i] * inv * w[i];
+    hout[base + i] = (ADD ? xout[base + i] : a[base + i]) * inv * w[i];
 }
+extern "C" __global__ void tl_rmsnorm(const float* __restrict__ x,
+                                      const float* __restrict__ w,
+                                      float* __restrict__ out, unsigned n,
+                                      float eps) {
+  rmsnorm_core<false>(x, nullptr, w, nullptr, out, n, eps);
+}
+extern "C" __global__ void tl_add_rmsnorm(const float* __restrict__ a,
+                                          const float* __restrict__ b,
+                                          const float* __restrict__ w,
+                                          float* __restrict__ xout,
+                                          float* __restrict__ hout, unsigned n,
+                                          float eps) {
+  rmsnorm_core<true>(a, b, w, xout, hout, n, eps);
+}
+extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 
 // SwiGLU straight out of the FUSED gate|up projection: gu is [rows, 2*ff] (row r
 // holds gate(ff) then up(ff)), out is [rows, ff]. Both paths already produce
@@ -608,38 +611,30 @@ extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 // would go occupancy-bound instead of bandwidth-bound, hiding the bf16 win. Each
 // z-slice sums its K-range and atomicAdds into a pre-zeroed y (host memsets when
 // gridDim.y>1); gridDim.y==1 stores directly and is bit-identical to no split.
-__global__ void tl_gemv_f32(const float* __restrict__ a,
-                            const float* __restrict__ B, float* __restrict__ y,
-                            unsigned n, unsigned k, unsigned ksplit) {
-  unsigned col = blockIdx.x * blockDim.x + threadIdx.x;
-  if (col >= n) return;
-  unsigned k0 = blockIdx.y * ksplit;
-  if (k0 >= k) return;
-  unsigned k1 = (k0 + ksplit < k) ? (k0 + ksplit) : k;
-  float acc = 0.0f;
-  for (unsigned kk = k0; kk < k1; kk++) acc += a[kk] * B[(size_t)kk * n + col];
-  if (gridDim.y > 1)
-    atomicAdd(&y[col], acc);
-  else
-    y[col] = acc;
-}
-__global__ void tl_gemv_bf16(const float* __restrict__ a,
-                             const __nv_bfloat16* __restrict__ B,
-                             float* __restrict__ y, unsigned n, unsigned k,
-                             unsigned ksplit) {
-  unsigned col = blockIdx.x * blockDim.x + threadIdx.x;
-  if (col >= n) return;
-  unsigned k0 = blockIdx.y * ksplit;
-  if (k0 >= k) return;
-  unsigned k1 = (k0 + ksplit < k) ? (k0 + ksplit) : k;
-  float acc = 0.0f;
-  for (unsigned kk = k0; kk < k1; kk++)
-    acc += a[kk] * __bfloat162float(B[(size_t)kk * n + col]);
-  if (gridDim.y > 1)
-    atomicAdd(&y[col], acc);
-  else
-    y[col] = acc;
-}
+// The f32 and bf16 kernels differ ONLY in how one weight element is loaded, so
+// one macro emits both — their timing ratio then isolates the storage width and
+// nothing else. LOAD is that expression, in terms of B and kk, the same way the
+// elementwise macros at the top of this file take `a[i] + b[i]`.
+#define TL_GEMV_SPLITK(NAME, BT, LOAD)                                        \
+  __global__ void NAME(const float* __restrict__ a,                           \
+                       const BT* __restrict__ B, float* __restrict__ y,       \
+                       unsigned n, unsigned k, unsigned ksplit) {             \
+    unsigned col = blockIdx.x * blockDim.x + threadIdx.x;                     \
+    if (col >= n) return;                                                     \
+    unsigned k0 = blockIdx.y * ksplit;                                        \
+    if (k0 >= k) return;                                                      \
+    unsigned k1 = (k0 + ksplit < k) ? (k0 + ksplit) : k;                      \
+    float acc = 0.0f;                                                         \
+    for (unsigned kk = k0; kk < k1; kk++) acc += a[kk] * (LOAD);              \
+    if (gridDim.y > 1)                                                        \
+      atomicAdd(&y[col], acc);                                                \
+    else                                                                      \
+      y[col] = acc;                                                           \
+  }
+TL_GEMV_SPLITK(tl_gemv_f32, float, B[(size_t)kk * n + col])
+TL_GEMV_SPLITK(tl_gemv_bf16, __nv_bfloat16,
+               __bfloat162float(B[(size_t)kk * n + col]))
+#undef TL_GEMV_SPLITK
 // Vectorized bf16 GEMV: 8 columns/thread via one 16-byte (uint4 = 8×bf16) load,
 // so each thread issues f32-width memory transactions instead of scalar 2-byte
 // loads — closes the bandwidth gap to the f32 kernel. Requires n % 8 == 0 (all
@@ -1129,43 +1124,20 @@ extern "C" __global__ void tl_kv_fill_bf16(__nv_bfloat16* Kc, __nv_bfloat16* Vc,
   kv_fill_core(Kc, Vc, K, V, T, kv_stride, pos0);
 }
 
-// Causal prefill attention: process all T query positions of a prompt at once.
-// Query at position p attends to keys 0..p (the causal mask). q,out are
-// [H_q, T, D]; K,V are the [H_kv, kv_max, D] cache read over [0,p] via kv_stride.
-// Reuses the decode online-softmax (no T×T scores materialized), one block per
-// (head, query pos) so the grid = H_q×T fills the SMs (no split-KV needed). This
-// is the correctness-first baseline — each query re-streams its keys from DRAM
-// (O(T²) traffic); a query×key tiled flash-attention is the deferred tuning pass.
-// grid = (H_q, T), blockDim = AD = head_dim (NW warps).
-template <int AD, typename KT = float>
-__device__ void attn_prefill_core(const float* __restrict__ q,
-                                  const KT* __restrict__ K,
-                                  const KT* __restrict__ V,
-                                  float* __restrict__ out, unsigned T,
-                                  unsigned kv_stride, unsigned group,
-                                  float scale, unsigned pos0) {
-  const unsigned h = blockIdx.x;                // query head
-  const unsigned p = blockIdx.y;                // query pos in this chunk
-  const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
-  // Causal: the row's absolute position is pos0 + p and it attends keys
-  // 0..pos0+p — with pos0 > 0 (a later chunk, or a turn appended to a live
-  // cache) that includes everything earlier chunks cached.
-  float gm, gl, o;
-  attn_span_core<AD, KT>(q + ((size_t)h * T + p) * AD,
-                         K + (size_t)kv_h * kv_stride,
-                         V + (size_t)kv_h * kv_stride, 0, pos0 + p + 1, scale,
-                         gm, gl, o);
-  out[((size_t)h * T + p) * AD + threadIdx.x] = o / gl;
-}
 // ---- Tiled causal prefill attention (flash-attention shape) ----
-// The per-query kernel above is correct but spends most of its instructions on
-// overhead: it warp-shuffle-reduces a dot product for EVERY key, so at Qwen's
-// D=64 each key costs 2 useful FMAs and ~7 reduction ops. Measured 1.67 TFLOP/s
-// at T=2048 — 5% of peak — and the KV it streams (2 MB for 2 KV heads) sits in
-// L2 the whole time, so this was never a bandwidth problem. Tiling fixes the
-// arithmetic instead: a block owns a tile of queries, streams K/V through shared
-// memory in TK-key tiles, and holds each score as a plain register dot product
-// with no cross-lane reduction at all.
+// Causal prefill attention: all T query positions of a prompt at once. Query at
+// position pos0+p attends keys 0..pos0+p, so a long prompt runs in chunks and a
+// later turn extends a live cache. q,out are [H_q, T, D]; K,V are the
+// [H_kv, kv_max, D] cache read over [0,pos0+p] via kv_stride.
+//
+// The first cut ran one block per (head, query) and reused the decode kernels'
+// online softmax directly — correct, but it warp-shuffle-reduced a dot product
+// for EVERY key, so at Qwen's D=64 each key cost 2 useful FMAs and ~7 reduction
+// ops: 1.67 TFLOP/s at T=2048, 5% of peak, while the KV it streamed (2 MB for 2
+// KV heads) sat in L2 the whole time — never a bandwidth problem. Tiling fixes
+// the arithmetic instead: a block owns a tile of queries, streams K/V through
+// shared memory in TK-key tiles, and holds each score as a plain register dot
+// product with no cross-lane reduction at all.
 //
 // Layout: 128 threads = ROWS(16) row slots x LANES(8). Lane `dg` of row slot
 // `qr0` owns QPT queries (qr0, qr0+ROWS, ...) and, of each, dims {d*LANES+dg}
@@ -1355,8 +1327,8 @@ extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 // x is [rows, D] contiguous (rows = H*T: a [H,T,D] tensor flattened, or [H,D]
 // with T=1). Row r's head-dim vector is at position pos + (r % T). Pairs
 // (j, j+D/2) rotate by angle = position · base^(-2j/D). grid = rows, block = D/2.
-// RoPE with an optional fused bias: rotates x (+bias if non-null). Folding q/k's
-// bias-add into rope removes 2 elementwise launches per decode layer.
+// An optional fused bias is added before the rotation: folding q/k's bias-add
+// into rope removes 2 elementwise launches per decode layer.
 static __device__ __forceinline__ void rope_core(
     const float* __restrict__ x, const float* __restrict__ bias,
     float* __restrict__ out, unsigned T, unsigned D, unsigned pos, float base) {

@@ -14,12 +14,16 @@
 // before the CPU reads a device-dirty one (array::raw()/data() →
 // gpu::sync_to_host). This is why array.h and storage.h need no changes.
 //
-// Async: flush() and sync_to_host() keep their SYNCHRONOUS signatures. The
+// Async: flush() and sync_to_host() keep their SYNCHRONOUS signatures — the one
+// thing that had to hold for array.h's eval seam to survive a browser backend,
+// so it was measured in a standalone probe before any of this was written. The
 // instance is created with the TimedWaitAny feature, which makes
 // wgpuInstanceWaitAny(timeout > 0) a legal blocking wait; emdawnwebgpu
-// implements it by suspending through Asyncify/JSPI. The suspend surface is
-// exactly two call sites — OnSubmittedWorkDone and MapAsync. Uploads
-// (WriteBuffer) are queued, never awaited. See spike/webgpu/README.md.
+// implements it by suspending through Asyncify/JSPI, and the suspend surface is
+// exactly two call sites — OnSubmittedWorkDone and MapAsync — not the whole
+// interpreter. Uploads (WriteBuffer) are queued, never awaited. Which of the two
+// suspend mechanisms to link is a build-time fork, not a backend concern: see
+// test/wasm/build.sh, which takes JSPI and says why.
 //
 // Batching: one command encoder accumulates dispatches and flush() submits and
 // waits once, as metal.h does. This matters more here than on Metal — a
@@ -656,21 +660,6 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
   return c.encode_(entry, ma, mb, mo, p, rows, 1);
 }
 
-// ---- Not ported yet. Returning false routes the op to CPU, which is why each
-// phase lands in a working state.
-inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
-inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
-inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
-                        int64_t, int64_t, float) {
-  return false;
-}
-inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
-  return false;
-}
-inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
-  return false;
-}
-
 #else  // !(TENSORLIB_WEBGPU && __EMSCRIPTEN__) — stubs, as in metal.h
 
 inline bool available() { return false; }
@@ -699,6 +688,13 @@ inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
                    float) {
   return false;
 }
+
+#endif
+
+// ---- Ops with no WGSL kernel yet (the LLM decode path). Outside the #if/#else
+// on purpose: both branches would define them identically, and returning false
+// is the whole implementation either way — it routes the op to CPU, which is
+// why each porting phase lands in a working state.
 inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
@@ -711,8 +707,6 @@ inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
 inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
   return false;
 }
-
-#endif
 
 // Every CPU-side buffer read funnels through array::raw()/data(), which call
 // this: one choke point makes mixed CPU/GPU graphs safe.

@@ -2,9 +2,14 @@
 
 // The GPU-backend facade: array.h and storage.h dispatch through tl::gpu, so
 // the eval seam carries no platform #ifdefs. Every backend header exposes the
-// identical API (available/pending/flush/alloc/release/binary/unary/gemm/
-// row_op/sync_to_host) and shares tl::metal::kop, which makes the alias below a
-// drop-in.
+// identical API and shares tl::metal::kop, which makes the alias below a
+// drop-in. The contract, i.e. everything array.h/storage.h may call:
+//   lifecycle  available / pending / flush / cpu_barrier
+//   memory     alloc / release / sync_to_host
+//   kernels    binary / binary_bcast / unary / gemm / row_op
+//   LLM path   gemv_f32 / gemv_bf16 / gemv_q4 / attn_decode / rope
+// A backend with no kernel for one of these returns false and the evaluator
+// falls back to the CPU — so the LLM row is real on CUDA and stubs elsewhere.
 //
 // Each backend compiles to stubs unless its own gate holds, so including all of
 // them is free: metal.h is real only on __APPLE__, cuda.h only on
