@@ -220,6 +220,69 @@ extern "C" __global__ void tl_merge_heads(const float* __restrict__ src,
   dst[(size_t)t * H * D + h * D + d] = src[((size_t)h * T + t) * D + d];
 }
 
+// tl_pad/tl_fold's per-call shape/stride metadata is uploaded to a scratch
+// device buffer by cuda.h's pad()/fold(); this caps how many int64 slots that
+// buffer (and each kernel's on-stack index array) needs to hold. im2col's
+// chained unfold/pad calls on a conv input (N,C,H,W -> ...,winH,winW) stay
+// well under it.
+#define TL_PAD_FOLD_MAX_RANK 8
+
+// ---- pad: copy a (contiguous) into a zero-initialized larger buffer,
+// shifted by `before` elements along one axis. The caller pre-zeros `out` on
+// the device (MemsetD8) since this kernel only visits a's own n elements —
+// the border cells pad introduces are never written here. meta packs
+// [a_shape(rank), out_strides(rank)] as int64; i is already a's own flat
+// contiguous index (a is required contiguous — see cuda.h's pad()), so no
+// a_strides are needed to read a[i].
+extern "C" __global__ void tl_pad(const float* __restrict__ a,
+                                  float* __restrict__ out,
+                                  const long long* __restrict__ meta, int rank,
+                                  unsigned shift, unsigned n) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const long long* a_shape = meta;
+  const long long* out_strides = meta + rank;
+  long long rem = i, dst = 0;
+  for (int d = rank - 1; d >= 0; --d) {
+    long long dim = a_shape[d];
+    long long coord = rem % dim;
+    rem /= dim;
+    dst += coord * out_strides[d];
+  }
+  out[dst + shift] = a[i];
+}
+
+// ---- fold: unfold's inverse. Scatter-add a (contiguous; its last dim is the
+// sliding window) into out (one rank smaller, pre-zeroed by the caller like
+// pad's out above), accumulating every window overlap via atomicAdd. meta
+// packs [a_shape(rank), out_strides(rank-1)] as int64 — mirrors tl::ref::fold
+// exactly, just with the index walk unrolled from a flat thread id instead of
+// a host-side nested loop.
+extern "C" __global__ void tl_fold(const float* __restrict__ a,
+                                   float* __restrict__ out,
+                                   const long long* __restrict__ meta,
+                                   int rank, int axis, unsigned step,
+                                   unsigned n) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const long long* a_shape = meta;
+  const long long* out_strides = meta + rank;
+  long long idx[TL_PAD_FOLD_MAX_RANK];
+  long long rem = i;
+  for (int d = rank - 1; d >= 0; --d) {
+    long long dim = a_shape[d];
+    idx[d] = rem % dim;
+    rem /= dim;
+  }
+  int last = rank - 1;
+  long long dst = 0;
+  for (int d = 0; d < last; ++d) {
+    long long di = (d == axis) ? idx[d] * (long long)step + idx[last] : idx[d];
+    dst += di * out_strides[d];
+  }
+  atomicAdd(&out[dst], a[i]);
+}
+
 // ---- softmax over the last axis (rows×cols out); scale/offset ignored ----
 // Numerically stable (subtract row max). Two shared reductions (max, sum).
 __global__ void tl_softmax(const float* in, float* out, unsigned rows,

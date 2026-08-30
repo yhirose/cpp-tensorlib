@@ -660,6 +660,17 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
   return c.encode_(entry, ma, mb, mo, p, rows, 1);
 }
 
+// No WGSL kernel yet for im2col's pad/fold — honest false sends the
+// evaluator to the CPU oracle.
+inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
+                const int64_t*, int, int64_t, int64_t, int64_t) {
+  return false;
+}
+inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,
+                 const int64_t*, int, int, int64_t, int64_t, int64_t) {
+  return false;
+}
+
 #else  // !(TENSORLIB_WEBGPU && __EMSCRIPTEN__) — stubs, as in metal.h
 
 inline bool available() { return false; }
@@ -686,6 +697,14 @@ inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
 }
 inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
                    float) {
+  return false;
+}
+inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
+                const int64_t*, int, int64_t, int64_t, int64_t) {
+  return false;
+}
+inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,
+                 const int64_t*, int, int, int64_t, int64_t, int64_t) {
   return false;
 }
 

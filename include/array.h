@@ -2003,6 +2003,60 @@ struct graph {
     return out;
   }
 
+  // Places `a` into a zero-initialized `out_shape`, shifted by `before`
+  // along `axis` — the GPU-dispatch twin of ref::pad. `a` must be contiguous
+  // (every gpu_* helper above shares that requirement, and it's what lets the
+  // backend read `a[i]` at a flat thread id without also uploading strides).
+  // Ranks above the backend's cap (im2col's own use stays well under it) fall
+  // back to the CPU oracle, same as gpu_binary's rank-2-only broadcast path.
+  static std::optional<array> gpu_pad_(const array& a, size_t axis,
+                                       int64_t before,
+                                       const shape_t& out_shape) {
+    if (!gpu_mode_(num_elements(out_shape), kernel_class::elementwise) ||
+        !a.contiguous()) {
+      return std::nullopt;
+    }
+    if (!a.storage_.native) return std::nullopt;
+    auto out = array::empty(out_shape);
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    std::vector<int64_t> a_shape(a.shape().begin(), a.shape().end());
+    auto out_strides = out.strides();
+    int rank = static_cast<int>(a_shape.size());
+    int64_t shift = before * out_strides[axis];
+    if (!gpu::pad(a.storage_.native, a.offset_ * 4, out.storage_.native,
+                 out.offset_ * 4, a_shape.data(), out_strides.data(), rank,
+                 shift, a.size(), out.size())) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
+  // unfold's inverse: scatter-add `a` back into a zero-initialized
+  // `out_shape`, accumulating every window overlap — the GPU-dispatch twin
+  // of ref::fold. Same contiguous-`a`/rank-cap contract as gpu_pad_ above.
+  static std::optional<array> gpu_fold_(const array& a, size_t axis,
+                                        int64_t step,
+                                        const shape_t& out_shape) {
+    if (!gpu_mode_(num_elements(out_shape), kernel_class::elementwise) ||
+        !a.contiguous()) {
+      return std::nullopt;
+    }
+    if (!a.storage_.native) return std::nullopt;
+    auto out = array::empty(out_shape);
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    std::vector<int64_t> a_shape(a.shape().begin(), a.shape().end());
+    auto out_strides = out.strides();
+    int rank = static_cast<int>(a_shape.size());
+    if (!gpu::fold(a.storage_.native, a.offset_ * 4, out.storage_.native,
+                  out.offset_ * 4, a_shape.data(), out_strides.data(), rank,
+                  static_cast<int>(axis), step, a.size(), out.size())) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
   // One topological pass over all roots (MLX-style batch eval), then each
   // node evaluates through eval_one. Iterative DFS: recursion depth must not
   // bound graph depth. do_flush=false leaves the launched kernels in flight on
@@ -2367,14 +2421,28 @@ struct graph {
       case op_t::sum_to_:
         r = ref::sum_to(in(0), n.shape);
         break;
-      case op_t::pad_:
-        r = ref::pad(in(0), static_cast<size_t>(n.axis),
-                    static_cast<int64_t>(n.arg0), n.shape);
+      case op_t::pad_: {
+        auto a = in(0);
+        size_t axis = static_cast<size_t>(n.axis);
+        auto before = static_cast<int64_t>(n.arg0);
+        if (auto g = gpu_pad_(a, axis, before, n.shape)) {
+          r = std::move(*g);
+        } else {
+          r = ref::pad(a, axis, before, n.shape);
+        }
         break;
-      case op_t::fold_:
-        r = ref::fold(in(0), static_cast<size_t>(n.axis),
-                     static_cast<int64_t>(n.arg0), n.shape);
+      }
+      case op_t::fold_: {
+        auto a = in(0);
+        size_t axis = static_cast<size_t>(n.axis);
+        auto step = static_cast<int64_t>(n.arg0);
+        if (auto g = gpu_fold_(a, axis, step, n.shape)) {
+          r = std::move(*g);
+        } else {
+          r = ref::fold(a, axis, step, n.shape);
+        }
         break;
+      }
       case op_t::view_: {
         // Pure layout: the source is evaluated, so re-applying the view on the
         // materialized wrap composes strides only (make_view_, no kernel, no

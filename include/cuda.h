@@ -363,6 +363,11 @@ struct context {
   CUfunction split_heads_() { return cached_(split_heads_fn, "tl_split_heads"); }
   CUfunction merge_heads_() { return cached_(merge_heads_fn, "tl_merge_heads"); }
 
+  // im2col's pad/fold, cached like split_heads/merge_heads.
+  CUfunction pad_fn = nullptr, fold_fn = nullptr;
+  CUfunction pad_() { return cached_(pad_fn, "tl_pad"); }
+  CUfunction fold_() { return cached_(fold_fn, "tl_fold"); }
+
   // M9 batched-prefill GEMM (bf16 [N,K] weights, the decode GEMV's own layout).
   CUfunction gemm_bf16_nt_fn = nullptr, gemm_bf16_nt_s_fn = nullptr,
              gemm_bf16_nt_sk_fn = nullptr;
@@ -475,6 +480,24 @@ struct context {
       attn_scratch_bytes = bytes;
     }
     return attn_scratch;
+  }
+
+  // Reusable device scratch for pad_/fold_'s per-call shape/stride metadata
+  // (small int64 arrays, one upload per call — too varied in size and too
+  // short-lived to route through the tracked mirror allocator).
+  CUdeviceptr meta_scratch = 0;
+  size_t meta_scratch_bytes = 0;
+  CUdeviceptr meta_scratch_(size_t bytes) {
+    if (bytes > meta_scratch_bytes) {
+      if (meta_scratch) d.MemFree(meta_scratch);  // syncs; fine (grows once)
+      if (d.MemAlloc(&meta_scratch, bytes) != 0) {
+        meta_scratch = 0;
+        meta_scratch_bytes = 0;
+        return 0;
+      }
+      meta_scratch_bytes = bytes;
+    }
+    return meta_scratch;
   }
 
   // char* pointer arithmetic to fold a byte offset into a managed pointer.
@@ -706,6 +729,83 @@ inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo, int64_t n,
   float* po = context::off_(out, oo);
   unsigned un = static_cast<unsigned>(n);
   return c.launch1d_(c.fn_(op), un, pa, po, un, scale, offset);
+}
+
+// Rank cap shared with the kernel side (tensorlib_cuda.cu's
+// TL_PAD_FOLD_MAX_RANK) — both the meta buffer layout and each kernel's
+// on-stack index array assume it.
+inline constexpr int kPadFoldMaxRank = 8;
+
+// Zero an output buffer that a kernel will only partially write (pad's
+// border, fold's atomicAdd accumulator) — device_write_ alone only flips the
+// mirror's dirty bit, it does not copy the (already-zeroed) host side over.
+// Async on the stream, like gemv_run_'s split-K zero above: ordered before
+// the launch that follows it on the same stream, capture-safe.
+inline void zero_device_(CUdeviceptr dst, int64_t n) {
+  auto& c = context::get();
+  size_t bytes = static_cast<size_t>(n) * 4;
+  if (c.d.MemsetD8Async) c.d.MemsetD8Async(dst, 0, bytes, c.stream);
+  else c.d.MemsetD8(dst, 0, bytes);
+}
+
+// Places `a` (contiguous) into a zero buffer of out_shape (array.h's
+// gpu_pad_ allocates `out` uninitialized via array::empty — this zeros the
+// device copy directly, no host round trip), shifted by `before` along
+// `axis`. `a_shape`/`out_strides` are host arrays of length `rank`; uploaded
+// once to the meta scratch buffer since tl_pad indexes them from a flat
+// thread id rather than taking per-dim scalar args. No scale/offset —
+// eval_one's shared epilogue applies those (see array.h's op_t::pad_ case).
+inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
+                const int64_t* a_shape, const int64_t* out_strides, int rank,
+                int64_t shift, int64_t n, int64_t out_n) {
+  if (rank <= 0 || rank > kPadFoldMaxRank) return false;
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(a_native);
+  c.device_write_(out_native);
+  zero_device_(reinterpret_cast<CUdeviceptr>(out_native), out_n);
+  size_t meta_bytes = 2 * static_cast<size_t>(rank) * sizeof(int64_t);
+  CUdeviceptr meta = c.meta_scratch_(meta_bytes);
+  if (!meta) return false;
+  std::vector<int64_t> host_meta(a_shape, a_shape + rank);
+  host_meta.insert(host_meta.end(), out_strides, out_strides + rank);
+  c.d.MemcpyHtoD(meta, host_meta.data(), meta_bytes);
+  float* pa = context::off_(a_native, ao);
+  float* po = context::off_(out_native, oo);
+  const long long* pmeta = reinterpret_cast<const long long*>(meta);
+  unsigned un = static_cast<unsigned>(n);
+  unsigned ushift = static_cast<unsigned>(shift);
+  return c.launch1d_(c.pad_(), un, pa, po, pmeta, rank, ushift, un);
+}
+
+// unfold's inverse: scatter-add `a` (contiguous; its last dim is the sliding
+// window) into a zero buffer of out_shape (zeroed the same way as pad()
+// above) — every overlap accumulates via atomicAdd, so it must start at 0).
+// Same meta-buffer convention as pad() above, packing [a_shape(rank),
+// out_strides(rank-1)].
+inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
+                 const int64_t* a_shape, const int64_t* out_strides, int rank,
+                 int axis, int64_t step, int64_t n, int64_t out_n) {
+  if (rank <= 0 || rank > kPadFoldMaxRank) return false;
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(a_native);
+  c.device_write_(out_native);
+  zero_device_(reinterpret_cast<CUdeviceptr>(out_native), out_n);
+  size_t meta_bytes =
+      (static_cast<size_t>(rank) + static_cast<size_t>(rank - 1)) *
+      sizeof(int64_t);
+  CUdeviceptr meta = c.meta_scratch_(meta_bytes);
+  if (!meta) return false;
+  std::vector<int64_t> host_meta(a_shape, a_shape + rank);
+  host_meta.insert(host_meta.end(), out_strides, out_strides + (rank - 1));
+  c.d.MemcpyHtoD(meta, host_meta.data(), meta_bytes);
+  float* pa = context::off_(a_native, ao);
+  float* po = context::off_(out_native, oo);
+  const long long* pmeta = reinterpret_cast<const long long*>(meta);
+  unsigned un = static_cast<unsigned>(n);
+  unsigned ustep = static_cast<unsigned>(step);
+  return c.launch1d_(c.fold_(), un, pa, po, pmeta, rank, axis, ustep, un);
 }
 
 // M7 decode GEMV: y(n) = a(1,k) @ B(k,n), F32 accumulate. B is either f32 or
@@ -1512,6 +1612,14 @@ inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
 }
 inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
                    float) {
+  return false;
+}
+inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
+                const int64_t*, int, int64_t, int64_t, int64_t) {
+  return false;
+}
+inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,
+                 const int64_t*, int, int, int64_t, int64_t, int64_t) {
   return false;
 }
 inline void sync_to_host(void*, bool) {}

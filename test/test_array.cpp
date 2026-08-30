@@ -1120,3 +1120,51 @@ TEST_CASE("pad and fold are real lazy-graph nodes, not an eager batch boundary")
   // position 0 is covered by exactly one window -> raw fold value == 0
   CHECK(folded_scaled.at({0}) == doctest::Approx(3.0f));  // 0*2+3
 }
+
+TEST_CASE("pad: GPU dispatch matches the ref oracle") {
+  // matches_gpu_oracle is a no-op (trivially true) where no GPU device
+  // exists — real coverage needs a CUDA (or, once written, Metal) backend.
+  std::vector<float> v(37);
+  for (int i = 0; i < 37; i++) v[static_cast<size_t>(i)] = static_cast<float>(i) - 10.0f;
+  auto x = array::from(v, {1, 37});
+  CHECK(matches_gpu_oracle([&] { return x.pad(1, 5, 8); }));
+  CHECK(matches_gpu_oracle([&] { return x.pad(0, 2, 3); }));
+}
+
+TEST_CASE("pad + unfold composed on the GPU matches the CPU im2col path") {
+  std::vector<float> img(64);
+  for (int i = 0; i < 64; i++) img[static_cast<size_t>(i)] = static_cast<float>(i);
+  auto x = array::from(img, {8, 8});
+  CHECK(matches_gpu_oracle([&] {
+    return x.pad(0, 1, 1).pad(1, 1, 1).unfold(0, 2, 2).unfold(1, 2, 2);
+  }));
+}
+
+TEST_CASE("fold: GPU dispatch matches the ref oracle on a contiguous window tensor") {
+  // Built via array::from directly (not through unfold's view) so
+  // gpu_fold_'s contiguous-input requirement is actually exercised here,
+  // rather than silently falling back to the CPU because the view chain
+  // that normally feeds fold() is itself non-contiguous.
+  std::vector<float> overlapping = {1, 2, 3, 2, 3, 4, 3, 4, 5, 4, 5, 6};
+  auto w = array::from(overlapping, {4, 3});  // 4 windows of 3, step 1: overlap
+  CHECK(matches_gpu_oracle([&] { return w.fold(0, 6, 1); }));  // exercises atomicAdd
+
+  std::vector<float> tiled = {1, 2, 3, 4, 5, 6};
+  auto w2 = array::from(tiled, {3, 2});  // 3 windows of 2, step 2: no overlap
+  CHECK(matches_gpu_oracle([&] { return w2.fold(0, 6, 2); }));
+}
+
+TEST_CASE("fold: 2-D round trip matches the CPU oracle regardless of which "
+         "backend actually ran it") {
+  // The unfold-view chain feeding fold here is generally non-contiguous, so
+  // this mainly re-confirms overall correctness (CPU fallback included) —
+  // the contiguous-input case above is what actually pins down the GPU
+  // kernel's own correctness.
+  std::vector<float> img(64);
+  for (int i = 0; i < 64; i++) img[static_cast<size_t>(i)] = static_cast<float>(i);
+  auto x = array::from(img, {8, 8});
+  CHECK(matches_gpu_oracle([&] {
+    auto windows = x.unfold(0, 2, 2).unfold(1, 2, 2);
+    return windows.fold(1, 8, 2).fold(0, 8, 2);
+  }));
+}
