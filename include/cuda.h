@@ -748,22 +748,38 @@ inline void zero_device_(CUdeviceptr dst, int64_t n) {
   else c.d.MemsetD8(dst, 0, bytes);
 }
 
+// Row-major strides of a contiguous tensor with the given shape — pad()/
+// fold() take shapes, not strides, so the same signature also serves
+// webgpu.h's gather-style kernels, which need shapes and derive strides (or
+// don't need them at all) on their own terms.
+inline void strides_from_shape_(const int64_t* shape, int rank,
+                                int64_t* strides) {
+  int64_t acc = 1;
+  for (int d = rank - 1; d >= 0; --d) {
+    strides[d] = acc;
+    acc *= shape[d];
+  }
+}
+
 // Places `a` (contiguous) into a zero buffer of out_shape (array.h's
 // gpu_pad_ allocates `out` uninitialized via array::empty — this zeros the
 // device copy directly, no host round trip), shifted by `before` along
-// `axis`. `a_shape`/`out_strides` are host arrays of length `rank`; uploaded
-// once to the meta scratch buffer since tl_pad indexes them from a flat
-// thread id rather than taking per-dim scalar args. No scale/offset —
-// eval_one's shared epilogue applies those (see array.h's op_t::pad_ case).
+// `axis`. `a_shape`/`out_shape` are host arrays of length `rank`; uploaded
+// once to the meta scratch buffer (as [a_shape, out_strides], the latter
+// derived here) since tl_pad indexes them from a flat thread id rather than
+// taking per-dim scalar args. No scale/offset — eval_one's shared epilogue
+// applies those (see array.h's op_t::pad_ case).
 inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
-                const int64_t* a_shape, const int64_t* out_strides, int rank,
-                int64_t shift, int64_t n, int64_t out_n) {
+                const int64_t* a_shape, const int64_t* out_shape, int rank,
+                int axis, int64_t before, int64_t n, int64_t out_n) {
   if (rank <= 0 || rank > kPadFoldMaxRank) return false;
   auto& c = context::get();
   if (!c.ready) return false;
   c.device_read_(a_native);
   c.device_write_(out_native);
   zero_device_(reinterpret_cast<CUdeviceptr>(out_native), out_n);
+  int64_t out_strides[kPadFoldMaxRank];
+  strides_from_shape_(out_shape, rank, out_strides);
   size_t meta_bytes = 2 * static_cast<size_t>(rank) * sizeof(int64_t);
   CUdeviceptr meta = c.meta_scratch_(meta_bytes);
   if (!meta) return false;
@@ -774,7 +790,7 @@ inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
   float* po = context::off_(out_native, oo);
   const long long* pmeta = reinterpret_cast<const long long*>(meta);
   unsigned un = static_cast<unsigned>(n);
-  unsigned ushift = static_cast<unsigned>(shift);
+  unsigned ushift = static_cast<unsigned>(before * out_strides[axis]);
   return c.launch1d_(c.pad_(), un, pa, po, pmeta, rank, ushift, un);
 }
 
@@ -782,9 +798,10 @@ inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
 // window) into a zero buffer of out_shape (zeroed the same way as pad()
 // above) — every overlap accumulates via atomicAdd, so it must start at 0).
 // Same meta-buffer convention as pad() above, packing [a_shape(rank),
-// out_strides(rank-1)].
+// out_strides(rank-1)] (out_strides derived from out_shape here, same as
+// pad() — out's own rank is rank-1, so only the first rank-1 strides count).
 inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
-                 const int64_t* a_shape, const int64_t* out_strides, int rank,
+                 const int64_t* a_shape, const int64_t* out_shape, int rank,
                  int axis, int64_t step, int64_t n, int64_t out_n) {
   if (rank <= 0 || rank > kPadFoldMaxRank) return false;
   auto& c = context::get();
@@ -792,6 +809,8 @@ inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
   c.device_read_(a_native);
   c.device_write_(out_native);
   zero_device_(reinterpret_cast<CUdeviceptr>(out_native), out_n);
+  int64_t out_strides[kPadFoldMaxRank];
+  strides_from_shape_(out_shape, rank - 1, out_strides);
   size_t meta_bytes =
       (static_cast<size_t>(rank) + static_cast<size_t>(rank - 1)) *
       sizeof(int64_t);
@@ -1615,7 +1634,7 @@ inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
   return false;
 }
 inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
-                const int64_t*, int, int64_t, int64_t, int64_t) {
+                const int64_t*, int, int, int64_t, int64_t, int64_t) {
   return false;
 }
 inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,

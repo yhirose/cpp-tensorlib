@@ -134,7 +134,8 @@ constexpr uint32_t kUniformSlotCount = 4096;
 // browser harness asserts each one dispatched — both need the same list, and a
 // new kernel missing from either loses a guarantee silently.
 inline constexpr const char* kEntryPoints[] = {
-    "sgemm", "ew_binary", "ew_unary", "ew_bcast", "softmax", "row_reduce"};
+    "sgemm", "ew_binary", "ew_unary", "ew_bcast", "softmax", "row_reduce",
+    "pad",   "fold"};
 
 // emscripten_webgpu_get_device() does not report "no device" — it hands
 // Module.preinitializedWebGPUDevice straight to importJsDevice, which reads
@@ -660,15 +661,131 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
   return c.encode_(entry, ma, mb, mo, p, rows, 1);
 }
 
-// No WGSL kernel yet for im2col's pad/fold — honest false sends the
-// evaluator to the CPU oracle.
-inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
-                const int64_t*, int, int64_t, int64_t, int64_t) {
-  return false;
+// A ring, not one reused buffer: queue.WriteBuffer runs ahead of whatever is
+// still sitting in the unsubmitted encoder (see device_read_'s comment
+// above), so two pad/fold calls batched into the same unflushed pass would
+// have the second call's metadata write stomp the first dispatch's
+// not-yet-executed read of the same buffer — the exact hazard the uniform
+// ring below (kUniformSlotCount) already exists to avoid for Params, just for
+// a second resource. One slot comfortably covers the rank-8 cap: pad needs
+// 2*rank <= 16 words, fold (rank-1)+rank <= 15.
+inline constexpr size_t kMetaSlotWords = 16;
+inline constexpr size_t kMetaSlotCount = 4096;
+
+// Allocated once, sized for the whole ring — through the same alloc() pool
+// every tensor buffer uses (by the time pad()/fold() below can run, alloc()
+// is already defined above). The static locals are safe: wasm is
+// single-threaded, and the token is opaque to eval_one's storage layer, so
+// nothing else could mistake it for a live array.
+inline void* meta_ring_(float** host_out) {
+  static void* tok = nullptr;
+  static float* host = nullptr;
+  if (!tok) {
+    tok = alloc(static_cast<int64_t>(kMetaSlotCount * kMetaSlotWords * 4),
+               &host);
+  }
+  if (!tok) return nullptr;
+  *host_out = host;
+  return tok;
 }
-inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,
-                 const int64_t*, int, int, int64_t, int64_t, int64_t) {
-  return false;
+
+// This call's word offset into the ring, advancing like the uniform ring's
+// `slot` and forcing the same flush-then-reset on wraparound.
+inline uint32_t meta_reserve_slot_() {
+  static uint32_t next = 0;
+  if (next >= kMetaSlotCount) {
+    flush();
+    next = 0;
+  }
+  return (next++) * static_cast<uint32_t>(kMetaSlotWords);
+}
+
+// Gather-style pad/fold (M11): unlike CUDA's scatter+atomicAdd, WGSL has no
+// float atomicAdd, so both dispatch one invocation per OUTPUT element and
+// have it read (pad) or sum (fold) whatever cells of `a` map to it — no
+// output cell is ever written by two invocations, so unlike cuda.h's pad/fold
+// neither needs a pre-zeroed buffer. `a_shape`/`out_shape` (length `rank`,
+// `rank-1` for fold's `out_shape`) ride the otherwise-unused second storage
+// binding as bit-reinterpreted u32 — WGSL's fixed Params uniform (used by
+// every other kernel here) has no room for a variable-length array, and
+// WriteBuffer is a raw byte copy regardless of the binding's declared type.
+inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
+                const int64_t* a_shape, const int64_t* out_shape, int rank,
+                int axis, int64_t before, int64_t n, int64_t out_n) {
+  (void)n;
+  auto& c = context::get();
+  if (!c.ready || rank <= 0 || rank > 8) return false;
+  params p = {};
+  if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
+  context::mirror* ma = c.mirror_(a_native);
+  context::mirror* mo = c.mirror_(out_native);
+  if (!ma || !mo) return false;
+  c.device_read_(a_native);
+  c.device_write_(out_native);
+
+  float* ring_host = nullptr;
+  void* ring_tok = meta_ring_(&ring_host);
+  if (!ring_tok) return false;
+  uint32_t word_off = meta_reserve_slot_();
+  auto* raw = reinterpret_cast<uint32_t*>(ring_host) + word_off;
+  for (int d = 0; d < rank; d++) raw[d] = static_cast<uint32_t>(out_shape[d]);
+  for (int d = 0; d < rank; d++) raw[rank + d] = static_cast<uint32_t>(a_shape[d]);
+  context::mirror* mm = c.mirror_(ring_tok);
+  size_t meta_words = 2 * static_cast<size_t>(rank);
+  // This call's slot only, at its own byte offset — an unconditional
+  // WriteBuffer, not device_read_'s dirty-flag check, since the ring's
+  // mirror never legitimately settles into a single steady HOST/DEVICE state
+  // (each slot is written once, read once, never again).
+  c.queue.WriteBuffer(mm->dev, word_off * 4, raw, meta_words * 4);
+  mm->where = context::BOTH;
+
+  p.M = static_cast<uint32_t>(out_n);
+  p.b_off = word_off;
+  p.pad0 = static_cast<uint32_t>(rank);
+  p.pad1 = static_cast<uint32_t>(axis);
+  p.pad2 = static_cast<uint32_t>(before);
+  return c.encode_("pad", ma, mm, mo, p, (out_n + 255) / 256, 1);
+}
+
+// unfold's inverse. Each output element sums over the bounded range of
+// window indices `w` whose window covers it (`w*step + k == out coordinate`
+// along `axis`, `0 <= k < win`) — the gather twin of cuda.h's scatter+
+// atomicAdd fold, needed because WGSL has no float atomicAdd. `a`'s own
+// strides aren't part of the metadata: `a` is contiguous (gpu_fold_'s
+// contract), so the kernel derives them from `a_shape` itself.
+inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
+                 const int64_t* a_shape, const int64_t* out_shape, int rank,
+                 int axis, int64_t step, int64_t n, int64_t out_n) {
+  (void)n;
+  auto& c = context::get();
+  if (!c.ready || rank <= 0 || rank > 8) return false;
+  params p = {};
+  if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
+  context::mirror* ma = c.mirror_(a_native);
+  context::mirror* mo = c.mirror_(out_native);
+  if (!ma || !mo) return false;
+  c.device_read_(a_native);
+  c.device_write_(out_native);
+
+  int out_rank = rank - 1;
+  float* ring_host = nullptr;
+  void* ring_tok = meta_ring_(&ring_host);
+  if (!ring_tok) return false;
+  uint32_t word_off = meta_reserve_slot_();
+  auto* raw = reinterpret_cast<uint32_t*>(ring_host) + word_off;
+  for (int d = 0; d < out_rank; d++) raw[d] = static_cast<uint32_t>(out_shape[d]);
+  for (int d = 0; d < rank; d++) raw[out_rank + d] = static_cast<uint32_t>(a_shape[d]);
+  context::mirror* mm = c.mirror_(ring_tok);
+  size_t meta_words = static_cast<size_t>(out_rank) + static_cast<size_t>(rank);
+  c.queue.WriteBuffer(mm->dev, word_off * 4, raw, meta_words * 4);
+  mm->where = context::BOTH;
+
+  p.M = static_cast<uint32_t>(out_n);
+  p.b_off = word_off;
+  p.pad0 = static_cast<uint32_t>(rank);
+  p.pad1 = static_cast<uint32_t>(axis);
+  p.pad2 = static_cast<uint32_t>(step);
+  return c.encode_("fold", ma, mm, mo, p, (out_n + 255) / 256, 1);
 }
 
 #else  // !(TENSORLIB_WEBGPU && __EMSCRIPTEN__) — stubs, as in metal.h
@@ -700,7 +817,7 @@ inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
   return false;
 }
 inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
-                const int64_t*, int, int64_t, int64_t, int64_t) {
+                const int64_t*, int, int, int64_t, int64_t, int64_t) {
   return false;
 }
 inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,

@@ -416,7 +416,7 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
 // No Metal kernel yet for im2col's pad/fold (cuda.h's tl_pad/tl_fold have no
 // Metal analogue) — honest false sends the evaluator to the CPU oracle.
 inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
-                const int64_t*, int, int64_t, int64_t, int64_t) {
+                const int64_t*, int, int, int64_t, int64_t, int64_t) {
   return false;
 }
 inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,
@@ -452,7 +452,7 @@ inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t,
   return false;
 }
 inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
-                const int64_t*, int, int64_t, int64_t, int64_t) {
+                const int64_t*, int, int, int64_t, int64_t, int64_t) {
   return false;
 }
 inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,

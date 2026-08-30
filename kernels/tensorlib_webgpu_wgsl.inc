@@ -305,4 +305,124 @@ fn row_reduce(@builtin(workgroup_id) wg : vec3<u32>,
   let r = tree_reduce(p.op, lid, acc);
   if (lid == 0u) { C[p.c_off + row] = r * p.scale + p.offset; }
 }
+
+// ---- im2col's pad/fold (M11)
+//
+// Both dispatch one invocation per OUTPUT element and gather from A, rather
+// than CUDA's scatter+atomicAdd: WGSL has no float atomicAdd. A gather needs
+// no pre-zeroed output (every C cell is written exactly once, by exactly one
+// invocation) and no atomics — the tradeoff is fold's small bounded loop over
+// the window indices that could cover a given output cell, in place of one
+// atomicAdd per source element.
+//
+// Neither family's shape metadata fits the fixed Params uniform (a
+// variable-length array has no home there), so it rides B as
+// bit-reinterpreted u32 — B's declared type is array<f32>, but WriteBuffer on
+// the host side is a raw byte copy regardless, and bitcast<u32> reads it back
+// correctly. p._pad0/_pad1/_pad2 (otherwise-unused Params padding) carry
+// rank/axis/before-or-step; p.M is the output element count (webgpu.h's
+// pad()/fold() dispatch over out_n, not a's own size).
+//
+// Shared by both: row-major decode of a dispatch-global thread id `i` against
+// a shape held in B at word offset `base`, into a fixed-size local array.
+// `rank8` bounds the loop so callers can pass either a full-rank or a
+// (rank-1)-length shape.
+fn decode_idx(i : u32, base : u32, rank8 : u32, out_idx : ptr<function, array<u32, 8>>) {
+  var rem = i;
+  for (var d : i32 = i32(rank8) - 1; d >= 0; d = d - 1) {
+    let dim = bitcast<u32>(B[base + u32(d)]);
+    (*out_idx)[u32(d)] = rem % dim;
+    rem = rem / dim;
+  }
+}
+
+// Row-major strides of a contiguous tensor whose shape is held in B at word
+// offset `base`, length `rank` — used to address `A`, which pad_/fold_'s GPU
+// dispatch (array.h's gpu_pad_/gpu_fold_) requires to be contiguous.
+fn a_strides_from_shape(base : u32, rank : u32, a_shape : ptr<function, array<u32, 8>>,
+                        out_strides : ptr<function, array<u32, 8>>) {
+  var acc : u32 = 1u;
+  for (var d : i32 = i32(rank) - 1; d >= 0; d = d - 1) {
+    let dim = bitcast<u32>(B[base + u32(d)]);
+    (*a_shape)[u32(d)] = dim;
+    (*out_strides)[u32(d)] = acc;
+    acc = acc * dim;
+  }
+}
+
+// B layout at word offset p.b_off: [out_shape(rank), a_shape(rank)] — webgpu.h
+// reserves a fresh ring slot per call (see meta_reserve_slot_), so two pad/
+// fold calls batched into the same unflushed pass never share one offset.
+@compute @workgroup_size(256, 1, 1)
+fn pad(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.M) { return; }
+  let rank = p._pad0;
+  let axis = p._pad1;
+  let before = i32(p._pad2);
+
+  var out_idx : array<u32, 8>;
+  decode_idx(i, p.b_off, rank, &out_idx);
+  var a_shape : array<u32, 8>;
+  var a_strides : array<u32, 8>;
+  a_strides_from_shape(p.b_off + rank, rank, &a_shape, &a_strides);
+
+  var src : u32 = 0u;
+  var in_bounds = true;
+  for (var d : u32 = 0u; d < rank; d = d + 1u) {
+    var c : i32 = i32(out_idx[d]);
+    if (d == axis) {
+      c = c - before;
+      if (c < 0 || c >= i32(a_shape[d])) { in_bounds = false; }
+    }
+    // Clamped even out of range: A[src] is still read below (WGSL's select
+    // evaluates both operands), so src must stay in bounds regardless of
+    // in_bounds — only the select, not the address, decides the result.
+    let cc = clamp(c, 0, i32(a_shape[d]) - 1);
+    src = src + u32(cc) * a_strides[d];
+  }
+  C[p.c_off + i] = select(0.0, A[p.a_off + src], in_bounds);
+}
+
+// B layout at word offset p.b_off: [out_shape(rank-1), a_shape(rank)] — same
+// per-call ring slot as pad above. a's last dim is the sliding window (size
+// a_shape[rank-1]); a's `axis` dim (size a_shape[axis]) is the window count.
+@compute @workgroup_size(256, 1, 1)
+fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.M) { return; }
+  let rank = p._pad0;
+  let axis = p._pad1;
+  let step = i32(p._pad2);
+  let out_rank = rank - 1u;
+
+  var out_idx : array<u32, 8>;
+  decode_idx(i, p.b_off, out_rank, &out_idx);
+  var a_shape : array<u32, 8>;
+  var a_strides : array<u32, 8>;
+  a_strides_from_shape(p.b_off + out_rank, rank, &a_shape, &a_strides);
+
+  let win : i32 = i32(a_shape[rank - 1u]);
+  let nwin : i32 = i32(a_shape[axis]);
+  let j : i32 = i32(out_idx[axis]);
+
+  var w_min : i32 = 0;
+  if (j - win + 1 > 0) { w_min = (j - win + 1 + step - 1) / step; }
+  var w_max : i32 = j / step;
+  if (w_max > nwin - 1) { w_max = nwin - 1; }
+
+  var sum : f32 = 0.0;
+  for (var w : i32 = w_min; w <= w_max; w = w + 1) {
+    let k = j - w * step;
+    if (k < 0 || k >= win) { continue; }
+    var src : u32 = 0u;
+    for (var d : u32 = 0u; d < out_rank; d = d + 1u) {
+      let coord = select(out_idx[d], u32(w), d == axis);
+      src = src + coord * a_strides[d];
+    }
+    src = src + u32(k) * a_strides[rank - 1u];
+    sum = sum + A[p.a_off + src];
+  }
+  C[p.c_off + i] = sum;
+}
 )WGSL"

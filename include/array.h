@@ -2021,12 +2021,11 @@ struct graph {
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
     std::vector<int64_t> a_shape(a.shape().begin(), a.shape().end());
-    auto out_strides = out.strides();
+    std::vector<int64_t> out_shape_v(out_shape.begin(), out_shape.end());
     int rank = static_cast<int>(a_shape.size());
-    int64_t shift = before * out_strides[axis];
     if (!gpu::pad(a.storage_.native, a.offset_ * 4, out.storage_.native,
-                 out.offset_ * 4, a_shape.data(), out_strides.data(), rank,
-                 shift, a.size(), out.size())) {
+                 out.offset_ * 4, a_shape.data(), out_shape_v.data(), rank,
+                 static_cast<int>(axis), before, a.size(), out.size())) {
       return std::nullopt;
     }
     return out;
@@ -2047,10 +2046,10 @@ struct graph {
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
     std::vector<int64_t> a_shape(a.shape().begin(), a.shape().end());
-    auto out_strides = out.strides();
+    std::vector<int64_t> out_shape_v(out_shape.begin(), out_shape.end());
     int rank = static_cast<int>(a_shape.size());
     if (!gpu::fold(a.storage_.native, a.offset_ * 4, out.storage_.native,
-                  out.offset_ * 4, a_shape.data(), out_strides.data(), rank,
+                  out.offset_ * 4, a_shape.data(), out_shape_v.data(), rank,
                   static_cast<int>(axis), step, a.size(), out.size())) {
       return std::nullopt;
     }
