@@ -109,6 +109,19 @@ inline shape_t reduce_shape(const shape_t& s, int& axis, bool keepdims) {
   return out;
 }
 
+// Validates and normalizes a (possibly negative, numpy-style) axis against
+// `rank`. Shared by slice/pad/unfold so the bounds check and the negative-
+// axis convention `reduce_shape` above already uses for sum/mean/max/argmax
+// live in exactly one place.
+inline size_t normalize_axis(int axis, size_t rank, const char* who) {
+  int r = static_cast<int>(rank);
+  if (axis < 0) axis += r;
+  if (axis < 0 || axis >= r) {
+    throw std::invalid_argument(std::string("tl::") + who + ": bad axis");
+  }
+  return static_cast<size_t>(axis);
+}
+
 // Soft rank cap so index walkers can use stack arrays instead of per-call
 // heap vectors (the walker is called per *op*, and tiny-tensor workloads
 // live or die on per-op allocation count).
@@ -155,25 +168,39 @@ struct node {
     attn_dec,  // fused decode attention: softmax(arg0 · q·Kᵀ)·V
     rope,      // rotary position embedding (arg0=base, axis=position offset)
     sum_ax, mean_ax, max_ax, argmax_ax, sum_to_,
-    view_,     // zero-copy view (transpose/reshape/slice) over a still-lazy
-               // source: composes strides at eval, no kernel, no flush — keeps
-               // the source in the same batch instead of forcing a boundary.
+    pad_,   // zero-pad axis `axis` by `arg0` (=before) elements; `shape` is
+            // the padded target (`after` is derivable: shape[axis] - before
+            // - input.shape()[axis]). A real write, not a view — see pad_.
+    fold_,  // unfold's inverse: scatter-add axis `axis` (step=`arg0`) back
+            // down to `shape`, accumulating overlaps. Also a real write.
+    view_,  // zero-copy view (transpose/reshape/slice/unfold) over a still-
+            // lazy source: composes strides at eval, no kernel, no flush —
+            // keeps the source in the same batch instead of forcing a
+            // boundary. unfold reuses view_axes[0]=axis, view_start=step
+            // (its window size is just shape.back(), needs no field).
   };
 
   op_t op = op_t::constant;
   shape_t shape;  // for sum_to this is the target shape (= the op parameter)
   std::vector<std::shared_ptr<node>> inputs;
   float scale = 1.0f, offset = 0.0f;  // fused epilogue: op(...) * scale + offset
-  float arg0 = 0.0f;  // op-specific scalar (attn_dec: softmax scale)
+  float arg0 = 0.0f;  // op-specific scalar: attn_dec's softmax scale,
+                      // pad_'s `before`, or fold_'s `step` (whichever the
+                      // op needs one generic slot for, rather than growing
+                      // this struct further — `axis` below covers the other
+                      // scalar both of them need).
   int axis = 0;
   bool keepdims = false;
 
   // view_ parameters (only meaningful when op == view_). view_axes is empty
-  // for non-transpose views (no allocation on the common non-view node).
-  enum class vkind : uint8_t { transpose, reshape, slice };
+  // for reshape (no allocation on the common non-view node); it holds the
+  // permutation for transpose, or a single axis (one element) for slice/
+  // unfold — reused rather than adding a dedicated field for one int.
+  enum class vkind : uint8_t { transpose, reshape, slice, unfold };
   vkind view_kind = vkind::reshape;
-  std::vector<int> view_axes;  // transpose permutation
-  int64_t view_start = 0;      // slice start along axis 0
+  std::vector<int> view_axes;  // transpose permutation, or [axis] for slice/unfold
+  int64_t view_start = 0;      // slice's start, or unfold's step, along
+                               // view_axes[0] (slice: 0 if view_axes empty)
 
   // constant source / evaluated result
   storage stor;
@@ -308,6 +335,31 @@ class array {
   array transpose(std::vector<int> axes) const;  // permutation
   array reshape(shape_t shape) const;  // view when contiguous, else copy
   array slice(int64_t start, int64_t count) const;  // axis 0
+  array slice(int axis, int64_t start, int64_t count) const;  // any axis
+  // Zero-pad `axis` by `before`/`after` elements on each side. Not a view —
+  // allocates the padded buffer and writes `*this` into it via `add_`
+  // through a `slice` (so it needs nothing beyond what already exists:
+  // `zeros` + the axis-general `slice` above + `add_`'s already-tested
+  // write-through-a-view behavior). Compose two calls for 2-D (H then W)
+  // padding, the same way two `unfold` calls give a 2-D window.
+  array pad(int axis, int64_t before, int64_t after) const;
+  // Sliding-window view over `axis` — shape gains a trailing `size` axis,
+  // `axis` itself becomes the window count (PyTorch's `Tensor.unfold`).
+  // Zero-copy: reuses the same base storage as transpose/reshape/slice, via
+  // a stride smaller than `axis`'s extent (the same trick broadcast's
+  // stride-0 already relies on, generalized to a nonzero overlap). Forces
+  // materialization first rather than deferring through the lazy graph as
+  // a view node — see the TODO at the call site for what a `vkind::unfold`
+  // would need.
+  array unfold(int axis, int64_t size, int64_t step) const;
+  // `unfold`'s inverse (PyTorch's `Tensor.fold`, generalized to any axis):
+  // scatter-adds `*this` (shaped like some `x.unfold(axis, size, step)`)
+  // back into a fresh `orig_size`-along-`axis` buffer, accumulating every
+  // overlap — the gradient a differentiable caller's backward needs. Unlike
+  // every view above, this genuinely computes (can't be a stride trick:
+  // overlapping windows write to the same destination element more than
+  // once), so it's a real O(size(*this)) walk, not a zero-copy view.
+  array fold(int axis, int64_t orig_size, int64_t step) const;
   array clone() const;                              // contiguous copy
 
   // Storage dtype (M7). bf16 is a weight-container storage type: create with
@@ -566,7 +618,9 @@ inline void host_sync_(void* native, bool for_write) {
 inline const float* array::raw() const {
   ensure_();
   if (storage_.dt != tl::dtype::f32) {
-    throw std::logic_error("tl::raw: bf16 storage; use to_f32()");
+    throw std::logic_error(std::string("tl::raw: ") +
+                           tl::dtype_name(storage_.dt) +
+                           " storage; use to_f32()");
   }
   detail::barrier_();
   detail::host_sync_(storage_.native, /*for_write=*/false);
@@ -576,7 +630,9 @@ inline const float* array::raw() const {
 inline float* array::data() {
   ensure_();
   if (storage_.dt != tl::dtype::f32) {
-    throw std::logic_error("tl::data: bf16 storage; use to_f32()");
+    throw std::logic_error(std::string("tl::data: ") +
+                           tl::dtype_name(storage_.dt) +
+                           " storage; use to_f32()");
   }
   detail::barrier_();
   if (!contiguous()) {
@@ -646,18 +702,56 @@ inline array array::reshape(shape_t shape) const {
 }
 
 inline array array::slice(int64_t start, int64_t count) const {
-  if (rank() == 0 || start < 0 || start + count > shape_[0]) {
+  return slice(0, start, count);
+}
+
+inline array array::slice(int axis, int64_t start, int64_t count) const {
+  size_t ax = detail::normalize_axis(axis, rank(), "slice");
+  if (start < 0 || count < 0 || start + count > shape_[ax]) {
     throw std::invalid_argument("tl::slice: out of range");
   }
   auto shape = shape_;
-  shape[0] = count;
-  int64_t voff = offset_ + start * strides_[0];
+  shape[ax] = count;
+  int64_t voff = offset_ + start * strides_[ax];
   if (node_) {  // lazy source: defer as a view node — no batch boundary
+    // `{}` for axis 0 keeps the common case allocation-free, same as before
+    // this overload existed; only a non-zero axis needs `view_axes` at all.
+    std::vector<int> axes = ax == 0 ? std::vector<int>{} : std::vector<int>{static_cast<int>(ax)};
     return lazy_view_(detail::node::vkind::slice, std::move(shape), strides_,
-                      voff, {}, start);
+                      voff, std::move(axes), start);
   }
   realize_();
   return make_view_(*this, std::move(shape), strides_, voff);
+}
+
+// `pad`/`fold` are defined out-of-line further down (near `sum_to`), once
+// `detail::graph` — which their bodies delegate to — is a complete type;
+// `unfold` doesn't need that (it only calls other `array` methods and the
+// free `detail::normalize_axis`, both already visible here).
+inline array array::unfold(int axis, int64_t win, int64_t step) const {
+  size_t ax = detail::normalize_axis(axis, rank(), "unfold");
+  int64_t n = shape_[ax];
+  if (win <= 0 || win > n || step <= 0) {
+    throw std::invalid_argument("tl::unfold: bad size/step");
+  }
+  int64_t nwin = (n - win) / step + 1;
+
+  shape_t shape = shape_;
+  shape[ax] = nwin;
+  shape.push_back(win);
+
+  std::vector<int64_t> strides = strides_;
+  int64_t base_stride = strides_[ax];
+  strides[ax] = base_stride * step;
+  strides.push_back(base_stride);
+
+  if (node_) {  // lazy source: defer as a view node — no batch boundary
+    return lazy_view_(detail::node::vkind::unfold, std::move(shape),
+                      std::move(strides), offset_,
+                      {static_cast<int>(ax)}, step);
+  }
+  realize_();
+  return make_view_(*this, std::move(shape), std::move(strides), offset_);
 }
 
 inline array array::clone() const {
@@ -1094,6 +1188,62 @@ inline array sum_to(const array& a, const shape_t& target) {
   return out;
 }
 
+// Places `a` into a zero buffer of `out_shape`, shifted by `before` along
+// `axis` — a real write (pad_'s non-overlapping placement has no stride
+// trick that could make it a view: the destination is strictly bigger than
+// the source). `for_each_index` walks `a`'s own shape, computing the
+// destination offset with `out_shape`'s strides as if `a` started at
+// position 0 along `axis`; adding the constant `before`-sized shift lands
+// each element at its real padded position.
+inline array pad(const array& a, size_t axis, int64_t before,
+                 const shape_t& out_shape) {
+  auto out = array::zeros(out_shape);
+  auto* po = out.data();
+  const auto* pi = a.raw();
+  auto dst_strides = out.strides();
+  int64_t shift = before * dst_strides[axis];
+  detail::for_each_index(a.shape(), {a.strides(), dst_strides},
+                         [&](int64_t, const std::vector<int64_t>& off) {
+                           po[off[1] + shift] = pi[off[0]];
+                         });
+  return out;
+}
+
+// unfold's inverse: scatter-add `a` (shaped like some `x.unfold(axis, win,
+// step)`) back into a zero buffer of `out_shape` (x's original shape),
+// accumulating every overlap. Genuinely computes rather than reinterprets
+// strides — two different source elements can target the same destination
+// slot, which no view can express — so this is its own manual index walk
+// rather than `for_each_index` (built for same-shape, different-strides
+// sources, not a rank-changing many-to-one map).
+inline array fold(const array& a, size_t axis, int64_t step,
+                  const shape_t& out_shape) {
+  auto out = array::zeros(out_shape);
+  auto* po = out.data();
+  const auto* pi = a.raw();
+  auto out_strides = out.strides();
+  size_t r = a.rank(), last = r - 1;
+  const auto& a_shape = a.shape();
+  const auto& a_strides = a.strides();
+  std::vector<int64_t> idx(r, 0);
+  int64_t n = a.size();
+  for (int64_t i = 0; i < n; i++) {
+    int64_t src_off = 0;
+    for (size_t d = 0; d < r; d++) src_off += idx[d] * a_strides[d];
+    int64_t dst_off = 0;
+    for (size_t d = 0; d < last; d++) {
+      int64_t di = (d == axis) ? idx[d] * step + idx[last] : idx[d];
+      dst_off += di * out_strides[d];
+    }
+    po[dst_off] += pi[src_off];
+    for (size_t d = r; d-- > 0;) {
+      if (++idx[d] < a_shape[d]) break;
+      idx[d] = 0;
+    }
+  }
+  return out;
+}
+
 }  // namespace ref
 
 // Accelerate backend (macOS) --------------------------------------------------
@@ -1386,6 +1536,38 @@ struct graph {
     auto n = std::make_shared<node>();
     n->op = op_t::sum_to_;
     n->shape = std::move(target);
+    n->inputs = {as_node(a)};
+    return from_node(std::move(n));
+  }
+
+  static array pad(const array& a, int axis, int64_t before, int64_t after) {
+    size_t ax = normalize_axis(axis, a.rank(), "pad");
+    if (before < 0 || after < 0) {
+      throw std::invalid_argument("tl::pad: negative pad");
+    }
+    auto n = std::make_shared<node>();
+    n->op = op_t::pad_;
+    n->shape = a.shape();
+    n->shape[ax] = n->shape[ax] + before + after;
+    n->axis = static_cast<int>(ax);
+    n->arg0 = static_cast<float>(before);
+    n->inputs = {as_node(a)};
+    return from_node(std::move(n));
+  }
+
+  static array fold(const array& a, int axis, int64_t orig_size,
+                    int64_t step) {
+    if (a.rank() < 1) throw std::invalid_argument("tl::fold: rank too low");
+    size_t ax = normalize_axis(axis, a.rank() - 1, "fold");
+    if (orig_size < 1 || step < 1) {
+      throw std::invalid_argument("tl::fold: bad orig_size/step");
+    }
+    auto n = std::make_shared<node>();
+    n->op = op_t::fold_;
+    n->shape = shape_t(a.shape().begin(), a.shape().end() - 1);
+    n->shape[ax] = orig_size;
+    n->axis = static_cast<int>(ax);
+    n->arg0 = static_cast<float>(step);
     n->inputs = {as_node(a)};
     return from_node(std::move(n));
   }
@@ -2185,20 +2367,41 @@ struct graph {
       case op_t::sum_to_:
         r = ref::sum_to(in(0), n.shape);
         break;
+      case op_t::pad_:
+        r = ref::pad(in(0), static_cast<size_t>(n.axis),
+                    static_cast<int64_t>(n.arg0), n.shape);
+        break;
+      case op_t::fold_:
+        r = ref::fold(in(0), static_cast<size_t>(n.axis),
+                     static_cast<int64_t>(n.arg0), n.shape);
+        break;
       case op_t::view_: {
         // Pure layout: the source is evaluated, so re-applying the view on the
         // materialized wrap composes strides only (make_view_, no kernel, no
         // barrier). A reshape of a non-contiguous view is the sole case that
         // copies — inherent, and rare.
+        //
+        // Falls through to the shared epilogue below instead of an early
+        // `store`+`return` — `graph::affine` fuses a scale/offset onto ANY
+        // unevaluated, non-constant node (view_ included), so a view that
+        // skipped the epilogue here would silently drop it (e.g. `x.slice(
+        // ...) * s + o` on a still-lazy `x` returned `x.slice(...)` verbatim).
         array src = wrap(*n.inputs[0]);
-        array v;
         switch (n.view_kind) {
-          case node::vkind::transpose: v = src.transpose(n.view_axes); break;
-          case node::vkind::reshape: v = src.reshape(n.shape); break;
-          case node::vkind::slice: v = src.slice(n.view_start, n.shape[0]); break;
+          case node::vkind::transpose: r = src.transpose(n.view_axes); break;
+          case node::vkind::reshape: r = src.reshape(n.shape); break;
+          case node::vkind::slice: {
+            int ax = n.view_axes.empty() ? 0 : n.view_axes[0];
+            r = src.slice(ax, n.view_start, n.shape[static_cast<size_t>(ax)]);
+            break;
+          }
+          case node::vkind::unfold: {
+            int ax = n.view_axes[0];
+            r = src.unfold(ax, n.shape.back(), n.view_start);
+            break;
+          }
         }
-        store(n, v);
-        return;
+        break;
       }
     }
     if (!epi_done && (n.scale != 1.0f || n.offset != 0.0f)) {
@@ -2348,6 +2551,13 @@ inline array array::sum_to(shape_t shape) const {
 }
 inline array sum_to(const array& a, shape_t shape) {
   return a.sum_to(std::move(shape));
+}
+
+inline array array::pad(int axis, int64_t before, int64_t after) const {
+  return detail::graph::pad(*this, axis, before, after);
+}
+inline array array::fold(int axis, int64_t orig_size, int64_t step) const {
+  return detail::graph::fold(*this, axis, orig_size, step);
 }
 
 inline array& array::add_(const array& b) {

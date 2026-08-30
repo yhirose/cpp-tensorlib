@@ -22,6 +22,18 @@ enum class dtype : uint8_t { f32, bf16, q4 };
 // Byte width for the plain widths (q4 is variable — use q4_bytes()).
 inline int64_t dtype_size(dtype dt) { return dt == dtype::bf16 ? 2 : 4; }
 
+// For error messages that name the actual non-f32 storage kind rather than
+// assuming it's always bf16 (raw()/data() used to hardcode "bf16 storage"
+// even when the real culprit was q4).
+inline const char* dtype_name(dtype dt) {
+  switch (dt) {
+    case dtype::f32: return "f32";
+    case dtype::bf16: return "bf16";
+    case dtype::q4: return "q4";
+  }
+  return "?";
+}
+
 // q4 layout: fixed group size, one buffer = [packed int4 [N][K/2] | scales
 // f32 [N][K/kQ4Group]]. K must be a multiple of kQ4Group (the kernel's per-lane
 // tail guard handles K % 256 != 0, e.g. Qwen's K=896).

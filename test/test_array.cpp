@@ -843,8 +843,16 @@ TEST_CASE("q4 weight storage: decode dot + widen fallback vs dequant oracle") {
       maxerr = std::max(maxerr, (double)std::fabs(deq.at({k, j}) - w.at({k, j})));
   CHECK(maxerr < 0.2);  // symmetric int4, scale = maxabs/7
 
-  // direct element access on q4 throws (weight-container semantics)
-  CHECK_THROWS(wq.at({0, 0}));
+  // direct element access on q4 throws (weight-container semantics) — and
+  // names the actual storage kind (q4), not a hardcoded "bf16" (raw()/
+  // data() used to assume any non-f32 storage was bf16).
+  try {
+    wq.at({0, 0});
+    FAIL("expected a throw");
+  } catch (const std::exception& e) {
+    CHECK(std::string(e.what()).find("q4") != std::string::npos);
+    CHECK(std::string(e.what()).find("bf16") == std::string::npos);
+  }
 
   // non-decode shape (M=2) widens q4 -> f32; matches the same dequant oracle
   auto a2v = std::vector<float>(2 * K);
@@ -853,4 +861,262 @@ TEST_CASE("q4 weight storage: decode dot + widen fallback vs dequant oracle") {
   auto ref2 = a2.dot(deq);
   auto got2 = a2.dot(wq);
   CHECK(got2.at({1, 3}) == doctest::Approx(ref2.at({1, 3})).epsilon(1e-3));
+}
+
+// `unfold`: the sliding-window view a differentiable im2col (or any other
+// windowed op) is built out of. See array.h's doc comment for what's still
+// missing (lazy-graph integration, a `fold`/scatter-add backward, GPU).
+TEST_CASE("unfold: 1-D sliding window matches a hand-written stride walk") {
+  auto a = array::from({0, 1, 2, 3, 4, 5});
+  auto w = a.unfold(0, 3, 1);
+  CHECK(w.shape() == tl::shape_t{4, 3});
+  float expected[4][3] = {{0, 1, 2}, {1, 2, 3}, {2, 3, 4}, {3, 4, 5}};
+  for (int64_t i = 0; i < 4; i++) {
+    for (int64_t j = 0; j < 3; j++) {
+      CHECK(w.at({i, j}) == expected[i][j]);
+    }
+  }
+}
+
+TEST_CASE("unfold: two axes composed gives im2col-style 2x2 non-overlapping blocks") {
+  // A 4x4 "image" (values 0..15), unfolded on both spatial axes with a 2x2,
+  // stride-2 window — the exact config test_conv.cul hand-verified for the
+  // culebra port's nested-loop im2col (block sums [[10,18],[42,50]]).
+  std::vector<float> img(16);
+  for (int i = 0; i < 16; i++) img[i] = static_cast<float>(i);
+  auto x = array::from(img, {4, 4});
+
+  auto windows = x.unfold(0, 2, 2).unfold(1, 2, 2);  // [2,2,2,2]: (oh,ow,kh,kw)
+  CHECK(windows.shape() == tl::shape_t{2, 2, 2, 2});
+
+  // Block (0,0) should be the top-left 2x2 patch {0,1,4,5}.
+  CHECK(windows.at({0, 0, 0, 0}) == 0);
+  CHECK(windows.at({0, 0, 0, 1}) == 1);
+  CHECK(windows.at({0, 0, 1, 0}) == 4);
+  CHECK(windows.at({0, 0, 1, 1}) == 5);
+  // Block (1,1) (bottom-right) should be {10,11,14,15}.
+  CHECK(windows.at({1, 1, 0, 0}) == 10);
+  CHECK(windows.at({1, 1, 0, 1}) == 11);
+  CHECK(windows.at({1, 1, 1, 0}) == 14);
+  CHECK(windows.at({1, 1, 1, 1}) == 15);
+
+  // Every element of a window sums to the same per-block totals im2col's
+  // matmul-with-a-ones-kernel would produce (10, 18, 42, 50).
+  auto block_sum = [&](int64_t bi, int64_t bj) {
+    float s = 0;
+    for (int64_t ki = 0; ki < 2; ki++)
+      for (int64_t kj = 0; kj < 2; kj++) s += windows.at({bi, bj, ki, kj});
+    return s;
+  };
+  CHECK(block_sum(0, 0) == 10);
+  CHECK(block_sum(0, 1) == 18);
+  CHECK(block_sum(1, 0) == 42);
+  CHECK(block_sum(1, 1) == 50);
+}
+
+TEST_CASE("unfold: overlapping windows share storage with the source (true view)") {
+  auto base = array::zeros({6});
+  auto w = base.unfold(0, 3, 1);  // overlapping: step < size
+  CHECK(w.shape() == tl::shape_t{4, 3});
+
+  // Mutate the base in place; the view must see it, proving no copy was
+  // made at unfold() time (this is the whole performance argument).
+  base.add_(array::from({1, 2, 3, 4, 5, 6}));
+  CHECK(w.at({0, 0}) == 1);
+  CHECK(w.at({0, 2}) == 3);
+  CHECK(w.at({1, 0}) == 2);   // overlaps window 0's last element's neighbor
+  CHECK(w.at({3, 2}) == 6);
+}
+
+TEST_CASE("slice: any axis, both the eager and the lazy-graph path") {
+  // 3x4, values row-major 0..11. Column-slice (axis 1) is the case the old
+  // axis-0-only `slice` couldn't express at all.
+  std::vector<float> v(12);
+  for (int i = 0; i < 12; i++) v[i] = static_cast<float>(i);
+  auto x = array::from(v, {3, 4});
+
+  auto eager = x.slice(1, 1, 2);  // columns 1..2 of every row
+  CHECK(eager.shape() == tl::shape_t{3, 2});
+  CHECK(eager.at({0, 0}) == 1);
+  CHECK(eager.at({1, 1}) == 6);
+  CHECK(eager.at({2, 0}) == 9);
+
+  // Through a still-lazy source, this exercises the view_ node's eval path
+  // (view_axes now carries the sliced axis instead of always meaning 0).
+  auto lazy_src = x + 0.0f;  // forces a lazy `affine` node, not yet evaluated
+  auto lazy = lazy_src.slice(1, 1, 2);
+  CHECK(lazy.shape() == tl::shape_t{3, 2});
+  CHECK(lazy.at({0, 0}) == 1);
+  CHECK(lazy.at({1, 1}) == 6);
+  CHECK(lazy.at({2, 0}) == 9);
+
+  CHECK_THROWS(x.slice(1, 3, 2));  // out of range
+  CHECK_THROWS(x.slice(5, 0, 1));  // bad axis
+}
+
+TEST_CASE("pad: single axis places the source at the right offset in a zero buffer") {
+  auto x = array::from({1, 2, 3}, {1, 3});
+  auto padded = x.pad(1, 2, 1);  // 2 zeros before, 1 after, on axis 1
+  CHECK(padded.shape() == tl::shape_t{1, 6});
+  float expected[6] = {0, 0, 1, 2, 3, 0};
+  for (int j = 0; j < 6; j++) CHECK(padded.at({0, j}) == expected[j]);
+
+  // asymmetric before/after and a lazy source both work.
+  auto lazy_padded = (x + 0.0f).pad(1, 0, 2);
+  CHECK(lazy_padded.shape() == tl::shape_t{1, 5});
+  float expected2[5] = {1, 2, 3, 0, 0};
+  for (int j = 0; j < 5; j++) CHECK(lazy_padded.at({0, j}) == expected2[j]);
+}
+
+TEST_CASE("pad + unfold composed on both spatial axes reproduces a padded im2col") {
+  // 4x4 image 0..15, pad=1 on H and W, then a 2x2/stride-2 window on each —
+  // the full pad -> unfold -> unfold pipeline a differentiable conv2d needs,
+  // with no host-side loop anywhere in this test.
+  std::vector<float> img(16);
+  for (int i = 0; i < 16; i++) img[i] = static_cast<float>(i);
+  auto x = array::from(img, {4, 4});
+
+  auto padded = x.pad(0, 1, 1).pad(1, 1, 1);
+  CHECK(padded.shape() == tl::shape_t{6, 6});
+  CHECK(padded.at({0, 0}) == 0);   // padding
+  CHECK(padded.at({1, 1}) == 0);   // original (0,0)
+  CHECK(padded.at({2, 2}) == 5);   // original (1,1)
+
+  auto windows = padded.unfold(0, 2, 2).unfold(1, 2, 2);  // [3,3,2,2]
+  CHECK(windows.shape() == tl::shape_t{3, 3, 2, 2});
+  // Top-left window is entirely padding-and-one-real-pixel: {0,0,0,0}.
+  CHECK(windows.at({0, 0, 0, 0}) == 0);
+  CHECK(windows.at({0, 0, 1, 1}) == 0);  // padded(1,1) == original(0,0) == 0
+  // Center window (1,1) covers original rows/cols 1..2 exactly.
+  CHECK(windows.at({1, 1, 0, 0}) == 5);   // original (1,1)
+  CHECK(windows.at({1, 1, 1, 1}) == 10);  // original (2,2)
+}
+
+TEST_CASE("a view over a lazy source still gets its fused affine epilogue") {
+  // Regression test: `graph::affine` fuses `* s + o` onto ANY unevaluated,
+  // non-constant node — view_ (transpose/reshape/slice) included — but
+  // `eval_one`'s view_ case used to `store()` and `return` immediately,
+  // bypassing the epilogue application entirely and silently dropping the
+  // scale/offset. Needs a source large enough to skip the eager-tiny fast
+  // path (kEagerTiny) so the arithmetic actually goes through the lazy
+  // graph instead of computing eagerly.
+  const int64_t n = 5000;
+  std::vector<float> v(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; i++) v[static_cast<size_t>(i)] = static_cast<float>(i);
+  auto base = array::from(v);
+
+  auto lazy = base + 0.0f;  // an unevaluated `affine` node, not yet stored
+  auto sliced = lazy.slice(10, 3);
+  auto scaled = sliced * 10.0f + 1.0f;
+  CHECK(scaled.at({0}) == doctest::Approx(101.0f));  // 10*1
+  CHECK(scaled.at({1}) == doctest::Approx(111.0f));  // 10*11 + 1
+  CHECK(scaled.at({2}) == doctest::Approx(121.0f));  // 10*12 + 1
+
+  // Same shape of bug through unfold's window view.
+  auto windowed = lazy.unfold(0, 3, 1) * 2.0f + 5.0f;
+  CHECK(windowed.at({7, 0}) == doctest::Approx(2.0f * 7 + 5));
+}
+
+TEST_CASE("slice/pad/unfold accept a negative axis, matching sum/mean/max's convention") {
+  std::vector<float> v(12);
+  for (int i = 0; i < 12; i++) v[static_cast<size_t>(i)] = static_cast<float>(i);
+  auto x = array::from(v, {3, 4});  // rank 2: axis -1 == axis 1
+
+  auto s_pos = x.slice(1, 1, 2);
+  auto s_neg = x.slice(-1, 1, 2);
+  CHECK(array_equal(s_pos, s_neg));
+
+  auto p_pos = x.pad(1, 1, 0);
+  auto p_neg = x.pad(-1, 1, 0);
+  CHECK(array_equal(p_pos, p_neg));
+
+  auto u_pos = x.unfold(1, 2, 2);
+  auto u_neg = x.unfold(-1, 2, 2);
+  CHECK(array_equal(u_pos, u_neg));
+
+  CHECK_THROWS(x.slice(-3, 0, 1));  // out of range even after normalizing
+}
+
+TEST_CASE("fold: non-overlapping windows reconstruct the source exactly") {
+  auto x = array::from({1, 2, 3, 4, 5, 6});
+  auto w = x.unfold(0, 2, 2);  // windows [1,2] [3,4] [5,6], no overlap
+  auto rec = w.fold(0, 6, 2);
+  CHECK(rec.shape() == tl::shape_t{6});
+  CHECK(array_equal(rec, x));
+}
+
+TEST_CASE("fold: overlapping windows accumulate, matching a hand-computed sum") {
+  auto x = array::from({1, 2, 3, 4, 5, 6});
+  auto w = x.unfold(0, 3, 1);  // 4 windows, step 1 < size 3: heavy overlap
+  auto rec = w.fold(0, 6, 1);
+  // position i's value = i+1, contributed once per window covering it.
+  // pos0: {w0}, pos1: {w0,w1}, pos2: {w0,w1,w2}, pos3: {w1,w2,w3},
+  // pos4: {w2,w3}, pos5: {w3} — each contributing (i+1) per window.
+  float expected[6] = {1, 4, 9, 12, 10, 6};
+  for (int i = 0; i < 6; i++) CHECK(rec.at({i}) == expected[i]);
+
+  // Sum conservation: fold never drops or duplicates a source element, it
+  // only ever redirects each one to exactly one destination slot.
+  CHECK(rec.sum() == doctest::Approx(w.sum()));
+}
+
+TEST_CASE("fold: 2-D pad -> unfold -> unfold -> fold -> fold round-trips a non-overlapping tiling") {
+  std::vector<float> img(16);
+  for (int i = 0; i < 16; i++) img[i] = static_cast<float>(i);
+  auto x = array::from(img, {4, 4});
+  auto windows = x.unfold(0, 2, 2).unfold(1, 2, 2);  // [2,2,2,2], no overlap
+
+  // fold undoes the two unfolds in reverse order. Undoing the W-unfold
+  // (axis 1) drops the trailing kw axis and widens axis 1 back to 4,
+  // leaving [oh=2, W=4, kh=2] — the H-unfold's own trailing axis (kh) is
+  // still there, one `fold` away from being undone too.
+  auto after_w = windows.fold(1, 4, 2);
+  CHECK(after_w.shape() == tl::shape_t{2, 4, 2});
+  auto rec = after_w.fold(0, 4, 2);
+  CHECK(rec.shape() == tl::shape_t{4, 4});
+  CHECK(array_equal(rec, x));
+}
+
+TEST_CASE("fold accepts a negative axis, matching slice/pad/unfold") {
+  auto x = array::from({1, 2, 3, 4, 5, 6});
+  auto w = x.unfold(0, 3, 1);
+  // The axis fold's bounds-check against is the *reconstructed* (pre-unfold)
+  // rank, which is 1 here (x is rank 1) — so -1, not w's own rank, is what
+  // maps back to 0.
+  CHECK(array_equal(w.fold(0, 6, 1), w.fold(-1, 6, 1)));
+}
+
+TEST_CASE("pad and fold are real lazy-graph nodes, not an eager batch boundary") {
+  // Large enough to skip the eager-tiny fast path, so `+ 0.0f` genuinely
+  // builds an unevaluated `affine` node rather than computing immediately.
+  const int64_t n = 5000;
+  std::vector<float> v(static_cast<size_t>(n));
+  for (int64_t i = 0; i < n; i++) v[static_cast<size_t>(i)] = static_cast<float>(i);
+  auto base = array::from(v);
+  auto lazy = base + 0.0f;
+  CHECK_FALSE(lazy.materialized());
+
+  // pad() must not force `lazy` to materialize just to build the node.
+  auto padded = lazy.pad(0, 2, 0);
+  CHECK_FALSE(padded.materialized());
+  CHECK_FALSE(lazy.materialized());  // still not forced by pad() itself
+
+  // ...and the fused affine epilogue (the earlier view_ bug's exact shape)
+  // must survive through a pad_ node too, since `graph::affine` fuses onto
+  // any unevaluated non-constant node, pad_ included.
+  auto scaled = padded * 10.0f + 1.0f;
+  CHECK(scaled.at({0}) == doctest::Approx(1.0f));    // pad: 0*10+1
+  CHECK(scaled.at({2}) == doctest::Approx(1.0f));    // original[0]=0: 0*10+1
+  CHECK(scaled.at({3}) == doctest::Approx(11.0f));   // original[1]=1: 1*10+1
+
+  // Same for fold: build it from a still-lazy unfold view over a lazy
+  // source, and confirm the epilogue still applies.
+  auto lazy2 = base + 0.0f;
+  auto windowed = lazy2.unfold(0, 3, 1);
+  CHECK_FALSE(windowed.materialized());
+  auto folded = windowed.fold(0, n, 1);
+  CHECK_FALSE(folded.materialized());
+  auto folded_scaled = folded * 2.0f + 3.0f;
+  // position 0 is covered by exactly one window -> raw fold value == 0
+  CHECK(folded_scaled.at({0}) == doctest::Approx(3.0f));  // 0*2+3
 }
