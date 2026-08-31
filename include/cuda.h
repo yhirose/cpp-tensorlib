@@ -28,6 +28,7 @@
 #include <cstdint>
 
 #include "metal.h"  // reuse tl::metal::kop (platform-independent op enum)
+#include "shape.h"  // tl::contiguous_strides_into (pad/fold meta upload)
 #include "types.h"  // tl::dtype (KV cache storage width)
 
 namespace tl {

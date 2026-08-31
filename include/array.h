@@ -16,6 +16,7 @@
 // Device dispatch slots in at detail::graph::eval_one (M3+).
 
 #include <cpu.h>
+#include <shape.h>
 #include <storage.h>
 #include <types.h>
 
