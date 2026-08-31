@@ -134,8 +134,10 @@ constexpr uint32_t kUniformSlotCount = 4096;
 // browser harness asserts each one dispatched — both need the same list, and a
 // new kernel missing from either loses a guarantee silently.
 inline constexpr const char* kEntryPoints[] = {
-    "sgemm", "ew_binary", "ew_unary", "ew_bcast", "softmax", "row_reduce",
-    "pad",   "fold"};
+    "sgemm",        "ew_binary",   "ew_unary",     "ew_bcast",
+    "softmax",      "row_reduce",  "pad",          "fold",
+    "index_select", "index_add",  "scatter_axis", "ew_bcast_nd",
+    "where_nd"};
 
 // emscripten_webgpu_get_device() does not report "no device" — it hands
 // Module.preinitializedWebGPUDevice straight to importJsDevice, which reads
@@ -277,7 +279,11 @@ struct context {
 
     // Explicit layout rather than GetBindGroupLayout(0): the auto-generated
     // one has no dynamic offset on the uniform binding, which the ring needs.
-    wgpu::BindGroupLayoutEntry be[4] = {};
+    // Bindings 4 (D) and 5 (E) are a third and fourth read-only operand —
+    // binary_bcast_nd and where_nd need more real buffers (operands + N-D
+    // shape/stride meta) than A/B/C alone can hold; see tensorlib_webgpu.wgsl's
+    // comment on D/E for which kernel binds what there.
+    wgpu::BindGroupLayoutEntry be[6] = {};
     for (int i = 0; i < 3; ++i) {
       be[i].binding = i;
       be[i].visibility = wgpu::ShaderStage::Compute;
@@ -289,8 +295,13 @@ struct context {
     be[3].buffer.type = wgpu::BufferBindingType::Uniform;
     be[3].buffer.hasDynamicOffset = true;
     be[3].buffer.minBindingSize = sizeof(params);
+    for (int i = 4; i < 6; ++i) {
+      be[i].binding = i;
+      be[i].visibility = wgpu::ShaderStage::Compute;
+      be[i].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
+    }
     wgpu::BindGroupLayoutDescriptor bgld = {};
-    bgld.entryCount = 4;
+    bgld.entryCount = 6;
     bgld.entries = be;
     bgl = device.CreateBindGroupLayout(&bgld);
     if (!bgl) return;
@@ -366,9 +377,15 @@ struct context {
   //
   // `b` may be the same mirror as `a` (a unary or reduce kernel binds its one
   // input twice): two read-only bindings may alias. `out` is always a fresh
-  // allocation from the evaluator, so a writable binding never does.
+  // allocation from the evaluator, so a writable binding never does. `d`/`e`
+  // are the optional third/fourth read-only operand (binary_bcast_nd/
+  // where_nd's extra tensor operand and/or N-D shape/stride meta); every
+  // other kernel leaves them null, which binds them to `a` -- unused by that
+  // kernel's WGSL, but bind group validation requires every declared binding
+  // be present regardless of which ones the active entry point reads.
   bool encode_(const char* entry, mirror* a, mirror* b, mirror* out,
-               const params& p, int64_t gx, int64_t gy) {
+               const params& p, int64_t gx, int64_t gy, mirror* d = nullptr,
+               mirror* e = nullptr) {
     if (gx <= 0 || gy <= 0) return false;
     if (gx > kMaxWorkgroups || gy > kMaxWorkgroups) return false;
     wgpu::ComputePipeline pipe = pipeline_(entry);
@@ -378,15 +395,19 @@ struct context {
     const uint32_t off = slot++ * (uint32_t)kUniformSlotBytes;
     queue.WriteBuffer(uniforms, off, &p, sizeof(p));
 
-    wgpu::BindGroupEntry e[4] = {};
-    e[0].binding = 0; e[0].buffer = a->dev;   e[0].size = a->bytes;
-    e[1].binding = 1; e[1].buffer = b->dev;   e[1].size = b->bytes;
-    e[2].binding = 2; e[2].buffer = out->dev; e[2].size = out->bytes;
-    e[3].binding = 3; e[3].buffer = uniforms; e[3].size = sizeof(params);
+    mirror* md = d ? d : a;
+    mirror* me = e ? e : a;
+    wgpu::BindGroupEntry bge[6] = {};
+    bge[0].binding = 0; bge[0].buffer = a->dev;    bge[0].size = a->bytes;
+    bge[1].binding = 1; bge[1].buffer = b->dev;    bge[1].size = b->bytes;
+    bge[2].binding = 2; bge[2].buffer = out->dev;  bge[2].size = out->bytes;
+    bge[3].binding = 3; bge[3].buffer = uniforms;  bge[3].size = sizeof(params);
+    bge[4].binding = 4; bge[4].buffer = md->dev;   bge[4].size = md->bytes;
+    bge[5].binding = 5; bge[5].buffer = me->dev;   bge[5].size = me->bytes;
     wgpu::BindGroupDescriptor bgd = {};
     bgd.layout = bgl;
-    bgd.entryCount = 4;
-    bgd.entries = e;
+    bgd.entryCount = 6;
+    bgd.entries = bge;
     wgpu::BindGroup bg = device.CreateBindGroup(&bgd);
 
     if (!enc) {
@@ -683,11 +704,13 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
 // not-yet-executed read of the same buffer — the exact hazard the uniform
 // ring above (kUniformSlotCount) already exists to avoid for Params, just for
 // a second resource. One slot comfortably covers the rank-8 cap (pad needs
-// 2*rank <= 16 words, fold (rank-1)+rank <= 15), which is why this state
-// lives on `context` (meta_ring_tok/meta_ring_host/meta_slot) right beside
-// `slot` instead of as a second, independent ring: flush() resets both
-// counters together, the way it already resets `slot`.
-inline constexpr size_t kMetaSlotWords = 16;
+// 2*rank <= 16 words, fold (rank-1)+rank <= 15, binary_bcast_nd 3*rank <= 24,
+// where_nd's own [out_shape, cond_strides, a_strides, b_strides] 4*rank <=
+// 32 -- the largest of the four, which is what sizes this), which is why
+// this state lives on `context` (meta_ring_tok/meta_ring_host/meta_slot)
+// right beside `slot` instead of as a second, independent ring: flush()
+// resets both counters together, the way it already resets `slot`.
+inline constexpr size_t kMetaSlotWords = 32;
 inline constexpr size_t kMetaSlotCount = 4096;
 
 // Rank cap for pad_/fold_'s GPU dispatch — matches cuda.h's own
@@ -723,6 +746,38 @@ inline uint32_t context::meta_reserve_slot_() {
   return (meta_slot++) * static_cast<uint32_t>(kMetaSlotWords);
 }
 
+// Reserve one meta-ring slot: returns the u32 write pointer for this call's
+// slot (already offset into the ring) via `host_words`, and this slot's word
+// offset via `word_off_out`; the return value is the ring's own opaque
+// token, or null if the ring couldn't be allocated. Shared by pad()/fold()/
+// binary_bcast_nd()/where_nd() below, which differ only in how many words
+// they fill in and with what.
+inline void* reserve_meta_(context& c, uint32_t* word_off_out,
+                           uint32_t** host_words) {
+  float* ring_host = nullptr;
+  void* ring_tok = c.meta_ring_(&ring_host);
+  if (!ring_tok) return nullptr;
+  *word_off_out = c.meta_reserve_slot_();
+  *host_words = reinterpret_cast<uint32_t*>(ring_host) + *word_off_out;
+  return ring_tok;
+}
+
+// Upload a filled meta-ring slot and mark it live -- the other half of
+// reserve_meta_ above, split from it so the caller can fill `host_words` (the
+// pointer reserve_meta_ handed back) in between.
+inline context::mirror* commit_meta_(context& c, void* ring_tok,
+                                     uint32_t word_off, const uint32_t* words,
+                                     size_t word_count) {
+  context::mirror* mm = c.mirror_(ring_tok);
+  // This call's slot only, at its own byte offset — an unconditional
+  // WriteBuffer, not device_read_'s dirty-flag check, since the ring's
+  // mirror never legitimately settles into a single steady HOST/DEVICE state
+  // (each slot is written once, read once, never again).
+  c.queue.WriteBuffer(mm->dev, word_off * 4, words, word_count * 4);
+  mm->where = context::BOTH;
+  return mm;
+}
+
 // Gather-style pad/fold (M11): unlike CUDA's scatter+atomicAdd, WGSL has no
 // float atomicAdd, so both dispatch one invocation per OUTPUT element and
 // have it read (pad) or sum (fold) whatever cells of `a` map to it — no
@@ -746,21 +801,13 @@ inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
   c.device_read_(a_native);
   c.device_write_(out_native);
 
-  float* ring_host = nullptr;
-  void* ring_tok = c.meta_ring_(&ring_host);
+  uint32_t word_off, *raw;
+  void* ring_tok = reserve_meta_(c, &word_off, &raw);
   if (!ring_tok) return false;
-  uint32_t word_off = c.meta_reserve_slot_();
-  auto* raw = reinterpret_cast<uint32_t*>(ring_host) + word_off;
   for (int d = 0; d < rank; d++) raw[d] = static_cast<uint32_t>(out_shape[d]);
   for (int d = 0; d < rank; d++) raw[rank + d] = static_cast<uint32_t>(a_shape[d]);
-  context::mirror* mm = c.mirror_(ring_tok);
-  size_t meta_words = 2 * static_cast<size_t>(rank);
-  // This call's slot only, at its own byte offset — an unconditional
-  // WriteBuffer, not device_read_'s dirty-flag check, since the ring's
-  // mirror never legitimately settles into a single steady HOST/DEVICE state
-  // (each slot is written once, read once, never again).
-  c.queue.WriteBuffer(mm->dev, word_off * 4, raw, meta_words * 4);
-  mm->where = context::BOTH;
+  context::mirror* mm =
+      commit_meta_(c, ring_tok, word_off, raw, 2 * static_cast<size_t>(rank));
 
   p.M = static_cast<uint32_t>(out_n);
   p.b_off = word_off;
@@ -791,17 +838,14 @@ inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
   c.device_write_(out_native);
 
   int out_rank = rank - 1;
-  float* ring_host = nullptr;
-  void* ring_tok = c.meta_ring_(&ring_host);
+  uint32_t word_off, *raw;
+  void* ring_tok = reserve_meta_(c, &word_off, &raw);
   if (!ring_tok) return false;
-  uint32_t word_off = c.meta_reserve_slot_();
-  auto* raw = reinterpret_cast<uint32_t*>(ring_host) + word_off;
   for (int d = 0; d < out_rank; d++) raw[d] = static_cast<uint32_t>(out_shape[d]);
   for (int d = 0; d < rank; d++) raw[out_rank + d] = static_cast<uint32_t>(a_shape[d]);
-  context::mirror* mm = c.mirror_(ring_tok);
-  size_t meta_words = static_cast<size_t>(out_rank) + static_cast<size_t>(rank);
-  c.queue.WriteBuffer(mm->dev, word_off * 4, raw, meta_words * 4);
-  mm->where = context::BOTH;
+  context::mirror* mm =
+      commit_meta_(c, ring_tok, word_off, raw,
+                   static_cast<size_t>(out_rank) + static_cast<size_t>(rank));
 
   p.M = static_cast<uint32_t>(out_n);
   p.b_off = word_off;
@@ -811,35 +855,174 @@ inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
   return c.encode_("fold", ma, mm, mo, p, (out_n + 255) / 256, 1);
 }
 
-// index_select/index_add/scatter_to_axis: no WebGPU kernel yet (CUDA-first).
-// Stub for now, same as every backend does for an op it hasn't
-// implemented — array.h's eval_one falls back to the CPU ref::
-// implementation. index_add would need the same atomic-free rewrite fold's
-// own gather-not-scatter trick uses, since WGSL has no float atomicAdd.
-inline bool index_select(void*, int64_t, void*, int64_t, void*, int64_t,
-                         int64_t, int64_t) {
-  return false;
+// Row gather along axis 0: out[i] = a[indices[row(i)]] (a, indices
+// contiguous). A = a, B = idx, C = out; p.pad0 = row_size.
+inline bool index_select(void* a_native, int64_t ao, void* idx_native,
+                         int64_t idxo, void* out_native, int64_t oo,
+                         int64_t row_size, int64_t k) {
+  auto& c = context::get();
+  int64_t n = k * row_size;
+  if (!c.ready || n <= 0) return false;
+  params p = {};
+  if (!elem_off_(ao, &p.a_off) || !elem_off_(idxo, &p.b_off) ||
+      !elem_off_(oo, &p.c_off)) {
+    return false;
+  }
+  context::mirror *ma, *mb, *mo;
+  if (!operands_(c, a_native, idx_native, out_native, &ma, &mb, &mo)) {
+    return false;
+  }
+  p.M = static_cast<uint32_t>(n);
+  p.pad0 = static_cast<uint32_t>(row_size);
+  return c.encode_("index_select", ma, mb, mo, p, (n + 255) / 256, 1);
 }
-inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
-                      int64_t, int64_t) {
-  return false;
+
+// index_select's dual, rewritten as a gather: WGSL has no float atomicAdd,
+// the same gap pad/fold above work around, so this sums over every source
+// row matching each OUTPUT row instead of scattering into a pre-zeroed
+// buffer -- no zeroing needed. A = idx, B = values, C = out; p.pad0 =
+// row_size, p.pad1 = k (number of source rows to scan).
+inline bool index_add(void* idx_native, int64_t idxo, void* values_native,
+                      int64_t vo, void* out_native, int64_t oo,
+                      int64_t row_size, int64_t k, int64_t out_n) {
+  auto& c = context::get();
+  if (!c.ready || out_n <= 0) return false;
+  params p = {};
+  if (!elem_off_(idxo, &p.a_off) || !elem_off_(vo, &p.b_off) ||
+      !elem_off_(oo, &p.c_off)) {
+    return false;
+  }
+  context::mirror *ma, *mb, *mo;
+  if (!operands_(c, idx_native, values_native, out_native, &ma, &mb, &mo)) {
+    return false;
+  }
+  p.M = static_cast<uint32_t>(out_n);
+  p.pad0 = static_cast<uint32_t>(row_size);
+  p.pad1 = static_cast<uint32_t>(k);
+  return c.encode_("index_add", ma, mb, mo, p, (out_n + 255) / 256, 1);
 }
-inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
-                            int64_t, int64_t) {
-  return false;
+
+// One-hot scatter into a new trailing axis, as a gather: out[pos,k] =
+// values[pos] where indices[pos] == k, else 0. Every output element reads,
+// never writes twice, so -- like index_select above -- no zeroing needed.
+// A = idx, B = values, C = out; p.pad0 = size.
+inline bool scatter_to_axis(void* idx_native, int64_t idxo,
+                            void* values_native, int64_t vo, void* out_native,
+                            int64_t oo, int64_t n, int64_t size) {
+  auto& c = context::get();
+  int64_t out_n = n * size;
+  if (!c.ready || out_n <= 0) return false;
+  params p = {};
+  if (!elem_off_(idxo, &p.a_off) || !elem_off_(vo, &p.b_off) ||
+      !elem_off_(oo, &p.c_off)) {
+    return false;
+  }
+  context::mirror *ma, *mb, *mo;
+  if (!operands_(c, idx_native, values_native, out_native, &ma, &mb, &mo)) {
+    return false;
+  }
+  p.M = static_cast<uint32_t>(out_n);
+  p.pad0 = static_cast<uint32_t>(size);
+  return c.encode_("scatter_axis", ma, mb, mo, p, (out_n + 255) / 256, 1);
 }
-// N-D broadcast binary/ternary (LayerNorm/masking at rank >= 3): no WebGPU
-// kernel yet (CUDA-first). Stub for now -- array.h falls back to the CPU
-// ref:: implementation, which already handles any rank.
-inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,
-                            int64_t, const int64_t*, void*, int64_t,
-                            const int64_t*, int, int64_t, float, float) {
-  return false;
+
+// N-D broadcast binary: generalizes binary_bcast() above to any rank (a
+// Transformer's [N,S,D] LayerNorm broadcasting a [N,S,1] mean, rank 3).
+// a_strides/b_strides are the broadcast strides (0 on a broadcast axis)
+// array.h computes host-side via the same broadcast_strides() the CPU
+// oracle uses. A = a, B = b, D = meta [out_shape(rank), a_strides(rank),
+// b_strides(rank)] (a and b already fill A/B, unlike pad/fold where B was
+// free for this); p.pad0 = rank, p.pad3 = meta's word offset into D.
+inline bool binary_bcast_nd(kop op, void* a_native, int64_t ao,
+                            const int64_t* a_strides, void* b_native,
+                            int64_t bo, const int64_t* b_strides,
+                            void* out_native, int64_t oo,
+                            const int64_t* out_shape, int rank, int64_t n,
+                            float scale, float offset) {
+  auto& c = context::get();
+  if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank || n <= 0) return false;
+  params p = {};
+  if (!elem_off_(ao, &p.a_off) || !elem_off_(bo, &p.b_off) ||
+      !elem_off_(oo, &p.c_off)) {
+    return false;
+  }
+  context::mirror *ma, *mb, *mo;
+  if (!operands_(c, a_native, b_native, out_native, &ma, &mb, &mo)) {
+    return false;
+  }
+
+  uint32_t word_off, *raw;
+  void* ring_tok = reserve_meta_(c, &word_off, &raw);
+  if (!ring_tok) return false;
+  for (int d = 0; d < rank; d++) raw[d] = static_cast<uint32_t>(out_shape[d]);
+  for (int d = 0; d < rank; d++) {
+    raw[rank + d] = static_cast<uint32_t>(a_strides[d]);
+  }
+  for (int d = 0; d < rank; d++) {
+    raw[2 * rank + d] = static_cast<uint32_t>(b_strides[d]);
+  }
+  context::mirror* mm =
+      commit_meta_(c, ring_tok, word_off, raw, 3 * static_cast<size_t>(rank));
+
+  p.M = static_cast<uint32_t>(n);
+  p.op = kernel_op_(op);
+  p.pad0 = static_cast<uint32_t>(rank);
+  p.pad3 = word_off;
+  p.scale = scale;
+  p.offset = offset;
+  return c.encode_("ew_bcast_nd", ma, mb, mo, p, (n + 255) / 256, 1, mm);
 }
-inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
-                     const int64_t*, void*, int64_t, const int64_t*, void*,
-                     int64_t, const int64_t*, int, int64_t) {
-  return false;
+
+// N-D broadcast ternary select: Tensor.where's GPU dispatch. A = cond, B = a,
+// D = b, E = meta [out_shape(rank), cond_strides(rank), a_strides(rank),
+// b_strides(rank)] (cond/a/b fill A/B/D, leaving E free for meta); p.pad0 =
+// rank, p.pad3 = b's element offset into D, p.pad4 = meta's word offset
+// into E. Bypasses operands_() (built for two real operands) since this one
+// needs three, the same way pad()/fold() above do their own mirror lookups.
+inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
+                     void* a_native, int64_t ao, const int64_t* a_strides,
+                     void* b_native, int64_t bo, const int64_t* b_strides,
+                     void* out_native, int64_t oo, const int64_t* out_shape,
+                     int rank, int64_t n) {
+  auto& c = context::get();
+  if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank || n <= 0) return false;
+  params p = {};
+  uint32_t b_elem_off;
+  if (!elem_off_(co, &p.a_off) || !elem_off_(ao, &p.b_off) ||
+      !elem_off_(bo, &b_elem_off) || !elem_off_(oo, &p.c_off)) {
+    return false;
+  }
+  context::mirror* mcond = c.mirror_(cond_native);
+  context::mirror* ma = c.mirror_(a_native);
+  context::mirror* mb = c.mirror_(b_native);
+  context::mirror* mo = c.mirror_(out_native);
+  if (!mcond || !ma || !mb || !mo) return false;
+  c.device_read_(cond_native);
+  c.device_read_(a_native);
+  c.device_read_(b_native);
+  c.device_write_(out_native);
+
+  uint32_t word_off, *raw;
+  void* ring_tok = reserve_meta_(c, &word_off, &raw);
+  if (!ring_tok) return false;
+  for (int d = 0; d < rank; d++) raw[d] = static_cast<uint32_t>(out_shape[d]);
+  for (int d = 0; d < rank; d++) {
+    raw[rank + d] = static_cast<uint32_t>(c_strides[d]);
+  }
+  for (int d = 0; d < rank; d++) {
+    raw[2 * rank + d] = static_cast<uint32_t>(a_strides[d]);
+  }
+  for (int d = 0; d < rank; d++) {
+    raw[3 * rank + d] = static_cast<uint32_t>(b_strides[d]);
+  }
+  context::mirror* mm =
+      commit_meta_(c, ring_tok, word_off, raw, 4 * static_cast<size_t>(rank));
+
+  p.M = static_cast<uint32_t>(n);
+  p.pad0 = static_cast<uint32_t>(rank);
+  p.pad3 = b_elem_off;
+  p.pad4 = word_off;
+  return c.encode_("where_nd", mcond, ma, mo, p, (n + 255) / 256, 1, mb, mm);
 }
 
 #else  // !(TENSORLIB_WEBGPU && __EMSCRIPTEN__) — stubs, as in metal.h

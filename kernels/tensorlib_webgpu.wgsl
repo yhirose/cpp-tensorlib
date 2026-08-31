@@ -54,6 +54,15 @@ struct Params {
 @group(0) @binding(1) var<storage, read>       B : array<f32>;
 @group(0) @binding(2) var<storage, read_write> C : array<f32>;
 @group(0) @binding(3) var<uniform>             p : Params;
+// A third and fourth read-only operand, for kernels A/B alone can't cover:
+// binary_bcast_nd's two real tensor operands (a, b) already fill A and B, so
+// its shape/stride meta needs D; where_nd's three real operands (cond, a, b)
+// fill A, B and D, so its meta needs E. Every other entry point ignores
+// these (webgpu.h's encode_ binds them to A when a kernel has no use for
+// them — bind group validation requires every declared binding be present
+// regardless of which bindings the active entry point actually reads).
+@group(0) @binding(4) var<storage, read>       D : array<f32>;
+@group(0) @binding(5) var<storage, read>       E : array<f32>;
 
 // ---- sgemm: C(M,N) = op(A)(M,K) @ op(B)(K,N) * scale + offset
 //
@@ -429,4 +438,120 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
     sum = sum + A[p.a_off + src];
   }
   C[p.c_off + i] = sum;
+}
+
+// ---- Embedding-table lookup (index_select/index_add) and pooling-style
+// one-hot scatter (scatter_to_axis) -- the WGSL counterparts of
+// tl_index_select/tl_index_add/tl_scatter_axis in kernels/tensorlib_cuda.cu.
+//
+// index_select and scatter_axis are gathers already (every output element
+// is written by exactly one invocation), so they port the CUDA kernel body
+// directly. index_add is CUDA's one true scatter+atomicAdd here -- repeated
+// indices really do collide -- and WGSL has no float atomicAdd, the same gap
+// pad/fold above work around. So index_add is a gather too: one invocation
+// per OUTPUT element, summing over every source row whose index matches it,
+// in place of scattering into a pre-zeroed buffer.
+
+// A = a (table), B = idx, C = out. p._pad0 = row_size.
+@compute @workgroup_size(256, 1, 1)
+fn index_select(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.M) { return; }
+  let row_size = p._pad0;
+  let row = i / row_size;
+  let col = i % row_size;
+  let src_row = u32(B[p.b_off + row] + 0.5);
+  C[p.c_off + i] = A[p.a_off + src_row * row_size + col];
+}
+
+// A = idx, B = values, C = out. p._pad0 = row_size, p._pad1 = k (source rows).
+@compute @workgroup_size(256, 1, 1)
+fn index_add(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.M) { return; }
+  let row_size = p._pad0;
+  let k_count = p._pad1;
+  let row = i / row_size;
+  let col = i % row_size;
+  var sum : f32 = 0.0;
+  for (var k : u32 = 0u; k < k_count; k = k + 1u) {
+    let idx_row = u32(A[p.a_off + k] + 0.5);
+    if (idx_row == row) {
+      sum = sum + B[p.b_off + k * row_size + col];
+    }
+  }
+  C[p.c_off + i] = sum;
+}
+
+// A = idx, B = values, C = out. p._pad0 = size (the new trailing axis).
+// out[pos, k] = values[pos] where idx[pos] == k, else 0 -- gather, so no
+// zeroing needed, unlike CUDA's pre-zeroed scatter.
+@compute @workgroup_size(256, 1, 1)
+fn scatter_axis(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.M) { return; }
+  let size = p._pad0;
+  let pos = i / size;
+  let k = i % size;
+  let dst_k = u32(A[p.a_off + pos] + 0.5);
+  C[p.c_off + i] = select(0.0, B[p.b_off + pos], dst_k == k);
+}
+
+// ---- N-D broadcast binary (any rank) and N-D broadcast ternary select
+// (Tensor.where's masking) -- the WGSL counterparts of tl_b*_nd/tl_where_nd
+// in kernels/tensorlib_cuda.cu. Same flat-index decode as pad/fold above,
+// against strides the host supplies (broadcast_strides(), 0 on a broadcast
+// axis) rather than derived from a shape -- inlined per kernel rather than
+// shared via decode_idx, since that helper always reads from B and here the
+// meta buffer is D or E (WGSL has no templates to parameterize over which
+// storage binding to read).
+
+// A = a, B = b, D = meta [out_shape(rank), a_strides(rank), b_strides(rank)],
+// E unused. p._pad0 = rank, p._pad3 = meta's word offset into D.
+@compute @workgroup_size(256, 1, 1)
+fn ew_bcast_nd(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.M) { return; }
+  let rank = p._pad0;
+  let base = p._pad3;
+  var rem = i;
+  var a_off : u32 = 0u;
+  var b_off : u32 = 0u;
+  for (var d : i32 = i32(rank) - 1; d >= 0; d = d - 1) {
+    let dim = bitcast<u32>(D[base + u32(d)]);
+    let coord = rem % dim;
+    rem = rem / dim;
+    a_off = a_off + coord * bitcast<u32>(D[base + rank + u32(d)]);
+    b_off = b_off + coord * bitcast<u32>(D[base + 2u * rank + u32(d)]);
+  }
+  let av = A[p.a_off + a_off];
+  let bv = B[p.b_off + b_off];
+  C[p.c_off + i] = fma(binary_op(p.op, av, bv), p.scale, p.offset);
+}
+
+// A = cond, B = a, D = b, E = meta [out_shape(rank), cond_strides(rank),
+// a_strides(rank), b_strides(rank)]. p._pad0 = rank, p._pad3 = b's element
+// offset into D, p._pad4 = meta's word offset into E.
+@compute @workgroup_size(256, 1, 1)
+fn where_nd(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.M) { return; }
+  let rank = p._pad0;
+  let base = p._pad4;
+  var rem = i;
+  var c_off : u32 = 0u;
+  var a_off : u32 = 0u;
+  var b_off : u32 = 0u;
+  for (var d : i32 = i32(rank) - 1; d >= 0; d = d - 1) {
+    let dim = bitcast<u32>(E[base + u32(d)]);
+    let coord = rem % dim;
+    rem = rem / dim;
+    c_off = c_off + coord * bitcast<u32>(E[base + rank + u32(d)]);
+    a_off = a_off + coord * bitcast<u32>(E[base + 2u * rank + u32(d)]);
+    b_off = b_off + coord * bitcast<u32>(E[base + 3u * rank + u32(d)]);
+  }
+  let cv = A[p.a_off + c_off];
+  let av = B[p.b_off + a_off];
+  let bv = D[p._pad3 + b_off];
+  C[p.c_off + i] = select(bv, av, cv != 0.0);
 }
