@@ -1,0 +1,14 @@
+# Ops allowed to stay CUDA-only for now (checked by check_backend_parity.py).
+# One name per line; '#' starts a comment. When an op here becomes REAL on
+# every backend, the script says so -- remove its line at that point rather
+# than let this list grow stale.
+#
+# The M9 LLM decode fast path: fused single-token attention, and the
+# bf16/int4-quantized GEMVs and RoPE it composes with for local-LLM
+# inference throughput. Deliberately landed CUDA-first (see project memory
+# project_cpp_tensorlib_handoff.md); Metal/WebGPU still take the CPU-widen
+# fallback for these specifically.
+gemv_f32
+gemv_bf16
+gemv_q4
+attn_decode

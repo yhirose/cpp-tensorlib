@@ -9,10 +9,12 @@
 //   kernels    binary / binary_bcast / binary_bcast_nd / where_nd / unary /
 //              gemm / row_op / pad / fold / index_select / index_add /
 //              scatter_to_axis / sum_to / compare / unary_ext / clamp /
-//              concat_part
-//   LLM path   gemv_f32 / gemv_bf16 / gemv_q4 / attn_decode / rope
+//              concat_part / rope
+//   LLM path   gemv_f32 / gemv_bf16 / gemv_q4 / attn_decode
 // A backend with no kernel for one of these returns false and the evaluator
-// falls back to the CPU — so the LLM row is real on CUDA and stubs elsewhere.
+// falls back to the CPU — so the LLM row is real on CUDA and stubs elsewhere
+// (tools/check_backend_parity.py checks every name on both lines here
+// against cuda.h/metal.h/webgpu.h and fails CI if one drifts unannounced).
 //
 // Each backend compiles to stubs unless its own gate holds, so including all of
 // them is free: metal.h is real only on __APPLE__, cuda.h only on

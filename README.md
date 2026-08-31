@@ -155,6 +155,12 @@ silently run on the CPU. The `auto` thresholds are measured per kernel class
 and per backend; `TL_BATCH_MATMUL_BIAS` overrides the batched-matmul one at
 runtime.
 
+New ops sometimes land on one backend (usually CUDA) before the others catch
+up. `tools/check_backend_parity.py` reports, per op, which of CUDA/Metal/
+WebGPU actually implement it rather than falling back to the CPU oracle, and
+fails (in CI too) if an asymmetry isn't recorded in
+`tools/backend_parity_allowlist.txt` as deliberate.
+
 ### Storage dtypes
 
 Compute and results are **always f32**. `bf16` and `q4` are weight-container

@@ -6,6 +6,20 @@ on:
   pull_request:
 
 jobs:
+  # Static, no build needed: is a GPU op real on the same backends everywhere,
+  # or did one backend land ahead of the others and never get caught up (that
+  # is exactly what happened to concat_part/rope before this job existed —
+  # see tools/check_backend_parity.py's own docstring). Deliberate gaps (the
+  # M9 LLM decode fast path, still CUDA-only) are recorded in
+  # tools/backend_parity_allowlist.txt and don't fail this job; an
+  # unallowlisted asymmetry does.
+  backend-parity:
+    name: backend parity (CUDA / Metal / WebGPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/check_backend_parity.py
+
   # All three modes — cpu / gpu / auto — on every OS.
   # What each hosted runner actually offers:
   #   - macos-15 (arm64): Metal works through a paravirtual GPU -> a real GPU test
