@@ -45,6 +45,7 @@ namespace webgpu {
 
 using kop = tl::metal::kop;
 using cmp_op = tl::metal::cmp_op;
+using unary_ext_op = tl::metal::unary_ext_op;
 
 #if defined(TENSORLIB_WEBGPU) && defined(__EMSCRIPTEN__)
 
@@ -1033,6 +1034,13 @@ inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
                     int64_t, int64_t) {
   return false;
 }
+inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
+                      float, float) {
+  return false;
+}
+inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {
+  return false;
+}
 
 #else  // !(TENSORLIB_WEBGPU && __EMSCRIPTEN__) — stubs, as in metal.h
 
@@ -1098,6 +1106,13 @@ inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
 }
 inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
                     int64_t, int64_t) {
+  return false;
+}
+inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
+                      float, float) {
+  return false;
+}
+inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {
   return false;
 }
 

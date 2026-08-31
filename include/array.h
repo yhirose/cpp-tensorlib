@@ -163,6 +163,9 @@ struct node {
     add, sub, mul, div, pow_,
     gt, lt, ge, le, eq, ne,  // masks as F32 (0/1)
     affine, recip, exp_, log_, sqrt_, sigmoid, relu,
+    tanh_, sin_, cos_,
+    clamp_,  // clip(x, arg0=min, arg1=max) — the only unary op needing two
+             // node-specific scalars, hence `arg1` below.
     softmax,
     where_,
     dot,
@@ -194,10 +197,12 @@ struct node {
   std::vector<std::shared_ptr<node>> inputs;
   float scale = 1.0f, offset = 0.0f;  // fused epilogue: op(...) * scale + offset
   float arg0 = 0.0f;  // op-specific scalar: attn_dec's softmax scale,
-                      // pad_'s `before`, or fold_'s `step` (whichever the
-                      // op needs one generic slot for, rather than growing
-                      // this struct further — `axis` below covers the other
-                      // scalar both of them need).
+                      // pad_'s `before`, fold_'s `step`, or clamp_'s `min`
+                      // (whichever the op needs one generic slot for,
+                      // rather than growing this struct further — `axis`
+                      // below covers another scalar some of them need).
+  float arg1 = 0.0f;  // clamp_'s `max` — the one op needing a second
+                      // scalar; everything else leaves this at 0.
   int axis = 0;
   bool keepdims = false;
 
@@ -239,6 +244,9 @@ inline constexpr auto ew_log = [](float x) { return std::log(x); };
 inline constexpr auto ew_sqrt = [](float x) { return std::sqrt(x); };
 inline constexpr auto ew_sigmoid = [](float x) { return 1.0f / (1.0f + std::exp(-x)); };
 inline constexpr auto ew_relu = [](float x) { return x > 0 ? x : 0.0f; };
+inline constexpr auto ew_tanh = [](float x) { return std::tanh(x); };
+inline constexpr auto ew_sin = [](float x) { return std::sin(x); };
+inline constexpr auto ew_cos = [](float x) { return std::cos(x); };
 
 // Dispatch helper for the sites that write their result into an EXISTING array
 // (they pay nothing for the callback, unlike the eager builders — see
@@ -273,6 +281,9 @@ bool visit_unary_op(node::op_t op, F&& f) {
     case op_t::sqrt_: f(ew_sqrt); return true;
     case op_t::sigmoid: f(ew_sigmoid); return true;
     case op_t::relu: f(ew_relu); return true;
+    case op_t::tanh_: f(ew_tanh); return true;
+    case op_t::sin_: f(ew_sin); return true;
+    case op_t::cos_: f(ew_cos); return true;
     default: return false;
   }
 }
@@ -390,6 +401,10 @@ class array {
   array sqrt() const;
   array sigmoid() const;
   array relu() const;
+  array tanh() const;
+  array sin() const;
+  array cos() const;
+  array clamp(float lo, float hi) const;
   array softmax() const;  // last axis, numerically stable
 
   // Linear algebra: (M,K)@(K,N); 1-d operands promote numpy-style. (lazy)
@@ -1670,7 +1685,10 @@ struct graph {
         case op_t::sqrt_: return map_unary(a, ew_sqrt);
         case op_t::sigmoid: return map_unary(a, ew_sigmoid);
         case op_t::relu: return map_unary(a, ew_relu);
-        default: break;  // softmax / affine etc. — fall through to lazy
+        case op_t::tanh_: return map_unary(a, ew_tanh);
+        case op_t::sin_: return map_unary(a, ew_sin);
+        case op_t::cos_: return map_unary(a, ew_cos);
+        default: break;  // softmax / affine / clamp etc. — fall through to lazy
       }
     }
     auto n = std::make_shared<node>();
@@ -1759,6 +1777,19 @@ struct graph {
     n->shape = indices.shape();
     n->shape.push_back(size);
     n->inputs = {as_node(indices), as_node(values)};
+    return from_node(std::move(n));
+  }
+
+  // clamp(x, lo, hi): the one unary op needing two node-specific scalars
+  // (arg0=lo, arg1=hi), so it can't go through the generic unary() builder
+  // above (which has no params to carry them).
+  static array clamp(const array& a, float lo, float hi) {
+    auto n = std::make_shared<node>();
+    n->op = op_t::clamp_;
+    n->shape = a.shape();
+    n->arg0 = lo;
+    n->arg1 = hi;
+    n->inputs = {as_node(a)};
     return from_node(std::move(n));
   }
 
@@ -2571,6 +2602,53 @@ struct graph {
     return out;
   }
 
+  // GPU dispatch for tanh_/sin_/cos_ -- a CUDA-only addition (like
+  // comparisons above), so its own small vocabulary rather than the
+  // shared kop table (see metal.h's cmp_op comment; unary_ext_op is the
+  // same reasoning applied to unary ops).
+  static std::optional<array> gpu_unary_ext_(op_t op, const array& a,
+                                             float scale, float offset) {
+    if (!gpu_mode_(a.size(), kernel_class::elementwise) || !a.contiguous()) {
+      return std::nullopt;
+    }
+    if (!a.storage_.native) return std::nullopt;
+    gpu::unary_ext_op u;
+    switch (op) {
+      case op_t::tanh_: u = gpu::unary_ext_op::tanh_; break;
+      case op_t::sin_: u = gpu::unary_ext_op::sin_; break;
+      case op_t::cos_: u = gpu::unary_ext_op::cos_; break;
+      default: return std::nullopt;
+    }
+    auto out = array::empty(a.shape());
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    if (!gpu::unary_ext(u, a.storage_.native, a.offset_ * 4,
+                        out.storage_.native, out.offset_ * 4, out.size(),
+                        scale, offset)) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
+  // GPU dispatch for clamp_ (Clip's forward -- Culebra's dz.raw_elementwise
+  // host loop before this). No epilogue: clamp's own two params occupy the
+  // role scale/offset play elsewhere, and nothing composes a further affine
+  // onto it today.
+  static std::optional<array> gpu_clamp_(const array& a, float lo, float hi) {
+    if (!gpu_mode_(a.size(), kernel_class::elementwise) || !a.contiguous()) {
+      return std::nullopt;
+    }
+    if (!a.storage_.native) return std::nullopt;
+    auto out = array::empty(a.shape());
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    if (!gpu::clamp(a.storage_.native, a.offset_ * 4, out.storage_.native,
+                    out.offset_ * 4, out.size(), lo, hi)) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
   // One topological pass over all roots (MLX-style batch eval), then each
   // node evaluates through eval_one. Iterative DFS: recursion depth must not
   // bound graph depth. do_flush=false leaves the launched kernels in flight on
@@ -2713,6 +2791,14 @@ struct graph {
       case op_t::affine:  // the epilogue IS the op here (identity f)
         unary_loop([](float x) { return x; });
         return true;
+      case op_t::clamp_: {
+        // Two node-specific scalars (arg0=min, arg1=max), so this can't go
+        // through visit_unary_op's one-constexpr-functor-per-op dispatch —
+        // same reason affine above is special-cased.
+        float lo = n.arg0, hi = n.arg1;
+        unary_loop([lo, hi](float x) { return x < lo ? lo : (x > hi ? hi : x); });
+        return true;
+      }
       default:  // unary ops the table knows; everything else declines
         return visit_unary_op(n.op, unary_loop);
     }
@@ -2850,6 +2936,32 @@ struct graph {
           r = std::move(*o);
         } else {
           visit_unary_op(n.op, [&](auto f) { r = map_unary(a, f); });
+        }
+        break;
+      }
+      case op_t::tanh_:
+      case op_t::sin_:
+      case op_t::cos_: {
+        auto a = in(0);
+        if (auto g = gpu_unary_ext_(n.op, a, n.scale, n.offset)) {
+          r = std::move(*g);
+          epi_done = true;
+        } else if (auto o = accel::unary(n.op, a)) {
+          r = std::move(*o);
+        } else {
+          visit_unary_op(n.op, [&](auto f) { r = map_unary(a, f); });
+        }
+        break;
+      }
+      case op_t::clamp_: {
+        auto a = in(0);
+        if (auto g = gpu_clamp_(a, n.arg0, n.arg1)) {
+          r = std::move(*g);
+        } else {
+          float lo = n.arg0, hi = n.arg1;
+          r = map_unary(a, [lo, hi](float x) {
+            return x < lo ? lo : (x > hi ? hi : x);
+          });
         }
         break;
       }
@@ -3265,6 +3377,18 @@ inline array array::sigmoid() const {
 }
 inline array array::relu() const {
   return detail::graph::unary(detail::node::op_t::relu, *this);
+}
+inline array array::tanh() const {
+  return detail::graph::unary(detail::node::op_t::tanh_, *this);
+}
+inline array array::sin() const {
+  return detail::graph::unary(detail::node::op_t::sin_, *this);
+}
+inline array array::cos() const {
+  return detail::graph::unary(detail::node::op_t::cos_, *this);
+}
+inline array array::clamp(float lo, float hi) const {
+  return detail::graph::clamp(*this, lo, hi);
 }
 inline array array::softmax() const {
   if (rank() == 0) throw std::invalid_argument("tl::softmax: rank 0");

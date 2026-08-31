@@ -36,6 +36,7 @@ namespace cuda {
 
 using kop = tl::metal::kop;
 using cmp_op = tl::metal::cmp_op;
+using unary_ext_op = tl::metal::unary_ext_op;
 
 #if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
 
@@ -429,6 +430,21 @@ struct context {
       default: return nullptr;
     }
   }
+
+  // tanh_/sin_/cos_ (RoPE's trig, RNN/LSTM's tanh) and clamp (Clip's
+  // forward). Own vocabulary, not the kop table (same reason as compare_
+  // above).
+  CUfunction tanh_fn = nullptr, sin_fn = nullptr, cos_fn = nullptr,
+             clamp_fn = nullptr;
+  CUfunction unary_ext_(unary_ext_op op) {
+    switch (op) {
+      case unary_ext_op::tanh_: return cached_(tanh_fn, "tl_tanh");
+      case unary_ext_op::sin_: return cached_(sin_fn, "tl_sin");
+      case unary_ext_op::cos_: return cached_(cos_fn, "tl_cos");
+      default: return nullptr;
+    }
+  }
+  CUfunction clamp_() { return cached_(clamp_fn, "tl_clamp"); }
 
   // M9 batched-prefill GEMM (bf16 [N,K] weights, the decode GEMV's own layout).
   CUfunction gemm_bf16_nt_fn = nullptr, gemm_bf16_nt_s_fn = nullptr,
@@ -977,6 +993,40 @@ inline bool compare(cmp_op op, void* a_native, int64_t ao, void* b_native,
   unsigned un = static_cast<unsigned>(n);
   unsigned ubs = static_cast<unsigned>(bstride);
   return c.launch1d_(f, un, pa, pb, po, un, ubs);
+}
+
+// tanh_/sin_/cos_: plain elementwise, same shape as tl_exp/tl_sqrt (scale/
+// offset epilogue included, same reason those have it).
+inline bool unary_ext(unary_ext_op op, void* a_native, int64_t ao,
+                      void* out_native, int64_t oo, int64_t n, float scale,
+                      float offset) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  CUfunction f = c.unary_ext_(op);
+  if (!f) return false;
+  c.device_read_(a_native);
+  c.device_write_(out_native);
+  float* pa = context::off_(a_native, ao);
+  float* po = context::off_(out_native, oo);
+  unsigned un = static_cast<unsigned>(n);
+  return c.launch1d_(f, un, pa, po, un, scale, offset);
+}
+
+// clamp(x, lo, hi): Clip's forward. No epilogue -- lo/hi occupy the role
+// scale/offset play elsewhere, and nothing composes a further affine onto
+// it today (array.h's gpu_clamp_ doesn't thread one through).
+inline bool clamp(void* a_native, int64_t ao, void* out_native, int64_t oo,
+                  int64_t n, float lo, float hi) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  CUfunction f = c.clamp_();
+  if (!f) return false;
+  c.device_read_(a_native);
+  c.device_write_(out_native);
+  float* pa = context::off_(a_native, ao);
+  float* po = context::off_(out_native, oo);
+  unsigned un = static_cast<unsigned>(n);
+  return c.launch1d_(f, un, pa, po, un, lo, hi);
 }
 
 // Places `a` (contiguous) into a zero buffer of out_shape (array.h's
@@ -1931,6 +1981,13 @@ inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
 }
 inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
                     int64_t, int64_t) {
+  return false;
+}
+inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
+                      float, float) {
+  return false;
+}
+inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {
   return false;
 }
 inline void sync_to_host(void*, bool) {}

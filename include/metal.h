@@ -58,6 +58,12 @@ enum class kop {
 // return false, same as index_select/index_add/scatter_axis/sum_to.
 enum class cmp_op { gt, lt, ge, le, eq, ne };
 
+// tanh_/sin_/cos_: same reasoning as cmp_op above -- a CUDA-only addition,
+// so its own vocabulary rather than a new kop. clamp (2 node-specific
+// scalars, no epilogue) gets its own dedicated function below instead of
+// an enum value, same as index_select/sum_to's own dedicated functions.
+enum class unary_ext_op { tanh_, sin_, cos_ };
+
 #ifdef __APPLE__
 
 struct mtl_size {
@@ -713,6 +719,16 @@ inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
                     int64_t, int64_t) {
   return false;
 }
+// tanh_/sin_/cos_ (RoPE's trig, RNN/LSTM's tanh) and clamp (Clip's
+// forward): no Metal kernel yet (CUDA-first). Stubs for now -- array.h
+// falls back to its own CPU unary loop.
+inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
+                      float, float) {
+  return false;
+}
+inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {
+  return false;
+}
 
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals
 
@@ -777,6 +793,13 @@ inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
 }
 inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
                     int64_t, int64_t) {
+  return false;
+}
+inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
+                      float, float) {
+  return false;
+}
+inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {
   return false;
 }
 

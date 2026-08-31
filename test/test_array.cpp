@@ -766,6 +766,30 @@ TEST_CASE("comparisons GPU dispatch matches the CPU oracle") {
   CHECK(matches_gpu_oracle([&] { return p >= row; }));
 }
 
+TEST_CASE("tanh/sin/cos/clamp GPU dispatch matches the CPU oracle") {
+  auto x = array::from({-2.0f, -0.5f, 0.0f, 0.5f, 2.0f, 5.0f}, {2, 3});
+
+  CHECK(matches_gpu_oracle([&] { return x.tanh(); }));
+  CHECK(matches_gpu_oracle([&] { return x.sin(); }));
+  CHECK(matches_gpu_oracle([&] { return x.cos(); }));
+  CHECK(matches_gpu_oracle([&] { return x.clamp(-1.0f, 1.0f); }));
+
+  // fused epilogue composes with tanh/sin/cos (same as exp_/sqrt_ do).
+  CHECK(matches_gpu_oracle([&] { return x.tanh() * 2.0f - 1.0f; }));
+
+  // clamp composed with a comparison: the actual Clip backward gate
+  // (x_data.ge(lo) * x_data.le(hi)).
+  CHECK(matches_gpu_oracle([&] {
+    return (x >= -1.0f) * (x <= 1.0f);
+  }));
+
+  // correctness spot-checks, not just self-consistency with the oracle.
+  auto c = x.clamp(-1.0f, 1.0f).eval();
+  CHECK(c.at({0, 0}) == -1.0f);  // -2.0 clamped to lo
+  CHECK(c.at({0, 1}) == -0.5f);  // within range, unchanged
+  CHECK(c.at({1, 2}) == 1.0f);   // 5.0 clamped to hi
+}
+
 TEST_CASE("in-place add_ accumulates gradients") {
   auto a = array::from({1, 2, 3, 4}, {2, 2});
 

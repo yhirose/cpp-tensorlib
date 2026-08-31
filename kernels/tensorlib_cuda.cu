@@ -202,7 +202,21 @@ TL_EW_UNARY(tl_sqrt, sqrtf(a[i]))
 TL_EW_UNARY(tl_sigmoid, 1.0f / (1.0f + expf(-a[i])))
 TL_EW_UNARY(tl_relu, a[i] > 0.0f ? a[i] : 0.0f)
 TL_EW_UNARY(tl_affine, a[i])
+TL_EW_UNARY(tl_tanh, tanhf(a[i]))
+TL_EW_UNARY(tl_sin, sinf(a[i]))
+TL_EW_UNARY(tl_cos, cosf(a[i]))
 #undef TL_EW_UNARY
+
+// ---- clamp: out = min(max(a, lo), hi). No scale/offset -- lo/hi occupy
+// that role (Clip's forward: culebra's dz.raw_elementwise host loop before
+// this got a native op).
+__global__ void tl_clamp(const float* a, float* out, unsigned n, float lo,
+                         float hi) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float v = a[i];
+  out[i] = v < lo ? lo : (v > hi ? hi : v);
+}
 
 // ---- row reductions over the last axis (cols); one block per row ----
 // Block-wide tree reduction in shared memory; cols may exceed blockDim, so
