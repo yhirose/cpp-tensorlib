@@ -142,7 +142,8 @@ inline constexpr const char* kEntryPoints[] = {
     "sgemm",        "ew_binary",   "ew_unary",     "ew_bcast",
     "softmax",      "row_reduce",  "pad",          "fold",
     "index_select", "index_add",  "scatter_axis", "ew_bcast_nd",
-    "where_nd",     "cmp",        "clamp_",       "sum_to"};
+    "where_nd",     "cmp",        "clamp_",       "sum_to",
+    "concat_part",  "rope"};
 
 // emscripten_webgpu_get_device() does not report "no device" — it hands
 // Module.preinitializedWebGPUDevice straight to importJsDevice, which reads
@@ -1134,9 +1135,82 @@ inline bool clamp(void* a, int64_t ao, void* out, int64_t oo, int64_t n,
   p.offset = hi;
   return c.encode_("clamp_", ma, mb, mo, p, (n + 255) / 256, 1);
 }
-inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,
-                        const int64_t*, int, int, int64_t, int64_t) {
-  return false;
+
+// concat_part (Tensor.concat along an arbitrary axis, KV-cache append):
+// scatters `a` (this part) into `out` at a flat element shift along one
+// axis -- see kernels/tensorlib_webgpu.wgsl's own concat_part for why this
+// is its own entry rather than reusing pad's (that one dispatches over
+// OUTPUT elements for its zero border; concat has no border and wants the
+// much smaller SOURCE element count instead). Only one real tensor operand
+// (`a`), so -- like pad/fold/sum_to above -- B is free for the meta ring:
+// [a_shape(rank), out_strides(rank)] (out_strides computed host-side,
+// mirrors cuda.h's own upload_pad_fold_meta_).
+inline bool concat_part(void* a_native, int64_t ao, void* out_native,
+                        int64_t oo, const int64_t* a_shape,
+                        const int64_t* out_shape, int rank, int axis,
+                        int64_t before, int64_t n) {
+  auto& c = context::get();
+  if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank || n <= 0) {
+    return false;
+  }
+  params p = {};
+  if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
+  context::mirror* ma = c.mirror_(a_native);
+  context::mirror* mo = c.mirror_(out_native);
+  if (!ma || !mo) return false;
+  c.device_read_(a_native);
+  c.device_write_(out_native);
+
+  int64_t out_strides[kPadFoldMaxRank];
+  int64_t acc = 1;
+  for (int d = rank - 1; d >= 0; d--) {
+    out_strides[d] = acc;
+    acc *= out_shape[d];
+  }
+
+  uint32_t word_off, *raw;
+  void* ring_tok = reserve_meta_(c, &word_off, &raw);
+  if (!ring_tok) return false;
+  for (int d = 0; d < rank; d++) raw[d] = static_cast<uint32_t>(a_shape[d]);
+  for (int d = 0; d < rank; d++) {
+    raw[rank + d] = static_cast<uint32_t>(out_strides[d]);
+  }
+  context::mirror* mm =
+      commit_meta_(c, ring_tok, word_off, raw, 2 * static_cast<size_t>(rank));
+
+  p.M = static_cast<uint32_t>(n);
+  p.b_off = word_off;
+  p.pad0 = static_cast<uint32_t>(rank);
+  p.pad1 = static_cast<uint32_t>(before * out_strides[axis]);
+  return c.encode_("concat_part", ma, mm, mo, p, (n + 255) / 256, 1);
+}
+
+// RoPE (rotary position embedding), half-split (GPT-NeoX / HF-llama)
+// convention -- mirrors cuda.h's/metal.h's own rope. x is [rows, D]
+// contiguous (rows = H*T); dispatched flat over rows*(D/2), matching
+// this file's other flat-1D kernels. No second real tensor operand, so
+// -- like unary()/clamp() above -- B binds x a second time (unused by
+// the WGSL). x/out always view at offset 0 (array.h's gpu_rope_ requires
+// x.offset_ == 0 and hands a fresh allocation for out), so there is no
+// ao/oo in this signature to convert.
+inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
+                 int64_t pos, float base) {
+  auto& c = context::get();
+  if (!c.ready || D <= 0 || (D & 1)) return false;
+  int64_t half = D / 2;
+  int64_t n = rows * half;
+  if (n <= 0) return false;
+  params p = {};
+  context::mirror *ma, *mb, *mo;
+  if (!operands_(c, x, nullptr, out, &ma, &mb, &mo)) return false;
+  p.b_off = p.a_off;
+  p.M = static_cast<uint32_t>(n);
+  p.N = static_cast<uint32_t>(T);
+  p.K = static_cast<uint32_t>(D);
+  p.pad0 = static_cast<uint32_t>(pos);
+  p.pad1 = static_cast<uint32_t>(half);
+  p.scale = base;
+  return c.encode_("rope", ma, mb, mo, p, (n + 255) / 256, 1);
 }
 
 #else  // !(TENSORLIB_WEBGPU && __EMSCRIPTEN__) — stubs, as in metal.h
@@ -1216,6 +1290,9 @@ inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,
                         const int64_t*, int, int, int64_t, int64_t) {
   return false;
 }
+inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
+  return false;
+}
 
 #endif
 
@@ -1227,9 +1304,6 @@ inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
                         int64_t, int64_t, float) {
-  return false;
-}
-inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
   return false;
 }
 inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {

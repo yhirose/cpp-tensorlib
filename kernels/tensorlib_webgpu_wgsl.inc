@@ -544,6 +544,64 @@ fn sum_to(@builtin(global_invocation_id) gid : vec3<u32>) {
   C[p.c_off + t] = sum;
 }
 
+// concat_part: writes `a` (contiguous, one part of an N-ary Tensor.concat)
+// into `out` at `p._pad1` (already before*out_strides[axis], a flat
+// element offset) along one axis. One invocation per SOURCE element (this
+// part's own count, p.M) -- unlike pad above, there is no zero border and
+// no bounds check: concat's parts exhaustively and disjointly cover `out`,
+// so this is a plain scatter that never collides across the separate
+// per-part dispatches building up one `out`. B layout at word offset
+// p.b_off: [a_shape(rank), out_strides(rank)] -- concat's own meta
+// convention (mirrors cuda.h's upload_pad_fold_meta_), different from
+// pad/fold's [out_shape, a_shape] above since this dispatch walks the
+// SOURCE part's own shape, not the output's. p._pad0 = rank.
+@compute @workgroup_size(256, 1, 1)
+fn concat_part(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.M) { return; }
+  let rank = p._pad0;
+  let shift = p._pad1;
+  var rem = i;
+  var dst : u32 = 0u;
+  for (var d : i32 = i32(rank) - 1; d >= 0; d = d - 1) {
+    let dim = bitcast<u32>(B[p.b_off + u32(d)]);
+    let coord = rem % dim;
+    rem = rem / dim;
+    let os = bitcast<u32>(B[p.b_off + rank + u32(d)]);
+    dst = dst + coord * os;
+  }
+  C[p.c_off + dst + shift] = A[p.a_off + i];
+}
+
+// RoPE (rotary position embedding), half-split (GPT-NeoX / HF-llama)
+// convention -- mirrors cuda.h's/metal.h's own rope. A is [rows, D]
+// contiguous (rows = H*T: a [H,T,D] tensor flattened, or [H,D] with
+// T=1); row r's head-dim vector sits at position `pos + (r % T)`; pairs
+// (j, j+D/2) rotate by angle = position * base^(-2j/D). Dispatched flat
+// over rows*(D/2), one invocation per (r, j) pair. p.N = T, p.K = D,
+// p._pad0 = pos, p._pad1 = D/2, p.scale = base (repurposed -- rope has
+// no affine epilogue to compose with, same idea as clamp_'s lo/hi above).
+@compute @workgroup_size(256, 1, 1)
+fn rope(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.M) { return; }
+  let half = p._pad1;
+  let r = i / half;
+  let j = i % half;
+  var t : u32 = 0u;
+  if (p.N > 0u) { t = r % p.N; }
+  let position = f32(p._pad0 + t);
+  let theta = pow(p.scale, -2.0 * f32(j) / f32(p.K));
+  let ang = position * theta;
+  let c = cos(ang);
+  let s = sin(ang);
+  let bi = r * p.K;
+  let x0 = A[p.a_off + bi + j];
+  let x1 = A[p.a_off + bi + j + half];
+  C[p.c_off + bi + j] = x0 * c - x1 * s;
+  C[p.c_off + bi + j + half] = x0 * s + x1 * c;
+}
+
 // ---- Embedding-table lookup (index_select/index_add) and pooling-style
 // one-hot scatter (scatter_to_axis) -- the WGSL counterparts of
 // tl_index_select/tl_index_add/tl_scatter_axis in kernels/tensorlib_cuda.cu.
