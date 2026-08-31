@@ -1077,6 +1077,32 @@ inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
   return c.launch1d_(c.fold_(), un, pa, po, pmeta, rank, axis, ustep, un);
 }
 
+// Writes `a` (contiguous) into `out_shape` at `before` along `axis`,
+// WITHOUT zeroing first — array.h's gpu_concat_ calls this once per part
+// into the same `out`, and every part together covers it exactly (no
+// padding border to zero, unlike pad() above). Reuses pad's own kernel:
+// writing a same-shape source at an axis-shifted offset is exactly what
+// tl_pad already does per source element.
+inline bool concat_part(void* a_native, int64_t ao, void* out_native,
+                        int64_t oo, const int64_t* a_shape,
+                        const int64_t* out_shape, int rank, int axis,
+                        int64_t before, int64_t n) {
+  if (rank <= 0 || rank > kPadFoldMaxRank) return false;
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(a_native);
+  c.device_write_(out_native);
+  int64_t out_strides[kPadFoldMaxRank];
+  const long long* pmeta =
+      upload_pad_fold_meta_(c, a_shape, rank, out_shape, rank, out_strides);
+  if (!pmeta) return false;
+  float* pa = context::off_(a_native, ao);
+  float* po = context::off_(out_native, oo);
+  unsigned un = static_cast<unsigned>(n);
+  unsigned ushift = static_cast<unsigned>(before * out_strides[axis]);
+  return c.launch1d_(c.pad_(), un, pa, po, pmeta, rank, ushift, un);
+}
+
 // Row gather along axis 0: out[i] = a[indices[i]] (a, indices contiguous;
 // indices float-valued, rounded on-device to match argmax's own
 // convention). One thread per output element, no write conflicts — no

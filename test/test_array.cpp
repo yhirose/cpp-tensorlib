@@ -790,6 +790,36 @@ TEST_CASE("tanh/sin/cos/clamp GPU dispatch matches the CPU oracle") {
   CHECK(c.at({1, 2}) == 1.0f);   // 5.0 clamped to hi
 }
 
+TEST_CASE("concat GPU dispatch matches the CPU oracle") {
+  auto a = array::from({1, 2, 3, 4}, {2, 2});
+  auto b = array::from({5, 6, 7, 8}, {2, 2});
+
+  // axis 0 (the old default) still works and dispatches to GPU.
+  CHECK(matches_gpu_oracle([&] { return tl::concat({a, b}); }));
+  CHECK(matches_gpu_oracle([&] { return tl::concat({a, b}, 0); }));
+
+  // axis 1 -- the new case (KV-cache append is along a non-leading axis).
+  CHECK(matches_gpu_oracle([&] { return tl::concat({a, b}, 1); }));
+
+  // three parts, rank 3, a middle axis -- (2,1,2)+(2,3,2)+(2,2,2) on axis 1.
+  auto p = array::from({1, 2, 3, 4}, {2, 1, 2});
+  auto q = array::ones({2, 3, 2});
+  auto s = array::full({2, 2, 2}, 9.0f);
+  CHECK(matches_gpu_oracle([&] { return tl::concat({p, q, s}, 1); }));
+
+  // fused epilogue composes with a concat operand (same as pad/fold do).
+  CHECK(matches_gpu_oracle([&] { return tl::concat({a, b}, 1) * 2.0f - 1.0f; }));
+
+  // correctness spot-checks, not just self-consistency with the oracle.
+  auto c = tl::concat({a, b}, 1).eval();
+  CHECK(c.shape() == tl::shape_t{2, 4});
+  CHECK(c.at({0, 0}) == 1.0f);
+  CHECK(c.at({0, 2}) == 5.0f);
+  CHECK(c.at({1, 3}) == 8.0f);
+
+  CHECK_THROWS(tl::concat({a, array::zeros({3, 2})}, 1));  // axis-1 rows must match
+}
+
 TEST_CASE("in-place add_ accumulates gradients") {
   auto a = array::from({1, 2, 3, 4}, {2, 2});
 

@@ -729,6 +729,13 @@ inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
 inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {
   return false;
 }
+// concat_part (Tensor.concat along an arbitrary axis, KV-cache append): no
+// Metal kernel yet (CUDA-first, reuses its own pad kernel there). Stub for
+// now -- array.h falls back to the CPU ref:: implementation.
+inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,
+                        const int64_t*, int, int, int64_t, int64_t) {
+  return false;
+}
 
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals
 
@@ -800,6 +807,10 @@ inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
   return false;
 }
 inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {
+  return false;
+}
+inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,
+                        const int64_t*, int, int, int64_t, int64_t) {
   return false;
 }
 

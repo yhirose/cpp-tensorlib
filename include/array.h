@@ -185,6 +185,10 @@ struct node {
     scatter_axis_,  // one-hot scatter into a new trailing axis. inputs=
                     // {indices, values}, same shape; `shape` is theirs
                     // with that axis (size = shape.back()) appended.
+    concat_,  // N-ary: inputs are the parts, joined along `axis`. `shape`
+              // is the output (every dim but `axis` matches the parts;
+              // `axis` is their sum) — same "target shape as op parameter"
+              // idea as sum_to_.
     view_,  // zero-copy view (transpose/reshape/slice/unfold) over a still-
             // lazy source: composes strides at eval, no kernel, no flush —
             // keeps the source in the same batch instead of forcing a
@@ -558,6 +562,7 @@ array scatter_to_axis(const array& indices, const array& values,
 
 array sum_to(const array& a, shape_t shape);
 
+array concat(const std::vector<array>& parts, int axis);
 array concat(const std::vector<array>& parts);  // axis 0
 
 // Batch evaluation: one topological pass over all roots.
@@ -1347,6 +1352,29 @@ inline array fold(const array& a, size_t axis, int64_t step,
   return out;
 }
 
+// Places every part into its own axis-window of a shared output buffer --
+// same for_each_index trick as pad above (each part covers its own shape at
+// a shift along `axis`), just run once per part into one `out` instead of
+// once into a zeroed buffer. Parts exhaustively cover `out` (no padding
+// border), so there's nothing to zero first.
+inline array concat(const std::vector<array>& parts, size_t axis,
+                    const shape_t& out_shape) {
+  auto out = array::empty(out_shape);
+  auto* po = out.data();
+  auto dst_strides = out.strides();
+  int64_t offset = 0;
+  for (auto& p : parts) {
+    const auto* pi = p.raw();
+    int64_t shift = offset * dst_strides[axis];
+    detail::for_each_index(p.shape(), {p.strides(), dst_strides},
+                           [&](int64_t, const std::vector<int64_t>& off) {
+                             po[off[1] + shift] = pi[off[0]];
+                           });
+    offset += p.shape()[axis];
+  }
+  return out;
+}
+
 // Row gather along axis 0: out[i] = a[indices[i]] (indices float-valued,
 // rounded, matching argmax's own convention). A full odometer over
 // `out`'s own shape (same rank as `a`) rather than `for_each_index` --
@@ -1790,6 +1818,37 @@ struct graph {
     n->arg0 = lo;
     n->arg1 = hi;
     n->inputs = {as_node(a)};
+    return from_node(std::move(n));
+  }
+
+  // N-ary: no generic binary()/unary() builder fits, same reason clamp above
+  // has its own. Every part must share rank and every dim but `axis`.
+  static array concat(const std::vector<array>& parts, int axis) {
+    if (parts.empty()) {
+      throw std::invalid_argument("tl::concat: empty");
+    }
+    size_t ax = normalize_axis(axis, parts[0].rank(), "concat");
+    auto shape = parts[0].shape();
+    int64_t total = 0;
+    for (auto& p : parts) {
+      auto s = p.shape();
+      if (s.size() != shape.size()) {
+        throw std::invalid_argument("tl::concat: rank mismatch");
+      }
+      for (size_t d = 0; d < s.size(); d++) {
+        if (d != ax && s[d] != shape[d]) {
+          throw std::invalid_argument("tl::concat: shape mismatch");
+        }
+      }
+      total += s[ax];
+    }
+    shape[ax] = total;
+    auto n = std::make_shared<node>();
+    n->op = op_t::concat_;
+    n->shape = std::move(shape);
+    n->axis = static_cast<int>(ax);
+    n->inputs.reserve(parts.size());
+    for (auto& p : parts) n->inputs.push_back(as_node(p));
     return from_node(std::move(n));
   }
 
@@ -2454,6 +2513,42 @@ struct graph {
                         });
   }
 
+  // The GPU-dispatch twin of ref::concat: one gpu::concat_part() launch per
+  // part into a shared `out`, reusing pad's own kernel (writing a
+  // same-shape source at an axis-shifted offset is exactly what pad already
+  // does per source element) minus its pre-zero — concat's parts
+  // exhaustively cover `out`, unlike pad's bordered write. All parts are
+  // validated up front so a mid-loop decline can't leave `out` half
+  // written and returned; a nullopt here just re-does the whole thing on
+  // the CPU oracle.
+  static std::optional<array> gpu_concat_(const std::vector<array>& parts,
+                                          size_t axis,
+                                          const shape_t& out_shape) {
+    if (!gpu_mode_(num_elements(out_shape), kernel_class::elementwise)) {
+      return std::nullopt;
+    }
+    for (auto& p : parts) {
+      if (!p.contiguous() || !p.storage_.native) return std::nullopt;
+    }
+    auto out = array::empty(out_shape);
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    std::vector<int64_t> out_shape_v(out_shape.begin(), out_shape.end());
+    int rank = static_cast<int>(out_shape_v.size());
+    int64_t offset = 0;
+    for (auto& p : parts) {
+      std::vector<int64_t> p_shape(p.shape().begin(), p.shape().end());
+      if (!gpu::concat_part(p.storage_.native, p.offset_ * 4,
+                            out.storage_.native, out.offset_ * 4,
+                            p_shape.data(), out_shape_v.data(), rank,
+                            static_cast<int>(axis), offset, p.size())) {
+        return std::nullopt;
+      }
+      offset += p_shape[static_cast<size_t>(axis)];
+    }
+    return out;
+  }
+
   // Row gather along axis 0 — the GPU-dispatch twin of ref::index_select.
   // No zeroing: every output element is written exactly once.
   static std::optional<array> gpu_index_select_(const array& a,
@@ -3087,6 +3182,18 @@ struct graph {
         }
         break;
       }
+      case op_t::concat_: {
+        std::vector<array> parts;
+        parts.reserve(n.inputs.size());
+        for (size_t i = 0; i < n.inputs.size(); i++) parts.push_back(in(i));
+        size_t axis = static_cast<size_t>(n.axis);
+        if (auto g = gpu_concat_(parts, axis, n.shape)) {
+          r = std::move(*g);
+        } else {
+          r = ref::concat(parts, axis, n.shape);
+        }
+        break;
+      }
       case op_t::pad_: {
         auto a = in(0);
         size_t axis = static_cast<size_t>(n.axis);
@@ -3477,30 +3584,10 @@ inline int64_t array::argmax() const {
   return best;
 }
 
-inline array concat(const std::vector<array>& parts) {
-  if (parts.empty()) throw std::invalid_argument("tl::concat: empty");
-  auto shape = parts[0].shape();
-  if (shape.empty()) throw std::invalid_argument("tl::concat: rank 0");
-  int64_t rows = 0;
-  for (auto& p : parts) {
-    auto s = p.shape();
-    rows += s[0];
-    s[0] = shape[0];
-    if (s != shape) throw std::invalid_argument("tl::concat: shape mismatch");
-  }
-  shape[0] = rows;
-  auto out = array::empty(shape);
-  auto* po = out.data();
-  for (auto& p : parts) {
-    const auto* pi = p.raw();
-    detail::for_each_index(p.shape(), {p.strides()},
-                           [&](int64_t i, const std::vector<int64_t>& off) {
-                             po[i] = pi[off[0]];
-                           });
-    po += p.size();
-  }
-  return out;
+inline array concat(const std::vector<array>& parts, int axis) {
+  return detail::graph::concat(parts, axis);
 }
+inline array concat(const std::vector<array>& parts) { return concat(parts, 0); }
 
 // Install the execution-engine hooks (TL_RUNTIME_HOOKS builds). Call once,
 // before any evaluation, from the embedder's tensor feature loader. This is
