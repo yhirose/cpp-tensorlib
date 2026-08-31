@@ -57,6 +57,23 @@ inline float bf16_to_f32(uint16_t h) {
   return f;
 }
 
+// Row-major (contiguous) strides for a shape given as a raw pointer + rank —
+// the allocation-free core that both array.h's detail::contiguous_strides
+// (which wraps this for a shape_t, returning a std::vector) and cuda.h's
+// pad/fold GPU dispatch (which writes into a fixed-size stack array, once per
+// call on a hot path) share. Lives here rather than in array.h because
+// cuda.h and webgpu.h are pulled in — via storage.h's gpu.h — before array.h
+// defines its own detail namespace, so they can't see anything declared
+// there; types.h sits below both and has no such ordering constraint.
+inline void contiguous_strides_into(const int64_t* shape, int rank,
+                                    int64_t* strides) {
+  int64_t acc = 1;
+  for (int d = rank - 1; d >= 0; --d) {
+    strides[d] = acc;
+    acc *= shape[d];
+  }
+}
+
 enum class device_type { cpu, gpu, auto_ };
 
 inline device_type device_ = device_type::cpu;

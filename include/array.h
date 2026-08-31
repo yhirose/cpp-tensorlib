@@ -50,8 +50,8 @@ inline int64_t num_elements(const shape_t& s) {
 }
 
 inline std::vector<int64_t> contiguous_strides(const shape_t& s) {
-  std::vector<int64_t> out(s.size(), 1);
-  for (size_t i = s.size(); i-- > 1;) out[i - 1] = out[i] * s[i];
+  std::vector<int64_t> out(s.size());
+  contiguous_strides_into(s.data(), static_cast<int>(s.size()), out.data());
   return out;
 }
 

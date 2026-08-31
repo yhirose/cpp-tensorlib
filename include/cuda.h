@@ -748,19 +748,6 @@ inline void zero_device_(CUdeviceptr dst, int64_t n) {
   else c.d.MemsetD8(dst, 0, bytes);
 }
 
-// Row-major strides of a contiguous tensor with the given shape — pad()/
-// fold() take shapes, not strides, so the same signature also serves
-// webgpu.h's gather-style kernels, which need shapes and derive strides (or
-// don't need them at all) on their own terms.
-inline void strides_from_shape_(const int64_t* shape, int rank,
-                                int64_t* strides) {
-  int64_t acc = 1;
-  for (int d = rank - 1; d >= 0; --d) {
-    strides[d] = acc;
-    acc *= shape[d];
-  }
-}
-
 // Shared by pad()/fold() below: builds this call's [a_shape(rank),
 // out_strides(stride_len)] meta buffer (out_strides derived from out_shape
 // here — pad passes stride_len==rank, fold passes rank-1, since fold's own
@@ -778,7 +765,7 @@ inline const long long* upload_pad_fold_meta_(context& c, const int64_t* a_shape
                                               int rank, const int64_t* out_shape,
                                               int stride_len,
                                               int64_t* out_strides) {
-  strides_from_shape_(out_shape, stride_len, out_strides);
+  contiguous_strides_into(out_shape, stride_len, out_strides);
   size_t meta_bytes =
       (static_cast<size_t>(rank) + static_cast<size_t>(stride_len)) *
       sizeof(int64_t);
