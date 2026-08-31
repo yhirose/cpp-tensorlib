@@ -204,6 +204,63 @@ TEST_CASE("dot") {
   CHECK_THROWS(a.dot(a));
 }
 
+TEST_CASE("batched dot: rank-3 matches per-slice 2-D dot") {
+  auto a = random_array({2, 4, 3}, 1);
+  auto b = random_array({2, 3, 5}, 2);
+  auto c = a.dot(b);
+  CHECK(c.shape() == tl::shape_t{2, 4, 5});
+  for (int64_t bi = 0; bi < 2; bi++) {
+    auto a2 = a.slice(0, bi, 1).reshape({4, 3});
+    auto b2 = b.slice(0, bi, 1).reshape({3, 5});
+    auto expected = a2.dot(b2);
+    for (int64_t i = 0; i < 4; i++) {
+      for (int64_t j = 0; j < 5; j++) {
+        CHECK(c.at({bi, i, j}) == doctest::Approx(expected.at({i, j})));
+      }
+    }
+  }
+}
+
+TEST_CASE("batched dot: rank-4 (two batch axes) matches per-slice 2-D dot") {
+  auto a = random_array({2, 3, 4, 5}, 3);
+  auto b = random_array({2, 3, 5, 6}, 4);
+  auto c = a.dot(b);
+  CHECK(c.shape() == tl::shape_t{2, 3, 4, 6});
+  for (int64_t p = 0; p < 2; p++) {
+    for (int64_t q = 0; q < 3; q++) {
+      auto a2 = a.slice(0, p, 1).slice(1, q, 1).reshape({4, 5});
+      auto b2 = b.slice(0, p, 1).slice(1, q, 1).reshape({5, 6});
+      auto expected = a2.dot(b2);
+      for (int64_t i = 0; i < 4; i++) {
+        for (int64_t j = 0; j < 6; j++) {
+          CHECK(c.at({p, q, i, j}) == doctest::Approx(expected.at({i, j})));
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("batched dot: mismatched batch dims or rank throws") {
+  auto a = random_array({2, 4, 3}, 5);
+  auto b = random_array({3, 3, 5}, 6);   // batch dim 2 vs 3
+  CHECK_THROWS(a.dot(b));
+  auto c = random_array({2, 3, 4, 3}, 7);  // rank 4 vs rank 3
+  CHECK_THROWS(a.dot(c));
+}
+
+TEST_CASE("batched dot: GPU dispatch matches the ref oracle") {
+  CHECK(matches_gpu_oracle([&] {
+    auto a = random_array({4, 6, 8}, 11);
+    auto b = random_array({4, 8, 5}, 12);
+    return a.dot(b);
+  }));
+  CHECK(matches_gpu_oracle([&] {
+    auto a = random_array({2, 3, 6, 8}, 13);
+    auto b = random_array({2, 3, 8, 5}, 14);
+    return a.dot(b);
+  }));
+}
+
 TEST_CASE("reductions") {
   auto a = array::from({1, 2, 3, 4, 5, 6}, {2, 3});
   CHECK(a.sum() == 21.0f);

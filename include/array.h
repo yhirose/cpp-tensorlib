@@ -1120,6 +1120,56 @@ inline array dot(const array& a_in, const array& b_in) {
   return out;
 }
 
+// Batched matmul: `a`/`b` share every leading (batch) dim exactly (checked
+// by graph::dot before this ever runs), and the trailing two dims of each
+// do one 2-D matmul per batch slice. Walks the batch index generically
+// (any rank, any strides — `a`/`b` need not be contiguous) rather than
+// assuming a flat batch stride, since only the innermost two strides are
+// guaranteed contiguous-shaped by anything upstream.
+inline array bdot(const array& a, const array& b) {
+  size_t r = a.rank();
+  const auto& ash = a.shape();
+  const auto& as = a.strides();
+  const auto& bs = b.strides();
+  int64_t m = ash[r - 2], k = ash[r - 1], n = b.shape().back();
+  shape_t out_shape(ash.begin(), ash.end() - 2);
+  out_shape.push_back(m);
+  out_shape.push_back(n);
+  auto out = array::zeros(out_shape);
+  auto* po = out.data();
+  const auto* pa = a.raw();
+  const auto* pb = b.raw();
+  int64_t batch = 1;
+  for (size_t i = 0; i + 2 < r; i++) batch *= ash[i];
+  int64_t as0 = as[r - 2], as1 = as[r - 1];
+  int64_t bs0 = bs[r - 2], bs1 = bs[r - 1];
+  int64_t out_mn = m * n;
+  std::vector<int64_t> idx(r - 2, 0);
+  for (int64_t bi = 0; bi < batch; bi++) {
+    int64_t a_off = 0, b_off = 0;
+    for (size_t d = 0; d < r - 2; d++) {
+      a_off += idx[d] * as[d];
+      b_off += idx[d] * bs[d];
+    }
+    const float* pa2 = pa + a_off;
+    const float* pb2 = pb + b_off;
+    float* po2 = po + bi * out_mn;
+    for (int64_t i = 0; i < m; i++) {
+      for (int64_t l = 0; l < k; l++) {
+        float av = pa2[i * as0 + l * as1];
+        for (int64_t j = 0; j < n; j++) {
+          po2[i * n + j] += av * pb2[l * bs0 + j * bs1];
+        }
+      }
+    }
+    for (size_t d = r - 2; d-- > 0;) {
+      if (++idx[d] < ash[d]) break;
+      idx[d] = 0;
+    }
+  }
+  return out;
+}
+
 inline array sum(const array& a, int axis, bool keepdims) {
   return detail::reduce_axis(a, axis, keepdims, 0.0f,
                              [](float& acc, float v) { acc += v; });
@@ -1586,6 +1636,27 @@ struct graph {
   static array dot(const array& a, const array& b) {
     const auto& sa = a.shape();
     const auto& sb = b.shape();
+    // Batched: rank >= 3 on both sides, leading (batch) dims matching
+    // exactly — no broadcasting yet, kept simple until a real workload
+    // needs more (attention's own q/k/v always share their batch/head
+    // dims). The last two dims of each do the 2-D matmul every batch slice
+    // gets; eval_one's op_t::dot dispatches on rank the same way this
+    // validates it.
+    if (sa.size() >= 3 || sb.size() >= 3) {
+      if (sa.size() != sb.size() || sa.size() < 3 ||
+          !std::equal(sa.begin(), sa.end() - 2, sb.begin()) ||
+          sa.back() != sb[sb.size() - 2]) {
+        throw std::invalid_argument("tl::dot: batched shape mismatch " +
+                                    shape_str(sa) + " @ " + shape_str(sb));
+      }
+      auto n = std::make_shared<node>();
+      n->op = op_t::dot;
+      n->shape = shape_t(sa.begin(), sa.end() - 2);
+      n->shape.push_back(sa[sa.size() - 2]);
+      n->shape.push_back(sb.back());
+      n->inputs = {as_node(a), as_node(b)};
+      return from_node(std::move(n));
+    }
     if (sa.size() < 1 || sa.size() > 2 || sb.size() < 1 || sb.size() > 2 ||
         sa.back() != sb[0]) {
       throw std::invalid_argument("tl::dot: shape mismatch " + shape_str(sa) +
@@ -1789,6 +1860,48 @@ struct graph {
       return std::nullopt;
     }
     return out.reshape(n.shape);
+  }
+
+  // Batched matmul, GPU dispatch (v1): a per-slice loop over the same
+  // gpu::gemm single-matmul entry point above, one launch per batch element
+  // on the same device queue — real backend acceleration per slice, not yet
+  // one fused batched kernel (no backend has one; a future optimization if
+  // profiling shows the per-slice launch count matters more than the FLOPs
+  // do). Requires both operands fully contiguous (batch dims included), not
+  // just gemm_classify_'s "2-D contiguous-or-transposed" — gpu::gemm only
+  // takes a flat byte offset per call, so a non-contiguous batch axis has no
+  // single stride to compute that offset from; falls back to the CPU oracle
+  // (ref::bdot) honestly rather than guessing. No scale/offset (matching
+  // gpu_gemm's caller): eval_one's shared epilogue applies those afterward.
+  static std::optional<array> gpu_bdot_(const array& a, const array& b) {
+    size_t r = a.rank();
+    int64_t m = a.shape()[r - 2], k = a.shape()[r - 1], nn = b.shape().back();
+    int64_t batch = 1;
+    for (size_t i = 0; i + 2 < r; i++) batch *= a.shape()[i];
+    if (!gpu_mode_(m * nn * (k > 0 ? k : 1) * (batch > 0 ? batch : 1),
+                   kernel_class::matmul)) {
+      return std::nullopt;
+    }
+    if (!a.contiguous() || !b.contiguous()) return std::nullopt;
+    if (!a.storage_.native || !b.storage_.native) return std::nullopt;
+    shape_t out_shape(a.shape().begin(), a.shape().end() - 2);
+    out_shape.push_back(m);
+    out_shape.push_back(nn);
+    auto out = array::empty(out_shape);
+    if (!out.storage_.native) return std::nullopt;
+    if (m == 0 || nn == 0 || batch == 0) return out;
+    int64_t a_stride = m * k, b_stride = k * nn, out_stride = m * nn;
+    for (int64_t bi = 0; bi < batch; bi++) {
+      int64_t a_off = (a.offset_ + bi * a_stride) * 4;
+      int64_t b_off = (b.offset_ + bi * b_stride) * 4;
+      int64_t out_off = (out.offset_ + bi * out_stride) * 4;
+      if (!gpu::gemm(a.storage_.native, a_off, k, false, b.storage_.native,
+                     b_off, nn, false, out.storage_.native, out_off, m, nn,
+                     k, 1.0f, 0.0f)) {
+        return std::nullopt;
+      }
+    }
+    return out;
   }
 
   // The decode-shape gate the three weight dtypes share: the activation must be
@@ -2335,6 +2448,20 @@ struct graph {
         break;
       }
       case op_t::dot: {
+        // Batched (rank >= 3, graph::dot already required matching batch
+        // dims): none of the GEMV/GEMM fast paths below know about a batch
+        // axis, so this branches off before them entirely. GPU dispatch is
+        // still to-do (see gpu_bdot_'s own comment) — CPU-correct today via
+        // a per-slice host loop.
+        if (n.inputs[0]->shape.size() > 2 || n.inputs[1]->shape.size() > 2) {
+          auto a = in(0), b = in(1);
+          if (auto g = gpu_bdot_(a, b)) {
+            r = std::move(*g);
+          } else {
+            r = ref::bdot(a, b);
+          }
+          break;
+        }
         // Decode GEMV fast path first (M=1; f32/bf16/q4 weights), on the
         // un-widened inputs.
         if (auto g = gpu_gemv(n, wrap(*n.inputs[0]), wrap(*n.inputs[1]))) {
