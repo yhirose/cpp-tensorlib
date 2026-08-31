@@ -182,9 +182,19 @@ const OP_SQRT    : u32 = 2u;
 const OP_SIGMOID : u32 = 3u;
 const OP_RELU    : u32 = 4u;
 const OP_AFFINE  : u32 = 5u;
+const OP_TANH    : u32 = 6u;
+const OP_SIN     : u32 = 7u;
+const OP_COS     : u32 = 8u;
 
 const OP_ROW_SUM : u32 = 0u;
 const OP_ROW_MAX : u32 = 1u;
+
+const OP_GT : u32 = 0u;
+const OP_LT : u32 = 1u;
+const OP_GE : u32 = 2u;
+const OP_LE : u32 = 3u;
+const OP_EQ : u32 = 4u;
+const OP_NE : u32 = 5u;
 
 // Identity for a max reduction. WGSL has no -inf literal, and the decimal
 // spelling of f32::lowest rounds just past the representable range ("cannot be
@@ -211,7 +221,25 @@ fn unary_op(op : u32, v : f32) -> f32 {
     case 3u: { return 1.0 / (1.0 + exp(-v)); }
     case 4u: { return max(v, 0.0); }
     case 5u: { return v; }
+    case 6u: { return tanh(v); }
+    case 7u: { return sin(v); }
+    case 8u: { return cos(v); }
     default: { return exp(v); }
+  }
+}
+
+// Elementwise comparison: out = (a OP b) ? 1.0 : 0.0. No scale/offset -- masks
+// don't compose with the affine epilogue, so ew_cmp below skips it (unlike
+// ew_binary/ew_unary). Own family/entry point, not folded into binary_op,
+// since it returns a bool-as-float rather than composing with `bv`.
+fn cmp_op(op : u32, av : f32, bv : f32) -> f32 {
+  switch (op) {
+    case 1u: { return select(0.0, 1.0, av < bv); }
+    case 2u: { return select(0.0, 1.0, av >= bv); }
+    case 3u: { return select(0.0, 1.0, av <= bv); }
+    case 4u: { return select(0.0, 1.0, av == bv); }
+    case 5u: { return select(0.0, 1.0, av != bv); }
+    default: { return select(0.0, 1.0, av > bv); }
   }
 }
 
@@ -230,6 +258,31 @@ fn ew_unary(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (i >= p.M) { return; }
   let v = unary_op(p.op, A[p.a_off + i]);
   C[p.c_off + i] = fma(v, p.scale, p.offset);
+}
+
+// Elementwise comparison over p.M elements: out = (a OP b) ? 1.0 : 0.0
+// (no epilogue -- masks don't compose with scale/offset). p.ars carries the
+// bstride webgpu.h's compare() receives: 1 for a same-shape b, 0 for a
+// scalar b (the concrete ReLU-style masked-gate shape array.h's `x > 0.0f`
+// produces) -- an unused field for this family, repurposed rather than
+// widening Params.
+@compute @workgroup_size(256, 1, 1)
+fn cmp(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.M) { return; }
+  let bv = B[p.b_off + i * p.ars];
+  C[p.c_off + i] = cmp_op(p.op, A[p.a_off + i], bv);
+}
+
+// clamp(x, lo, hi): Clip's forward. No affine epilogue -- p.scale/p.offset
+// carry lo/hi instead (a dedicated entry, same as this family's clamp_ in
+// metal_kernels.metal/tl_clamp in tensorlib_cuda.cu). Named clamp_, not
+// clamp, so the entry point doesn't shadow WGSL's builtin of that name.
+@compute @workgroup_size(256, 1, 1)
+fn clamp_(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.M) { return; }
+  C[p.c_off + i] = clamp(A[p.a_off + i], p.scale, p.offset);
 }
 
 // Rank-2 broadcast binary: out[r,c] = f(a[r*ars + c*acs], b[r*brs + c*bcs])
@@ -440,6 +493,55 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
     sum = sum + A[p.a_off + src];
   }
   C[p.c_off + i] = sum;
+}
+
+// sum_to: sum `a` down to a smaller broadcast-target shape (the dual of
+// broadcast_to that every arithmetic op's backward uses to un-broadcast a
+// gradient). Gather, not scatter: one invocation per OUTPUT element sums
+// every `a` element that broadcasts onto it, so -- like pad/fold above --
+// no write conflict and no atomics. B layout at word offset p.b_off:
+// [a_shape(rank), a_strides(rank), acc(rank)] -- acc is a's shape
+// broadcast-aligned against the output's own strides (array.h's
+// broadcast_strides(target, out.strides(), a.shape())), 0 on a reduced
+// axis. p._pad0 = rank, p._pad1 = reduced_n (product of a_shape over
+// exactly the zero-acc axes; 1 if there are none).
+@compute @workgroup_size(256, 1, 1)
+fn sum_to(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let t = gid.x;
+  if (t >= p.M) { return; }
+  let rank = p._pad0;
+  let reduced_n = p._pad1;
+
+  var base : u32 = 0u;
+  var red_axis : array<u32, kPadFoldMaxRank>;
+  var red_count : u32 = 0u;
+  for (var d : u32 = 0u; d < rank; d = d + 1u) {
+    let a_shape_d = bitcast<u32>(B[p.b_off + d]);
+    let acc_d = bitcast<u32>(B[p.b_off + 2u * rank + d]);
+    if (acc_d != 0u) {
+      let a_strides_d = bitcast<u32>(B[p.b_off + rank + d]);
+      let idx = (t / acc_d) % a_shape_d;
+      base = base + idx * a_strides_d;
+    } else {
+      red_axis[red_count] = d;
+      red_count = red_count + 1u;
+    }
+  }
+  var sum : f32 = 0.0;
+  for (var r : u32 = 0u; r < reduced_n; r = r + 1u) {
+    var rem = r;
+    var off = base;
+    for (var k : i32 = i32(red_count) - 1; k >= 0; k = k - 1) {
+      let d = red_axis[u32(k)];
+      let dim = bitcast<u32>(B[p.b_off + d]);
+      let coord = rem % dim;
+      rem = rem / dim;
+      let stride = bitcast<u32>(B[p.b_off + rank + d]);
+      off = off + coord * stride;
+    }
+    sum = sum + A[p.a_off + off];
+  }
+  C[p.c_off + t] = sum;
 }
 
 // ---- Embedding-table lookup (index_select/index_add) and pooling-style

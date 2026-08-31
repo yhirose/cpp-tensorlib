@@ -112,6 +112,9 @@ inline uint32_t kernel_op_(kop op) {
     case kop::sigmoid: return 3;
     case kop::relu: return 4;
     case kop::affine: return 5;
+    case kop::tanh_: return 6;
+    case kop::sin_: return 7;
+    case kop::cos_: return 8;
 
     case kop::row_sum: return 0;
     case kop::row_max: return 1;
@@ -139,7 +142,7 @@ inline constexpr const char* kEntryPoints[] = {
     "sgemm",        "ew_binary",   "ew_unary",     "ew_bcast",
     "softmax",      "row_reduce",  "pad",          "fold",
     "index_select", "index_add",  "scatter_axis", "ew_bcast_nd",
-    "where_nd"};
+    "where_nd",     "cmp",        "clamp_",       "sum_to"};
 
 // emscripten_webgpu_get_device() does not report "no device" — it hands
 // Module.preinitializedWebGPUDevice straight to importJsDevice, which reads
@@ -1026,20 +1029,110 @@ inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
   p.pad4 = word_off;
   return c.encode_("where_nd", mcond, ma, mo, p, (n + 255) / 256, 1, mb, mm);
 }
-inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
-                   const int64_t*, int, int64_t, int64_t, void*, int64_t) {
-  return false;
+
+// sum_to (un-broadcast a gradient): gather, mirrors cuda.h's tl_sum_to and
+// metal.h's own sum_to -- one invocation per OUTPUT element sums every `a`
+// element that broadcasts onto it, so no atomics (unlike index_add). Only
+// one real tensor operand (`a`), so -- like pad/fold above -- B is free for
+// the meta ring: [a_shape(rank), a_strides(rank), acc(rank)].
+inline bool sum_to(void* a_native, int64_t ao, const int64_t* a_shape,
+                   const int64_t* a_strides, const int64_t* acc, int rank,
+                   int64_t out_n, int64_t reduced_n, void* out_native,
+                   int64_t oo) {
+  auto& c = context::get();
+  if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank) return false;
+  params p = {};
+  if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
+  context::mirror* ma = c.mirror_(a_native);
+  context::mirror* mo = c.mirror_(out_native);
+  if (!ma || !mo) return false;
+  c.device_read_(a_native);
+  c.device_write_(out_native);
+
+  uint32_t word_off, *raw;
+  void* ring_tok = reserve_meta_(c, &word_off, &raw);
+  if (!ring_tok) return false;
+  for (int d = 0; d < rank; d++) {
+    raw[d] = static_cast<uint32_t>(a_shape[d]);
+  }
+  for (int d = 0; d < rank; d++) {
+    raw[rank + d] = static_cast<uint32_t>(a_strides[d]);
+  }
+  for (int d = 0; d < rank; d++) {
+    raw[2 * rank + d] = static_cast<uint32_t>(acc[d]);
+  }
+  context::mirror* mm =
+      commit_meta_(c, ring_tok, word_off, raw, 3 * static_cast<size_t>(rank));
+
+  p.M = static_cast<uint32_t>(out_n);
+  p.b_off = word_off;
+  p.pad0 = static_cast<uint32_t>(rank);
+  p.pad1 = static_cast<uint32_t>(reduced_n);
+  return c.encode_("sum_to", ma, mm, mo, p, (out_n + 255) / 256, 1);
 }
-inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
-                    int64_t, int64_t) {
-  return false;
+
+// gt/lt/ge/le/eq/ne (array.h's comparison ops, ReLU/LeakyReLU/Clip's
+// backward gate): same-shape only (bstride=1) or a scalar b (bstride=0) --
+// the two shapes array.h's gpu_compare_ ever dispatches. p.ars (unused by
+// this family) carries bstride. Own entry point/op numbering, not folded
+// into ew_binary's binary_op -- it returns a bool-as-float mask rather than
+// composing with scale/offset.
+inline bool compare(cmp_op op, void* a, int64_t ao, void* b, int64_t bo,
+                    void* out, int64_t oo, int64_t n, int64_t bstride) {
+  auto& c = context::get();
+  if (!c.ready || n <= 0) return false;
+  params p = {};
+  if (!elem_off_(ao, &p.a_off) || !elem_off_(bo, &p.b_off) ||
+      !elem_off_(oo, &p.c_off)) {
+    return false;
+  }
+  context::mirror *ma, *mb, *mo;
+  if (!operands_(c, a, b, out, &ma, &mb, &mo)) return false;
+  p.M = static_cast<uint32_t>(n);
+  p.ars = static_cast<uint32_t>(bstride);
+  switch (op) {
+    case cmp_op::gt: p.op = 0; break;
+    case cmp_op::lt: p.op = 1; break;
+    case cmp_op::ge: p.op = 2; break;
+    case cmp_op::le: p.op = 3; break;
+    case cmp_op::eq: p.op = 4; break;
+    case cmp_op::ne: p.op = 5; break;
+  }
+  return c.encode_("cmp", ma, mb, mo, p, (n + 255) / 256, 1);
 }
-inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
-                      float, float) {
-  return false;
+
+// tanh_/sin_/cos_ (RoPE's trig, RNN/LSTM's tanh): plain elementwise, same
+// shape as exp_/sqrt_ -- unary() above already does exactly this dispatch
+// through ew_unary, just keyed by a kop array.h doesn't see directly.
+inline bool unary_ext(unary_ext_op op, void* a, int64_t ao, void* out,
+                      int64_t oo, int64_t n, float scale, float offset) {
+  kop k;
+  switch (op) {
+    case unary_ext_op::tanh_: k = kop::tanh_; break;
+    case unary_ext_op::sin_: k = kop::sin_; break;
+    case unary_ext_op::cos_: k = kop::cos_; break;
+  }
+  // Qualified: unqualified unary(...) is ambiguous here -- kop is really
+  // tl::metal::kop, so ADL pulls in metal.h's non-Apple unary() stub
+  // alongside this namespace's own.
+  return tl::webgpu::unary(k, a, ao, out, oo, n, scale, offset);
 }
-inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {
-  return false;
+
+// clamp(x, lo, hi): Clip's forward. No epilogue -- p.scale/p.offset carry
+// lo/hi instead (mirrors cuda.h's/metal.h's own clamp).
+inline bool clamp(void* a, int64_t ao, void* out, int64_t oo, int64_t n,
+                  float lo, float hi) {
+  auto& c = context::get();
+  if (!c.ready || n <= 0) return false;
+  params p = {};
+  if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
+  context::mirror *ma, *mb, *mo;
+  if (!operands_(c, a, nullptr, out, &ma, &mb, &mo)) return false;
+  p.b_off = p.a_off;  // the kernel binds its one input twice
+  p.M = static_cast<uint32_t>(n);
+  p.scale = lo;
+  p.offset = hi;
+  return c.encode_("clamp_", ma, mb, mo, p, (n + 255) / 256, 1);
 }
 inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,
                         const int64_t*, int, int, int64_t, int64_t) {
