@@ -167,6 +167,12 @@ inline const char* kernel_name_(kop op) {
     case kop::sub: return "tl_sub";
     case kop::mul: return "tl_mul";
     case kop::div: return "tl_div";
+    case kop::pow_: return "tl_pow";
+    case kop::badd: return "tl_badd";
+    case kop::bsub: return "tl_bsub";
+    case kop::bmul: return "tl_bmul";
+    case kop::bdiv: return "tl_bdiv";
+    case kop::bpow: return "tl_bpow";
     case kop::exp_: return "tl_exp";
     case kop::log_: return "tl_log";
     case kop::sqrt_: return "tl_sqrt";
@@ -380,6 +386,26 @@ struct context {
   CUfunction scatter_axis_() {
     return cached_(scatter_axis_fn, "tl_scatter_axis");
   }
+
+  // N-D broadcast binary (any rank) and N-D broadcast ternary select
+  // (Tensor.where's GPU dispatch) -- new capabilities, one kernel per op
+  // like the rank-2 kop/fn_() vocabulary above, but not part of that
+  // vocabulary itself (fn_() caches one name per kop; these need a second,
+  // different name for the same op), so each gets its own cached
+  // CUfunction, dispatched by a small switch on the existing kop value.
+  CUfunction badd_nd_fn = nullptr, bsub_nd_fn = nullptr, bmul_nd_fn = nullptr,
+             bdiv_nd_fn = nullptr, bpow_nd_fn = nullptr, where_nd_fn = nullptr;
+  CUfunction bcast_nd_(kop op) {
+    switch (op) {
+      case kop::badd: return cached_(badd_nd_fn, "tl_badd_nd");
+      case kop::bsub: return cached_(bsub_nd_fn, "tl_bsub_nd");
+      case kop::bmul: return cached_(bmul_nd_fn, "tl_bmul_nd");
+      case kop::bdiv: return cached_(bdiv_nd_fn, "tl_bdiv_nd");
+      case kop::bpow: return cached_(bpow_nd_fn, "tl_bpow_nd");
+      default: return nullptr;
+    }
+  }
+  CUfunction where_nd_() { return cached_(where_nd_fn, "tl_where_nd"); }
 
   // M9 batched-prefill GEMM (bf16 [N,K] weights, the decode GEMV's own layout).
   CUfunction gemm_bf16_nt_fn = nullptr, gemm_bf16_nt_s_fn = nullptr,
@@ -711,7 +737,6 @@ inline void sync_to_host(void* native, bool for_write) {
 // out = (a OP b) * scale + offset, contiguous; offsets in bytes.
 inline bool binary(kop op, void* a, int64_t ao, void* b, int64_t bo, void* out,
                    int64_t oo, int64_t n, float scale, float offset) {
-  if (op == kop::pow_) return false;  // no CUDA pow kernel yet — CPU fallback
   auto& c = context::get();
   if (!c.ready) return false;
   c.device_read_(a);
@@ -724,12 +749,27 @@ inline bool binary(kop op, void* a, int64_t ao, void* b, int64_t bo, void* out,
   return c.launch1d_(c.fn_(op), un, pa, pb, po, un, scale, offset);
 }
 
-// Rank-2 broadcast binary — no CUDA kernel yet; false sends the evaluator
-// down the CPU fallback, matching pre-bcast behavior on this backend.
-inline bool binary_bcast(kop, void*, int64_t, int64_t, int64_t, void*, int64_t,
-                         int64_t, int64_t, void*, int64_t, int64_t, int64_t,
-                         float, float) {
-  return false;
+// Rank-2 broadcast binary (bias / row-vector / column-vector / scalar) --
+// mirrors metal.h's own kernel; ars/acs/brs/bcs are element strides (0 on a
+// broadcast axis), computed host-side by array.h's gpu_binary via the same
+// broadcast_strides() the CPU oracle uses.
+inline bool binary_bcast(kop op, void* a, int64_t ao, int64_t ars, int64_t acs,
+                         void* b, int64_t bo, int64_t brs, int64_t bcs,
+                         void* out, int64_t oo, int64_t m, int64_t n,
+                         float scale, float offset) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(a);
+  c.device_read_(b);
+  c.device_write_(out);
+  float* pa = context::off_(a, ao);
+  float* pb = context::off_(b, bo);
+  float* po = context::off_(out, oo);
+  unsigned um = static_cast<unsigned>(m), un = static_cast<unsigned>(n);
+  return c.launch1d_(c.fn_(op), um * un, pa, pb, po, um, un,
+                     static_cast<unsigned>(ars), static_cast<unsigned>(acs),
+                     static_cast<unsigned>(brs), static_cast<unsigned>(bcs),
+                     scale, offset);
 }
 
 inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo, int64_t n,
@@ -788,6 +828,82 @@ inline const long long* upload_pad_fold_meta_(context& c, const int64_t* a_shape
   host_meta.insert(host_meta.end(), out_strides, out_strides + stride_len);
   c.d.MemcpyHtoDAsync(meta, host_meta.data(), meta_bytes, c.stream);
   return reinterpret_cast<const long long*>(meta);
+}
+
+// Shared by binary_bcast_nd()/where_nd() below: uploads [out_shape(rank),
+// strides_0(rank), strides_1(rank), ...] as one int64 buffer -- same async
+// reasoning as upload_pad_fold_meta_ above, just a variable operand count
+// instead of that one's fixed [a_shape, out_strides] pair.
+inline const long long* upload_bcast_meta_(
+    context& c, const int64_t* out_shape, int rank,
+    std::initializer_list<const int64_t*> stride_arrays) {
+  size_t parts = 1 + stride_arrays.size();
+  size_t meta_bytes = parts * static_cast<size_t>(rank) * sizeof(int64_t);
+  CUdeviceptr meta = c.meta_scratch_(meta_bytes);
+  if (!meta) return nullptr;
+  std::vector<int64_t> host_meta(out_shape, out_shape + rank);
+  for (auto* s : stride_arrays) {
+    host_meta.insert(host_meta.end(), s, s + rank);
+  }
+  c.d.MemcpyHtoDAsync(meta, host_meta.data(), meta_bytes, c.stream);
+  return reinterpret_cast<const long long*>(meta);
+}
+
+// N-D broadcast binary: generalizes binary_bcast() above to any rank (a
+// Transformer's [batch,seq,dim] LayerNorm broadcasts a [N,S,1] mean against
+// a [N,S,D] input, rank 3 -- the rank-2 kernel only covers a Linear bias /
+// BatchNorm-shaped [N,D] input). `a_strides`/`b_strides` are the broadcast
+// strides (0 on a broadcast axis) array.h's gpu_binary_nd_ computes via the
+// same broadcast_strides() the CPU oracle uses.
+inline bool binary_bcast_nd(kop op, void* a_native, int64_t ao,
+                            const int64_t* a_strides, void* b_native,
+                            int64_t bo, const int64_t* b_strides,
+                            void* out_native, int64_t oo,
+                            const int64_t* out_shape, int rank, int64_t n,
+                            float scale, float offset) {
+  if (rank <= 0 || rank > kPadFoldMaxRank) return false;
+  auto& c = context::get();
+  if (!c.ready) return false;
+  CUfunction f = c.bcast_nd_(op);
+  if (!f) return false;
+  c.device_read_(a_native);
+  c.device_read_(b_native);
+  c.device_write_(out_native);
+  const long long* pmeta =
+      upload_bcast_meta_(c, out_shape, rank, {a_strides, b_strides});
+  if (!pmeta) return false;
+  float* pa = context::off_(a_native, ao);
+  float* pb = context::off_(b_native, bo);
+  float* po = context::off_(out_native, oo);
+  unsigned un = static_cast<unsigned>(n);
+  return c.launch1d_(f, un, pa, pb, po, pmeta, rank, un, scale, offset);
+}
+
+// N-D broadcast ternary select: Tensor.where's GPU dispatch, which existed
+// on no backend before this (eval_one's where_ case always ran the CPU
+// map_ternary). Same flat-index decode as binary_bcast_nd above, one more
+// operand -- masking (attention/padding masks) is the concrete caller.
+inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
+                     void* a_native, int64_t ao, const int64_t* a_strides,
+                     void* b_native, int64_t bo, const int64_t* b_strides,
+                     void* out_native, int64_t oo, const int64_t* out_shape,
+                     int rank, int64_t n) {
+  if (rank <= 0 || rank > kPadFoldMaxRank) return false;
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(cond_native);
+  c.device_read_(a_native);
+  c.device_read_(b_native);
+  c.device_write_(out_native);
+  const long long* pmeta = upload_bcast_meta_(
+      c, out_shape, rank, {c_strides, a_strides, b_strides});
+  if (!pmeta) return false;
+  float* pc = context::off_(cond_native, co);
+  float* pa = context::off_(a_native, ao);
+  float* pb = context::off_(b_native, bo);
+  float* po = context::off_(out_native, oo);
+  unsigned un = static_cast<unsigned>(n);
+  return c.launch1d_(c.where_nd_(), un, pc, pa, pb, po, pmeta, rank, un);
 }
 
 // Places `a` (contiguous) into a zero buffer of out_shape (array.h's
@@ -1724,6 +1840,16 @@ inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
 }
 inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
                             int64_t, int64_t) {
+  return false;
+}
+inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,
+                            int64_t, const int64_t*, void*, int64_t,
+                            const int64_t*, int, int64_t, float, float) {
+  return false;
+}
+inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
+                     const int64_t*, void*, int64_t, const int64_t*, void*,
+                     int64_t, const int64_t*, int, int64_t) {
   return false;
 }
 inline void sync_to_host(void*, bool) {}

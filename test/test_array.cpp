@@ -1339,3 +1339,78 @@ TEST_CASE("scatter_to_axis: GPU dispatch matches the ref oracle") {
     return tl::scatter_to_axis(idx, values, 8);
   }));
 }
+
+// --- broadcast binop GPU dispatch: was a hard stub on CUDA (binary_bcast
+// unconditionally returned false) regardless of rank; now real at rank 2
+// and, via a new N-D kernel, at any other rank too (a Transformer's
+// [N,S,D] - [N,S,1] LayerNorm mean-subtract is rank 3). ---
+
+TEST_CASE("broadcast binop: GPU dispatch matches the ref oracle (rank 2)") {
+  CHECK(matches_gpu_oracle([&] {
+    auto x = random_array({64, 32}, 51);
+    auto bias = random_array({1, 32}, 52);
+    return x + bias;
+  }));
+  CHECK(matches_gpu_oracle([&] {
+    auto x = random_array({64, 32}, 53);
+    auto col = random_array({64, 1}, 54);
+    return x - col;
+  }));
+  CHECK(matches_gpu_oracle([&] {
+    auto x = random_array({64, 32}, 55);
+    return x * array::full({}, 2.5f);
+  }));
+}
+
+TEST_CASE("broadcast binop: GPU dispatch matches the ref oracle (rank 3, "
+         "LayerNorm-shaped)") {
+  CHECK(matches_gpu_oracle([&] {
+    auto x = random_array({4, 16, 32}, 56);         // [N, S, D]
+    auto mean = random_array({4, 16, 1}, 57);        // [N, S, 1]
+    return x - mean;
+  }));
+  CHECK(matches_gpu_oracle([&] {
+    auto x = random_array({4, 16, 32}, 58);
+    auto gamma = random_array({1, 32}, 59);          // [1, D], rank promoted
+    return x * gamma;
+  }));
+}
+
+TEST_CASE("broadcast binop: GPU dispatch matches the ref oracle (rank 4, "
+         "attention-mask-shaped)") {
+  CHECK(matches_gpu_oracle([&] {
+    auto scores = random_array({2, 4, 8, 8}, 60);    // [batch, heads, S, S]
+    auto bias = random_array({1, 1, 8, 8}, 61);
+    return scores + bias;
+  }));
+}
+
+// --- where() GPU dispatch: had none on any backend before this. ---
+
+TEST_CASE("where: GPU dispatch matches the ref oracle (rank 2)") {
+  CHECK(matches_gpu_oracle([&] {
+    auto cond = random_array({8, 8}, 71) > 0.0f;
+    auto a = random_array({8, 8}, 72);
+    auto b = random_array({8, 8}, 73);
+    return tl::where(cond, a, b);
+  }));
+}
+
+TEST_CASE("where: GPU dispatch matches the ref oracle (rank 4, attention-"
+         "mask-shaped, broadcasting the mask over batch and heads)") {
+  CHECK(matches_gpu_oracle([&] {
+    auto mask = random_array({1, 1, 8, 8}, 74) > 0.0f;
+    auto scores = random_array({2, 4, 8, 8}, 75);
+    return tl::where(mask, scores, array::full({}, -1.0e9f));
+  }));
+}
+
+// --- pow: had no CUDA kernel at all (binary()'s own pow_ case always
+// returned false) -- LayerNorm's own sqrt (`.pow(0.5)`) goes through this.
+
+TEST_CASE("pow: GPU dispatch matches the ref oracle") {
+  CHECK(matches_gpu_oracle([&] {
+    auto x = random_array({64, 32}, 81).relu() + 0.1f;
+    return tl::pow(x, 0.5f);
+  }));
+}

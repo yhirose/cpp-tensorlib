@@ -1978,11 +1978,14 @@ struct graph {
     // Rank-2 broadcast (bias / row vector / column vector / scalar): one
     // stride-parameterized kernel keeps the op on the GPU — a CPU fallback
     // here drains the whole pending pipeline (commit + wait) mid-graph.
-    if (n.shape.size() != 2 || !a.contiguous() || !b.contiguous()) {
+    if (!a.contiguous() || !b.contiguous()) {
       return std::nullopt;
     }
     auto bk = to_bcast_kop_(n.op);
     if (!bk) return std::nullopt;
+    // Any other rank (a Transformer's [N,S,D] LayerNorm broadcasting a
+    // [N,S,1] mean, say): the general N-D kernel this rank-2 one predates.
+    if (n.shape.size() != 2) return gpu_binary_bcast_nd_(n, a, b, *bk);
     auto ra = broadcast_strides(a.shape(), a.strides(), n.shape);
     auto rb = broadcast_strides(b.shape(), b.strides(), n.shape);
     auto out = array::empty(n.shape);
@@ -1992,6 +1995,66 @@ struct graph {
                            b.storage_.native, b.offset_ * 4, rb[0], rb[1],
                            out.storage_.native, out.offset_ * 4, n.shape[0],
                            n.shape[1], n.scale, n.offset)) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
+  // gpu_binary's own rank-2 path, generalized to any rank -- see
+  // gpu::binary_bcast_nd's own comment for the concrete Transformer-shaped
+  // caller (LayerNorm's [N,S,D] - [N,S,1] mean subtraction, rank 3).
+  static std::optional<array> gpu_binary_bcast_nd_(const node& n,
+                                                    const array& a,
+                                                    const array& b,
+                                                    gpu::kop bk) {
+    int rank = static_cast<int>(n.shape.size());
+    if (rank <= 0) return std::nullopt;
+    auto ra = broadcast_strides(a.shape(), a.strides(), n.shape);
+    auto rb = broadcast_strides(b.shape(), b.strides(), n.shape);
+    auto out = array::empty(n.shape);
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    std::vector<int64_t> out_shape_v(n.shape.begin(), n.shape.end());
+    if (!gpu::binary_bcast_nd(bk, a.storage_.native, a.offset_ * 4, ra.data(),
+                              b.storage_.native, b.offset_ * 4, rb.data(),
+                              out.storage_.native, out.offset_ * 4,
+                              out_shape_v.data(), rank, out.size(), n.scale,
+                              n.offset)) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
+  // Tensor.where's GPU dispatch (any rank) -- existed on no backend before
+  // this (eval_one's where_ case always ran the CPU map_ternary). Masking
+  // (attention/padding masks) is the concrete caller; `n.shape` is
+  // eval_one's own already-broadcast output shape (where_'s graph builder
+  // computes it via a double broadcast_shape at node-construction time),
+  // not recomputed here.
+  static std::optional<array> gpu_where_(const shape_t& out_shape,
+                                         const array& cond, const array& a,
+                                         const array& b) {
+    if (!gpu_mode_(num_elements(out_shape), kernel_class::elementwise) ||
+        !cond.contiguous() || !a.contiguous() || !b.contiguous()) {
+      return std::nullopt;
+    }
+    if (!cond.storage_.native || !a.storage_.native || !b.storage_.native) {
+      return std::nullopt;
+    }
+    int rank = static_cast<int>(out_shape.size());
+    if (rank <= 0) return std::nullopt;
+    auto rc = broadcast_strides(cond.shape(), cond.strides(), out_shape);
+    auto ra = broadcast_strides(a.shape(), a.strides(), out_shape);
+    auto rb = broadcast_strides(b.shape(), b.strides(), out_shape);
+    auto out = array::empty(out_shape);
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    std::vector<int64_t> out_shape_v(out_shape.begin(), out_shape.end());
+    if (!gpu::where_nd(cond.storage_.native, cond.offset_ * 4, rc.data(),
+                       a.storage_.native, a.offset_ * 4, ra.data(),
+                       b.storage_.native, b.offset_ * 4, rb.data(),
+                       out.storage_.native, out.offset_ * 4,
+                       out_shape_v.data(), rank, out.size())) {
       return std::nullopt;
     }
     return out;
@@ -2660,11 +2723,17 @@ struct graph {
         }
         break;
       }
-      case op_t::where_:
-        r = map_ternary(in(0), in(1), in(2), [](float c, float x, float y) {
-          return c != 0.0f ? x : y;
-        });
+      case op_t::where_: {
+        auto c0 = in(0), a0 = in(1), b0 = in(2);
+        if (auto g = gpu_where_(n.shape, c0, a0, b0)) {
+          r = std::move(*g);
+        } else {
+          r = map_ternary(c0, a0, b0, [](float c, float x, float y) {
+            return c != 0.0f ? x : y;
+          });
+        }
         break;
+      }
       case op_t::affine: {
         float s = n.scale, o = n.offset;
         auto a = in(0);

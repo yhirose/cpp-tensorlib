@@ -32,7 +32,96 @@ TL_EW_BINARY(tl_add, a[i] + b[i])
 TL_EW_BINARY(tl_sub, a[i] - b[i])
 TL_EW_BINARY(tl_mul, a[i] * b[i])
 TL_EW_BINARY(tl_div, a[i] / b[i])
+TL_EW_BINARY(tl_pow, powf(a[i], b[i]))
 #undef TL_EW_BINARY
+
+// ---- rank-2 broadcast binary: out[r,c] = f(a[r*ars+c*acs], b[r*brs+c*bcs])
+// * scale + offset, into a contiguous [m,n] output. Mirrors metal.h's own
+// rank-2 broadcast kernel (bias/row-vector/column-vector/scalar) -- CUDA
+// had no kernel for this at all before (binary_bcast() unconditionally
+// returned false, sending every broadcasting op through the CPU fallback,
+// draining the pending pipeline every time).
+#define TL_EW_BINARY_BCAST(NAME, EXPR)                                      \
+  __global__ void NAME(const float* a, const float* b, float* out,         \
+                       unsigned m, unsigned n, unsigned ars, unsigned acs,  \
+                       unsigned brs, unsigned bcs, float scale,             \
+                       float offset) {                                     \
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;                    \
+    if (i >= m * n) return;                                                \
+    unsigned r = i / n, c = i % n;                                         \
+    float av = a[r * ars + c * acs];                                       \
+    float bv = b[r * brs + c * bcs];                                       \
+    out[i] = (EXPR) * scale + offset;                                      \
+  }
+TL_EW_BINARY_BCAST(tl_badd, av + bv)
+TL_EW_BINARY_BCAST(tl_bsub, av - bv)
+TL_EW_BINARY_BCAST(tl_bmul, av * bv)
+TL_EW_BINARY_BCAST(tl_bdiv, av / bv)
+TL_EW_BINARY_BCAST(tl_bpow, powf(av, bv))
+#undef TL_EW_BINARY_BCAST
+
+// ---- N-D broadcast binary: generalizes tl_b*/binary_bcast above to any
+// rank (the rank-2 kernel only covers a Linear bias / BatchNorm-shaped
+// [N,D] input; a Transformer's [batch,seq,dim] LayerNorm broadcasts a
+// [N,S,1] mean against a [N,S,D] input, rank 3). meta packs [out_shape
+// (rank), a_strides(rank), b_strides(rank)] -- a_strides/b_strides are the
+// *broadcast* strides (0 on a broadcast axis), computed host-side by the
+// same detail::broadcast_strides() the CPU oracle already uses, so this
+// kernel needs no broadcast logic of its own, just the flat-index decode
+// pad/fold's own kernels above already establish.
+#define TL_EW_BINARY_BCAST_ND(NAME, EXPR)                                    \
+  __global__ void NAME(const float* a, const float* b, float* out,          \
+                       const long long* meta, int rank, unsigned n,         \
+                       float scale, float offset) {                         \
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;                     \
+    if (i >= n) return;                                                     \
+    const long long* out_shape = meta;                                      \
+    const long long* a_strides = meta + rank;                               \
+    const long long* b_strides = meta + 2 * rank;                           \
+    long long rem = i;                                                      \
+    long long a_off = 0, b_off = 0;                                         \
+    for (int d = rank - 1; d >= 0; --d) {                                   \
+      long long dim = out_shape[d];                                         \
+      long long coord = rem % dim;                                          \
+      rem /= dim;                                                           \
+      a_off += coord * a_strides[d];                                        \
+      b_off += coord * b_strides[d];                                        \
+    }                                                                       \
+    float av = a[a_off], bv = b[b_off];                                     \
+    out[i] = (EXPR) * scale + offset;                                       \
+  }
+TL_EW_BINARY_BCAST_ND(tl_badd_nd, av + bv)
+TL_EW_BINARY_BCAST_ND(tl_bsub_nd, av - bv)
+TL_EW_BINARY_BCAST_ND(tl_bmul_nd, av * bv)
+TL_EW_BINARY_BCAST_ND(tl_bdiv_nd, av / bv)
+TL_EW_BINARY_BCAST_ND(tl_bpow_nd, powf(av, bv))
+#undef TL_EW_BINARY_BCAST_ND
+
+// ---- N-D broadcast ternary select (Tensor.where's GPU dispatch, which
+// didn't exist on any backend before this): same flat-index decode as
+// tl_badd_nd above, one more operand. meta packs [out_shape(rank),
+// cond_strides(rank), a_strides(rank), b_strides(rank)].
+__global__ void tl_where_nd(const float* cond, const float* a,
+                            const float* b, float* out,
+                            const long long* meta, int rank, unsigned n) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const long long* out_shape = meta;
+  const long long* cond_strides = meta + rank;
+  const long long* a_strides = meta + 2 * rank;
+  const long long* b_strides = meta + 3 * rank;
+  long long rem = i;
+  long long c_off = 0, a_off = 0, b_off = 0;
+  for (int d = rank - 1; d >= 0; --d) {
+    long long dim = out_shape[d];
+    long long coord = rem % dim;
+    rem /= dim;
+    c_off += coord * cond_strides[d];
+    a_off += coord * a_strides[d];
+    b_off += coord * b_strides[d];
+  }
+  out[i] = cond[c_off] != 0.0f ? a[a_off] : b[b_off];
+}
 
 // ---- unary: out = f(a) * scale + offset (affine = identity f) ----
 #define TL_EW_UNARY(NAME, EXPR)                                             \

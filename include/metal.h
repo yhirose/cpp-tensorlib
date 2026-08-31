@@ -512,6 +512,20 @@ inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
                             int64_t, int64_t) {
   return false;
 }
+// N-D broadcast binary/ternary (LayerNorm/masking at rank >= 3): no Metal
+// kernel yet (CUDA-first). Stub for now, same as every backend does for an
+// op it hasn't implemented -- array.h falls back to the CPU ref::
+// implementation, which already handles any rank.
+inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,
+                            int64_t, const int64_t*, void*, int64_t,
+                            const int64_t*, int, int64_t, float, float) {
+  return false;
+}
+inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
+                     const int64_t*, void*, int64_t, const int64_t*, void*,
+                     int64_t, const int64_t*, int, int64_t) {
+  return false;
+}
 
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals
 
@@ -558,6 +572,16 @@ inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
 }
 inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
                             int64_t, int64_t) {
+  return false;
+}
+inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,
+                            int64_t, const int64_t*, void*, int64_t,
+                            const int64_t*, int, int64_t, float, float) {
+  return false;
+}
+inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
+                     const int64_t*, void*, int64_t, const int64_t*, void*,
+                     int64_t, const int64_t*, int, int64_t) {
   return false;
 }
 
