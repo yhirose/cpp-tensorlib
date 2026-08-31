@@ -43,7 +43,10 @@ enum class kop {
   badd, bsub, bmul, bdiv, bpow,  // rank-2 broadcast binary (strided operands)
   sgemm32, sgemm32x64, sgemm64x32, sgemm64,
   steel, steel32x64, steel_ta, steel_tb, steel32x64_ta, steel32x64_tb,
-  softmax, row_sum, row_max, pad, fold
+  softmax, row_sum, row_max, pad, fold,
+  index_select, index_add, scatter_axis,
+  badd_nd, bsub_nd, bmul_nd, bdiv_nd, bpow_nd,  // N-D broadcast binary
+  where_nd
 };
 
 #ifdef __APPLE__
@@ -115,6 +118,15 @@ struct context {
       case kop::row_max: return "row_max_";
       case kop::pad: return "pad_";
       case kop::fold: return "fold_";
+      case kop::index_select: return "index_select_";
+      case kop::index_add: return "index_add_";
+      case kop::scatter_axis: return "scatter_axis_";
+      case kop::badd_nd: return "badd_nd_";
+      case kop::bsub_nd: return "bsub_nd_";
+      case kop::bmul_nd: return "bmul_nd_";
+      case kop::bdiv_nd: return "bdiv_nd_";
+      case kop::bpow_nd: return "bpow_nd_";
+      case kop::where_nd: return "where_nd_";
     }
     return "";
   }
@@ -496,35 +508,188 @@ inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
                                      step, out_n);
 }
 
-// index_select/index_add/scatter_to_axis: no Metal kernel yet (CUDA-first;
-// Metal is a planned follow-up). Stub for now, same as every backend does
-// for an op it hasn't implemented — array.h's eval_one falls back to the
-// CPU ref:: implementation.
-inline bool index_select(void*, int64_t, void*, int64_t, void*, int64_t,
-                         int64_t, int64_t) {
-  return false;
+namespace detail_ {
+struct gather_params {
+  uint32_t row_size;
+  uint32_t n;
+};
+struct index_add_params {
+  uint32_t row_size;
+  uint32_t k;
+  uint32_t n;
+};
+struct scatter_axis_params {
+  uint32_t size;
+  uint32_t n;
+};
+
+// Shared by index_select()/index_add()/scatter_to_axis() below: all three
+// are a gather into `out` from two source buffers plus a small params blob,
+// differing only in which kop/buffers/params struct they use and how `n`
+// (the dispatch bound) is derived -- mirrors dispatch_pad_fold_ above, which
+// extracts the same kind of shared tail for pad()/fold().
+inline bool dispatch_gather3_(kop op, void* buf0, int64_t off0, void* buf1,
+                              int64_t off1, void* out_native, int64_t oo,
+                              const void* params, unsigned long params_size,
+                              uint32_t n) {
+  auto& c = context::get();
+  if (!c.device) return false;
+  auto pso = c.pso_(op);
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  set_buf_(c.enc, buf0, off0, 0ul);
+  set_buf_(c.enc, buf1, off1, 1ul);
+  set_buf_(c.enc, out_native, oo, 2ul);
+  objc::send(c.enc, "setBytes:length:atIndex:", params, params_size, 3ul);
+  unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
+  dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
+  return true;
 }
-inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
-                      int64_t, int64_t) {
-  return false;
+}  // namespace detail_
+
+// Row gather along axis 0: out[i] = a[indices[row(i)]] (a, indices
+// contiguous). One thread per output element, no write conflicts.
+inline bool index_select(void* a_native, int64_t ao, void* idx_native,
+                         int64_t idxo, void* out_native, int64_t oo,
+                         int64_t row_size, int64_t k) {
+  detail_::gather_params p{static_cast<uint32_t>(row_size),
+                           static_cast<uint32_t>(k * row_size)};
+  return detail_::dispatch_gather3_(kop::index_select, a_native, ao,
+                                    idx_native, idxo, out_native, oo, &p,
+                                    sizeof(p), p.n);
 }
-inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
-                            int64_t, int64_t) {
-  return false;
+
+// index_select's dual, rewritten as a gather: Metal's device-memory atomics
+// are int/uint only (no float atomicAdd), the same gap pad_/fold_ above work
+// around, so this sums over every source row matching each OUTPUT row
+// instead of scattering into a pre-zeroed buffer -- no zeroing needed.
+inline bool index_add(void* idx_native, int64_t idxo, void* values_native,
+                      int64_t vo, void* out_native, int64_t oo,
+                      int64_t row_size, int64_t k, int64_t out_n) {
+  detail_::index_add_params p{static_cast<uint32_t>(row_size),
+                              static_cast<uint32_t>(k),
+                              static_cast<uint32_t>(out_n)};
+  return detail_::dispatch_gather3_(kop::index_add, idx_native, idxo,
+                                    values_native, vo, out_native, oo, &p,
+                                    sizeof(p), p.n);
 }
-// N-D broadcast binary/ternary (LayerNorm/masking at rank >= 3): no Metal
-// kernel yet (CUDA-first). Stub for now, same as every backend does for an
-// op it hasn't implemented -- array.h falls back to the CPU ref::
-// implementation, which already handles any rank.
-inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,
-                            int64_t, const int64_t*, void*, int64_t,
-                            const int64_t*, int, int64_t, float, float) {
-  return false;
+
+// One-hot scatter into a new trailing axis, as a gather: out[pos,k] =
+// values[pos] where indices[pos] == k, else 0. Every output element reads,
+// never writes twice, so — like index_select above — no zeroing needed.
+inline bool scatter_to_axis(void* idx_native, int64_t idxo,
+                            void* values_native, int64_t vo, void* out_native,
+                            int64_t oo, int64_t n, int64_t size) {
+  detail_::scatter_axis_params p{static_cast<uint32_t>(size),
+                                 static_cast<uint32_t>(n * size)};
+  return detail_::dispatch_gather3_(kop::scatter_axis, idx_native, idxo,
+                                    values_native, vo, out_native, oo, &p,
+                                    sizeof(p), p.n);
 }
-inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
-                     const int64_t*, void*, int64_t, const int64_t*, void*,
-                     int64_t, const int64_t*, int, int64_t) {
-  return false;
+
+namespace detail_ {
+struct bcast_nd_params {
+  uint32_t out_shape[kPadFoldMaxRank];
+  uint32_t a_strides[kPadFoldMaxRank];
+  uint32_t b_strides[kPadFoldMaxRank];
+  uint32_t rank;
+  uint32_t n;
+  float scale;
+  float offset;
+};
+struct where_nd_params {
+  uint32_t out_shape[kPadFoldMaxRank];
+  uint32_t c_strides[kPadFoldMaxRank];
+  uint32_t a_strides[kPadFoldMaxRank];
+  uint32_t b_strides[kPadFoldMaxRank];
+  uint32_t rank;
+  uint32_t n;
+};
+
+// binary_bcast_nd's incoming `op` is one of the rank-2 kop values (badd etc,
+// shared with binary_bcast() above -- array.h's gpu_binary_bcast_nd_ passes
+// the same `bk` either kernel would take); map it to its own PSO/kernel name
+// here rather than caching the N-D kernel under the rank-2 op's slot in
+// context::psos, which pso_() keys by this same enum value.
+inline kop to_nd_(kop op) {
+  switch (op) {
+    case kop::badd: return kop::badd_nd;
+    case kop::bsub: return kop::bsub_nd;
+    case kop::bmul: return kop::bmul_nd;
+    case kop::bdiv: return kop::bdiv_nd;
+    case kop::bpow: return kop::bpow_nd;
+    default: return op;
+  }
+}
+}  // namespace detail_
+
+// N-D broadcast binary: generalizes binary_bcast() above to any rank (a
+// Transformer's [N,S,D] LayerNorm broadcasting a [N,S,1] mean, rank 3).
+// a_strides/b_strides are the broadcast strides (0 on a broadcast axis)
+// array.h computes host-side via the same broadcast_strides() the CPU
+// oracle uses -- mirrors cuda.h's own binary_bcast_nd exactly.
+inline bool binary_bcast_nd(kop op, void* a_native, int64_t ao,
+                            const int64_t* a_strides, void* b_native,
+                            int64_t bo, const int64_t* b_strides,
+                            void* out_native, int64_t oo,
+                            const int64_t* out_shape, int rank, int64_t n,
+                            float scale, float offset) {
+  auto& c = context::get();
+  if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
+  auto pso = c.pso_(detail_::to_nd_(op));
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  detail_::set_buf_(c.enc, a_native, ao, 0ul);
+  detail_::set_buf_(c.enc, b_native, bo, 1ul);
+  detail_::set_buf_(c.enc, out_native, oo, 2ul);
+  detail_::bcast_nd_params p{};
+  for (int d = 0; d < rank; d++) {
+    p.out_shape[d] = static_cast<uint32_t>(out_shape[d]);
+    p.a_strides[d] = static_cast<uint32_t>(a_strides[d]);
+    p.b_strides[d] = static_cast<uint32_t>(b_strides[d]);
+  }
+  p.rank = static_cast<uint32_t>(rank);
+  p.n = static_cast<uint32_t>(n);
+  p.scale = scale;
+  p.offset = offset;
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), 3ul);
+  unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
+  detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
+  return true;
+}
+
+// N-D broadcast ternary select: Tensor.where's GPU dispatch. Same flat-index
+// decode as binary_bcast_nd above, one more operand -- mirrors cuda.h's own
+// where_nd exactly.
+inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
+                     void* a_native, int64_t ao, const int64_t* a_strides,
+                     void* b_native, int64_t bo, const int64_t* b_strides,
+                     void* out_native, int64_t oo, const int64_t* out_shape,
+                     int rank, int64_t n) {
+  auto& c = context::get();
+  if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
+  auto pso = c.pso_(kop::where_nd);
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  detail_::set_buf_(c.enc, cond_native, co, 0ul);
+  detail_::set_buf_(c.enc, a_native, ao, 1ul);
+  detail_::set_buf_(c.enc, b_native, bo, 2ul);
+  detail_::set_buf_(c.enc, out_native, oo, 3ul);
+  detail_::where_nd_params p{};
+  for (int d = 0; d < rank; d++) {
+    p.out_shape[d] = static_cast<uint32_t>(out_shape[d]);
+    p.c_strides[d] = static_cast<uint32_t>(c_strides[d]);
+    p.a_strides[d] = static_cast<uint32_t>(a_strides[d]);
+    p.b_strides[d] = static_cast<uint32_t>(b_strides[d]);
+  }
+  p.rank = static_cast<uint32_t>(rank);
+  p.n = static_cast<uint32_t>(n);
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), 4ul);
+  unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
+  detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
+  return true;
 }
 
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals

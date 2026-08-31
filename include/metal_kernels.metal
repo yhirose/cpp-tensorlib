@@ -905,3 +905,144 @@ kernel void fold_(device const float* a [[buffer(0)]],
   }
   out[i] = sum;
 }
+
+// ---------------------------------------------------------------------------
+// Embedding-table lookup (index_select/index_add) and pooling-style one-hot
+// scatter (scatter_to_axis) — the Metal counterparts of tl_index_select/
+// tl_index_add/tl_scatter_axis in kernels/tensorlib_cuda.cu.
+//
+// index_select and scatter_to_axis are gathers already (every output element
+// is written by exactly one invocation, reading whatever it needs), so they
+// port the CUDA kernel body directly. index_add is CUDA's one true scatter+
+// atomicAdd here — repeated indices really do collide — and Metal's
+// device-memory atomics are int/uint only (no float atomicAdd), the same gap
+// pad_/fold_ above worked around. So index_add_ is rewritten as a gather too:
+// one invocation per OUTPUT element, summing over every source row whose
+// index matches it (bounded by p.k, the number of source rows) instead of
+// scattering into a pre-zeroed buffer.
+// ---------------------------------------------------------------------------
+
+struct gather_params {
+  uint row_size;
+  uint n;  // dispatch bound: k * row_size
+};
+
+kernel void index_select_(device const float* a [[buffer(0)]],
+                          device const float* idx [[buffer(1)]],
+                          device float* out [[buffer(2)]],
+                          constant gather_params& p [[buffer(3)]],
+                          uint i [[thread_position_in_grid]]) {
+  if (i >= p.n) return;
+  uint row = i / p.row_size, col = i % p.row_size;
+  uint src_row = uint(idx[row] + 0.5f);
+  out[i] = a[src_row * p.row_size + col];
+}
+
+struct index_add_params {
+  uint row_size;
+  uint k;  // number of source rows to scan
+  uint n;  // dispatch bound: target_rows * row_size
+};
+
+kernel void index_add_(device const float* idx [[buffer(0)]],
+                       device const float* values [[buffer(1)]],
+                       device float* out [[buffer(2)]],
+                       constant index_add_params& p [[buffer(3)]],
+                       uint i [[thread_position_in_grid]]) {
+  if (i >= p.n) return;
+  uint row = i / p.row_size, col = i % p.row_size;
+  float sum = 0.0f;
+  for (uint k = 0; k < p.k; k++) {
+    if (uint(idx[k] + 0.5f) == row) sum += values[k * p.row_size + col];
+  }
+  out[i] = sum;
+}
+
+struct scatter_axis_params {
+  uint size;
+  uint n;  // dispatch bound: num_positions * size
+};
+
+kernel void scatter_axis_(device const float* idx [[buffer(0)]],
+                          device const float* values [[buffer(1)]],
+                          device float* out [[buffer(2)]],
+                          constant scatter_axis_params& p [[buffer(3)]],
+                          uint i [[thread_position_in_grid]]) {
+  if (i >= p.n) return;
+  uint pos = i / p.size, k = i % p.size;
+  out[i] = (uint(idx[pos] + 0.5f) == k) ? values[pos] : 0.0f;
+}
+
+// ---------------------------------------------------------------------------
+// N-D broadcast binary (any rank) and N-D broadcast ternary select
+// (Tensor.where's masking) — the Metal counterparts of tl_b*_nd/tl_where_nd
+// in kernels/tensorlib_cuda.cu. Same flat-index decode as pad_/fold_ above,
+// against strides supplied by the host (broadcast_strides(), 0 on a
+// broadcast axis) rather than derived from a shape.
+// ---------------------------------------------------------------------------
+
+struct bcast_nd_params {
+  uint out_shape[kPadFoldMaxRank];
+  uint a_strides[kPadFoldMaxRank];
+  uint b_strides[kPadFoldMaxRank];
+  uint rank;
+  uint n;
+  float scale;
+  float offset;
+};
+
+#define EW_BCAST_ND(name, expr)                                              \
+  kernel void name(device const float* a [[buffer(0)]],                     \
+                   device const float* b [[buffer(1)]],                     \
+                   device float* out [[buffer(2)]],                         \
+                   constant bcast_nd_params& p [[buffer(3)]],               \
+                   uint i [[thread_position_in_grid]]) {                    \
+    if (i >= p.n) return;                                                    \
+    uint rem = i;                                                            \
+    uint a_off = 0, b_off = 0;                                               \
+    for (int d = int(p.rank) - 1; d >= 0; d--) {                            \
+      uint dim = p.out_shape[d];                                            \
+      uint coord = rem % dim;                                               \
+      rem /= dim;                                                           \
+      a_off += coord * p.a_strides[d];                                      \
+      b_off += coord * p.b_strides[d];                                      \
+    }                                                                        \
+    float av = a[a_off], bv = b[b_off];                                     \
+    out[i] = fma((expr), p.scale, p.offset);                                \
+  }
+
+EW_BCAST_ND(badd_nd_, av + bv)
+EW_BCAST_ND(bsub_nd_, av - bv)
+EW_BCAST_ND(bmul_nd_, av * bv)
+EW_BCAST_ND(bdiv_nd_, av / bv)
+EW_BCAST_ND(bpow_nd_, pow(av, bv))
+#undef EW_BCAST_ND
+
+struct where_nd_params {
+  uint out_shape[kPadFoldMaxRank];
+  uint c_strides[kPadFoldMaxRank];
+  uint a_strides[kPadFoldMaxRank];
+  uint b_strides[kPadFoldMaxRank];
+  uint rank;
+  uint n;
+};
+
+kernel void where_nd_(device const float* cond [[buffer(0)]],
+                      device const float* a [[buffer(1)]],
+                      device const float* b [[buffer(2)]],
+                      device float* out [[buffer(3)]],
+                      constant where_nd_params& p [[buffer(4)]],
+                      uint i [[thread_position_in_grid]]) {
+  if (i >= p.n) return;
+  uint rem = i;
+  uint c_off = 0, a_off = 0, b_off = 0;
+  for (int d = int(p.rank) - 1; d >= 0; d--) {
+    uint dim = p.out_shape[d];
+    uint coord = rem % dim;
+    rem /= dim;
+    c_off += coord * p.c_strides[d];
+    a_off += coord * p.a_strides[d];
+    b_off += coord * p.b_strides[d];
+  }
+  out[i] = cond[c_off] != 0.0f ? a[a_off] : b[b_off];
+}
