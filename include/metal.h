@@ -43,7 +43,7 @@ enum class kop {
   badd, bsub, bmul, bdiv, bpow,  // rank-2 broadcast binary (strided operands)
   sgemm32, sgemm32x64, sgemm64x32, sgemm64,
   steel, steel32x64, steel_ta, steel_tb, steel32x64_ta, steel32x64_tb,
-  softmax, row_sum, row_max
+  softmax, row_sum, row_max, pad, fold
 };
 
 #ifdef __APPLE__
@@ -113,6 +113,8 @@ struct context {
       case kop::softmax: return "softmax_";
       case kop::row_sum: return "row_sum_";
       case kop::row_max: return "row_max_";
+      case kop::pad: return "pad_";
+      case kop::fold: return "fold_";
     }
     return "";
   }
@@ -413,15 +415,85 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
   return true;
 }
 
-// No Metal kernel yet for im2col's pad/fold (cuda.h's tl_pad/tl_fold have no
-// Metal analogue) — honest false sends the evaluator to the CPU oracle.
-inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
-                const int64_t*, int, int, int64_t, int64_t, int64_t) {
-  return false;
+// Rank cap for pad_/fold_'s GPU dispatch — matches cuda.h's kPadFoldMaxRank
+// and metal_kernels.metal's own copy (an MSL kernel can't see a host-side
+// C++ constant), and bounds pad_fold_params' fixed-size arrays.
+inline constexpr int kPadFoldMaxRank = 8;
+
+namespace detail_ {
+struct pad_fold_params {
+  uint32_t out_shape[kPadFoldMaxRank];  // pad: length rank; fold: rank-1
+  uint32_t a_shape[kPadFoldMaxRank];    // length rank
+  uint32_t rank;
+  uint32_t axis;
+  int32_t shift;  // pad: `before`; fold: `step`
+  uint32_t n;     // output element count (dispatch bound)
+};
+
+// Shared by pad()/fold() below: the two differ only in which kop to run and
+// how many leading dims `out_shape` has (rank for pad, rank-1 for fold,
+// since fold's own out has one fewer axis than `a`) — everything else, down
+// to the dispatch grid, is identical.
+inline bool dispatch_pad_fold_(kop op, void* a_native, int64_t ao,
+                               void* out_native, int64_t oo,
+                               const int64_t* a_shape,
+                               const int64_t* out_shape, int rank,
+                               int out_rank, int axis, int64_t shift,
+                               int64_t out_n) {
+  auto& c = context::get();
+  if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
+  auto pso = c.pso_(op);
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  set_buf_(c.enc, a_native, ao, 0ul);
+  set_buf_(c.enc, out_native, oo, 1ul);
+  pad_fold_params p{};
+  for (int d = 0; d < out_rank; d++)
+    p.out_shape[d] = static_cast<uint32_t>(out_shape[d]);
+  for (int d = 0; d < rank; d++)
+    p.a_shape[d] = static_cast<uint32_t>(a_shape[d]);
+  p.rank = static_cast<uint32_t>(rank);
+  p.axis = static_cast<uint32_t>(axis);
+  p.shift = static_cast<int32_t>(shift);
+  p.n = static_cast<uint32_t>(out_n);
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), 2ul);
+  unsigned long groups = (static_cast<unsigned long>(out_n) + 255ul) / 256ul;
+  dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
+  return true;
 }
-inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,
-                 const int64_t*, int, int, int64_t, int64_t, int64_t) {
-  return false;
+}  // namespace detail_
+
+// Gather-style pad/fold (im2col), mirroring kernels/tensorlib_webgpu.wgsl's
+// pad/fold: one invocation per OUTPUT element reads (pad) or sums (fold)
+// whatever cells of `a` map to it, so — unlike cuda.h's scatter+atomicAdd —
+// no output cell is ever written by two invocations, and no pre-zeroed
+// buffer or atomics are needed (Metal's device-memory atomics are int/uint
+// only, the same gap WGSL has). `a` is required contiguous by array.h's
+// gpu_pad_/gpu_fold_, so the metal_kernels.metal side derives a_strides from
+// a_shape rather than have them uploaded. Encodes without committing, like
+// every other dispatch above.
+inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
+                const int64_t* a_shape, const int64_t* out_shape, int rank,
+                int axis, int64_t before, int64_t n, int64_t out_n) {
+  (void)n;
+  return detail_::dispatch_pad_fold_(kop::pad, a_native, ao, out_native, oo,
+                                     a_shape, out_shape, rank, rank, axis,
+                                     before, out_n);
+}
+
+// unfold's inverse: the gather twin of fold — see pad() above for why this
+// is a gather rather than a scatter+atomicAdd. `out_shape` has rank-1 dims
+// (fold's own out has one fewer axis than `a`); `a`'s last dim is the
+// sliding window (size a_shape[rank-1]), and `a`'s `axis` dim is the window
+// count.
+inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
+                 const int64_t* a_shape, const int64_t* out_shape, int rank,
+                 int axis, int64_t step, int64_t n, int64_t out_n) {
+  (void)n;
+  return detail_::dispatch_pad_fold_(kop::fold, a_native, ao, out_native, oo,
+                                     a_shape, out_shape, rank, rank - 1, axis,
+                                     step, out_n);
 }
 
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals

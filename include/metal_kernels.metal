@@ -786,3 +786,122 @@ kernel void softmax_(device const float* in [[buffer(0)]],
 
 ROW_REDUCE(row_sum_, 0.0f, acc + v, acc_final)
 ROW_REDUCE(row_max_, -INFINITY, max(acc, v), acc_final)
+
+// ---------------------------------------------------------------------------
+// im2col's pad/fold — gather-style, one invocation per OUTPUT element,
+// mirroring kernels/tensorlib_webgpu.wgsl's pad/fold: Metal's device-memory
+// atomics are int/uint only (no float atomic add), the same gap that pushed
+// WGSL away from CUDA's scatter+atomicAdd. A gather needs no pre-zeroed
+// output (every C cell is written exactly once) and no atomics — the
+// tradeoff is fold's small bounded loop over the window indices that could
+// cover a given output cell. `a` is required contiguous by array.h's
+// gpu_pad_/gpu_fold_, so a_strides are derived from a_shape below rather
+// than uploaded separately.
+// ---------------------------------------------------------------------------
+
+constant uint kPadFoldMaxRank = 8;
+
+struct pad_fold_params {
+  uint out_shape[kPadFoldMaxRank];  // pad: length rank; fold: length rank-1
+  uint a_shape[kPadFoldMaxRank];    // length rank
+  uint rank;
+  uint axis;
+  int shift;  // pad: `before`; fold: `step`
+  uint n;     // output element count (dispatch bound)
+};
+
+// Shared by both kernels below (mirrors tensorlib_webgpu.wgsl's decode_idx):
+// row-major decode of a dispatch-global thread id against a shape held in
+// `shape`, into a fixed-size local array. `rank8` lets callers pass either a
+// full-rank or a (rank-1)-length shape.
+inline void decode_idx(uint i, constant uint* shape, uint rank8,
+                       thread uint* out_idx) {
+  uint rem = i;
+  for (int d = int(rank8) - 1; d >= 0; d--) {
+    uint dim = shape[d];
+    out_idx[d] = rem % dim;
+    rem /= dim;
+  }
+}
+
+// Row-major strides of a contiguous tensor whose shape is `a_shape`, length
+// `rank` — used to address `a`, which pad_/fold_'s GPU dispatch (array.h's
+// gpu_pad_/gpu_fold_) requires to be contiguous.
+inline void a_strides_from_shape(constant uint* a_shape, uint rank,
+                                 thread uint* out_strides) {
+  uint acc = 1;
+  for (int d = int(rank) - 1; d >= 0; d--) {
+    out_strides[d] = acc;
+    acc *= a_shape[d];
+  }
+}
+
+kernel void pad_(device const float* a [[buffer(0)]],
+                 device float* out [[buffer(1)]],
+                 constant pad_fold_params& p [[buffer(2)]],
+                 uint i [[thread_position_in_grid]]) {
+  if (i >= p.n) return;
+  uint rank = p.rank;
+
+  uint out_idx[kPadFoldMaxRank];
+  decode_idx(i, p.out_shape, rank, out_idx);
+  uint a_strides[kPadFoldMaxRank];
+  a_strides_from_shape(p.a_shape, rank, a_strides);
+
+  uint src = 0;
+  bool in_bounds = true;
+  for (uint d = 0; d < rank; d++) {
+    int c = int(out_idx[d]);
+    if (d == p.axis) {
+      c -= p.shift;
+      if (c < 0 || c >= int(p.a_shape[d])) in_bounds = false;
+    }
+    // Clamped even out of range so the address stays valid; only `in_bounds`
+    // decides the result (mirrors the WGSL kernel's select-both-operands
+    // note).
+    int cc = clamp(c, 0, int(p.a_shape[d]) - 1);
+    src += uint(cc) * a_strides[d];
+  }
+  out[i] = in_bounds ? a[src] : 0.0f;
+}
+
+kernel void fold_(device const float* a [[buffer(0)]],
+                  device float* out [[buffer(1)]],
+                  constant pad_fold_params& p [[buffer(2)]],
+                  uint i [[thread_position_in_grid]]) {
+  if (i >= p.n) return;
+  uint rank = p.rank;
+  uint out_rank = rank - 1;
+  int step = p.shift;
+
+  uint out_idx[kPadFoldMaxRank];
+  decode_idx(i, p.out_shape, out_rank, out_idx);
+  uint a_strides[kPadFoldMaxRank];
+  a_strides_from_shape(p.a_shape, rank, a_strides);
+
+  int win = int(p.a_shape[rank - 1]);
+  int nwin = int(p.a_shape[p.axis]);
+  int j = int(out_idx[p.axis]);
+
+  int w_min = 0;
+  if (j - win + 1 > 0) w_min = (j - win + 1 + step - 1) / step;
+  int w_max = min(j / step, nwin - 1);
+
+  // Every non-axis dimension's contribution to `src` is the same across the
+  // whole w loop below (only the axis and window-offset terms vary per w) —
+  // hoisted out so each window iteration is O(1) address math instead of
+  // O(out_rank).
+  uint base = 0;
+  for (uint d = 0; d < out_rank; d++) {
+    if (d != p.axis) base += out_idx[d] * a_strides[d];
+  }
+
+  float sum = 0.0f;
+  for (int w = w_min; w <= w_max; w++) {
+    int k = j - w * step;
+    if (k < 0 || k >= win) continue;
+    uint src = base + uint(w) * a_strides[p.axis] + uint(k) * a_strides[rank - 1];
+    sum += a[src];
+  }
+  out[i] = sum;
+}
