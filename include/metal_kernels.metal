@@ -79,6 +79,53 @@ EW_UNARY(sqrt_, sqrt(a[i]))
 EW_UNARY(sigmoid_, 1.0f / (1.0f + exp(-a[i])))
 EW_UNARY(relu_, max(a[i], 0.0f))
 EW_UNARY(affine_, a[i])
+EW_UNARY(tanh_, tanh(a[i]))
+EW_UNARY(sin_, sin(a[i]))
+EW_UNARY(cos_, cos(a[i]))
+
+// Elementwise comparison: out = (a OP b) ? 1.0 : 0.0 (no scale/offset --
+// masks don't compose with the affine epilogue). `bstride` is 1 for a
+// same-shape `b` and 0 for a scalar `b` (the concrete ReLU-style masked-gate
+// shape array.h's `x > 0.0f` produces) -- mirrors tensorlib_cuda.cu's
+// TL_EW_CMP exactly.
+struct cmp_params {
+  uint n;
+  uint bstride;
+};
+
+#define EW_CMP(name, expr)                                     \
+  kernel void name(device const float* a [[buffer(0)]],        \
+                   device const float* b [[buffer(1)]],        \
+                   device float* out [[buffer(2)]],            \
+                   constant cmp_params& p [[buffer(3)]],       \
+                   uint i [[thread_position_in_grid]]) {       \
+    if (i >= p.n) return;                                      \
+    float bv = b[i * p.bstride];                               \
+    out[i] = (expr) ? 1.0f : 0.0f;                              \
+  }
+
+EW_CMP(gt_, a[i] > bv)
+EW_CMP(lt_, a[i] < bv)
+EW_CMP(ge_, a[i] >= bv)
+EW_CMP(le_, a[i] <= bv)
+EW_CMP(eq_, a[i] == bv)
+EW_CMP(ne_, a[i] != bv)
+#undef EW_CMP
+
+// clamp(x, lo, hi): Clip's forward. No epilogue -- lo/hi occupy the role
+// scale/offset play elsewhere.
+struct clamp_params {
+  float lo, hi;
+  uint n;
+};
+
+kernel void clamp_(device const float* a [[buffer(0)]],
+                   device float* out [[buffer(1)]],
+                   constant clamp_params& p [[buffer(2)]],
+                   uint i [[thread_position_in_grid]]) {
+  if (i >= p.n) return;
+  out[i] = clamp(a[i], p.lo, p.hi);
+}
 
 // ---------------------------------------------------------------------------
 // Tiled SGEMM — simdgroup_matrix 8×8 MMA. One shared template body
@@ -1045,4 +1092,55 @@ kernel void where_nd_(device const float* cond [[buffer(0)]],
     b_off += coord * p.b_strides[d];
   }
   out[i] = cond[c_off] != 0.0f ? a[a_off] : b[b_off];
+}
+
+// ---------------------------------------------------------------------------
+// sum_to: sum `a` down to a smaller broadcast-target shape (the dual of
+// broadcast_to that every arithmetic op's backward uses to un-broadcast a
+// gradient) -- the Metal counterpart of tl_sum_to in kernels/tensorlib_cuda.cu.
+// Gather, not scatter: one thread per OUTPUT element sums every `a` element
+// that broadcasts onto it, so unlike index_add there is no write conflict
+// and no atomics needed.
+// ---------------------------------------------------------------------------
+
+struct sum_to_params {
+  uint a_shape[kPadFoldMaxRank];
+  uint a_strides[kPadFoldMaxRank];
+  uint acc[kPadFoldMaxRank];  // a's shape broadcast-aligned against the
+                              // output's own strides; 0 on a reduced axis
+  uint rank;
+  uint out_n;
+  uint reduced_n;  // product of a_shape over exactly the zero-acc axes
+};
+
+kernel void sum_to_(device const float* a [[buffer(0)]],
+                    device float* out [[buffer(1)]],
+                    constant sum_to_params& p [[buffer(2)]],
+                    uint t [[thread_position_in_grid]]) {
+  if (t >= p.out_n) return;
+  uint base = 0;
+  uint red_axis[kPadFoldMaxRank];
+  uint red_count = 0;
+  for (uint d = 0; d < p.rank; d++) {
+    if (p.acc[d] != 0) {
+      uint idx = (t / p.acc[d]) % p.a_shape[d];
+      base += idx * p.a_strides[d];
+    } else {
+      red_axis[red_count++] = d;
+    }
+  }
+  float sum = 0.0f;
+  for (uint r = 0; r < p.reduced_n; r++) {
+    uint rem = r;
+    uint off = base;
+    for (int k = int(red_count) - 1; k >= 0; k--) {
+      uint d = red_axis[k];
+      uint dim = p.a_shape[d];
+      uint coord = rem % dim;
+      rem /= dim;
+      off += coord * p.a_strides[d];
+    }
+    sum += a[off];
+  }
+  out[t] = sum;
 }

@@ -46,7 +46,10 @@ enum class kop {
   softmax, row_sum, row_max, pad, fold,
   index_select, index_add, scatter_axis,
   badd_nd, bsub_nd, bmul_nd, bdiv_nd, bpow_nd,  // N-D broadcast binary
-  where_nd
+  where_nd,
+  gt_, lt_, ge_, le_, eq_, ne_,  // comparisons -- cmp_op maps onto these
+  tanh_, sin_, cos_,             // unary_ext_op maps onto these
+  clamp_, sum_to_                // dedicated ops, mirroring cuda.h's own
 };
 
 // Comparisons (gt/lt/ge/le/eq/ne) are deliberately NOT kop values: kop is
@@ -142,6 +145,17 @@ struct context {
       case kop::bdiv_nd: return "bdiv_nd_";
       case kop::bpow_nd: return "bpow_nd_";
       case kop::where_nd: return "where_nd_";
+      case kop::gt_: return "gt_";
+      case kop::lt_: return "lt_";
+      case kop::ge_: return "ge_";
+      case kop::le_: return "le_";
+      case kop::eq_: return "eq_";
+      case kop::ne_: return "ne_";
+      case kop::tanh_: return "tanh_";
+      case kop::sin_: return "sin_";
+      case kop::cos_: return "cos_";
+      case kop::clamp_: return "clamp_";
+      case kop::sum_to_: return "sum_to_";
     }
     return "";
   }
@@ -706,28 +720,120 @@ inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
   detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
   return true;
 }
-// sum_to (un-broadcast a gradient): no Metal kernel yet (CUDA-first). Stub
-// for now -- array.h falls back to the CPU ref:: implementation.
-inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
-                   const int64_t*, int, int64_t, int64_t, void*, int64_t) {
-  return false;
+namespace detail_ {
+inline kop to_cmp_(cmp_op op) {
+  switch (op) {
+    case cmp_op::gt: return kop::gt_;
+    case cmp_op::lt: return kop::lt_;
+    case cmp_op::ge: return kop::ge_;
+    case cmp_op::le: return kop::le_;
+    case cmp_op::eq: return kop::eq_;
+    case cmp_op::ne: return kop::ne_;
+  }
+  return kop::gt_;
 }
+inline kop to_unary_ext_(unary_ext_op op) {
+  switch (op) {
+    case unary_ext_op::tanh_: return kop::tanh_;
+    case unary_ext_op::sin_: return kop::sin_;
+    case unary_ext_op::cos_: return kop::cos_;
+  }
+  return kop::tanh_;
+}
+struct cmp_params {
+  uint32_t n;
+  uint32_t bstride;
+};
+struct clamp_params {
+  float lo, hi;
+  uint32_t n;
+};
+struct sum_to_params {
+  uint32_t a_shape[kPadFoldMaxRank];
+  uint32_t a_strides[kPadFoldMaxRank];
+  uint32_t acc[kPadFoldMaxRank];
+  uint32_t rank;
+  uint32_t out_n;
+  uint32_t reduced_n;
+};
+}  // namespace detail_
+
 // gt/lt/ge/le/eq/ne (array.h's comparison ops, ReLU/LeakyReLU/Clip's
-// backward gate): no Metal kernel yet (CUDA-first). Stub for now --
-// array.h falls back to its own CPU comparison loop.
-inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
-                    int64_t, int64_t) {
-  return false;
+// backward gate): same-shape only (bstride=1) or a scalar b (bstride=0) --
+// the two shapes array.h's gpu_compare_ ever dispatches. cmp_op stays its
+// own vocabulary at the array.h boundary (see this file's cmp_op comment);
+// mapped onto a dedicated kop slot here so it shares pso_()'s caching, same
+// idea as binary_bcast_nd's to_nd_ above. Mirrors cuda.h's own compare().
+inline bool compare(cmp_op op, void* a, int64_t ao, void* b, int64_t bo,
+                    void* out, int64_t oo, int64_t n, int64_t bstride) {
+  auto& c = context::get();
+  if (!c.device) return false;
+  auto pso = c.pso_(detail_::to_cmp_(op));
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  detail_::set_buf_(c.enc, a, ao, 0ul);
+  detail_::set_buf_(c.enc, b, bo, 1ul);
+  detail_::set_buf_(c.enc, out, oo, 2ul);
+  detail_::cmp_params p{static_cast<uint32_t>(n),
+                        static_cast<uint32_t>(bstride)};
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), 3ul);
+  unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
+  detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
+  return true;
 }
-// tanh_/sin_/cos_ (RoPE's trig, RNN/LSTM's tanh) and clamp (Clip's
-// forward): no Metal kernel yet (CUDA-first). Stubs for now -- array.h
-// falls back to its own CPU unary loop.
-inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
-                      float, float) {
-  return false;
+// tanh_/sin_/cos_ (RoPE's trig, RNN/LSTM's tanh): plain elementwise, same
+// shape as exp_/sqrt_ above -- unary() already does exactly this dispatch,
+// just keyed by a kop array.h doesn't see directly.
+inline bool unary_ext(unary_ext_op op, void* a, int64_t ao, void* out,
+                      int64_t oo, int64_t n, float scale, float offset) {
+  return unary(detail_::to_unary_ext_(op), a, ao, out, oo, n, scale, offset);
 }
-inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {
-  return false;
+// clamp(x, lo, hi): Clip's forward. No epilogue -- lo/hi occupy the role
+// scale/offset play elsewhere (mirrors cuda.h's own clamp).
+inline bool clamp(void* a, int64_t ao, void* out, int64_t oo, int64_t n,
+                  float lo, float hi) {
+  auto& c = context::get();
+  if (!c.device) return false;
+  auto pso = c.pso_(kop::clamp_);
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  detail_::set_buf_(c.enc, a, ao, 0ul);
+  detail_::set_buf_(c.enc, out, oo, 1ul);
+  detail_::clamp_params p{lo, hi, static_cast<uint32_t>(n)};
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), 2ul);
+  unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
+  detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
+  return true;
+}
+// sum_to (un-broadcast a gradient): gather, mirrors cuda.h's tl_sum_to --
+// one thread per OUTPUT element sums every `a` element that broadcasts
+// onto it, so no atomics (unlike index_add).
+inline bool sum_to(void* a, int64_t ao, const int64_t* a_shape,
+                   const int64_t* a_strides, const int64_t* acc, int rank,
+                   int64_t out_n, int64_t reduced_n, void* out, int64_t oo) {
+  auto& c = context::get();
+  if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
+  auto pso = c.pso_(kop::sum_to_);
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  detail_::set_buf_(c.enc, a, ao, 0ul);
+  detail_::set_buf_(c.enc, out, oo, 1ul);
+  detail_::sum_to_params p{};
+  for (int d = 0; d < rank; d++) {
+    p.a_shape[d] = static_cast<uint32_t>(a_shape[d]);
+    p.a_strides[d] = static_cast<uint32_t>(a_strides[d]);
+    p.acc[d] = static_cast<uint32_t>(acc[d]);
+  }
+  p.rank = static_cast<uint32_t>(rank);
+  p.out_n = static_cast<uint32_t>(out_n);
+  p.reduced_n = static_cast<uint32_t>(reduced_n);
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), 2ul);
+  unsigned long groups = (static_cast<unsigned long>(out_n) + 255ul) / 256ul;
+  detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
+  return true;
 }
 // concat_part (Tensor.concat along an arbitrary axis, KV-cache append): no
 // Metal kernel yet (CUDA-first, reuses its own pad kernel there). Stub for
