@@ -112,7 +112,7 @@ Everything below is lazy unless noted.
 | Comparison | `> < >= <= == !=`, same three forms — result is an f32 mask of 1.0/0.0; `where(cond, a, b)` |
 | Unary | `.exp() .log() .sqrt() .sigmoid() .relu()` |
 | Softmax | `.softmax()` — **last axis only**, numerically stable, throws on rank 0 |
-| Matmul | `a.dot(b)` — **rank 1 or 2 only**. 2d@2d→`{M,N}`, 2d@1d→`{M}`, 1d@2d→`{N}`, 1d@1d→scalar |
+| Matmul | `a.dot(b)` — rank 1 or 2, or batched rank ≥ 3 (same rank, identical leading batch dims, no broadcast). 2d@2d→`{M,N}`, 2d@1d→`{M}`, 1d@2d→`{N}`, 1d@1d→scalar, `[...,M,K]`@`[...,K,N]`→`[...,M,N]` |
 | Axis reductions | `.sum(axis, keepdims=false)`, `.mean(...)`, `.max(...)`, `.argmax(...)` — any axis, negatives count from the end; `argmax` returns indices as f32 |
 | Scalar reductions | `float sum()`, `float max()`, `float mean()`, `int64_t argmax()` — **eager**, return host values |
 | Views | `.transpose()`, `.transpose({axes})`, `.reshape(shape)`, `.slice(start, count)` (**axis 0 only**), `.clone()` |

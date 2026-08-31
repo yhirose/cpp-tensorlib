@@ -2450,9 +2450,9 @@ struct graph {
       case op_t::dot: {
         // Batched (rank >= 3, graph::dot already required matching batch
         // dims): none of the GEMV/GEMM fast paths below know about a batch
-        // axis, so this branches off before them entirely. GPU dispatch is
-        // still to-do (see gpu_bdot_'s own comment) — CPU-correct today via
-        // a per-slice host loop.
+        // axis, so this branches off before them entirely. gpu_bdot_ tries
+        // real per-slice GPU dispatch first (see its own comment); ref::bdot
+        // is the CPU-correct fallback when it declines.
         if (n.inputs[0]->shape.size() > 2 || n.inputs[1]->shape.size() > 2) {
           auto a = in(0), b = in(1);
           if (auto g = gpu_bdot_(a, b)) {
