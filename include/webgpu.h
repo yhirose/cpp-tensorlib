@@ -44,6 +44,7 @@ namespace tl {
 namespace webgpu {
 
 using kop = tl::metal::kop;
+using cmp_op = tl::metal::cmp_op;
 
 #if defined(TENSORLIB_WEBGPU) && defined(__EMSCRIPTEN__)
 
@@ -1028,6 +1029,10 @@ inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
                    const int64_t*, int, int64_t, int64_t, void*, int64_t) {
   return false;
 }
+inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
+                    int64_t, int64_t) {
+  return false;
+}
 
 #else  // !(TENSORLIB_WEBGPU && __EMSCRIPTEN__) — stubs, as in metal.h
 
@@ -1089,6 +1094,10 @@ inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
 }
 inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
                    const int64_t*, int, int64_t, int64_t, void*, int64_t) {
+  return false;
+}
+inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
+                    int64_t, int64_t) {
   return false;
 }
 

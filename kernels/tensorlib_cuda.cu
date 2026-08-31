@@ -35,6 +35,27 @@ TL_EW_BINARY(tl_div, a[i] / b[i])
 TL_EW_BINARY(tl_pow, powf(a[i], b[i]))
 #undef TL_EW_BINARY
 
+// ---- elementwise comparison: out = (a OP b) ? 1.0f : 0.0f (no scale/offset
+// -- masks don't compose with the affine epilogue). `bstride` is 1 for a
+// same-shape `b` and 0 for a scalar `b` (array.h's `x > 0.0f` broadcasts a
+// rank-0 scalar, ReLU/LeakyReLU/Clip's backward gate's own shape) -- one
+// kernel covers both, the only two shapes array.h's gpu_compare_ dispatches.
+#define TL_EW_CMP(NAME, EXPR)                                               \
+  __global__ void NAME(const float* a, const float* b, float* out,         \
+                       unsigned n, unsigned bstride) {                     \
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;                     \
+    if (i >= n) return;                                                    \
+    float bv = b[i * bstride];                                             \
+    out[i] = (EXPR) ? 1.0f : 0.0f;                                         \
+  }
+TL_EW_CMP(tl_gt, a[i] > bv)
+TL_EW_CMP(tl_lt, a[i] < bv)
+TL_EW_CMP(tl_ge, a[i] >= bv)
+TL_EW_CMP(tl_le, a[i] <= bv)
+TL_EW_CMP(tl_eq, a[i] == bv)
+TL_EW_CMP(tl_ne, a[i] != bv)
+#undef TL_EW_CMP
+
 // ---- rank-2 broadcast binary: out[r,c] = f(a[r*ars+c*acs], b[r*brs+c*bcs])
 // * scale + offset, into a contiguous [m,n] output. Mirrors metal.h's own
 // rank-2 broadcast kernel (bias/row-vector/column-vector/scalar) -- CUDA

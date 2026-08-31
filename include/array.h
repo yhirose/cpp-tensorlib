@@ -2526,6 +2526,51 @@ struct graph {
     return out;
   }
 
+  // GPU dispatch for the 6 comparison ops (gt/lt/ge/le/eq/ne) -- same shape
+  // only (no broadcast form; ReLU/LeakyReLU/Clip's backward gate and the
+  // concrete Tensor.gt/... callers never need one). Kept off the shared
+  // to_kop_/kop vocabulary deliberately -- see metal.h's cmp_op comment.
+  static std::optional<array> gpu_compare_(op_t op, const array& a,
+                                           const array& b) {
+    // Same-shape (bstride=1) or a scalar b (bstride=0, broadcast-read) --
+    // the two shapes array.h's `a > 0.0f`-style scalar overloads and a
+    // same-shape mask multiply actually produce. Anything else (a real
+    // N-D broadcast b) declines to the CPU oracle, which already handles
+    // it generally.
+    int64_t bstride;
+    if (a.shape() == b.shape()) {
+      bstride = 1;
+    } else if (b.size() == 1) {
+      bstride = 0;
+    } else {
+      return std::nullopt;
+    }
+    if (!gpu_mode_(a.size(), kernel_class::elementwise) || !a.contiguous() ||
+        !b.contiguous()) {
+      return std::nullopt;
+    }
+    if (!a.storage_.native || !b.storage_.native) return std::nullopt;
+    gpu::cmp_op c;
+    switch (op) {
+      case op_t::gt: c = gpu::cmp_op::gt; break;
+      case op_t::lt: c = gpu::cmp_op::lt; break;
+      case op_t::ge: c = gpu::cmp_op::ge; break;
+      case op_t::le: c = gpu::cmp_op::le; break;
+      case op_t::eq: c = gpu::cmp_op::eq; break;
+      case op_t::ne: c = gpu::cmp_op::ne; break;
+      default: return std::nullopt;
+    }
+    auto out = array::empty(a.shape());
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    if (!gpu::compare(c, a.storage_.native, a.offset_ * 4, b.storage_.native,
+                      b.offset_ * 4, out.storage_.native, out.offset_ * 4,
+                      out.size(), bstride)) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
   // One topological pass over all roots (MLX-style batch eval), then each
   // node evaluates through eval_one. Iterative DFS: recursion depth must not
   // bound graph depth. do_flush=false leaves the launched kernels in flight on
@@ -2729,21 +2774,35 @@ struct graph {
       case op_t::sub:
       case op_t::mul:
       case op_t::div:
-      case op_t::pow_:
+      case op_t::pow_: {
+        // ONE chain for every elementwise binary: each stage declines the ops it
+        // has no kernel for (gpu_binary via to_kop_, accel::binary via its own
+        // switch), so pow_ falls through to the CPU table without needing an
+        // arm of its own.
+        auto a = in(0), b = in(1);
+        if (auto g = gpu_binary(n, a, b)) {
+          r = std::move(*g);
+          epi_done = true;  // kernels apply the epilogue in the store
+        } else if (auto o = accel::binary(n.op, a, b)) {
+          r = std::move(*o);
+        } else {
+          visit_binary_op(n.op, [&](auto f) { r = map_binary(a, b, f); });
+        }
+        break;
+      }
       case op_t::gt:   // comparisons yield F32 masks
       case op_t::lt:
       case op_t::ge:
       case op_t::le:
       case op_t::eq:
       case op_t::ne: {
-        // ONE chain for every elementwise binary: each stage declines the ops it
-        // has no kernel for (gpu_binary via to_kop_, accel::binary via its own
-        // switch), so pow_ and the masks fall through to the CPU table without
-        // needing an arm of their own.
+        // gpu_compare_ instead of gpu_binary/to_kop_: comparisons are a
+        // CUDA-only addition and to_kop_'s vocabulary is called
+        // unconditionally through Metal's/WebGPU's throwing pso_() path
+        // (see metal.h's cmp_op comment), so they can't join it yet.
         auto a = in(0), b = in(1);
-        if (auto g = gpu_binary(n, a, b)) {
+        if (auto g = gpu_compare_(n.op, a, b)) {
           r = std::move(*g);
-          epi_done = true;  // kernels apply the epilogue in the store
         } else if (auto o = accel::binary(n.op, a, b)) {
           r = std::move(*o);
         } else {

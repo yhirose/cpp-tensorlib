@@ -35,6 +35,7 @@ namespace tl {
 namespace cuda {
 
 using kop = tl::metal::kop;
+using cmp_op = tl::metal::cmp_op;
 
 #if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
 
@@ -411,6 +412,23 @@ struct context {
   // meta-buffer layout (not the bcast_nd family's), so its own slot.
   CUfunction sum_to_fn = nullptr;
   CUfunction sum_to_() { return cached_(sum_to_fn, "tl_sum_to"); }
+
+  // Comparisons (gt/lt/ge/le/eq/ne): ReLU/LeakyReLU/Clip's backward gate
+  // and Tensor.gt/lt/... generally. Own vocabulary, not the kop table
+  // (see metal.h's cmp_op comment for why).
+  CUfunction gt_fn = nullptr, lt_fn = nullptr, ge_fn = nullptr,
+             le_fn = nullptr, eq_fn = nullptr, ne_fn = nullptr;
+  CUfunction compare_(cmp_op op) {
+    switch (op) {
+      case cmp_op::gt: return cached_(gt_fn, "tl_gt");
+      case cmp_op::lt: return cached_(lt_fn, "tl_lt");
+      case cmp_op::ge: return cached_(ge_fn, "tl_ge");
+      case cmp_op::le: return cached_(le_fn, "tl_le");
+      case cmp_op::eq: return cached_(eq_fn, "tl_eq");
+      case cmp_op::ne: return cached_(ne_fn, "tl_ne");
+      default: return nullptr;
+    }
+  }
 
   // M9 batched-prefill GEMM (bf16 [N,K] weights, the decode GEMV's own layout).
   CUfunction gemm_bf16_nt_fn = nullptr, gemm_bf16_nt_s_fn = nullptr,
@@ -937,6 +955,28 @@ inline bool sum_to(void* a_native, int64_t ao, const int64_t* a_shape,
   unsigned un = static_cast<unsigned>(out_n);
   unsigned ured = static_cast<unsigned>(reduced_n);
   return c.launch1d_(f, un, pa, po, pmeta, rank, un, ured);
+}
+
+// Elementwise comparison, same shape only (array.h's gpu_compare_ gates on
+// that; ReLU/LeakyReLU/Clip's backward gate and the concrete Tensor.gt/...
+// callers never need a broadcast form). Output is a F32 mask (1.0f/0.0f),
+// matching the CPU oracle's own comparison ops.
+inline bool compare(cmp_op op, void* a_native, int64_t ao, void* b_native,
+                    int64_t bo, void* out_native, int64_t oo, int64_t n,
+                    int64_t bstride) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  CUfunction f = c.compare_(op);
+  if (!f) return false;
+  c.device_read_(a_native);
+  c.device_read_(b_native);
+  c.device_write_(out_native);
+  float* pa = context::off_(a_native, ao);
+  float* pb = context::off_(b_native, bo);
+  float* po = context::off_(out_native, oo);
+  unsigned un = static_cast<unsigned>(n);
+  unsigned ubs = static_cast<unsigned>(bstride);
+  return c.launch1d_(f, un, pa, pb, po, un, ubs);
 }
 
 // Places `a` (contiguous) into a zero buffer of out_shape (array.h's
@@ -1887,6 +1927,10 @@ inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
 }
 inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
                    const int64_t*, int, int64_t, int64_t, void*, int64_t) {
+  return false;
+}
+inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
+                    int64_t, int64_t) {
   return false;
 }
 inline void sync_to_host(void*, bool) {}

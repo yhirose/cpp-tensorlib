@@ -49,6 +49,15 @@ enum class kop {
   where_nd
 };
 
+// Comparisons (gt/lt/ge/le/eq/ne) are deliberately NOT kop values: kop is
+// called unconditionally through this file's own pso_()-based binary(),
+// which throws rather than declining an enum value it has no MSL kernel
+// for -- fine for ops every backend already implements, not for a
+// CUDA-only addition landing ahead of its Metal/WebGPU kernels. compare()
+// below is its own small vocabulary so an unimplemented backend can just
+// return false, same as index_select/index_add/scatter_axis/sum_to.
+enum class cmp_op { gt, lt, ge, le, eq, ne };
+
 #ifdef __APPLE__
 
 struct mtl_size {
@@ -697,6 +706,13 @@ inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
                    const int64_t*, int, int64_t, int64_t, void*, int64_t) {
   return false;
 }
+// gt/lt/ge/le/eq/ne (array.h's comparison ops, ReLU/LeakyReLU/Clip's
+// backward gate): no Metal kernel yet (CUDA-first). Stub for now --
+// array.h falls back to its own CPU comparison loop.
+inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
+                    int64_t, int64_t) {
+  return false;
+}
 
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals
 
@@ -757,6 +773,10 @@ inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
 }
 inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
                    const int64_t*, int, int64_t, int64_t, void*, int64_t) {
+  return false;
+}
+inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
+                    int64_t, int64_t) {
   return false;
 }
 

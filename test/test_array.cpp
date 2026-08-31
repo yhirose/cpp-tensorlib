@@ -737,6 +737,35 @@ TEST_CASE("comparisons and where") {
   CHECK(c.at({0}) == -2.0f);
 }
 
+TEST_CASE("comparisons GPU dispatch matches the CPU oracle") {
+  auto p = array::from({-3, -1, 0, 2, 4, -5, 6, 1}, {2, 4});
+  auto q = array::from({1, -1, 0, 1, 3, -5, 7, 0}, {2, 4});
+
+  // scalar b (bstride=0): the concrete ReLU/LeakyReLU/Clip backward-gate
+  // shape (`x > 0.0f` broadcasts a rank-0 scalar, see operator>(a, float)).
+  CHECK(matches_gpu_oracle([&] { return p > 0.0f; }));
+  CHECK(matches_gpu_oracle([&] { return p < 0.0f; }));
+  CHECK(matches_gpu_oracle([&] { return p >= 1.0f; }));
+  CHECK(matches_gpu_oracle([&] { return p <= -1.0f; }));
+  CHECK(matches_gpu_oracle([&] { return p == 0.0f; }));
+  CHECK(matches_gpu_oracle([&] { return p != 0.0f; }));
+
+  // same-shape b (bstride=1).
+  CHECK(matches_gpu_oracle([&] { return p > q; }));
+  CHECK(matches_gpu_oracle([&] { return p == q; }));
+  CHECK(matches_gpu_oracle([&] { return p != q; }));
+
+  // the actual masked_gate composition: gy * (x > 0).
+  auto gy = array::full({2, 4}, 1.5f);
+  CHECK(matches_gpu_oracle([&] { return gy * (p > 0.0f); }));
+  CHECK(matches_gpu_oracle([&] { return gy * (p.relu() > 0.0f); }));
+
+  // a genuine N-D broadcast (not scalar, not same-shape): declines to the
+  // CPU oracle honestly rather than mis-dispatching.
+  auto row = array::from({1, -1, 0, 1});
+  CHECK(matches_gpu_oracle([&] { return p >= row; }));
+}
+
 TEST_CASE("in-place add_ accumulates gradients") {
   auto a = array::from({1, 2, 3, 4}, {2, 2});
 
