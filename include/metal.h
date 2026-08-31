@@ -691,6 +691,12 @@ inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
   detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
   return true;
 }
+// sum_to (un-broadcast a gradient): no Metal kernel yet (CUDA-first). Stub
+// for now -- array.h falls back to the CPU ref:: implementation.
+inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
+                   const int64_t*, int, int64_t, int64_t, void*, int64_t) {
+  return false;
+}
 
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals
 
@@ -747,6 +753,10 @@ inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,
 inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
                      const int64_t*, void*, int64_t, const int64_t*, void*,
                      int64_t, const int64_t*, int, int64_t) {
+  return false;
+}
+inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
+                   const int64_t*, int, int64_t, int64_t, void*, int64_t) {
   return false;
 }
 

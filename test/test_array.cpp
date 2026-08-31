@@ -677,6 +677,31 @@ TEST_CASE("sum_to reduces broadcast dims (VJP of broadcasting)") {
   CHECK_THROWS(a.sum_to({3, 2}));
 }
 
+TEST_CASE("sum_to GPU dispatch matches the CPU oracle") {
+  auto a = array::full({8, 16}, 2.0f);
+  auto row = array::from(std::vector<float>(16, 1.0f), {16});
+
+  // The concrete caller: a broadcast-add's backward reducing a [N,D]
+  // gradient down to a [D] bias gradient (Linear layer bias, LayerNorm
+  // gamma/beta).
+  CHECK(matches_gpu_oracle([&] { return a.sum_to({16}); }));
+  CHECK(matches_gpu_oracle([&] { return a.sum_to({1, 16}); }));  // size-1 kept
+  CHECK(matches_gpu_oracle([&] { return a.sum_to({8, 1}); }));   // row sums
+  CHECK(matches_gpu_oracle([&] { return a.sum_to({}); }));       // full reduce
+  CHECK(matches_gpu_oracle([&] { return (a + row).sum_to({16}); }));
+
+  // Rank 3 (Transformer-shaped): [N,S,D] gradient summed to a [D] bias grad.
+  auto x = array::full({4, 8, 32}, 1.5f);
+  CHECK(matches_gpu_oracle([&] { return x.sum_to({32}); }));
+  CHECK(matches_gpu_oracle([&] { return x.sum_to({1, 1, 32}); }));
+  CHECK(matches_gpu_oracle([&] { return x.sum_to({4, 1, 1}); }));
+
+  // Non-contiguous input (a view) falls back to the CPU oracle honestly
+  // (gpu_sum_to_ gates on a.contiguous()) rather than mis-dispatching.
+  auto t = array::from({1, 2, 3, 4, 5, 6}, {2, 3}).transpose();  // shape (3,2)
+  CHECK(matches_gpu_oracle([&] { return t.sum_to({2}); }));
+}
+
 TEST_CASE("comparisons and where") {
   auto x = array::from({-2, -1, 0, 1, 2});
 

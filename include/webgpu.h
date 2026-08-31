@@ -1024,6 +1024,10 @@ inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
   p.pad4 = word_off;
   return c.encode_("where_nd", mcond, ma, mo, p, (n + 255) / 256, 1, mb, mm);
 }
+inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
+                   const int64_t*, int, int64_t, int64_t, void*, int64_t) {
+  return false;
+}
 
 #else  // !(TENSORLIB_WEBGPU && __EMSCRIPTEN__) — stubs, as in metal.h
 
@@ -1081,6 +1085,10 @@ inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,
 inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
                      const int64_t*, void*, int64_t, const int64_t*, void*,
                      int64_t, const int64_t*, int, int64_t) {
+  return false;
+}
+inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
+                   const int64_t*, int, int64_t, int64_t, void*, int64_t) {
   return false;
 }
 

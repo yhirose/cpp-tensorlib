@@ -123,6 +123,51 @@ __global__ void tl_where_nd(const float* cond, const float* a,
   out[i] = cond[c_off] != 0.0f ? a[a_off] : b[b_off];
 }
 
+// ---- sum_to: sum `a` down to a smaller broadcast-target shape (array.h's
+// sum_to, the dual of broadcast_to that every arithmetic op's backward uses
+// to un-broadcast a gradient). Gather, not scatter: one thread per OUTPUT
+// element sums every `a` element that broadcasts onto it, so unlike
+// index_add there is no write conflict and no atomics. meta packs
+// [a_shape(rank), a_strides(rank), acc(rank)] -- acc is a's shape
+// broadcast-aligned against the *output*'s own strides (array.h's
+// broadcast_strides(target, out.strides(), a.shape())), 0 on every axis
+// being summed over. `reduced_n` is the host-computed product of a_shape
+// over exactly those zero-acc axes (1 if there are none, i.e. sum_to is
+// really just a shape-preserving copy).
+__global__ void tl_sum_to(const float* a, float* out, const long long* meta,
+                          int rank, unsigned out_n, unsigned reduced_n) {
+  unsigned t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t >= out_n) return;
+  const long long* a_shape = meta;
+  const long long* a_strides = meta + rank;
+  const long long* acc = meta + 2 * rank;
+  long long base = 0;
+  int red_axis[8];
+  int red_count = 0;
+  for (int d = 0; d < rank; d++) {
+    if (acc[d] != 0) {
+      long long idx = (t / acc[d]) % a_shape[d];
+      base += idx * a_strides[d];
+    } else {
+      red_axis[red_count++] = d;
+    }
+  }
+  float sum = 0.0f;
+  for (unsigned r = 0; r < reduced_n; r++) {
+    unsigned rem = r;
+    long long off = base;
+    for (int k = red_count - 1; k >= 0; --k) {
+      int d = red_axis[k];
+      unsigned dim = static_cast<unsigned>(a_shape[d]);
+      unsigned coord = rem % dim;
+      rem /= dim;
+      off += static_cast<long long>(coord) * a_strides[d];
+    }
+    sum += a[off];
+  }
+  out[t] = sum;
+}
+
 // ---- unary: out = f(a) * scale + offset (affine = identity f) ----
 #define TL_EW_UNARY(NAME, EXPR)                                             \
   __global__ void NAME(const float* a, float* out, unsigned n, float scale, \

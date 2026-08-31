@@ -407,6 +407,11 @@ struct context {
   }
   CUfunction where_nd_() { return cached_(where_nd_fn, "tl_where_nd"); }
 
+  // array.h's sum_to (un-broadcast a gradient) -- gather-based, its own
+  // meta-buffer layout (not the bcast_nd family's), so its own slot.
+  CUfunction sum_to_fn = nullptr;
+  CUfunction sum_to_() { return cached_(sum_to_fn, "tl_sum_to"); }
+
   // M9 batched-prefill GEMM (bf16 [N,K] weights, the decode GEMV's own layout).
   CUfunction gemm_bf16_nt_fn = nullptr, gemm_bf16_nt_s_fn = nullptr,
              gemm_bf16_nt_sk_fn = nullptr;
@@ -904,6 +909,34 @@ inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
   float* po = context::off_(out_native, oo);
   unsigned un = static_cast<unsigned>(n);
   return c.launch1d_(c.where_nd_(), un, pc, pa, pb, po, pmeta, rank, un);
+}
+
+// Gather-based GPU dispatch for array.h's sum_to (un-broadcast a gradient).
+// See tl_sum_to's own comment for why this needs no atomics, unlike
+// index_add. `a_shape`/`a_strides` describe `a` (the caller has already
+// checked it's contiguous); `acc` is array.h's own
+// broadcast_strides(target, out_strides, a.shape()) -- 0 on every axis
+// being summed over. `reduced_n` is the product of a_shape over exactly
+// those zero-acc axes (1 if there are none).
+inline bool sum_to(void* a_native, int64_t ao, const int64_t* a_shape,
+                   const int64_t* a_strides, const int64_t* acc, int rank,
+                   int64_t out_n, int64_t reduced_n, void* out_native,
+                   int64_t oo) {
+  if (rank <= 0 || rank > kPadFoldMaxRank) return false;
+  auto& c = context::get();
+  if (!c.ready) return false;
+  CUfunction f = c.sum_to_();
+  if (!f) return false;
+  c.device_read_(a_native);
+  c.device_write_(out_native);
+  const long long* pmeta =
+      upload_bcast_meta_(c, a_shape, rank, {a_strides, acc});
+  if (!pmeta) return false;
+  float* pa = context::off_(a_native, ao);
+  float* po = context::off_(out_native, oo);
+  unsigned un = static_cast<unsigned>(out_n);
+  unsigned ured = static_cast<unsigned>(reduced_n);
+  return c.launch1d_(f, un, pa, po, pmeta, rank, un, ured);
 }
 
 // Places `a` (contiguous) into a zero buffer of out_shape (array.h's
@@ -1850,6 +1883,10 @@ inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,
 inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
                      const int64_t*, void*, int64_t, const int64_t*, void*,
                      int64_t, const int64_t*, int, int64_t) {
+  return false;
+}
+inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
+                   const int64_t*, int, int64_t, int64_t, void*, int64_t) {
   return false;
 }
 inline void sync_to_host(void*, bool) {}

@@ -2498,6 +2498,34 @@ struct graph {
     return out;
   }
 
+  // GPU dispatch for op_t::sum_to_ (un-broadcast a gradient, the dual of
+  // broadcast_to every arithmetic op's backward calls). Gather-based (see
+  // gpu::sum_to's own comment) -- no atomics needed, unlike index_add.
+  static std::optional<array> gpu_sum_to_(const array& a,
+                                          const shape_t& target) {
+    if (!gpu_mode_(a.size(), kernel_class::reduction) || !a.contiguous()) {
+      return std::nullopt;
+    }
+    if (!a.storage_.native) return std::nullopt;
+    auto out = array::empty(target);
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    auto acc = broadcast_strides(target, out.strides(), a.shape());
+    int rank = static_cast<int>(a.rank());
+    std::vector<int64_t> a_shape_v(a.shape().begin(), a.shape().end());
+    auto a_strides_v = a.strides();
+    int64_t reduced_n = 1;
+    for (int d = 0; d < rank; d++) {
+      if (acc[d] == 0) reduced_n *= a_shape_v[d];
+    }
+    if (!gpu::sum_to(a.storage_.native, a.offset_ * 4, a_shape_v.data(),
+                     a_strides_v.data(), acc.data(), rank, out.size(),
+                     reduced_n, out.storage_.native, out.offset_ * 4)) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
   // One topological pass over all roots (MLX-style batch eval), then each
   // node evaluates through eval_one. Iterative DFS: recursion depth must not
   // bound graph depth. do_flush=false leaves the launched kernels in flight on
@@ -2879,9 +2907,15 @@ struct graph {
       case op_t::argmax_ax:
         r = ref::argmax(in(0), n.axis, n.keepdims);
         break;
-      case op_t::sum_to_:
-        r = ref::sum_to(in(0), n.shape);
+      case op_t::sum_to_: {
+        auto a = in(0);
+        if (auto g = gpu_sum_to_(a, n.shape)) {
+          r = std::move(*g);
+        } else {
+          r = ref::sum_to(a, n.shape);
+        }
         break;
+      }
       case op_t::pad_: {
         auto a = in(0);
         size_t axis = static_cast<size_t>(n.axis);
