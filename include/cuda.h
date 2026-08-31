@@ -369,6 +369,18 @@ struct context {
   CUfunction pad_() { return cached_(pad_fn, "tl_pad"); }
   CUfunction fold_() { return cached_(fold_fn, "tl_fold"); }
 
+  // Embedding-table lookup (index_select/index_add) and pooling-style
+  // one-hot scatter (scatter_to_axis), cached the same way.
+  CUfunction index_select_fn = nullptr, index_add_fn = nullptr,
+             scatter_axis_fn = nullptr;
+  CUfunction index_select_() {
+    return cached_(index_select_fn, "tl_index_select");
+  }
+  CUfunction index_add_() { return cached_(index_add_fn, "tl_index_add"); }
+  CUfunction scatter_axis_() {
+    return cached_(scatter_axis_fn, "tl_scatter_axis");
+  }
+
   // M9 batched-prefill GEMM (bf16 [N,K] weights, the decode GEMV's own layout).
   CUfunction gemm_bf16_nt_fn = nullptr, gemm_bf16_nt_s_fn = nullptr,
              gemm_bf16_nt_sk_fn = nullptr;
@@ -824,6 +836,68 @@ inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
   unsigned un = static_cast<unsigned>(n);
   unsigned ustep = static_cast<unsigned>(step);
   return c.launch1d_(c.fold_(), un, pa, po, pmeta, rank, axis, ustep, un);
+}
+
+// Row gather along axis 0: out[i] = a[indices[i]] (a, indices contiguous;
+// indices float-valued, rounded on-device to match argmax's own
+// convention). One thread per output element, no write conflicts — no
+// zeroing needed (every element is written exactly once).
+inline bool index_select(void* a_native, int64_t ao, void* idx_native,
+                         int64_t idxo, void* out_native, int64_t oo,
+                         int64_t row_size, int64_t k) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(a_native);
+  c.device_read_(idx_native);
+  c.device_write_(out_native);
+  float* pa = context::off_(a_native, ao);
+  float* pidx = context::off_(idx_native, idxo);
+  float* po = context::off_(out_native, oo);
+  unsigned un = static_cast<unsigned>(k * row_size);
+  unsigned urow = static_cast<unsigned>(row_size);
+  return c.launch1d_(c.index_select_(), un, pa, pidx, po, urow, un);
+}
+
+// index_select's dual: scatter-add `values` into `out` by row index.
+// Repeated indices really do collide (real write conflicts — the kernel
+// uses atomicAdd), so `out` must start zeroed, same as pad/fold above.
+inline bool index_add(void* idx_native, int64_t idxo, void* values_native,
+                      int64_t vo, void* out_native, int64_t oo,
+                      int64_t row_size, int64_t k, int64_t out_n) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(idx_native);
+  c.device_read_(values_native);
+  c.device_write_(out_native);
+  zero_device_(reinterpret_cast<CUdeviceptr>(out_native), out_n);
+  float* pidx = context::off_(idx_native, idxo);
+  float* pv = context::off_(values_native, vo);
+  float* po = context::off_(out_native, oo);
+  unsigned un = static_cast<unsigned>(k * row_size);
+  unsigned urow = static_cast<unsigned>(row_size);
+  return c.launch1d_(c.index_add_(), un, pidx, pv, po, urow, un);
+}
+
+// One-hot scatter into a new trailing axis of size `size`: out[..., k] =
+// values[...] where indices[...] == k, else 0. Every input position maps
+// to a distinct output slot (the axis is brand new), so — unlike
+// index_add above — there is no accumulation and no atomics; `out` still
+// starts zeroed since untouched slots must read back as 0.
+inline bool scatter_to_axis(void* idx_native, int64_t idxo,
+                            void* values_native, int64_t vo, void* out_native,
+                            int64_t oo, int64_t n, int64_t size) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(idx_native);
+  c.device_read_(values_native);
+  c.device_write_(out_native);
+  zero_device_(reinterpret_cast<CUdeviceptr>(out_native), n * size);
+  float* pidx = context::off_(idx_native, idxo);
+  float* pv = context::off_(values_native, vo);
+  float* po = context::off_(out_native, oo);
+  unsigned un = static_cast<unsigned>(n);
+  unsigned usize = static_cast<unsigned>(size);
+  return c.launch1d_(c.scatter_axis_(), un, pidx, pv, po, usize, un);
 }
 
 // M7 decode GEMV: y(n) = a(1,k) @ B(k,n), F32 accumulate. B is either f32 or
@@ -1638,6 +1712,18 @@ inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
 }
 inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,
                  const int64_t*, int, int, int64_t, int64_t, int64_t) {
+  return false;
+}
+inline bool index_select(void*, int64_t, void*, int64_t, void*, int64_t,
+                         int64_t, int64_t) {
+  return false;
+}
+inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
+                      int64_t, int64_t) {
+  return false;
+}
+inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
+                            int64_t, int64_t) {
   return false;
 }
 inline void sync_to_host(void*, bool) {}

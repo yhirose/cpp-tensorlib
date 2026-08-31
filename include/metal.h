@@ -496,6 +496,23 @@ inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
                                      step, out_n);
 }
 
+// index_select/index_add/scatter_to_axis: no Metal kernel yet (CUDA-first;
+// Metal is a planned follow-up). Stub for now, same as every backend does
+// for an op it hasn't implemented — array.h's eval_one falls back to the
+// CPU ref:: implementation.
+inline bool index_select(void*, int64_t, void*, int64_t, void*, int64_t,
+                         int64_t, int64_t) {
+  return false;
+}
+inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
+                      int64_t, int64_t) {
+  return false;
+}
+inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
+                            int64_t, int64_t) {
+  return false;
+}
+
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals
 
 inline bool available() { return false; }
@@ -529,6 +546,18 @@ inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
 }
 inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,
                  const int64_t*, int, int, int64_t, int64_t, int64_t) {
+  return false;
+}
+inline bool index_select(void*, int64_t, void*, int64_t, void*, int64_t,
+                         int64_t, int64_t) {
+  return false;
+}
+inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
+                      int64_t, int64_t) {
+  return false;
+}
+inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
+                            int64_t, int64_t) {
   return false;
 }
 

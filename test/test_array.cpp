@@ -1225,3 +1225,117 @@ TEST_CASE("fold: 2-D round trip matches the CPU oracle regardless of which "
     return windows.fold(1, 8, 2).fold(0, 8, 2);
   }));
 }
+
+TEST_CASE("index_select: gathers rows by a 1-D index array") {
+  auto table = array::from({1, 2, 3, 4, 5, 6, 7, 8}, {4, 2});  // 4 rows of 2
+  auto idx = array::from({2, 0, 2}, {3});
+  auto out = table.index_select(idx);
+  CHECK(out.shape() == tl::shape_t{3, 2});
+  CHECK(out.at({0, 0}) == doctest::Approx(5));
+  CHECK(out.at({0, 1}) == doctest::Approx(6));
+  CHECK(out.at({1, 0}) == doctest::Approx(1));
+  CHECK(out.at({1, 1}) == doctest::Approx(2));
+  CHECK(out.at({2, 0}) == doctest::Approx(5));
+  CHECK(out.at({2, 1}) == doctest::Approx(6));
+}
+
+TEST_CASE("index_select: GPU dispatch matches the ref oracle") {
+  CHECK(matches_gpu_oracle([&] {
+    auto table = random_array({64, 16}, 21);
+    auto idx = array::from({5, 5, 0, 63, 30, 5}, {6});
+    return table.index_select(idx);
+  }));
+}
+
+TEST_CASE("index_add: index_select's dual, scatter-adds rows by index") {
+  auto idx = array::from({1, 1, 0}, {3});   // row 1 hit twice: must accumulate
+  auto values = array::from({10, 20, 30, 40, 1, 2}, {3, 2});
+  auto out = tl::index_add(idx, values, {4, 2});
+  CHECK(out.shape() == tl::shape_t{4, 2});
+  CHECK(out.at({0, 0}) == doctest::Approx(1));   // row 0 <- values[2]
+  CHECK(out.at({0, 1}) == doctest::Approx(2));
+  CHECK(out.at({1, 0}) == doctest::Approx(40));  // row 1 <- values[0]+values[1]
+  CHECK(out.at({1, 1}) == doctest::Approx(60));
+  CHECK(out.at({2, 0}) == doctest::Approx(0));   // untouched row stays zero
+  CHECK(out.at({3, 0}) == doctest::Approx(0));
+}
+
+TEST_CASE("index_add: is index_select's exact transpose (dot-product check)") {
+  // <index_select(a, idx), g> == <a, index_add(idx, g, a.shape())> for any
+  // a/g -- the standard way to confirm a scatter and a gather are duals.
+  auto a = random_array({20, 5}, 31);
+  auto idx = array::from({3, 3, 7, 0, 19, 3}, {6});
+  auto gathered = a.index_select(idx);
+  auto g = random_array({6, 5}, 32);
+  float lhs = (gathered * g).eval().sum();
+  auto scattered = tl::index_add(idx, g, {20, 5});
+  float rhs = (a * scattered).eval().sum();
+  CHECK(lhs == doctest::Approx(rhs).epsilon(1e-4));
+}
+
+TEST_CASE("index_add: GPU dispatch matches the ref oracle (repeated indices)") {
+  CHECK(matches_gpu_oracle([&] {
+    auto idx = array::from({5, 5, 5, 0, 63, 30, 5, 12}, {8});
+    auto values = random_array({8, 16}, 22);
+    return tl::index_add(idx, values, {64, 16});
+  }));
+}
+
+TEST_CASE("index_select/index_add: bad shapes throw") {
+  auto table = random_array({4, 2}, 33);
+  auto idx2d = random_array({3, 1}, 34);
+  CHECK_THROWS(table.index_select(idx2d));  // indices must be rank-1
+  auto idx = array::from({0, 1}, {2});
+  auto bad_values = random_array({3, 2}, 35);  // 3 rows for 2 indices
+  CHECK_THROWS(tl::index_add(idx, bad_values, {4, 2}));
+}
+
+TEST_CASE("scatter_to_axis: one-hot scatter into a new trailing axis") {
+  auto idx = array::from({2, 0, 1}, {3});
+  auto values = array::from({5, 7, 9}, {3});
+  auto out = tl::scatter_to_axis(idx, values, 4);
+  CHECK(out.shape() == tl::shape_t{3, 4});
+  std::vector<float> expected = {0, 0, 5, 0,   // row 0: value at slot 2
+                                 7, 0, 0, 0,   // row 1: value at slot 0
+                                 0, 9, 0, 0};  // row 2: value at slot 1
+  for (int64_t i = 0; i < 3; i++) {
+    for (int64_t k = 0; k < 4; k++) {
+      CHECK(out.at({i, k}) ==
+           doctest::Approx(expected[static_cast<size_t>(i * 4 + k)]));
+    }
+  }
+}
+
+TEST_CASE("scatter_to_axis: is the exact shape Pooling's own backward needs "
+         "(2-D window axis)") {
+  // argmax/max over a [n, oh, ow, kh*kw] window axis, scattered back --
+  // the same shape a pooling layer's hand-derived backward composes with
+  // fold() to reconstruct the padded input gradient.
+  auto idx = array::from({0, 3, 2, 1}, {2, 2});  // [n=2, ow=2], indices < 4
+  auto values = array::from({1, 2, 3, 4}, {2, 2});
+  auto out = tl::scatter_to_axis(idx, values, 4);
+  CHECK(out.shape() == tl::shape_t{2, 2, 4});
+  CHECK(out.at({0, 0, 0}) == doctest::Approx(1));
+  CHECK(out.at({0, 1, 3}) == doctest::Approx(2));
+  CHECK(out.at({1, 0, 2}) == doctest::Approx(3));
+  CHECK(out.at({1, 1, 1}) == doctest::Approx(4));
+  CHECK(out.sum() == doctest::Approx(1 + 2 + 3 + 4));  // every other slot is 0
+}
+
+TEST_CASE("scatter_to_axis: mismatched indices/values shape throws") {
+  auto idx = array::from({0, 1}, {2});
+  auto values = random_array({3}, 36);
+  CHECK_THROWS(tl::scatter_to_axis(idx, values, 4));
+}
+
+TEST_CASE("scatter_to_axis: GPU dispatch matches the ref oracle") {
+  CHECK(matches_gpu_oracle([&] {
+    std::mt19937 rng(41);
+    std::uniform_int_distribution<int> dist(0, 7);
+    std::vector<float> idx_v(64 * 32);
+    for (auto& x : idx_v) x = static_cast<float>(dist(rng));
+    auto idx = array::from(idx_v, {64, 32});
+    auto values = random_array({64, 32}, 42);
+    return tl::scatter_to_axis(idx, values, 8);
+  }));
+}

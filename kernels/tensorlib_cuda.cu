@@ -283,6 +283,50 @@ extern "C" __global__ void tl_fold(const float* __restrict__ a,
   atomicAdd(&out[dst], a[i]);
 }
 
+// ---- index_select: row gather along axis 0. out[i] = a[indices[row(i)]]
+// (indices float-valued, rounded here to match argmax's own convention).
+// One thread per output element, flat index i decomposed into (row, col)
+// by row_size -- no write conflicts, so no pre-zero needed.
+extern "C" __global__ void tl_index_select(const float* __restrict__ a,
+                                           const float* __restrict__ idx,
+                                           float* __restrict__ out,
+                                           unsigned row_size, unsigned n) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  unsigned row = i / row_size, col = i % row_size;
+  long long src_row = (long long)(idx[row] + 0.5f);
+  out[i] = a[(size_t)src_row * row_size + col];
+}
+
+// ---- index_add: index_select's dual. Scatter-adds `values` into `out` by
+// row index -- repeated indices really do collide (real write conflicts),
+// so this needs atomicAdd; the caller pre-zeros `out` (cuda.h's index_add)
+// since untouched rows must read back as 0.
+extern "C" __global__ void tl_index_add(const float* __restrict__ idx,
+                                        const float* __restrict__ values,
+                                        float* __restrict__ out,
+                                        unsigned row_size, unsigned n) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  unsigned row = i / row_size, col = i % row_size;
+  long long dst_row = (long long)(idx[row] + 0.5f);
+  atomicAdd(&out[(size_t)dst_row * row_size + col], values[i]);
+}
+
+// ---- scatter_to_axis: one-hot scatter into a new trailing axis of size
+// `size`. out[i*size + indices[i]] = values[i], every other slot stays the
+// 0 the caller pre-zeroed. Every input position writes a distinct output
+// slot (the axis is brand new), so — unlike index_add above — no atomics.
+extern "C" __global__ void tl_scatter_axis(const float* __restrict__ idx,
+                                           const float* __restrict__ values,
+                                           float* __restrict__ out,
+                                           unsigned size, unsigned n) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  long long k = (long long)(idx[i] + 0.5f);
+  out[(size_t)i * size + k] = values[i];
+}
+
 // ---- softmax over the last axis (rows×cols out); scale/offset ignored ----
 // Numerically stable (subtract row max). Two shared reductions (max, sum).
 __global__ void tl_softmax(const float* in, float* out, unsigned rows,

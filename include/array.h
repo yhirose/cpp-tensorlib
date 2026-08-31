@@ -174,6 +174,14 @@ struct node {
             // - input.shape()[axis]). A real write, not a view — see pad_.
     fold_,  // unfold's inverse: scatter-add axis `axis` (step=`arg0`) back
             // down to `shape`, accumulating overlaps. Also a real write.
+    index_select_,  // row gather along axis 0. inputs={table, indices};
+                    // `shape` is the output (indices.size() rows).
+    index_add_,     // index_select's dual: scatter-add along axis 0.
+                    // inputs={indices, values}; `shape` is the target
+                    // (an explicit param, same idea as sum_to_).
+    scatter_axis_,  // one-hot scatter into a new trailing axis. inputs=
+                    // {indices, values}, same shape; `shape` is theirs
+                    // with that axis (size = shape.back()) appended.
     view_,  // zero-copy view (transpose/reshape/slice/unfold) over a still-
             // lazy source: composes strides at eval, no kernel, no flush —
             // keeps the source in the same batch instead of forcing a
@@ -387,6 +395,14 @@ class array {
   // Linear algebra: (M,K)@(K,N); 1-d operands promote numpy-style. (lazy)
   array dot(const array& b) const;
 
+  // Row gather along axis 0: out[i] = (*this)[indices[i]] (a 1-D index
+  // array; indices are float-valued like argmax's own output, rounded to
+  // int). Output shape is indices.size() followed by this array's own
+  // trailing dims. The embedding-table lookup PyTorch calls
+  // `Tensor.index_select(0, index)` / `nn.Embedding`. Differentiable
+  // w.r.t. `*this` -- see index_add below, its exact dual.
+  array index_select(const array& indices) const;
+
   // Fused decode attention (M9): out(h,:) = softmax(scale · q(h,:)·K(h)ᵀ)·V(h),
   // one query row per head. q [H,D], K/V [H,ctx,D], out [H,D]. On CUDA with
   // D==128 this is the fused flash-attention kernel; otherwise a CPU reference.
@@ -503,6 +519,27 @@ array operator==(const array& a, float s);
 array operator!=(const array& a, float s);
 
 array where(const array& cond, const array& a, const array& b);
+
+// index_select's exact dual: scatter-add `values` (shaped like some
+// t.index_select(indices)) into a fresh zero buffer of `target_shape` --
+// the embedding-table gradient PyTorch computes via
+// `grad_weight.index_add_(0, index, grad_output)`. Repeated indices
+// accumulate (unlike scatter_to_axis below, this one has real write
+// conflicts, so the GPU kernel needs atomics). indices get no gradient.
+array index_add(const array& indices, const array& values,
+                shape_t target_shape);
+
+// One-hot scatter into a new trailing axis of size `size`: out[..., k] =
+// values[...] where indices[...] == k, else 0 -- no accumulation, since
+// every input position maps to a distinct output slot (the axis is
+// brand new, not shared across inputs). The native counterpart of
+// argmax's own host-loop backward: `max(axis)`/`argmax(axis)` pick one
+// element out of a window; this scatters a gradient back into that same
+// window shape -- e.g. a pooling layer's own hand-derived backward. No
+// native VJP yet: that would need this op's own dual (gather one element
+// per position back out of the window axis), which no caller needs today.
+array scatter_to_axis(const array& indices, const array& values,
+                      int64_t size);
 
 array sum_to(const array& a, shape_t shape);
 
@@ -1295,6 +1332,101 @@ inline array fold(const array& a, size_t axis, int64_t step,
   return out;
 }
 
+// Row gather along axis 0: out[i] = a[indices[i]] (indices float-valued,
+// rounded, matching argmax's own convention). A full odometer over
+// `out`'s own shape (same rank as `a`) rather than `for_each_index` --
+// `indices[idx[0]]` makes the row 0 stride data-dependent, which no fixed
+// reindex could express (the same reason fold above needs a manual walk).
+inline array index_select(const array& a, const array& indices,
+                          const shape_t& out_shape) {
+  auto out = array::empty(out_shape);
+  auto* po = out.data();
+  const auto* pi = a.raw();
+  const auto* pidx = indices.raw();
+  size_t r = a.rank();
+  const auto& a_strides = a.strides();
+  const auto& out_strides = out.strides();
+  std::vector<int64_t> idx(r, 0);
+  int64_t n = out.size();
+  for (int64_t i = 0; i < n; i++) {
+    int64_t row = static_cast<int64_t>(std::llround(pidx[idx[0]]));
+    int64_t src_off = row * a_strides[0];
+    int64_t dst_off = 0;
+    for (size_t d = 0; d < r; d++) dst_off += idx[d] * out_strides[d];
+    for (size_t d = 1; d < r; d++) src_off += idx[d] * a_strides[d];
+    po[dst_off] = pi[src_off];
+    for (size_t d = r; d-- > 0;) {
+      if (++idx[d] < out_shape[d]) break;
+      idx[d] = 0;
+    }
+  }
+  return out;
+}
+
+// index_select's dual: scatter-add `values` (shaped like some
+// t.index_select(indices)) into a zero buffer of `target_shape`. Repeated
+// indices really do accumulate here (`+=`), unlike scatter_to_axis below.
+inline array index_add(const array& indices, const array& values,
+                       const shape_t& target_shape) {
+  auto out = array::zeros(target_shape);
+  auto* po = out.data();
+  const auto* pv = values.raw();
+  const auto* pidx = indices.raw();
+  size_t r = target_shape.size();
+  const auto& v_shape = values.shape();
+  const auto& v_strides = values.strides();
+  const auto& out_strides = out.strides();
+  std::vector<int64_t> idx(r, 0);
+  int64_t n = values.size();
+  for (int64_t i = 0; i < n; i++) {
+    int64_t row = static_cast<int64_t>(std::llround(pidx[idx[0]]));
+    int64_t src_off = 0;
+    for (size_t d = 0; d < r; d++) src_off += idx[d] * v_strides[d];
+    int64_t dst_off = row * out_strides[0];
+    for (size_t d = 1; d < r; d++) dst_off += idx[d] * out_strides[d];
+    po[dst_off] += pv[src_off];
+    for (size_t d = r; d-- > 0;) {
+      if (++idx[d] < v_shape[d]) break;
+      idx[d] = 0;
+    }
+  }
+  return out;
+}
+
+// One-hot scatter into a new trailing axis: out[..., k] = values[...] where
+// indices[...] == k, else 0. Every input position writes a distinct output
+// slot (the axis is brand new), so unlike index_add above there is no
+// accumulation and no write conflict -- `out` starting zeroed is enough.
+inline array scatter_to_axis(const array& indices, const array& values,
+                             const shape_t& out_shape) {
+  auto out = array::zeros(out_shape);
+  auto* po = out.data();
+  const auto* pv = values.raw();
+  const auto* pidx = indices.raw();
+  size_t r = indices.rank();
+  const auto& v_shape = values.shape();
+  const auto& v_strides = values.strides();
+  const auto& idx_strides = indices.strides();
+  const auto& out_strides = out.strides();  // rank r+1, contiguous (fresh)
+  std::vector<int64_t> idx(r, 0);
+  int64_t n = values.size();
+  for (int64_t i = 0; i < n; i++) {
+    int64_t v_off = 0, idx_off = 0, out_off = 0;
+    for (size_t d = 0; d < r; d++) {
+      v_off += idx[d] * v_strides[d];
+      idx_off += idx[d] * idx_strides[d];
+      out_off += idx[d] * out_strides[d];
+    }
+    int64_t k = static_cast<int64_t>(std::llround(pidx[idx_off]));
+    po[out_off + k] = pv[v_off];
+    for (size_t d = r; d-- > 0;) {
+      if (++idx[d] < v_shape[d]) break;
+      idx[d] = 0;
+    }
+  }
+  return out;
+}
+
 }  // namespace ref
 
 // Accelerate backend (macOS) --------------------------------------------------
@@ -1575,6 +1707,58 @@ struct graph {
     n->shape = broadcast_shape(broadcast_shape(c.shape(), a.shape()),
                                b.shape());  // throws early
     n->inputs = {as_node(c), as_node(a), as_node(b)};
+    return from_node(std::move(n));
+  }
+
+  static array index_select(const array& a, const array& indices) {
+    if (a.rank() < 1) {
+      throw std::invalid_argument("tl::index_select: rank too low");
+    }
+    if (indices.rank() != 1) {
+      throw std::invalid_argument("tl::index_select: indices must be rank-1");
+    }
+    auto n = std::make_shared<node>();
+    n->op = op_t::index_select_;
+    n->shape = a.shape();
+    n->shape[0] = indices.shape()[0];
+    n->inputs = {as_node(a), as_node(indices)};
+    return from_node(std::move(n));
+  }
+
+  static array index_add(const array& indices, const array& values,
+                         shape_t target_shape) {
+    if (indices.rank() != 1) {
+      throw std::invalid_argument("tl::index_add: indices must be rank-1");
+    }
+    if (target_shape.empty()) {
+      throw std::invalid_argument("tl::index_add: rank too low");
+    }
+    shape_t expect = target_shape;
+    expect[0] = indices.shape()[0];
+    if (values.shape() != expect) {
+      throw std::invalid_argument("tl::index_add: values shape mismatch");
+    }
+    auto n = std::make_shared<node>();
+    n->op = op_t::index_add_;
+    n->shape = std::move(target_shape);
+    n->inputs = {as_node(indices), as_node(values)};
+    return from_node(std::move(n));
+  }
+
+  static array scatter_to_axis(const array& indices, const array& values,
+                               int64_t size) {
+    if (indices.shape() != values.shape()) {
+      throw std::invalid_argument(
+          "tl::scatter_to_axis: indices/values shape mismatch");
+    }
+    if (size < 1) {
+      throw std::invalid_argument("tl::scatter_to_axis: bad size");
+    }
+    auto n = std::make_shared<node>();
+    n->op = op_t::scatter_axis_;
+    n->shape = indices.shape();
+    n->shape.push_back(size);
+    n->inputs = {as_node(indices), as_node(values)};
     return from_node(std::move(n));
   }
 
@@ -2176,6 +2360,81 @@ struct graph {
                         });
   }
 
+  // Row gather along axis 0 — the GPU-dispatch twin of ref::index_select.
+  // No zeroing: every output element is written exactly once.
+  static std::optional<array> gpu_index_select_(const array& a,
+                                                const array& indices,
+                                                const shape_t& out_shape) {
+    if (!gpu_mode_(num_elements(out_shape), kernel_class::elementwise) ||
+        !a.contiguous() || !indices.contiguous()) {
+      return std::nullopt;
+    }
+    if (!a.storage_.native || !indices.storage_.native) return std::nullopt;
+    auto out = array::empty(out_shape);
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    int64_t row_size = a.size() / a.shape()[0];
+    if (!gpu::index_select(a.storage_.native, a.offset_ * 4,
+                           indices.storage_.native, indices.offset_ * 4,
+                           out.storage_.native, out.offset_ * 4, row_size,
+                           out_shape[0])) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
+  // index_select's dual — the GPU-dispatch twin of ref::index_add. Repeated
+  // indices accumulate (real write conflicts), so the backend kernel needs
+  // atomics; the backend also owns zeroing `out` before it runs, the same
+  // way gpu::pad/gpu::fold do internally.
+  static std::optional<array> gpu_index_add_(const array& indices,
+                                             const array& values,
+                                             const shape_t& target_shape) {
+    if (!gpu_mode_(num_elements(target_shape), kernel_class::elementwise) ||
+        !indices.contiguous() || !values.contiguous()) {
+      return std::nullopt;
+    }
+    if (!indices.storage_.native || !values.storage_.native) {
+      return std::nullopt;
+    }
+    auto out = array::empty(target_shape);
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    int64_t row_size = out.size() / target_shape[0];
+    if (!gpu::index_add(indices.storage_.native, indices.offset_ * 4,
+                        values.storage_.native, values.offset_ * 4,
+                        out.storage_.native, out.offset_ * 4, row_size,
+                        indices.shape()[0], out.size())) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
+  // One-hot scatter into a new trailing axis — the GPU-dispatch twin of
+  // ref::scatter_to_axis. No accumulation (see the ref:: comment), so no
+  // atomics and no zeroing responsibility beyond the backend's own launch.
+  static std::optional<array> gpu_scatter_to_axis_(const array& indices,
+                                                    const array& values,
+                                                    const shape_t& out_shape) {
+    if (!gpu_mode_(num_elements(out_shape), kernel_class::elementwise) ||
+        !indices.contiguous() || !values.contiguous()) {
+      return std::nullopt;
+    }
+    if (!indices.storage_.native || !values.storage_.native) {
+      return std::nullopt;
+    }
+    auto out = array::empty(out_shape);
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    if (!gpu::scatter_to_axis(indices.storage_.native, indices.offset_ * 4,
+                              values.storage_.native, values.offset_ * 4,
+                              out.storage_.native, out.offset_ * 4,
+                              values.size(), out_shape.back())) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
   // One topological pass over all roots (MLX-style batch eval), then each
   // node evaluates through eval_one. Iterative DFS: recursion depth must not
   // bound graph depth. do_flush=false leaves the launched kernels in flight on
@@ -2576,6 +2835,36 @@ struct graph {
         }
         break;
       }
+      case op_t::index_select_: {
+        auto a = in(0);
+        auto indices = in(1);
+        if (auto g = gpu_index_select_(a, indices, n.shape)) {
+          r = std::move(*g);
+        } else {
+          r = ref::index_select(a, indices, n.shape);
+        }
+        break;
+      }
+      case op_t::index_add_: {
+        auto indices = in(0);
+        auto values = in(1);
+        if (auto g = gpu_index_add_(indices, values, n.shape)) {
+          r = std::move(*g);
+        } else {
+          r = ref::index_add(indices, values, n.shape);
+        }
+        break;
+      }
+      case op_t::scatter_axis_: {
+        auto indices = in(0);
+        auto values = in(1);
+        if (auto g = gpu_scatter_to_axis_(indices, values, n.shape)) {
+          r = std::move(*g);
+        } else {
+          r = ref::scatter_to_axis(indices, values, n.shape);
+        }
+        break;
+      }
       case op_t::view_: {
         // Pure layout: the source is evaluated, so re-applying the view on the
         // materialized wrap composes strides only (make_view_, no kernel, no
@@ -2745,6 +3034,18 @@ inline array operator!=(const array& a, float s) { return a != array::full({}, s
 
 inline array where(const array& cond, const array& a, const array& b) {
   return detail::graph::where(cond, a, b);
+}
+
+inline array array::index_select(const array& indices) const {
+  return detail::graph::index_select(*this, indices);
+}
+inline array index_add(const array& indices, const array& values,
+                       shape_t target_shape) {
+  return detail::graph::index_add(indices, values, std::move(target_shape));
+}
+inline array scatter_to_axis(const array& indices, const array& values,
+                             int64_t size) {
+  return detail::graph::scatter_to_axis(indices, values, size);
 }
 
 inline array array::sum_to(shape_t shape) const {

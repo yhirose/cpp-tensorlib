@@ -811,6 +811,24 @@ inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
   return c.encode_("fold", ma, mm, mo, p, (out_n + 255) / 256, 1);
 }
 
+// index_select/index_add/scatter_to_axis: no WebGPU kernel yet (CUDA-first).
+// Stub for now, same as every backend does for an op it hasn't
+// implemented — array.h's eval_one falls back to the CPU ref::
+// implementation. index_add would need the same atomic-free rewrite fold's
+// own gather-not-scatter trick uses, since WGSL has no float atomicAdd.
+inline bool index_select(void*, int64_t, void*, int64_t, void*, int64_t,
+                         int64_t, int64_t) {
+  return false;
+}
+inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
+                      int64_t, int64_t) {
+  return false;
+}
+inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
+                            int64_t, int64_t) {
+  return false;
+}
+
 #else  // !(TENSORLIB_WEBGPU && __EMSCRIPTEN__) — stubs, as in metal.h
 
 inline bool available() { return false; }
@@ -845,6 +863,18 @@ inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
 }
 inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,
                  const int64_t*, int, int, int64_t, int64_t, int64_t) {
+  return false;
+}
+inline bool index_select(void*, int64_t, void*, int64_t, void*, int64_t,
+                         int64_t, int64_t) {
+  return false;
+}
+inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
+                      int64_t, int64_t) {
+  return false;
+}
+inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
+                            int64_t, int64_t) {
   return false;
 }
 
