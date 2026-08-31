@@ -323,11 +323,17 @@ fn row_reduce(@builtin(workgroup_id) wg : vec3<u32>,
 // rank/axis/before-or-step; p.M is the output element count (webgpu.h's
 // pad()/fold() dispatch over out_n, not a's own size).
 //
+// Rank cap — matches webgpu.h's own kPadFoldMaxRank (a shader can't see a
+// host-side C++ constant, so this is its own copy) and bounds every
+// fixed-size local array below.
+const kPadFoldMaxRank : u32 = 8u;
+
 // Shared by both: row-major decode of a dispatch-global thread id `i` against
 // a shape held in B at word offset `base`, into a fixed-size local array.
 // `rank8` bounds the loop so callers can pass either a full-rank or a
 // (rank-1)-length shape.
-fn decode_idx(i : u32, base : u32, rank8 : u32, out_idx : ptr<function, array<u32, 8>>) {
+fn decode_idx(i : u32, base : u32, rank8 : u32,
+             out_idx : ptr<function, array<u32, kPadFoldMaxRank>>) {
   var rem = i;
   for (var d : i32 = i32(rank8) - 1; d >= 0; d = d - 1) {
     let dim = bitcast<u32>(B[base + u32(d)]);
@@ -339,8 +345,9 @@ fn decode_idx(i : u32, base : u32, rank8 : u32, out_idx : ptr<function, array<u3
 // Row-major strides of a contiguous tensor whose shape is held in B at word
 // offset `base`, length `rank` — used to address `A`, which pad_/fold_'s GPU
 // dispatch (array.h's gpu_pad_/gpu_fold_) requires to be contiguous.
-fn a_strides_from_shape(base : u32, rank : u32, a_shape : ptr<function, array<u32, 8>>,
-                        out_strides : ptr<function, array<u32, 8>>) {
+fn a_strides_from_shape(base : u32, rank : u32,
+                        a_shape : ptr<function, array<u32, kPadFoldMaxRank>>,
+                        out_strides : ptr<function, array<u32, kPadFoldMaxRank>>) {
   var acc : u32 = 1u;
   for (var d : i32 = i32(rank) - 1; d >= 0; d = d - 1) {
     let dim = bitcast<u32>(B[base + u32(d)]);
@@ -361,10 +368,10 @@ fn pad(@builtin(global_invocation_id) gid : vec3<u32>) {
   let axis = p._pad1;
   let before = i32(p._pad2);
 
-  var out_idx : array<u32, 8>;
+  var out_idx : array<u32, kPadFoldMaxRank>;
   decode_idx(i, p.b_off, rank, &out_idx);
-  var a_shape : array<u32, 8>;
-  var a_strides : array<u32, 8>;
+  var a_shape : array<u32, kPadFoldMaxRank>;
+  var a_strides : array<u32, kPadFoldMaxRank>;
   a_strides_from_shape(p.b_off + rank, rank, &a_shape, &a_strides);
 
   var src : u32 = 0u;
@@ -396,10 +403,10 @@ fn fold(@builtin(global_invocation_id) gid : vec3<u32>) {
   let step = i32(p._pad2);
   let out_rank = rank - 1u;
 
-  var out_idx : array<u32, 8>;
+  var out_idx : array<u32, kPadFoldMaxRank>;
   decode_idx(i, p.b_off, out_rank, &out_idx);
-  var a_shape : array<u32, 8>;
-  var a_strides : array<u32, 8>;
+  var a_shape : array<u32, kPadFoldMaxRank>;
+  var a_strides : array<u32, kPadFoldMaxRank>;
   a_strides_from_shape(p.b_off + out_rank, rank, &a_shape, &a_strides);
 
   let win : i32 = i32(a_shape[rank - 1u]);

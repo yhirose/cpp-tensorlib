@@ -177,6 +177,20 @@ struct context {
   wgpu::ComputePassEncoder pass;
   uint32_t slot = 0;  // next free uniform ring slot
 
+  // pad_/fold_'s per-call shape metadata ring — same idea as the uniform
+  // ring above (queue.WriteBuffer runs ahead of whatever is still sitting in
+  // the unsubmitted encoder, so two calls sharing one buffer before a flush
+  // would have the second's write stomp the first dispatch's not-yet-
+  // executed read), kept as real context state rather than a second,
+  // independent static-local ring so flush() resets both counters together
+  // (see meta_ring_/meta_reserve_slot_ below, defined once alloc() is in
+  // scope, same reason flush_() is forward-declared here).
+  void* meta_ring_tok = nullptr;
+  float* meta_ring_host = nullptr;
+  uint32_t meta_slot = 0;
+  void* meta_ring_(float** host_out);
+  uint32_t meta_reserve_slot_();
+
   // Host/device mirror per allocation, keyed by the opaque handle alloc()
   // returns as `native`. Views sharing a storage share the key, so one dirty
   // state serves every view. `where` tracks which copy is live.
@@ -414,6 +428,7 @@ inline void flush() {
   if (!c.pending) return;
   c.pending = false;
   c.slot = 0;
+  c.meta_slot = 0;
   if (!c.enc) return;
   c.pass.End();
   c.pass = nullptr;
@@ -666,38 +681,46 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
 // above), so two pad/fold calls batched into the same unflushed pass would
 // have the second call's metadata write stomp the first dispatch's
 // not-yet-executed read of the same buffer — the exact hazard the uniform
-// ring below (kUniformSlotCount) already exists to avoid for Params, just for
-// a second resource. One slot comfortably covers the rank-8 cap: pad needs
-// 2*rank <= 16 words, fold (rank-1)+rank <= 15.
+// ring above (kUniformSlotCount) already exists to avoid for Params, just for
+// a second resource. One slot comfortably covers the rank-8 cap (pad needs
+// 2*rank <= 16 words, fold (rank-1)+rank <= 15), which is why this state
+// lives on `context` (meta_ring_tok/meta_ring_host/meta_slot) right beside
+// `slot` instead of as a second, independent ring: flush() resets both
+// counters together, the way it already resets `slot`.
 inline constexpr size_t kMetaSlotWords = 16;
 inline constexpr size_t kMetaSlotCount = 4096;
 
+// Rank cap for pad_/fold_'s GPU dispatch — matches cuda.h's own
+// kPadFoldMaxRank (not unified with it: the two backends derive their caps
+// from different physical constraints, kMetaSlotWords here vs a fixed-size
+// on-stack index array there) and kernels/tensorlib_webgpu.wgsl's
+// kPadFoldMaxRank, which the WGSL side needs as its own `const` since a
+// shader can't see a host-side C++ constant.
+inline constexpr int kPadFoldMaxRank = 8;
+
 // Allocated once, sized for the whole ring — through the same alloc() pool
 // every tensor buffer uses (by the time pad()/fold() below can run, alloc()
-// is already defined above). The static locals are safe: wasm is
-// single-threaded, and the token is opaque to eval_one's storage layer, so
-// nothing else could mistake it for a live array.
-inline void* meta_ring_(float** host_out) {
-  static void* tok = nullptr;
-  static float* host = nullptr;
-  if (!tok) {
-    tok = alloc(static_cast<int64_t>(kMetaSlotCount * kMetaSlotWords * 4),
-               &host);
+// is already defined above). The token is opaque to eval_one's storage
+// layer, so nothing else could mistake it for a live array.
+inline void* context::meta_ring_(float** host_out) {
+  if (!meta_ring_tok) {
+    meta_ring_tok = alloc(
+        static_cast<int64_t>(kMetaSlotCount * kMetaSlotWords * 4),
+        &meta_ring_host);
   }
-  if (!tok) return nullptr;
-  *host_out = host;
-  return tok;
+  if (!meta_ring_tok) return nullptr;
+  *host_out = meta_ring_host;
+  return meta_ring_tok;
 }
 
 // This call's word offset into the ring, advancing like the uniform ring's
 // `slot` and forcing the same flush-then-reset on wraparound.
-inline uint32_t meta_reserve_slot_() {
-  static uint32_t next = 0;
-  if (next >= kMetaSlotCount) {
+inline uint32_t context::meta_reserve_slot_() {
+  if (meta_slot >= kMetaSlotCount) {
     flush();
-    next = 0;
+    meta_slot = 0;
   }
-  return (next++) * static_cast<uint32_t>(kMetaSlotWords);
+  return (meta_slot++) * static_cast<uint32_t>(kMetaSlotWords);
 }
 
 // Gather-style pad/fold (M11): unlike CUDA's scatter+atomicAdd, WGSL has no
@@ -714,7 +737,7 @@ inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
                 int axis, int64_t before, int64_t n, int64_t out_n) {
   (void)n;
   auto& c = context::get();
-  if (!c.ready || rank <= 0 || rank > 8) return false;
+  if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank) return false;
   params p = {};
   if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
   context::mirror* ma = c.mirror_(a_native);
@@ -724,9 +747,9 @@ inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
   c.device_write_(out_native);
 
   float* ring_host = nullptr;
-  void* ring_tok = meta_ring_(&ring_host);
+  void* ring_tok = c.meta_ring_(&ring_host);
   if (!ring_tok) return false;
-  uint32_t word_off = meta_reserve_slot_();
+  uint32_t word_off = c.meta_reserve_slot_();
   auto* raw = reinterpret_cast<uint32_t*>(ring_host) + word_off;
   for (int d = 0; d < rank; d++) raw[d] = static_cast<uint32_t>(out_shape[d]);
   for (int d = 0; d < rank; d++) raw[rank + d] = static_cast<uint32_t>(a_shape[d]);
@@ -758,7 +781,7 @@ inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
                  int axis, int64_t step, int64_t n, int64_t out_n) {
   (void)n;
   auto& c = context::get();
-  if (!c.ready || rank <= 0 || rank > 8) return false;
+  if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank) return false;
   params p = {};
   if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
   context::mirror* ma = c.mirror_(a_native);
@@ -769,9 +792,9 @@ inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
 
   int out_rank = rank - 1;
   float* ring_host = nullptr;
-  void* ring_tok = meta_ring_(&ring_host);
+  void* ring_tok = c.meta_ring_(&ring_host);
   if (!ring_tok) return false;
-  uint32_t word_off = meta_reserve_slot_();
+  uint32_t word_off = c.meta_reserve_slot_();
   auto* raw = reinterpret_cast<uint32_t*>(ring_host) + word_off;
   for (int d = 0; d < out_rank; d++) raw[d] = static_cast<uint32_t>(out_shape[d]);
   for (int d = 0; d < rank; d++) raw[out_rank + d] = static_cast<uint32_t>(a_shape[d]);

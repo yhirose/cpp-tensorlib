@@ -465,21 +465,30 @@ struct context {
                            : cached_(attn_prefill_tiled_fn, "tl_attn_prefill_tiled_f32"));
   }
 
-  // Reusable device scratch for split-KV partials. Grown as needed, reused
-  // across attention calls (sequential on the null stream), freed at teardown.
+  // Grow-once device scratch, shared by every reusable buffer below: on the
+  // first call past its current size, free (syncs; fine, this only happens
+  // while growing) and reallocate. `buf`/`bytes` are the caller's own
+  // persistent slot (attn_scratch/meta_scratch below), so each buffer still
+  // grows independently.
+  CUdeviceptr grow_scratch_(CUdeviceptr& buf, size_t& cur_bytes, size_t want) {
+    if (want > cur_bytes) {
+      if (buf) d.MemFree(buf);
+      if (d.MemAlloc(&buf, want) != 0) {
+        buf = 0;
+        cur_bytes = 0;
+        return 0;
+      }
+      cur_bytes = want;
+    }
+    return buf;
+  }
+
+  // Reusable device scratch for split-KV partials, reused across attention
+  // calls (sequential on the null stream), freed at teardown.
   CUdeviceptr attn_scratch = 0;
   size_t attn_scratch_bytes = 0;
   CUdeviceptr attn_scratch_(size_t bytes) {
-    if (bytes > attn_scratch_bytes) {
-      if (attn_scratch) d.MemFree(attn_scratch);  // syncs; fine (grows once)
-      if (d.MemAlloc(&attn_scratch, bytes) != 0) {
-        attn_scratch = 0;
-        attn_scratch_bytes = 0;
-        return 0;
-      }
-      attn_scratch_bytes = bytes;
-    }
-    return attn_scratch;
+    return grow_scratch_(attn_scratch, attn_scratch_bytes, bytes);
   }
 
   // Reusable device scratch for pad_/fold_'s per-call shape/stride metadata
@@ -488,16 +497,7 @@ struct context {
   CUdeviceptr meta_scratch = 0;
   size_t meta_scratch_bytes = 0;
   CUdeviceptr meta_scratch_(size_t bytes) {
-    if (bytes > meta_scratch_bytes) {
-      if (meta_scratch) d.MemFree(meta_scratch);  // syncs; fine (grows once)
-      if (d.MemAlloc(&meta_scratch, bytes) != 0) {
-        meta_scratch = 0;
-        meta_scratch_bytes = 0;
-        return 0;
-      }
-      meta_scratch_bytes = bytes;
-    }
-    return meta_scratch;
+    return grow_scratch_(meta_scratch, meta_scratch_bytes, bytes);
   }
 
   // char* pointer arithmetic to fold a byte offset into a managed pointer.
@@ -761,14 +761,40 @@ inline void strides_from_shape_(const int64_t* shape, int rank,
   }
 }
 
+// Shared by pad()/fold() below: builds this call's [a_shape(rank),
+// out_strides(stride_len)] meta buffer (out_strides derived from out_shape
+// here — pad passes stride_len==rank, fold passes rank-1, since fold's own
+// out has one fewer dim than `a`) and uploads it. Async on `c.stream`, right
+// after zero_device_'s own async memset on the same stream — both ordered
+// before the kernel launch that follows, so nothing here blocks the host
+// waiting on the *device* the way the plain (non-Async) MemcpyHtoD would.
+// `host_meta` is safe to let go out of scope on return despite being
+// pageable, not pinned: a pageable HtoD async copy still stages the source
+// into the driver's own DMA buffer synchronously, as part of this call — only
+// the destination-side completion is deferred, which is exactly the
+// blocking this function needs to avoid. `out_strides` is written out too,
+// since pad's shift and fold's axis math both need it.
+inline const long long* upload_pad_fold_meta_(context& c, const int64_t* a_shape,
+                                              int rank, const int64_t* out_shape,
+                                              int stride_len,
+                                              int64_t* out_strides) {
+  strides_from_shape_(out_shape, stride_len, out_strides);
+  size_t meta_bytes =
+      (static_cast<size_t>(rank) + static_cast<size_t>(stride_len)) *
+      sizeof(int64_t);
+  CUdeviceptr meta = c.meta_scratch_(meta_bytes);
+  if (!meta) return nullptr;
+  std::vector<int64_t> host_meta(a_shape, a_shape + rank);
+  host_meta.insert(host_meta.end(), out_strides, out_strides + stride_len);
+  c.d.MemcpyHtoDAsync(meta, host_meta.data(), meta_bytes, c.stream);
+  return reinterpret_cast<const long long*>(meta);
+}
+
 // Places `a` (contiguous) into a zero buffer of out_shape (array.h's
 // gpu_pad_ allocates `out` uninitialized via array::empty — this zeros the
 // device copy directly, no host round trip), shifted by `before` along
-// `axis`. `a_shape`/`out_shape` are host arrays of length `rank`; uploaded
-// once to the meta scratch buffer (as [a_shape, out_strides], the latter
-// derived here) since tl_pad indexes them from a flat thread id rather than
-// taking per-dim scalar args. No scale/offset — eval_one's shared epilogue
-// applies those (see array.h's op_t::pad_ case).
+// `axis`. No scale/offset — eval_one's shared epilogue applies those (see
+// array.h's op_t::pad_ case).
 inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
                 const int64_t* a_shape, const int64_t* out_shape, int rank,
                 int axis, int64_t before, int64_t n, int64_t out_n) {
@@ -779,16 +805,11 @@ inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
   c.device_write_(out_native);
   zero_device_(reinterpret_cast<CUdeviceptr>(out_native), out_n);
   int64_t out_strides[kPadFoldMaxRank];
-  strides_from_shape_(out_shape, rank, out_strides);
-  size_t meta_bytes = 2 * static_cast<size_t>(rank) * sizeof(int64_t);
-  CUdeviceptr meta = c.meta_scratch_(meta_bytes);
-  if (!meta) return false;
-  std::vector<int64_t> host_meta(a_shape, a_shape + rank);
-  host_meta.insert(host_meta.end(), out_strides, out_strides + rank);
-  c.d.MemcpyHtoD(meta, host_meta.data(), meta_bytes);
+  const long long* pmeta =
+      upload_pad_fold_meta_(c, a_shape, rank, out_shape, rank, out_strides);
+  if (!pmeta) return false;
   float* pa = context::off_(a_native, ao);
   float* po = context::off_(out_native, oo);
-  const long long* pmeta = reinterpret_cast<const long long*>(meta);
   unsigned un = static_cast<unsigned>(n);
   unsigned ushift = static_cast<unsigned>(before * out_strides[axis]);
   return c.launch1d_(c.pad_(), un, pa, po, pmeta, rank, ushift, un);
@@ -796,10 +817,7 @@ inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
 
 // unfold's inverse: scatter-add `a` (contiguous; its last dim is the sliding
 // window) into a zero buffer of out_shape (zeroed the same way as pad()
-// above) — every overlap accumulates via atomicAdd, so it must start at 0).
-// Same meta-buffer convention as pad() above, packing [a_shape(rank),
-// out_strides(rank-1)] (out_strides derived from out_shape here, same as
-// pad() — out's own rank is rank-1, so only the first rank-1 strides count).
+// above) — every overlap accumulates via atomicAdd, so it must start at 0.
 inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
                  const int64_t* a_shape, const int64_t* out_shape, int rank,
                  int axis, int64_t step, int64_t n, int64_t out_n) {
@@ -810,18 +828,11 @@ inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
   c.device_write_(out_native);
   zero_device_(reinterpret_cast<CUdeviceptr>(out_native), out_n);
   int64_t out_strides[kPadFoldMaxRank];
-  strides_from_shape_(out_shape, rank - 1, out_strides);
-  size_t meta_bytes =
-      (static_cast<size_t>(rank) + static_cast<size_t>(rank - 1)) *
-      sizeof(int64_t);
-  CUdeviceptr meta = c.meta_scratch_(meta_bytes);
-  if (!meta) return false;
-  std::vector<int64_t> host_meta(a_shape, a_shape + rank);
-  host_meta.insert(host_meta.end(), out_strides, out_strides + (rank - 1));
-  c.d.MemcpyHtoD(meta, host_meta.data(), meta_bytes);
+  const long long* pmeta = upload_pad_fold_meta_(c, a_shape, rank, out_shape,
+                                                 rank - 1, out_strides);
+  if (!pmeta) return false;
   float* pa = context::off_(a_native, ao);
   float* po = context::off_(out_native, oo);
-  const long long* pmeta = reinterpret_cast<const long long*>(meta);
   unsigned un = static_cast<unsigned>(n);
   unsigned ustep = static_cast<unsigned>(step);
   return c.launch1d_(c.fold_(), un, pa, po, pmeta, rank, axis, ustep, un);

@@ -2003,15 +2003,17 @@ struct graph {
     return out;
   }
 
-  // Places `a` into a zero-initialized `out_shape`, shifted by `before`
-  // along `axis` — the GPU-dispatch twin of ref::pad. `a` must be contiguous
-  // (every gpu_* helper above shares that requirement, and it's what lets the
-  // backend read `a[i]` at a flat thread id without also uploading strides).
-  // Ranks above the backend's cap (im2col's own use stays well under it) fall
-  // back to the CPU oracle, same as gpu_binary's rank-2-only broadcast path.
-  static std::optional<array> gpu_pad_(const array& a, size_t axis,
-                                       int64_t before,
-                                       const shape_t& out_shape) {
+  // Shared setup for gpu_pad_/gpu_fold_ below: validates the gate + `a`'s
+  // contiguity (every gpu_* helper above shares that requirement, and it's
+  // what lets a backend read `a[i]` at a flat thread id without also
+  // uploading strides), allocates `out`, and hands both shapes plus `out` to
+  // `dispatch` to make the one backend call pad/fold each need. Ranks above
+  // the backend's cap (im2col's own use stays well under it) fall back to
+  // the CPU oracle, same as gpu_binary's rank-2-only broadcast path.
+  template <typename Dispatch>
+  static std::optional<array> gpu_pad_fold_(const array& a,
+                                            const shape_t& out_shape,
+                                            Dispatch&& dispatch) {
     if (!gpu_mode_(num_elements(out_shape), kernel_class::elementwise) ||
         !a.contiguous()) {
       return std::nullopt;
@@ -2023,37 +2025,41 @@ struct graph {
     std::vector<int64_t> a_shape(a.shape().begin(), a.shape().end());
     std::vector<int64_t> out_shape_v(out_shape.begin(), out_shape.end());
     int rank = static_cast<int>(a_shape.size());
-    if (!gpu::pad(a.storage_.native, a.offset_ * 4, out.storage_.native,
-                 out.offset_ * 4, a_shape.data(), out_shape_v.data(), rank,
-                 static_cast<int>(axis), before, a.size(), out.size())) {
-      return std::nullopt;
-    }
+    if (!dispatch(out, a_shape, out_shape_v, rank)) return std::nullopt;
     return out;
+  }
+
+  // Places `a` into a zero-initialized `out_shape`, shifted by `before`
+  // along `axis` — the GPU-dispatch twin of ref::pad.
+  static std::optional<array> gpu_pad_(const array& a, size_t axis,
+                                       int64_t before,
+                                       const shape_t& out_shape) {
+    return gpu_pad_fold_(a, out_shape,
+                        [&](array& out, std::vector<int64_t>& a_shape,
+                            std::vector<int64_t>& out_shape_v, int rank) {
+                          return gpu::pad(a.storage_.native, a.offset_ * 4,
+                                          out.storage_.native, out.offset_ * 4,
+                                          a_shape.data(), out_shape_v.data(),
+                                          rank, static_cast<int>(axis), before,
+                                          a.size(), out.size());
+                        });
   }
 
   // unfold's inverse: scatter-add `a` back into a zero-initialized
   // `out_shape`, accumulating every window overlap — the GPU-dispatch twin
-  // of ref::fold. Same contiguous-`a`/rank-cap contract as gpu_pad_ above.
+  // of ref::fold.
   static std::optional<array> gpu_fold_(const array& a, size_t axis,
                                         int64_t step,
                                         const shape_t& out_shape) {
-    if (!gpu_mode_(num_elements(out_shape), kernel_class::elementwise) ||
-        !a.contiguous()) {
-      return std::nullopt;
-    }
-    if (!a.storage_.native) return std::nullopt;
-    auto out = array::empty(out_shape);
-    if (out.size() == 0) return out;
-    if (!out.storage_.native) return std::nullopt;
-    std::vector<int64_t> a_shape(a.shape().begin(), a.shape().end());
-    std::vector<int64_t> out_shape_v(out_shape.begin(), out_shape.end());
-    int rank = static_cast<int>(a_shape.size());
-    if (!gpu::fold(a.storage_.native, a.offset_ * 4, out.storage_.native,
-                  out.offset_ * 4, a_shape.data(), out_shape_v.data(), rank,
-                  static_cast<int>(axis), step, a.size(), out.size())) {
-      return std::nullopt;
-    }
-    return out;
+    return gpu_pad_fold_(a, out_shape,
+                        [&](array& out, std::vector<int64_t>& a_shape,
+                            std::vector<int64_t>& out_shape_v, int rank) {
+                          return gpu::fold(a.storage_.native, a.offset_ * 4,
+                                           out.storage_.native, out.offset_ * 4,
+                                           a_shape.data(), out_shape_v.data(),
+                                           rank, static_cast<int>(axis), step,
+                                           a.size(), out.size());
+                        });
   }
 
   // One topological pass over all roots (MLX-style batch eval), then each
