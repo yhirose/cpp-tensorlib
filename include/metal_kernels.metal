@@ -1144,3 +1144,71 @@ kernel void sum_to_(device const float* a [[buffer(0)]],
   }
   out[t] = sum;
 }
+
+// concat_part: writes `a` (contiguous, one part of an N-ary Tensor.concat)
+// into `out` at `p.shift` (already before*out_strides[axis], a flat
+// element offset) along one axis. One invocation per SOURCE element (this
+// part's own count, `p.n`) -- unlike pad_ above, there is no zero border
+// to fill and no bounds check: concat's parts exhaustively and disjointly
+// cover `out`, so this is a plain scatter, one write per source element,
+// never colliding across the separate per-part dispatches that build up
+// one `out`. Mirrors tensorlib_cuda.cu's own reuse of tl_pad's body for
+// this, just as its own kernel rather than sharing pad_'s PSO (that one
+// dispatches over OUTPUT elements, which this doesn't want).
+struct concat_part_params {
+  uint out_strides[kPadFoldMaxRank];
+  uint a_shape[kPadFoldMaxRank];
+  uint rank;
+  uint shift;
+  uint n;
+};
+
+kernel void concat_part_(device const float* a [[buffer(0)]],
+                         device float* out [[buffer(1)]],
+                         constant concat_part_params& p [[buffer(2)]],
+                         uint i [[thread_position_in_grid]]) {
+  if (i >= p.n) return;
+  uint rem = i;
+  uint dst = 0;
+  for (int d = int(p.rank) - 1; d >= 0; d--) {
+    uint dim = p.a_shape[d];
+    uint coord = rem % dim;
+    rem /= dim;
+    dst += coord * p.out_strides[d];
+  }
+  out[dst + p.shift] = a[i];
+}
+
+// RoPE (rotary position embedding), half-split (GPT-NeoX / HF-llama)
+// convention -- mirrors tensorlib_cuda.cu's own tl_rope. `a` is [rows, D]
+// contiguous (rows = H*T: a [H,T,D] tensor flattened, or [H,D] with T=1);
+// row r's head-dim vector sits at position `pos + (r % T)`; pairs
+// (j, j+D/2) rotate by angle = position * base^(-2j/D). Dispatched flat
+// over rows*(D/2), one invocation per (r, j) pair (CUDA instead grids by
+// row, blocks by D/2 -- every kernel in this file is flat-1D).
+struct rope_params {
+  uint T, D, pos;
+  uint half_;
+  float base;
+  uint n;
+};
+
+kernel void rope_(device const float* x [[buffer(0)]],
+                  device float* out [[buffer(1)]],
+                  constant rope_params& p [[buffer(2)]],
+                  uint i [[thread_position_in_grid]]) {
+  if (i >= p.n) return;
+  uint r = i / p.half_;
+  uint j = i % p.half_;
+  uint t = p.T > 0 ? (r % p.T) : 0u;
+  float position = float(p.pos + t);
+  float theta = pow(p.base, -2.0f * float(j) / float(p.D));
+  float ang = position * theta;
+  float c = cos(ang);
+  float s = sin(ang);
+  uint bi = r * p.D;
+  float x0 = x[bi + j];
+  float x1 = x[bi + j + p.half_];
+  out[bi + j] = x0 * c - x1 * s;
+  out[bi + j + p.half_] = x0 * s + x1 * c;
+}

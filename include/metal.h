@@ -49,7 +49,8 @@ enum class kop {
   where_nd,
   gt_, lt_, ge_, le_, eq_, ne_,  // comparisons -- cmp_op maps onto these
   tanh_, sin_, cos_,             // unary_ext_op maps onto these
-  clamp_, sum_to_                // dedicated ops, mirroring cuda.h's own
+  clamp_, sum_to_,               // dedicated ops, mirroring cuda.h's own
+  concat_part_, rope_            // ditto -- Tensor.concat / RoPE's own dispatch
 };
 
 // Comparisons (gt/lt/ge/le/eq/ne) are deliberately NOT kop values: kop is
@@ -156,6 +157,8 @@ struct context {
       case kop::cos_: return "cos_";
       case kop::clamp_: return "clamp_";
       case kop::sum_to_: return "sum_to_";
+      case kop::concat_part_: return "concat_part_";
+      case kop::rope_: return "rope_";
     }
     return "";
   }
@@ -835,12 +838,97 @@ inline bool sum_to(void* a, int64_t ao, const int64_t* a_shape,
   detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
   return true;
 }
-// concat_part (Tensor.concat along an arbitrary axis, KV-cache append): no
-// Metal kernel yet (CUDA-first, reuses its own pad kernel there). Stub for
-// now -- array.h falls back to the CPU ref:: implementation.
-inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,
-                        const int64_t*, int, int, int64_t, int64_t) {
-  return false;
+namespace detail_ {
+struct concat_part_params {
+  uint32_t out_strides[kPadFoldMaxRank];
+  uint32_t a_shape[kPadFoldMaxRank];
+  uint32_t rank;
+  uint32_t shift;
+  uint32_t n;
+};
+}  // namespace detail_
+
+// concat_part (Tensor.concat along an arbitrary axis, KV-cache append):
+// writes `a` (contiguous, this part) into `out` at `shift` (already
+// before*out_strides[axis], a flat element offset) -- no zeroing, no
+// bounds check, since concat's parts exhaustively cover `out` with no
+// border. cuda.h's own concat_part reuses its tl_pad kernel body for this
+// (writing a source at an axis-shifted offset is exactly what pad already
+// does per element), but this file's pad_ above is a gather dispatched
+// over OUTPUT elements (needed for pad's zero border) rather than the much
+// smaller SOURCE (this part's own) element count concat wants, so this
+// gets its own small kernel instead of reusing pad_'s PSO.
+inline bool concat_part(void* a, int64_t ao, void* out, int64_t oo,
+                        const int64_t* a_shape, const int64_t* out_shape,
+                        int rank, int axis, int64_t before, int64_t n) {
+  auto& c = context::get();
+  if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
+  int64_t out_strides[kPadFoldMaxRank];
+  int64_t acc = 1;
+  for (int d = rank - 1; d >= 0; d--) {
+    out_strides[d] = acc;
+    acc *= out_shape[d];
+  }
+  auto pso = c.pso_(kop::concat_part_);
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  detail_::set_buf_(c.enc, a, ao, 0ul);
+  detail_::set_buf_(c.enc, out, oo, 1ul);
+  detail_::concat_part_params p{};
+  for (int d = 0; d < rank; d++) {
+    p.out_strides[d] = static_cast<uint32_t>(out_strides[d]);
+    p.a_shape[d] = static_cast<uint32_t>(a_shape[d]);
+  }
+  p.rank = static_cast<uint32_t>(rank);
+  p.shift = static_cast<uint32_t>(before * out_strides[axis]);
+  p.n = static_cast<uint32_t>(n);
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), 2ul);
+  unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
+  detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
+  return true;
+}
+
+namespace detail_ {
+struct rope_params {
+  uint32_t T, D, pos;
+  uint32_t half_;
+  float base;
+  uint32_t n;
+};
+}  // namespace detail_
+
+// RoPE (rotary position embedding), half-split (GPT-NeoX / HF-llama)
+// convention -- mirrors tensorlib_cuda.cu's own tl_rope exactly (no fused
+// bias: array.h's gpu_rope_ never passes one). x is [rows, D] contiguous
+// (rows = H*T: a [H,T,D] tensor flattened, or [H,D] with T=1); row r's
+// head-dim vector sits at position `pos + (r % T)`; pairs (j, j+D/2)
+// rotate by angle = position * base^(-2j/D). Dispatched flat over
+// rows*(D/2) (CUDA instead grids by row, blocks by D/2 -- this file's own
+// kernels are all flat-1D, same as sum_to/compare/unary_ext above).
+inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
+                 int64_t pos, float base) {
+  auto& c = context::get();
+  if (!c.device || D <= 0 || (D & 1)) return false;
+  int64_t half = D / 2;
+  int64_t n = rows * half;
+  auto pso = c.pso_(kop::rope_);
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  detail_::set_buf_(c.enc, x, 0, 0ul);
+  detail_::set_buf_(c.enc, out, 0, 1ul);
+  detail_::rope_params p{};
+  p.T = static_cast<uint32_t>(T);
+  p.D = static_cast<uint32_t>(D);
+  p.pos = static_cast<uint32_t>(pos);
+  p.half_ = static_cast<uint32_t>(half);
+  p.base = base;
+  p.n = static_cast<uint32_t>(n);
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), 2ul);
+  unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
+  detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
+  return true;
 }
 
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals
@@ -919,6 +1007,9 @@ inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,
                         const int64_t*, int, int, int64_t, int64_t) {
   return false;
 }
+inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
+  return false;
+}
 
 #endif
 
@@ -931,9 +1022,6 @@ inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
                         int64_t, int64_t, float) {
-  return false;
-}
-inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
   return false;
 }
 inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {

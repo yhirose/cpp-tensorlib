@@ -790,6 +790,29 @@ TEST_CASE("tanh/sin/cos/clamp GPU dispatch matches the CPU oracle") {
   CHECK(c.at({1, 2}) == 1.0f);   // 5.0 clamped to hi
 }
 
+TEST_CASE("rope GPU dispatch matches the CPU oracle") {
+  // [H,D] (decode shape, T=1).
+  auto x = array::from({1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f}, {2, 4});
+  CHECK(matches_gpu_oracle([&] { return array::rope(x, 0, 10000.0f); }));
+  CHECK(matches_gpu_oracle([&] { return array::rope(x, 5, 10000.0f); }));
+
+  // [H,T,D] (prefill shape): row r's position is pos + (r % T).
+  auto y = array::full({2, 3, 8}, 0.5f);
+  CHECK(matches_gpu_oracle([&] { return array::rope(y, 0, 10000.0f); }));
+  CHECK(matches_gpu_oracle([&] { return array::rope(y, 4, 10000.0f); }));
+
+  // fused epilogue composes with rope (same as tanh/sin/cos do).
+  CHECK(matches_gpu_oracle(
+      [&] { return array::rope(x, 2, 10000.0f) * 2.0f - 1.0f; }));
+
+  // correctness spot-check: pos=0 rotates every row by angle 0 (position=0
+  // regardless of theta), so rope is the identity there.
+  auto r0 = array::rope(x, 0, 10000.0f).eval();
+  const float* px = x.raw();
+  const float* pr = r0.raw();
+  for (int64_t i = 0; i < x.size(); i++) CHECK(pr[i] == px[i]);
+}
+
 TEST_CASE("concat GPU dispatch matches the CPU oracle") {
   auto a = array::from({1, 2, 3, 4}, {2, 2});
   auto b = array::from({5, 6, 7, 8}, {2, 2});
