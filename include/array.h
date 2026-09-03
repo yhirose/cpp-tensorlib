@@ -1440,6 +1440,8 @@ inline array index_add(const array& indices, const array& values,
 // indices[...] == k, else 0. Every input position writes a distinct output
 // slot (the axis is brand new), so unlike index_add above there is no
 // accumulation and no write conflict -- `out` starting zeroed is enough.
+// `k` is taken on trust: graph::check_labels_ has already rejected any label
+// outside the new axis before either backend runs.
 inline array scatter_to_axis(const array& indices, const array& values,
                              const shape_t& out_shape) {
   auto out = array::zeros(out_shape);
@@ -2572,6 +2574,36 @@ struct graph {
     return out;
   }
 
+  // The three index ops read their labels out of a tensor, so a label past
+  // the end is bad input rather than a bug in this file -- and unchecked it
+  // is an out-of-bounds write (index_add, scatter_to_axis) or read
+  // (index_select) straight past the buffer, because every kernel indexes
+  // bare-handed by design. Checked here, once, ahead of the backend fork:
+  // the reference walk and the device kernels then agree on which labels are
+  // an error instead of one corrupting memory while the other's gather
+  // quietly returns zeros. `raw()` pulls device-resident labels back to the
+  // host, which is the cost of saying so.
+  //
+  // invalid_argument, the same exception the shape checks on these three ops
+  // already raise: out_of_range would put a caller's mistake in the same
+  // bucket as this library's own logic errors.
+  static void check_labels_(const array& indices, int64_t limit,
+                            const char* what) {
+    const float* p = indices.raw();
+    std::optional<int64_t> bad;
+    for_each_index(indices.shape(), {indices.strides()},
+                   [&](int64_t, const std::vector<int64_t>& off) {
+                     if (bad) return;
+                     auto k = static_cast<int64_t>(std::llround(p[off[0]]));
+                     if (k < 0 || k >= limit) bad = k;
+                   });
+    if (bad) {
+      throw std::invalid_argument(
+          std::string("tl::") + what + ": index " + std::to_string(*bad) +
+          " out of range [0, " + std::to_string(limit) + ")");
+    }
+  }
+
   // index_select's dual — the GPU-dispatch twin of ref::index_add. Repeated
   // indices accumulate (real write conflicts), so the backend kernel needs
   // atomics; the backend also owns zeroing `out` before it runs, the same
@@ -3219,6 +3251,7 @@ struct graph {
       case op_t::index_select_: {
         auto a = in(0);
         auto indices = in(1);
+        check_labels_(indices, a.shape()[0], "index_select");
         if (auto g = gpu_index_select_(a, indices, n.shape)) {
           r = std::move(*g);
         } else {
@@ -3229,6 +3262,7 @@ struct graph {
       case op_t::index_add_: {
         auto indices = in(0);
         auto values = in(1);
+        check_labels_(indices, n.shape[0], "index_add");
         if (auto g = gpu_index_add_(indices, values, n.shape)) {
           r = std::move(*g);
         } else {
@@ -3239,6 +3273,7 @@ struct graph {
       case op_t::scatter_axis_: {
         auto indices = in(0);
         auto values = in(1);
+        check_labels_(indices, n.shape.back(), "scatter_to_axis");
         if (auto g = gpu_scatter_to_axis_(indices, values, n.shape)) {
           r = std::move(*g);
         } else {

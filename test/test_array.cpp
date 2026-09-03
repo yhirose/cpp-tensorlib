@@ -1453,6 +1453,27 @@ TEST_CASE("scatter_to_axis: is the exact shape Pooling's own backward needs "
   CHECK(out.sum() == doctest::Approx(1 + 2 + 3 + 4));  // every other slot is 0
 }
 
+TEST_CASE("index ops: a label outside the target throws at eval") {
+  // Unchecked, these were an out-of-bounds read (index_select) and two
+  // out-of-bounds WRITES (index_add, scatter_to_axis). The check is at eval
+  // rather than at construction, because that is when the labels exist: they
+  // are a tensor, and this one may itself be the result of a graph.
+  auto table = random_array({4, 2}, 37);
+  CHECK_THROWS(table.index_select(array::from({0, 4}, {2})).eval());
+  CHECK_THROWS(table.index_select(array::from({-1}, {1})).eval());
+
+  auto row = random_array({1, 2}, 38);
+  CHECK_THROWS(tl::index_add(array::from({4}, {1}), row, {4, 2}).eval());
+
+  auto vals = random_array({3}, 39);
+  CHECK_THROWS(tl::scatter_to_axis(array::from({0, 1, 4}, {3}), vals, 4).eval());
+
+  // The last in-range label is still in range.
+  CHECK_NOTHROW(table.index_select(array::from({3}, {1})).eval());
+  CHECK_NOTHROW(
+      tl::scatter_to_axis(array::from({0, 1, 3}, {3}), vals, 4).eval());
+}
+
 TEST_CASE("scatter_to_axis: mismatched indices/values shape throws") {
   auto idx = array::from({0, 1}, {2});
   auto values = random_array({3}, 36);
