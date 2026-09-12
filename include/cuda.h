@@ -1854,13 +1854,19 @@ struct kv_cache {
   }
 };
 
-// C(m,n) = (A @ B) * scale + offset. lda/ldb row strides; trans reads a
-// transposed view in place. One output per thread (16×16 blocks).
-inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
-                 int64_t ldb, bool tb, void* out, int64_t oo, int64_t m,
-                 int64_t n, int64_t k, float scale, float offset) {
+// C[bi](m,n) = (A[bi] @ B[bi]) * scale + offset for bi < batch, the batch
+// elements sa/sb floats apart (0 broadcasts) and C's packed at m·n. lda/ldb
+// row strides; trans reads a transposed view in place. One launch: the batch
+// rides on gridDim.z next to split-K. batch == 1 is the plain GEMM and keeps
+// the one-output-per-thread fallback (tl_sgemm) for the layouts the fast path
+// declines; batch > 1 has no fallback here and returns false, so the caller
+// loops per slice.
+inline bool gemm_batched(void* a, int64_t ao, int64_t lda, bool ta, int64_t sa,
+                         void* b, int64_t bo, int64_t ldb, bool tb, int64_t sb,
+                         void* out, int64_t oo, int64_t m, int64_t n, int64_t k,
+                         int64_t batch, float scale, float offset) {
   auto& c = context::get();
-  if (!c.ready) return false;
+  if (!c.ready || batch < 1) return false;
   c.device_read_(a);
   c.device_read_(b);
   c.device_write_(out);
@@ -1873,13 +1879,19 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
   // operand contiguous in its own layout (lda == k, or == m for a transposed
   // view; ldb == n, or == k transposed), K%8==0 for the 8-slab, the dim a
   // float4 load runs along a multiple of 4 (N for NN's B, M for TN's A; K%8
-  // covers the K-contiguous operands), and 16B-aligned bases. M and N block
-  // edges are predicated in-kernel. Strided views, odd K and unaligned offsets
-  // fall to tl_sgemm.
-  bool aligned = (ao % 16 == 0) && (bo % 16 == 0) && (oo % 16 == 0);
+  // covers the K-contiguous operands), and 16B-aligned bases — for every
+  // batch element, so the A/B batch strides are multiples of 4 floats (C is
+  // stored per element) and fit the kernel's 32-bit stride. M and N block
+  // edges are predicated in-kernel. Strided views, odd K and unaligned
+  // offsets fall to tl_sgemm.
+  bool aligned = (ao % 16 == 0) && (bo % 16 == 0) && (oo % 16 == 0) &&
+                 sa % 4 == 0 && sb % 4 == 0;
   bool a_ok = ta ? (lda == m && m % 4 == 0) : (lda == k);
   bool b_ok = tb ? (ldb == k) : (ldb == n && n % 4 == 0);
-  if (a_ok && b_ok && k % 8 == 0 && aligned && m > 0 && n > 0 && k > 0) {
+  bool strides_fit = sa >= 0 && sb >= 0 && sa <= (int64_t)UINT32_MAX &&
+                     sb <= (int64_t)UINT32_MAX && m * n <= (int64_t)UINT32_MAX;
+  if (a_ok && b_ok && k % 8 == 0 && aligned && strides_fit && m > 0 && n > 0 &&
+      k > 0) {
     unsigned gx = (un + 127) / 128, gy = (um + 127) / 128;
 
     if (CUfunction f = c.sgemm_rb_(ta, tb)) {
@@ -1893,10 +1905,12 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
       // 0.63→0.75, 2048³ 0.74→0.76); S≥4 regresses as C-atomic traffic + short-K
       // per-block overhead overtake the occupancy gain, and 4096³ (6 waves) wants
       // S=1. So auto uses S=2 for base<512 with K≥512 (each half ≥256, enough to
-      // amortize the smem pipeline). TL_SPLITK forces S for the census.
+      // amortize the smem pipeline). The batch counts toward the base blocks, so
+      // a batched product that already fills the GPU declines to split.
+      // TL_SPLITK forces S for the census.
       unsigned S = 1, ksplit = uk;
       if (scale == 1.0f && offset == 0.0f) {
-        long base = (long)gx * gy;
+        long base = (long)gx * gy * batch;
         long want = -1;
         if (const char* e = std::getenv("TL_SPLITK"))
           want = std::atol(e);
@@ -1910,13 +1924,18 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
           if (s > 1) { S = s; ksplit = chunk; }
         }
       }
-
-      if (S > 1) c.d.MemsetD8(reinterpret_cast<CUdeviceptr>(po), 0,
-                              (size_t)m * n * 4);  // zero C for atomicAdd
-      return c.launch_(f, {gx, gy, S}, {256}, 0, pa, pb, po, um, un, uk, scale,
-                       offset, ksplit);
+      // gridDim.z carries batch × S; the driver caps it at 65535.
+      if ((int64_t)S * batch <= 65535) {
+        if (S > 1) c.d.MemsetD8(reinterpret_cast<CUdeviceptr>(po), 0,
+                                (size_t)batch * m * n * 4);  // zero C for atomicAdd
+        unsigned usa = (unsigned)sa, usb = (unsigned)sb, usc = (unsigned)(m * n),
+                 uz = (unsigned)(S * batch);
+        return c.launch_(f, {gx, gy, uz}, {256}, 0, pa, pb, po, um, un, uk, scale,
+                         offset, ksplit, usa, usb, usc);
+      }
     }
   }
+  if (batch != 1) return false;
 
   unsigned ula = (unsigned)lda, ulb = (unsigned)ldb;
   unsigned uta = ta ? 1u : 0u, utb = tb ? 1u : 0u;
@@ -1927,6 +1946,14 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
   // kop::sgemm32 is routed to tl_sgemm by kernel_name_.
   return c.launch_(c.fn_(kop::sgemm32), {gx, gy}, {bx, by}, 0, pa, pb, po, um,
                    un, uk, ula, ulb, uta, utb, scale, offset);
+}
+
+// C(m,n) = (A @ B) * scale + offset: the batch == 1 case of gemm_batched.
+inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
+                 int64_t ldb, bool tb, void* out, int64_t oo, int64_t m,
+                 int64_t n, int64_t k, float scale, float offset) {
+  return gemm_batched(a, ao, lda, ta, 0, b, bo, ldb, tb, 0, out, oo, m, n, k, 1,
+                      scale, offset);
 }
 
 // Row op over the last axis: softmax writes rows×cols; row_sum/row_max write
@@ -1974,6 +2001,11 @@ inline bool unary(kop, void*, int64_t, void*, int64_t, int64_t, float, float) {
 }
 inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
                  void*, int64_t, int64_t, int64_t, int64_t, float, float) {
+  return false;
+}
+inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
+                         int64_t, int64_t, bool, int64_t, void*, int64_t,
+                         int64_t, int64_t, int64_t, int64_t, float, float) {
   return false;
 }
 inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,

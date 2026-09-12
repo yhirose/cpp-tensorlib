@@ -581,13 +581,19 @@ __global__ void tl_sgemm(const float* A, const float* B, float* C, unsigned m,
 // K-contiguous ones), all base offsets folded in and 16B-aligned. M and N
 // block edges are predicated (zero-filled loads, guarded stores).
 //
-// Split-K (ladder ②): gridDim.z = S partitions the K axis so S× more blocks
-// fill the SMs at mid sizes (1024³/2048³ underfill 82 SMs with 128² tiles).
-// blockIdx.z picks the split; ksplit is the per-split K chunk (a multiple of
-// TL_BK, so slab boundaries stay aligned). When S>1 each split atomicAdds its
-// partial into a pre-zeroed C (scale/offset must be identity — the host gates
-// on that); when S==1 (ksplit>=k) the epilogue is the normal fused store, so
-// the non-split path is bit-identical to before.
+// Split-K (ladder ②): S = ceil(k/ksplit) partitions the K axis so S× more
+// blocks fill the SMs at mid sizes (1024³/2048³ underfill 82 SMs with 128²
+// tiles). ksplit is the per-split K chunk (a multiple of TL_BK, so slab
+// boundaries stay aligned). When S>1 each split atomicAdds its partial into a
+// pre-zeroed C (scale/offset must be identity — the host gates on that); when
+// S==1 (ksplit>=k) the epilogue is the normal fused store, so the non-split
+// path is bit-identical to before.
+//
+// Batching: gridDim.z = batch × S, blockIdx.z / S picks the batch element and
+// blockIdx.z % S its K split. sa/sb/sc are the per-batch element strides of
+// A/B/C (0 for a broadcast operand), so a batched matmul over [batch,m,k] ·
+// [batch,k,n] is one launch instead of `batch` of them; batch == 1 with zero
+// strides is the plain GEMM.
 }  // close extern "C": the __device__ core template below can't have C linkage;
    // each __global__ wrapper re-declares its own for a stable symbol.
 #define TL_BM 128
@@ -604,7 +610,9 @@ __device__ __forceinline__ void sgemm_rb_core(const float* __restrict__ A,
                                               const float* __restrict__ B,
                                               float* __restrict__ C, unsigned m,
                                               unsigned n, unsigned k, float scale,
-                                              float offset, unsigned ksplit) {
+                                              float offset, unsigned ksplit,
+                                              unsigned sa, unsigned sb,
+                                              unsigned sc) {
   __shared__ float As[2][TL_BK][TL_BM];  // double-buffered, transposed
   __shared__ float Bs[2][TL_BK][TL_BN];
 
@@ -612,8 +620,14 @@ __device__ __forceinline__ void sgemm_rb_core(const float* __restrict__ A,
   const unsigned blockCol = blockIdx.x * TL_BN;
   const unsigned tid = threadIdx.x;  // 0..255
 
-  // split-K K-range for this z-slice (multiple of TL_BK; identity when S==1)
-  const unsigned k0 = blockIdx.z * ksplit;
+  // z = batch element × K split: step the operands to this batch element,
+  // then take the split's K-range (a multiple of TL_BK; identity when S==1)
+  const unsigned S = (k + ksplit - 1) / ksplit;
+  const unsigned bi = blockIdx.z / S;
+  A += (size_t)bi * sa;
+  B += (size_t)bi * sb;
+  C += (size_t)bi * sc;
+  const unsigned k0 = (blockIdx.z % S) * ksplit;
   if (k0 >= k) return;
   const unsigned k1 = (k0 + ksplit < k) ? (k0 + ksplit) : k;
 
@@ -707,9 +721,9 @@ __device__ __forceinline__ void sgemm_rb_core(const float* __restrict__ A,
 
   // --- epilogue: guarded store (mirror the load map) ---
   // S==1: fused affine store. S>1: atomicAdd the raw partial into a pre-zeroed
-  // C (scale/offset are identity on this path, gated host-side). gridDim.z is
+  // C (scale/offset are identity on this path, gated host-side). ksplit is
   // uniform across the block, so the branch never diverges.
-  const bool split = gridDim.z > 1;
+  const bool split = ksplit < k;
 #pragma unroll
   for (unsigned i = 0; i < TL_TM; i++) {
     unsigned gRow = blockRow + warpRow * TL_WM + threadRowInWarp * TL_TM + i;
@@ -742,23 +756,27 @@ __device__ __forceinline__ void sgemm_rb_core(const float* __restrict__ A,
 #undef TL_TNSUB
 extern "C" __global__ void tl_sgemm_rb(const float* __restrict__ A,
     const float* __restrict__ B, float* __restrict__ C, unsigned m, unsigned n,
-    unsigned k, float scale, float offset, unsigned ksplit) {
-  sgemm_rb_core<false, false>(A, B, C, m, n, k, scale, offset, ksplit);
+    unsigned k, float scale, float offset, unsigned ksplit, unsigned sa,
+    unsigned sb, unsigned sc) {
+  sgemm_rb_core<false, false>(A, B, C, m, n, k, scale, offset, ksplit, sa, sb, sc);
 }
 extern "C" __global__ void tl_sgemm_rb_nt(const float* __restrict__ A,
     const float* __restrict__ B, float* __restrict__ C, unsigned m, unsigned n,
-    unsigned k, float scale, float offset, unsigned ksplit) {
-  sgemm_rb_core<false, true>(A, B, C, m, n, k, scale, offset, ksplit);
+    unsigned k, float scale, float offset, unsigned ksplit, unsigned sa,
+    unsigned sb, unsigned sc) {
+  sgemm_rb_core<false, true>(A, B, C, m, n, k, scale, offset, ksplit, sa, sb, sc);
 }
 extern "C" __global__ void tl_sgemm_rb_tn(const float* __restrict__ A,
     const float* __restrict__ B, float* __restrict__ C, unsigned m, unsigned n,
-    unsigned k, float scale, float offset, unsigned ksplit) {
-  sgemm_rb_core<true, false>(A, B, C, m, n, k, scale, offset, ksplit);
+    unsigned k, float scale, float offset, unsigned ksplit, unsigned sa,
+    unsigned sb, unsigned sc) {
+  sgemm_rb_core<true, false>(A, B, C, m, n, k, scale, offset, ksplit, sa, sb, sc);
 }
 extern "C" __global__ void tl_sgemm_rb_tt(const float* __restrict__ A,
     const float* __restrict__ B, float* __restrict__ C, unsigned m, unsigned n,
-    unsigned k, float scale, float offset, unsigned ksplit) {
-  sgemm_rb_core<true, true>(A, B, C, m, n, k, scale, offset, ksplit);
+    unsigned k, float scale, float offset, unsigned ksplit, unsigned sa,
+    unsigned sb, unsigned sc) {
+  sgemm_rb_core<true, true>(A, B, C, m, n, k, scale, offset, ksplit, sa, sb, sc);
 }
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 

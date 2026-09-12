@@ -439,6 +439,14 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b,
   return true;
 }
 
+// Batched GEMM in one launch: not on this backend yet — array.h's batched dot
+// loops gemm per slice when this declines (CUDA folds the batch into its grid).
+inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
+                         int64_t, int64_t, bool, int64_t, void*, int64_t,
+                         int64_t, int64_t, int64_t, int64_t, float, float) {
+  return false;
+}
+
 // Row-wise op over the last axis (cols): softmax writes rows×cols; row_sum/
 // row_max write one value per row (rows), with the affine epilogue.
 inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
@@ -952,6 +960,11 @@ inline bool unary(kop, void*, int64_t, void*, int64_t, int64_t, float, float) {
 }
 inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
                  void*, int64_t, int64_t, int64_t, int64_t, float, float) {
+  return false;
+}
+inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
+                         int64_t, int64_t, bool, int64_t, void*, int64_t,
+                         int64_t, int64_t, int64_t, int64_t, float, float) {
   return false;
 }
 inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t,

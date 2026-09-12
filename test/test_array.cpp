@@ -273,6 +273,46 @@ TEST_CASE("batched dot: GPU dispatch matches the ref oracle") {
   }));
 }
 
+TEST_CASE("batched dot: one-launch GPU gemm matches the ref oracle") {
+  // Shapes the register-blocked kernel takes whole, with the batch folded into
+  // its grid: a whole tile per slice; m and n off the tile; the split-K
+  // trigger (base blocks × batch < 512 with K >= 512, so z = batch × 2); the
+  // attention probs·v shape (NN) and scores shape (NT); and rank 4 whose two
+  // batch axes collapse to one stride. Then the layouts the one-launch path
+  // must hand back to the per-slice loop: n not a multiple of 4 on NN, K odd,
+  // a permuted batch axis, a size-1 batch axis in the middle (which still
+  // collapses), and the fused epilogue (which the split-K path declines).
+  struct { int64_t batch, m, k, n; } shapes[] = {
+      {4, 128, 64, 128}, {3, 129, 64, 130}, {4, 200, 1024, 136},
+      {8, 256, 256, 64}, {2, 96, 8, 32},
+  };
+  int seed = 700;
+  for (auto s : shapes) {
+    auto A = random_array({s.batch, s.m, s.k}, seed++);
+    auto B = random_array({s.batch, s.k, s.n}, seed++);
+    auto Bt = random_array({s.batch, s.n, s.k}, seed++);
+    auto At = random_array({s.batch, s.k, s.m}, seed++);
+    const float rtol = 1e-4f, atol = std::max(1e-5f, 2e-7f * (float)s.k);
+    CHECK(matches_gpu_oracle([&] { return A.dot(B); }, rtol, atol));
+    CHECK(matches_gpu_oracle([&] { return A.dot(Bt.transpose({0, 2, 1})); }, rtol, atol));
+    CHECK(matches_gpu_oracle([&] { return At.transpose({0, 2, 1}).dot(B); }, rtol, atol));
+    CHECK(matches_gpu_oracle([&] { return A.dot(B) * 0.5f + 1.0f; }, rtol, atol));
+  }
+  auto A4 = random_array({2, 3, 64, 32}, seed++);
+  auto B4 = random_array({2, 3, 32, 64}, seed++);
+  CHECK(matches_gpu_oracle([&] { return A4.dot(B4); }));
+  CHECK(matches_gpu_oracle([&] { return A4.transpose({1, 0, 2, 3}).dot(B4.transpose({1, 0, 2, 3})); }));
+  CHECK(matches_gpu_oracle([&] {
+    return A4.reshape({2, 1, 3, 64, 32}).dot(B4.reshape({2, 1, 3, 32, 64}));
+  }));
+  CHECK(matches_gpu_oracle([&] {
+    return random_array({4, 64, 8}, 800).dot(random_array({4, 8, 33}, 801));
+  }));
+  CHECK(matches_gpu_oracle([&] {
+    return random_array({4, 33, 17}, 802).dot(random_array({4, 17, 31}, 803));
+  }));
+}
+
 TEST_CASE("batched dot: own CPU gemm per slice matches the ref oracle") {
   // The same shapes through cpu_bdot_ (cpu::sgemm per slice, strides passed
   // through) against ref::bdot, plain and with permuted operands.

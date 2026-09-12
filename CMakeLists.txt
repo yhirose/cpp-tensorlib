@@ -258,6 +258,11 @@ target_link_libraries(tensorlib_census_pool_latency PRIVATE tensorlib)
 add_executable(tensorlib_census_gemm_layout misc/census_gemm_layout.cpp)
 target_link_libraries(tensorlib_census_gemm_layout PRIVATE tensorlib)
 
+# Batched-GEMM launch census (misc/census_gemm_batched.cpp): one launch with
+# the batch on the grid vs a per-slice loop, at attention's shapes. GPU only.
+add_executable(tensorlib_census_gemm_batched misc/census_gemm_batched.cpp)
+target_link_libraries(tensorlib_census_gemm_batched PRIVATE tensorlib)
+
 # Local-LLM shape bench — the dev harness for M7-M9 (decode/prefill GEMM +
 # attention at real decoder-layer shapes). Same backend-agnostic array API.
 add_executable(tensorlib_bench_llm bench/shared/speed/bench_llm.cpp)
@@ -283,6 +288,7 @@ if(TENSORLIB_CUDA)
   tensorlib_enable_cuda(tensorlib_bench)
   tensorlib_enable_cuda(tensorlib_census)
   tensorlib_enable_cuda(tensorlib_census_gemm_layout)
+  tensorlib_enable_cuda(tensorlib_census_gemm_batched)
   tensorlib_enable_cuda(tensorlib_bench_llm)
   tensorlib_enable_cuda(tensorlib_bench_mlp)
   tensorlib_enable_cuda(tensorlib_check_llm_block)

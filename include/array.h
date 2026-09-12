@@ -2348,17 +2348,40 @@ struct graph {
     }
   };
 
-  // Batched matmul, GPU dispatch: a per-slice loop over the same gpu::gemm
-  // single-matmul entry point above, one launch per batch element on the same
-  // device queue — real backend acceleration per slice, not yet one fused
-  // batched kernel (no backend has one; a future optimization if profiling
-  // shows the per-slice launch count matters more than the FLOPs do). Each
-  // slice's 2-D layout is gemm_classify_'s "row-major or its transpose", so a
-  // permuted view goes to the kernel's transposed operand rather than
-  // declining — attention's q·kᵀ used to fall all the way to ref::bdot over
-  // that (57 ms against 0.1 for the same product plain). The fused scale/
-  // offset go into each launch's epilogue like gpu_gemm's, so `q·kᵀ * scale`
-  // never round-trips 2M scores through the host affine tail.
+  // The batch axes of x as one linear stride, when they walk like a single
+  // axis (each stride the product of the inner batch extents — the array's
+  // own layout, or a slice of it; size-1 axes don't count): what a backend's
+  // one-launch batched gemm can step by. nullopt for a permuted batch (a
+  // [B,H,…] view transposed to [H,B,…]) and for a broadcast one, which walk
+  // the batch_walk_ odometer per slice instead.
+  static std::optional<int64_t> batch_stride_(const array& x) {
+    size_t r = x.rank();
+    int64_t stride = 0, extent = 1;
+    for (size_t d = r - 2; d-- > 0;) {
+      if (x.shape()[d] == 1) continue;
+      if (extent == 1) {
+        stride = x.strides()[d];
+      } else if (x.strides()[d] != stride * extent) {
+        return std::nullopt;
+      }
+      extent *= x.shape()[d];
+    }
+    return stride;
+  }
+
+  // Batched matmul, GPU dispatch. Each slice's 2-D layout is gemm_classify_'s
+  // "row-major or its transpose", so a permuted view goes to the kernel's
+  // transposed operand rather than declining — attention's q·kᵀ used to fall
+  // all the way to ref::bdot over that (57 ms against 0.1 for the same
+  // product plain). When the batch axes collapse to one stride per operand
+  // the whole product is one gpu::gemm_batched launch (CUDA folds the batch
+  // into its grid; the other backends decline); otherwise, or when the
+  // backend declines a layout, it is a per-slice loop over the same gpu::gemm
+  // entry point above, one launch per batch element on the same device queue
+  // (H launches for attention's probs·v cost 0.43 ms against 0.1 fused).
+  // The fused scale/offset go into the launch's epilogue like gpu_gemm's, so
+  // `q·kᵀ * scale` never round-trips 2M scores through the host affine tail.
+  // TL_BDOT_PER_SLICE forces the loop, for the census.
   static std::optional<array> gpu_bdot_(const node& n, const array& a,
                                         const array& b) {
     size_t r = a.rank();
@@ -2378,6 +2401,15 @@ struct graph {
     auto out = array::empty(out_shape);
     if (!out.storage_.native) return std::nullopt;
     if (m == 0 || nn == 0 || batch == 0) return out;
+    static const bool per_slice = std::getenv("TL_BDOT_PER_SLICE") != nullptr;
+    auto sa = batch_stride_(a), sb = batch_stride_(b);
+    if (!per_slice && sa && sb &&
+        gpu::gemm_batched(a.storage_.native, a.offset_ * 4, la->ld, la->trans,
+                          *sa, b.storage_.native, b.offset_ * 4, lb->ld,
+                          lb->trans, *sb, out.storage_.native, out.offset_ * 4,
+                          m, nn, k, batch, n.scale, n.offset)) {
+      return out;
+    }
     batch_walk_ w(r - 2);
     for (int64_t bi = 0; bi < batch; bi++, w.step(a)) {
       if (!gpu::gemm(a.storage_.native, w.offset(a) * 4, la->ld, la->trans,

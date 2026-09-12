@@ -13,3 +13,7 @@ gemv_bf16
 gemv_q4
 attn_decode
 attn_prefill
+
+# One-launch batched GEMM (the batch on gridDim.z next to split-K). CUDA-first
+# for attention's probs·v; Metal/WebGPU loop gemm per slice meanwhile.
+gemm_batched
