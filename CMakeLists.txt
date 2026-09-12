@@ -248,6 +248,16 @@ target_link_libraries(tensorlib_census PRIVATE tensorlib)
 add_executable(tensorlib_census_cpu_threads misc/census_cpu_threads.cpp)
 target_link_libraries(tensorlib_census_cpu_threads PRIVATE tensorlib)
 
+# Thread-pool round-trip census (misc/census_pool_latency.cpp): the wake+join
+# cost per thread count, and the thread floor it implies. CPU only.
+add_executable(tensorlib_census_pool_latency misc/census_pool_latency.cpp)
+target_link_libraries(tensorlib_census_pool_latency PRIVATE tensorlib)
+
+# GEMM operand-layout census (misc/census_gemm_layout.cpp): NN/NT/TN/TT on
+# both devices — where a backend's fast kernel is NN-only, the cliff shows.
+add_executable(tensorlib_census_gemm_layout misc/census_gemm_layout.cpp)
+target_link_libraries(tensorlib_census_gemm_layout PRIVATE tensorlib)
+
 # Local-LLM shape bench — the dev harness for M7-M9 (decode/prefill GEMM +
 # attention at real decoder-layer shapes). Same backend-agnostic array API.
 add_executable(tensorlib_bench_llm bench/shared/speed/bench_llm.cpp)
@@ -272,6 +282,7 @@ add_test(NAME llm_block COMMAND tensorlib_check_llm_block)
 if(TENSORLIB_CUDA)
   tensorlib_enable_cuda(tensorlib_bench)
   tensorlib_enable_cuda(tensorlib_census)
+  tensorlib_enable_cuda(tensorlib_census_gemm_layout)
   tensorlib_enable_cuda(tensorlib_bench_llm)
   tensorlib_enable_cuda(tensorlib_bench_mlp)
   tensorlib_enable_cuda(tensorlib_check_llm_block)
