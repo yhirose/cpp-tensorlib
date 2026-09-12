@@ -2356,9 +2356,11 @@ struct graph {
   // slice's 2-D layout is gemm_classify_'s "row-major or its transpose", so a
   // permuted view goes to the kernel's transposed operand rather than
   // declining — attention's q·kᵀ used to fall all the way to ref::bdot over
-  // that (57 ms against 0.1 for the same product plain). No scale/offset
-  // (matching gpu_gemm's caller): eval_one's shared epilogue applies those.
-  static std::optional<array> gpu_bdot_(const array& a, const array& b) {
+  // that (57 ms against 0.1 for the same product plain). The fused scale/
+  // offset go into each launch's epilogue like gpu_gemm's, so `q·kᵀ * scale`
+  // never round-trips 2M scores through the host affine tail.
+  static std::optional<array> gpu_bdot_(const node& n, const array& a,
+                                        const array& b) {
     size_t r = a.rank();
     int64_t m = a.shape()[r - 2], k = a.shape()[r - 1], nn = b.shape().back();
     int64_t batch = 1;
@@ -2381,7 +2383,7 @@ struct graph {
       if (!gpu::gemm(a.storage_.native, w.offset(a) * 4, la->ld, la->trans,
                      b.storage_.native, w.offset(b) * 4, lb->ld, lb->trans,
                      out.storage_.native, (out.offset_ + bi * m * nn) * 4, m,
-                     nn, k, 1.0f, 0.0f)) {
+                     nn, k, n.scale, n.offset)) {
         return std::nullopt;
       }
     }
@@ -2390,9 +2392,11 @@ struct graph {
 
   // Batched matmul on the own CPU backend: one stride-aware cpu::sgemm per
   // slice (a transposed view passes its strides through, no packing detour),
-  // walking the batch like gpu_bdot_. Gated by cpu::enabled_ as cpu_gemm is,
-  // so oracle tests can force ref::bdot.
-  static std::optional<array> cpu_bdot_(const array& a, const array& b) {
+  // walking the batch like gpu_bdot_; the scale rides as alpha and the offset
+  // is the same post-pass cpu_gemm's caller uses. Gated by cpu::enabled_ as
+  // cpu_gemm is, so oracle tests can force ref::bdot.
+  static std::optional<array> cpu_bdot_(const node& n, const array& a,
+                                        const array& b) {
     if (!cpu::enabled_) return std::nullopt;
     size_t r = a.rank();
     int64_t m = a.shape()[r - 2], k = a.shape()[r - 1], nn = b.shape().back();
@@ -2411,8 +2415,9 @@ struct graph {
     batch_walk_ w(r - 2);
     for (int64_t bi = 0; bi < batch; bi++, w.step(a)) {
       cpu::sgemm(pa + w.offset(a), as[r - 2], as[r - 1], pb + w.offset(b),
-                 bs[r - 2], bs[r - 1], po + bi * m * nn, m, nn, k, 1.0f);
+                 bs[r - 2], bs[r - 1], po + bi * m * nn, m, nn, k, n.scale);
     }
+    apply_dot_offset_(out, n.offset);
     return out;
   }
 
@@ -2574,8 +2579,50 @@ struct graph {
     return out;
   }
 
-  // CPU reference causal prefill attention (fallback / non-GPU builds): row t
-  // of head h is the decode reference over the keys 0..t.
+  // Causal prefill attention on the own CPU backend: per head, the scores
+  // [T,T] as one stride-aware cpu::sgemm against Kᵀ (a stride pair, no copy),
+  // a causal softmax over each row's keys 0..t (the rest set to 0), and the
+  // context as a second sgemm. Auto mode sends the small shapes here, so this
+  // is the path a modest model trains on — 3x the composed dot/softmax/dot
+  // the scalar reference below sat at. Gated by cpu::enabled_ like cpu_gemm.
+  static std::optional<array> cpu_attn_prefill_(const array& q, const array& K,
+                                                const array& V, float scale) {
+    if (!cpu::enabled_) return std::nullopt;
+    int64_t H = q.shape()[0], T = q.shape()[1], D = q.shape()[2];
+    array out = array::empty({H, T, D});
+    if (H == 0 || T == 0 || D == 0) return out;
+    const float* pq = q.raw();
+    const float* pk = K.raw();
+    const float* pv = V.raw();
+    float* po = out.data();
+    std::vector<float> s(static_cast<size_t>(T * T));
+    for (int64_t h = 0; h < H; h++) {
+      const float* qh = pq + h * T * D;
+      const float* Kh = pk + h * T * D;
+      const float* Vh = pv + h * T * D;
+      // S = scale · q_h · K_hᵀ: B(p, j) = K_h[j*D + p], i.e. strides (1, D).
+      cpu::sgemm(qh, D, 1, Kh, 1, D, s.data(), T, T, D, scale);
+      for (int64_t t = 0; t < T; t++) {
+        float* row = s.data() + t * T;
+        float mx = -std::numeric_limits<float>::infinity();
+        for (int64_t j = 0; j <= t; j++) mx = std::max(mx, row[j]);
+        float sum = 0;
+        for (int64_t j = 0; j <= t; j++) {
+          row[j] = std::exp(row[j] - mx);
+          sum += row[j];
+        }
+        float inv = 1.0f / sum;
+        for (int64_t j = 0; j <= t; j++) row[j] *= inv;
+        for (int64_t j = t + 1; j < T; j++) row[j] = 0.0f;
+      }
+      cpu::sgemm(s.data(), T, 1, Vh, D, 1, po + h * T * D, T, D, T, 1.0f);
+    }
+    return out;
+  }
+
+  // CPU reference causal prefill attention (the oracle, and the fallback when
+  // cpu::enabled_ is off): row t of head h is the decode reference over the
+  // keys 0..t.
   static array ref_attn_prefill_(const array& q, const array& K,
                                  const array& V, float scale) {
     int64_t H = q.shape()[0], T = q.shape()[1], D = q.shape()[2];
@@ -3348,10 +3395,12 @@ struct graph {
         // scalar oracle when both decline.
         if (n.inputs[0]->shape.size() > 2 || n.inputs[1]->shape.size() > 2) {
           auto a = in(0), b = in(1);
-          if (auto g = gpu_bdot_(a, b)) {
+          if (auto g = gpu_bdot_(n, a, b)) {
             r = std::move(*g);
-          } else if (auto c = cpu_bdot_(a, b)) {
+            epi_done = true;
+          } else if (auto c = cpu_bdot_(n, a, b)) {
             r = std::move(*c);
+            epi_done = true;
           } else {
             r = ref::bdot(a, b);
           }
@@ -3403,6 +3452,8 @@ struct graph {
                                        wrap(*n.inputs[1]),
                                        wrap(*n.inputs[2]))) {
           r = std::move(*g);
+        } else if (auto c = cpu_attn_prefill_(in(0), in(1), in(2), n.arg0)) {
+          r = std::move(*c);
         } else {
           r = ref_attn_prefill_(in(0), in(1), in(2), n.arg0);
         }

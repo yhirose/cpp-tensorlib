@@ -1096,6 +1096,14 @@ TEST_CASE("fused prefill attention matches an explicit causal softmax(qKt)V") {
     }
   }
 
+  // the own-CPU path (sgemm scores, causal softmax, sgemm context) against
+  // the scalar reference it replaces, at a size past the tiny-tensor cutoffs
+  CHECK(cpu_matches_ref([&] {
+    return tl::array::attn_prefill(random_array({3, 40, 64}, 813),
+                                   random_array({3, 40, 64}, 814),
+                                   random_array({3, 40, 64}, 815), scale);
+  }));
+
   // shape validation: q, K, V must all be [H,T,D] and agree
   CHECK_THROWS(tl::array::attn_prefill(q.reshape({H * T, D}), K, V, scale));
   CHECK_THROWS(tl::array::attn_prefill(q, K, V.reshape({H, D, T}), scale));
