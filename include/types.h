@@ -122,18 +122,21 @@ inline int64_t auto_threshold_(kernel_class kc) {
     case kernel_class::reduction: return 200'000;       // ~2e5 elements
   }
 #elif defined(TENSORLIB_CUDA)
-  // RTX 3090 (sm_86) census 2026-07-04, misc/census.cpp. No AMX rival on the
-  // CPU side (own BLIS), so the GPU wins far earlier than on Apple's Metal:
-  //   matmul      64^3=2.6e5 already GPU (0.038 vs cpu 0.152 ms) — crossover
-  //               is at/below the smallest measured size; below trivial matmul
-  //               that CPU handles cheaply anyway.
-  //   elementwise 256K tie (0.374 vs 0.377), 1M GPU (0.438 vs 0.575) → ~5e5.
-  //   reduction   softmax 16K already GPU (0.034 vs 0.044); CPU's per-row loop
-  //               is slow, GPU wins from the smallest measured size.
+  // RTX 3090 (sm_86) + 20-thread Zen census 2026-09-12, misc/census.cpp. No
+  // AMX rival on the CPU side (own BLIS), so the GPU still wins earlier than
+  // on Apple's Metal — but not as early as the 2026-07-04 census said: that
+  // one measured a CPU gemm paying the thread pool's wake+join on every
+  // call (64^3 "0.152 ms" was ~0.008 ms of arithmetic), so its matmul
+  // crossover sat at 2e5 and sent MNIST-sized gemms to the GPU.
+  //   matmul      64^3=2.6e5 cpu (0.008 vs gpu 0.027 ms), 128^3=2.1e6 cpu
+  //               (0.037 vs 0.052), 256^3=1.7e7 GPU (0.165 vs 0.078) → ~6e6.
+  //   elementwise 64K cpu (0.005 vs 0.022), 256K GPU (0.042 vs 0.023) → ~1.5e5.
+  //   reduction   softmax 64x256=16K a tie (0.039 vs 0.040), 65536 GPU at
+  //               every row width (0.154 vs 0.042) → ~3e4.
   switch (kc) {
-    case kernel_class::matmul: return 200'000;          // ~58^3; GPU by 64^3
-    case kernel_class::elementwise: return 500'000;     // tie ~256K, GPU by 1M
-    case kernel_class::reduction: return 16'000;        // GPU from ~16K
+    case kernel_class::matmul: return 6'000'000;        // ~182^3
+    case kernel_class::elementwise: return 150'000;     // cpu at 64K, GPU by 256K
+    case kernel_class::reduction: return 32'000;        // tie at 16K, GPU by 64K
   }
 #else
   // Metal / M1 Pro. elementwise/reduction: census 2026-07-03 (load ~4,
@@ -188,7 +191,12 @@ inline int64_t batch_matmul_bias_threshold_() {
     // earns the GPU at roughly the size its largest gemm does.
     return 8'000'000;
 #elif defined(TENSORLIB_CUDA)
-    return 4'000'000;             // GPU wins early; a couple of small gemms
+    // Not measured on a transformer batch; set just above the per-op matmul
+    // crossover (6e6), the WebGPU arm's relation — the batch's FFN gemm
+    // dominates the sum, so a batch earns the GPU at about the size its
+    // largest gemm does. Re-anchor with TL_BATCH_MATMUL_BIAS when a
+    // pipelined block bench runs on this backend.
+    return 8'000'000;
 #else
     // Metal / M1 Pro, calibrated 2026-07-18 on the pipelined transformer bench
     // (position-rotated, per-config min). The batch bias helps only when the
