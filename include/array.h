@@ -2071,6 +2071,18 @@ struct graph {
                             : auto_threshold_(kernel_class::matmul);
   }
 
+  // The batch-bias threshold in force. TL_BATCH_MATMUL_BIAS pins it exactly
+  // (batch_matmul_bias_threshold_ honors the env); otherwise it never sits
+  // below the per-op matmul crossover, so "a batch earns the GPU at about the
+  // size its largest gemm does" holds on whatever host calibrate_auto_
+  // measured — the baked pair assumed that relationship, and calibration can
+  // now move the crossover above the baked bias.
+  static int64_t batch_bias_threshold_() {
+    static const bool pinned = std::getenv("TL_BATCH_MATMUL_BIAS") != nullptr;
+    int64_t baked = batch_matmul_bias_threshold_();
+    return pinned ? baked : std::max(baked, auto_matmul_threshold_());
+  }
+
   // Derive the matmul crossover on this host, once, at the first graph eval
   // in auto mode (TL_AUTO_TRACE=1 prints the census to stderr). The baked
   // value is a census of one box, and it moved 30x on the
@@ -2424,15 +2436,47 @@ struct graph {
 
   // M9 fused decode attention on the GPU. q[H,D], K/V[H,ctx,D] contiguous,
   // D==128. Returns nullopt (→ CPU ref) when the kernel declines.
+  // q/K/V all contiguous, unoffset and device-resident — the shared
+  // eligibility gate for the fused attention kernels (else → CPU ref).
+  static bool attn_operands_ready_(const array& q, const array& K,
+                                   const array& V) {
+    return q.contiguous() && q.offset_ == 0 && K.contiguous() &&
+           K.offset_ == 0 && V.contiguous() && V.offset_ == 0 &&
+           q.storage_.native && K.storage_.native && V.storage_.native;
+  }
+
+  // One output row of reference attention: softmax over keys [0, klen) of
+  // scale · q·Kh[j]ᵀ, then that distribution · Vh. q is D long; Kh/Vh are the
+  // head's key/value bases; `s` is caller-owned scratch of at least klen. The
+  // key bound is the only thing decode (klen=ctx) and causal prefill (klen=
+  // t+1) differ by, so both references share this numerically-stable kernel.
+  static void ref_attn_row_(const float* q, const float* Kh, const float* Vh,
+                            int64_t klen, int64_t D, float scale, float* out,
+                            std::vector<float>& s) {
+    float mx = -std::numeric_limits<float>::infinity();
+    for (int64_t j = 0; j < klen; j++) {
+      float acc = 0;
+      for (int64_t d = 0; d < D; d++) acc += q[d] * Kh[j * D + d];
+      s[j] = acc * scale;
+      mx = std::max(mx, s[j]);
+    }
+    float sum = 0;
+    for (int64_t j = 0; j < klen; j++) {
+      s[j] = std::exp(s[j] - mx);
+      sum += s[j];
+    }
+    for (int64_t d = 0; d < D; d++) {
+      float acc = 0;
+      for (int64_t j = 0; j < klen; j++) acc += s[j] * Vh[j * D + d];
+      out[d] = acc / sum;
+    }
+  }
+
   static std::optional<array> gpu_attn_(const node& n, const array& q,
                                         const array& K, const array& V) {
     int64_t H = q.shape()[0], D = q.shape()[1], ctx = K.shape()[1];
     if (!gpu_mode_(H * ctx * D, kernel_class::matmul)) return std::nullopt;
-    if (!q.contiguous() || q.offset_ != 0 || !K.contiguous() ||
-        K.offset_ != 0 || !V.contiguous() || V.offset_ != 0)
-      return std::nullopt;
-    if (!q.storage_.native || !K.storage_.native || !V.storage_.native)
-      return std::nullopt;
+    if (!attn_operands_ready_(q, K, V)) return std::nullopt;
     array out = array::empty({H, D});
     if (!out.storage_.native) return std::nullopt;
     // Array path has no persistent cache: K/V are [H,ctx,D], so n_kv_heads==H
@@ -2456,27 +2500,8 @@ struct graph {
     float* po = out.data();
     std::vector<float> s(ctx);
     for (int64_t h = 0; h < H; h++) {
-      const float* qh = pq + h * D;
-      const float* Kh = pk + h * ctx * D;
-      const float* Vh = pv + h * ctx * D;
-      float mx = -std::numeric_limits<float>::infinity();
-      for (int64_t j = 0; j < ctx; j++) {
-        float acc = 0;
-        for (int64_t d = 0; d < D; d++) acc += qh[d] * Kh[j * D + d];
-        s[j] = acc * scale;
-        mx = std::max(mx, s[j]);
-      }
-      float sum = 0;
-      for (int64_t j = 0; j < ctx; j++) {
-        s[j] = std::exp(s[j] - mx);
-        sum += s[j];
-      }
-      float* oh = po + h * D;
-      for (int64_t d = 0; d < D; d++) {
-        float acc = 0;
-        for (int64_t j = 0; j < ctx; j++) acc += s[j] * Vh[j * D + d];
-        oh[d] = acc / sum;
-      }
+      ref_attn_row_(pq + h * D, pk + h * ctx * D, pv + h * ctx * D, ctx, D,
+                    scale, po + h * D, s);
     }
     return out;
   }
@@ -2488,11 +2513,7 @@ struct graph {
                                                 const array& V) {
     int64_t H = q.shape()[0], T = q.shape()[1], D = q.shape()[2];
     if (!gpu_mode_(H * T * T * D, kernel_class::matmul)) return std::nullopt;
-    if (!q.contiguous() || q.offset_ != 0 || !K.contiguous() ||
-        K.offset_ != 0 || !V.contiguous() || V.offset_ != 0)
-      return std::nullopt;
-    if (!q.storage_.native || !K.storage_.native || !V.storage_.native)
-      return std::nullopt;
+    if (!attn_operands_ready_(q, K, V)) return std::nullopt;
     array out = array::empty({H, T, D});
     if (!out.storage_.native) return std::nullopt;
     // No persistent cache on the array path: K/V are [H,T,D], so n_kv_heads==H
@@ -2520,25 +2541,8 @@ struct graph {
       const float* Kh = pk + h * T * D;
       const float* Vh = pv + h * T * D;
       for (int64_t t = 0; t < T; t++) {
-        const float* qt = pq + (h * T + t) * D;
-        float mx = -std::numeric_limits<float>::infinity();
-        for (int64_t j = 0; j <= t; j++) {
-          float acc = 0;
-          for (int64_t d = 0; d < D; d++) acc += qt[d] * Kh[j * D + d];
-          s[j] = acc * scale;
-          mx = std::max(mx, s[j]);
-        }
-        float sum = 0;
-        for (int64_t j = 0; j <= t; j++) {
-          s[j] = std::exp(s[j] - mx);
-          sum += s[j];
-        }
-        float* ot = po + (h * T + t) * D;
-        for (int64_t d = 0; d < D; d++) {
-          float acc = 0;
-          for (int64_t j = 0; j <= t; j++) acc += s[j] * Vh[j * D + d];
-          ot[d] = acc / sum;
-        }
+        ref_attn_row_(pq + (h * T + t) * D, Kh, Vh, t + 1, D, scale,
+                      po + (h * T + t) * D, s);
       }
     }
     return out;
@@ -3018,7 +3022,7 @@ struct graph {
         const auto& sb = n->inputs[1]->shape;
         if (sa.size() == 2 && sb.size() == 2) work += sa[0] * sa[1] * sb[1];
       }
-      if (work >= batch_matmul_bias_threshold_()) batch_gpu_bias_ = true;
+      if (work >= batch_bias_threshold_()) batch_gpu_bias_ = true;
     }
     for (auto* n : order) eval_one(*n);
     if (do_flush) gpu::flush();  // blocking eval: batch done when run() returns
