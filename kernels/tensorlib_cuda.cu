@@ -554,7 +554,7 @@ __global__ void tl_sgemm(const float* A, const float* B, float* C, unsigned m,
   C[(size_t)i * n + j] = acc * scale + offset;
 }
 
-// ---- warp-tiled SGEMM fast path (NN, contiguous) ----
+// ---- warp-tiled SGEMM fast path (contiguous operands, any transpose) ----
 // C(m,n) = (A(m,k) @ B(k,n)) * scale + offset. A 128×128×8 blocktile split into
 // 64×32 warp tiles (8 warps / 256 threads), each warp iterating WNITER=2 column
 // sub-tiles so every thread accumulates an 8×8 register microtile (64 outputs).
@@ -565,10 +565,21 @@ __global__ void tl_sgemm(const float* A, const float* B, float* C, unsigned m,
 // hits (its stride-8 B reads serialize 4-way). This is the step that lifts the
 // kernel toward cuBLAS; global loads are float4, one __syncthreads per K-slab.
 //
+// One core templated on the operand layouts <TA, TB>, so NT (attention's
+// Q·Kᵀ) and TN (the backward gemms) run at NN speed instead of falling to
+// tl_sgemm (512×1024×512 NT on the RTX 3090: 1128 → ~110 µs). A K-contiguous
+// operand (A when !TA, B when TB) is read as a float4 along K and scattered
+// into the K-major shared tile; an M/N-contiguous one (A when TA, B when !TB)
+// is read as a float4 along M/N and stored straight. The tile, the inner loop
+// and the epilogue are shared, so the four instantiations differ only in the
+// global loads.
+//
 // Contract for eligibility (checked host-side in cuda::gemm, else tl_sgemm runs):
-// no transpose, lda==k, ldb==n, K%8==0, N%4==0, all base offsets folded in and
-// 16B-aligned. M and N block edges are predicated (zero-filled loads, guarded
-// stores), so arbitrary M and any N%4==0 are correct.
+// each operand contiguous in its own layout (A: lda==k, or lda==m when TA;
+// B: ldb==n, or ldb==k when TB), K%8==0 for the 8-slab, the dim a float4 load
+// runs along a multiple of 4 (N for NN's B, M for TN's A — K%8 covers the
+// K-contiguous ones), all base offsets folded in and 16B-aligned. M and N
+// block edges are predicated (zero-filled loads, guarded stores).
 //
 // Split-K (ladder ②): gridDim.z = S partitions the K axis so S× more blocks
 // fill the SMs at mid sizes (1024³/2048³ underfill 82 SMs with 128² tiles).
@@ -577,6 +588,8 @@ __global__ void tl_sgemm(const float* A, const float* B, float* C, unsigned m,
 // partial into a pre-zeroed C (scale/offset must be identity — the host gates
 // on that); when S==1 (ksplit>=k) the epilogue is the normal fused store, so
 // the non-split path is bit-identical to before.
+}  // close extern "C": the __device__ core template below can't have C linkage;
+   // each __global__ wrapper re-declares its own for a stable symbol.
 #define TL_BM 128
 #define TL_BN 128
 #define TL_BK 8
@@ -586,10 +599,12 @@ __global__ void tl_sgemm(const float* A, const float* B, float* C, unsigned m,
 #define TL_TM 8    // thread microtile rows
 #define TL_TN 8    // thread microtile cols (TL_WNI * (TN/TL_WNI)=4 per sub-tile)
 #define TL_TNSUB 4  // = TL_TN / TL_WNI, cols per warp sub-iteration
-__global__ void tl_sgemm_rb(const float* __restrict__ A,
-                            const float* __restrict__ B, float* __restrict__ C,
-                            unsigned m, unsigned n, unsigned k, float scale,
-                            float offset, unsigned ksplit) {
+template <bool TA, bool TB>
+__device__ __forceinline__ void sgemm_rb_core(const float* __restrict__ A,
+                                              const float* __restrict__ B,
+                                              float* __restrict__ C, unsigned m,
+                                              unsigned n, unsigned k, float scale,
+                                              float offset, unsigned ksplit) {
   __shared__ float As[2][TL_BK][TL_BM];  // double-buffered, transposed
   __shared__ float Bs[2][TL_BK][TL_BN];
 
@@ -611,34 +626,52 @@ __global__ void tl_sgemm_rb(const float* __restrict__ A,
   const unsigned threadRowInWarp = lane / (TL_WN / TL_WNI / TL_TNSUB);  // 0..7
   const unsigned threadColInWarp = lane % (TL_WN / TL_WNI / TL_TNSUB);  // 0..3
 
-  // global-load index maps (one float4 per thread per stage: BM*BK/256 = 4)
-  const unsigned aRow = tid / (TL_BK / 4);          // 0..127
-  const unsigned aColx4 = (tid % (TL_BK / 4)) * 4;  // 0 or 4
-  const unsigned bRow = tid / (TL_BN / 4);          // 0..7
-  const unsigned bColx4 = (tid % (TL_BN / 4)) * 4;  // 0,4,..,124
-  const unsigned gArow = blockRow + aRow;
-  const unsigned gBcol = blockCol + bColx4;
+  // global-load index maps (one float4 per thread per stage: BM*BK/256 = 4).
+  // A K-contiguous operand: one row (A) / column (B) per thread, 4 along K. An
+  // M/N-contiguous one: one k per thread, 4 along M (A) / N (B).
+  const unsigned aRow = TA ? tid / (TL_BM / 4) : tid / (TL_BK / 4);  // k 0..7 | m 0..127
+  const unsigned aCol = (TA ? tid % (TL_BM / 4) : tid % (TL_BK / 4)) * 4;  // m | k
+  const unsigned bRow = TB ? tid / (TL_BK / 4) : tid / (TL_BN / 4);  // n 0..127 | k 0..7
+  const unsigned bCol = (TB ? tid % (TL_BK / 4) : tid % (TL_BN / 4)) * 4;  // k | n
+  const unsigned gArow = blockRow + (TA ? aCol : aRow);  // the M index this thread loads
+  const unsigned gBcol = blockCol + (TB ? bRow : bCol);  // the N index
 
   float acc[TL_TM][TL_TN] = {};
   float regM[TL_TM];
   float regN[TL_TN];
 
-  // global loads staged in registers → overlap with compute (double buffer)
+  // global loads staged in registers → overlap with compute (double buffer).
+  // Each operand's row stride is its own contiguous dim (host-gated lda/ldb).
   float4 ldgA, ldgB;
   auto load_regs = [&](unsigned kt) {
     ldgA = (gArow < m)
-        ? *reinterpret_cast<const float4*>(&A[(size_t)gArow * k + kt + aColx4])
+        ? *reinterpret_cast<const float4*>(
+              TA ? &A[(size_t)(kt + aRow) * m + gArow]
+                 : &A[(size_t)gArow * k + kt + aCol])
         : make_float4(0, 0, 0, 0);
     ldgB = (gBcol < n)
-        ? *reinterpret_cast<const float4*>(&B[(size_t)(kt + bRow) * n + gBcol])
+        ? *reinterpret_cast<const float4*>(
+              TB ? &B[(size_t)gBcol * k + kt + bCol]
+                 : &B[(size_t)(kt + bRow) * n + gBcol])
         : make_float4(0, 0, 0, 0);
   };
   auto store_smem = [&](int buf) {
-    As[buf][aColx4 + 0][aRow] = ldgA.x;
-    As[buf][aColx4 + 1][aRow] = ldgA.y;
-    As[buf][aColx4 + 2][aRow] = ldgA.z;
-    As[buf][aColx4 + 3][aRow] = ldgA.w;
-    *reinterpret_cast<float4*>(&Bs[buf][bRow][bColx4]) = ldgB;
+    if constexpr (TA) {
+      *reinterpret_cast<float4*>(&As[buf][aRow][aCol]) = ldgA;
+    } else {
+      As[buf][aCol + 0][aRow] = ldgA.x;
+      As[buf][aCol + 1][aRow] = ldgA.y;
+      As[buf][aCol + 2][aRow] = ldgA.z;
+      As[buf][aCol + 3][aRow] = ldgA.w;
+    }
+    if constexpr (TB) {
+      Bs[buf][bCol + 0][bRow] = ldgB.x;
+      Bs[buf][bCol + 1][bRow] = ldgB.y;
+      Bs[buf][bCol + 2][bRow] = ldgB.z;
+      Bs[buf][bCol + 3][bRow] = ldgB.w;
+    } else {
+      *reinterpret_cast<float4*>(&Bs[buf][bRow][bCol]) = ldgB;
+    }
   };
 
   load_regs(k0);
@@ -707,6 +740,27 @@ __global__ void tl_sgemm_rb(const float* __restrict__ A,
 #undef TL_TM
 #undef TL_TN
 #undef TL_TNSUB
+extern "C" __global__ void tl_sgemm_rb(const float* __restrict__ A,
+    const float* __restrict__ B, float* __restrict__ C, unsigned m, unsigned n,
+    unsigned k, float scale, float offset, unsigned ksplit) {
+  sgemm_rb_core<false, false>(A, B, C, m, n, k, scale, offset, ksplit);
+}
+extern "C" __global__ void tl_sgemm_rb_nt(const float* __restrict__ A,
+    const float* __restrict__ B, float* __restrict__ C, unsigned m, unsigned n,
+    unsigned k, float scale, float offset, unsigned ksplit) {
+  sgemm_rb_core<false, true>(A, B, C, m, n, k, scale, offset, ksplit);
+}
+extern "C" __global__ void tl_sgemm_rb_tn(const float* __restrict__ A,
+    const float* __restrict__ B, float* __restrict__ C, unsigned m, unsigned n,
+    unsigned k, float scale, float offset, unsigned ksplit) {
+  sgemm_rb_core<true, false>(A, B, C, m, n, k, scale, offset, ksplit);
+}
+extern "C" __global__ void tl_sgemm_rb_tt(const float* __restrict__ A,
+    const float* __restrict__ B, float* __restrict__ C, unsigned m, unsigned n,
+    unsigned k, float scale, float offset, unsigned ksplit) {
+  sgemm_rb_core<true, true>(A, B, C, m, n, k, scale, offset, ksplit);
+}
+extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 
 // ---- M9 batched-prefill GEMM: C[M,N] f32 = A[M,K] f32 @ B[N,K]^T bf16 ----
 // Decode is a GEMV (M=1) and bandwidth-bound; PREFILL has M = the prompt chunk,

@@ -348,10 +348,16 @@ struct context {
     return slot;
   }
 
-  // The register-blocked SGEMM fast path (tl_sgemm_rb), cached separately from
-  // the kop table since it has no kop of its own.
-  CUfunction sgemm_rb_fn = nullptr;
-  CUfunction sgemm_rb_() { return cached_(sgemm_rb_fn, "tl_sgemm_rb"); }
+  // The register-blocked SGEMM fast path, one instantiation per operand layout
+  // (tl_sgemm_rb / _nt / _tn / _tt), cached separately from the kop table
+  // since it has no kop of its own.
+  CUfunction sgemm_rb_fn[4] = {};
+  CUfunction sgemm_rb_(bool ta, bool tb) {
+    static const char* const names[4] = {"tl_sgemm_rb", "tl_sgemm_rb_nt",
+                                         "tl_sgemm_rb_tn", "tl_sgemm_rb_tt"};
+    int i = (ta ? 2 : 0) | (tb ? 1 : 0);
+    return cached_(sgemm_rb_fn[i], names[i]);
+  }
 
   // M7 decode GEMV (f32 and bf16-weight variants), cached like sgemm_rb.
   CUfunction gemv_f32_fn = nullptr, gemv_bf16_fn = nullptr, gemv_bf16v8_fn = nullptr;
@@ -1863,17 +1869,20 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
   float* po = context::off_(out, oo);
   unsigned um = (unsigned)m, un = (unsigned)n, uk = (unsigned)k;
 
-  // Register-blocked fast path (tl_sgemm_rb): NN, contiguous (lda==k, ldb==n),
-  // K%8==0 and N%4==0 for the 8-slab / float4 loads, and 16B-aligned bases. M
-  // and N block edges are predicated in-kernel, so only the divisibility of the
-  // *inner* load dims (K,N) and alignment gate eligibility. Everything else
-  // (transpose, strided views, odd K/N, unaligned offset) falls to tl_sgemm.
+  // Register-blocked fast path (tl_sgemm_rb*, one per operand layout): each
+  // operand contiguous in its own layout (lda == k, or == m for a transposed
+  // view; ldb == n, or == k transposed), K%8==0 for the 8-slab, the dim a
+  // float4 load runs along a multiple of 4 (N for NN's B, M for TN's A; K%8
+  // covers the K-contiguous operands), and 16B-aligned bases. M and N block
+  // edges are predicated in-kernel. Strided views, odd K and unaligned offsets
+  // fall to tl_sgemm.
   bool aligned = (ao % 16 == 0) && (bo % 16 == 0) && (oo % 16 == 0);
-  if (!ta && !tb && lda == k && ldb == n && k % 8 == 0 && n % 4 == 0 &&
-      aligned && m > 0 && n > 0 && k > 0) {
+  bool a_ok = ta ? (lda == m && m % 4 == 0) : (lda == k);
+  bool b_ok = tb ? (ldb == k) : (ldb == n && n % 4 == 0);
+  if (a_ok && b_ok && k % 8 == 0 && aligned && m > 0 && n > 0 && k > 0) {
     unsigned gx = (un + 127) / 128, gy = (um + 127) / 128;
 
-    if (CUfunction f = c.sgemm_rb_()) {
+    if (CUfunction f = c.sgemm_rb_(ta, tb)) {
       // Split-K (ladder ②): when the 128² tiling underfills the 82 SMs (base
       // blocks < ~3 waves of 82×2 slots), partition K into S z-slices so S× more
       // blocks run concurrently. Split-K partitions K (not replicates it), so

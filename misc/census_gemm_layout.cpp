@@ -1,10 +1,12 @@
 // GEMM operand-layout census: the same product with each operand plain or a
 // transposed view (NN, NT, TN, TT), on the CPU and the GPU, in µs. The
 // attention scores gemm is NT (Q · Kᵀ) and gradients are TN/NT, so a backend
-// whose fast kernel takes only NN shows up here as a cliff. On the RTX 3090
-// (2026-09-12) the CUDA register-blocked kernel is NN-only and NT at
-// 512x1024x512 fell to the one-output-per-thread fallback: 1057 µs against
-// 117 µs for NN. Medians, warm-up first (misc/census.cpp discipline).
+// whose fast kernel takes only NN shows up here as a cliff. That was the CUDA
+// register-blocked kernel until it was templated on the operand layouts: on
+// the RTX 3090 (2026-09-12) NT at 512x1024x512 fell to the one-output-per-
+// thread fallback, 1128 µs against 109 for NN; the four layouts now sit
+// within 5% of each other (NN 105 / NT 108 / TN 102 / TT 105). Medians,
+// warm-up first (misc/census.cpp discipline).
 #include <tensorlib.h>
 
 #include <algorithm>

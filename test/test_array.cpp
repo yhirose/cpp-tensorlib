@@ -593,6 +593,35 @@ TEST_CASE("lazy graph: build then eval") {
   CHECK_THROWS(a.dot(array::zeros({3, 3})));
 }
 
+TEST_CASE("GPU GEMM: transposed operands take the fast path and match the ref oracle") {
+  // The CUDA register-blocked kernel takes each operand plain or as the
+  // transposed view of a contiguous array (NN/NT/TN/TT), predicated at the M
+  // and N block edges and, on an underfilled grid, split over K. One shape per
+  // class: a whole tile; m and n off the tile; the split-K trigger (base blocks
+  // < 512 with K >= 512); n not a multiple of 4 (NT still qualifies — B's
+  // float4 runs along K); the attention-scores shape; and K odd, which every
+  // layout must hand to the plain kernel.
+  struct { int64_t m, k, n; } shapes[] = {
+      {128, 64, 128}, {129, 64, 130}, {200, 1024, 136},
+      {64, 8, 33},    {512, 1024, 512}, {33, 17, 31},
+  };
+  int seed = 300;
+  for (auto s : shapes) {
+    auto A = random_array({s.m, s.k}, seed++), At = random_array({s.k, s.m}, seed++);
+    auto B = random_array({s.k, s.n}, seed++), Bt = random_array({s.n, s.k}, seed++);
+    // float32 accumulation over K terms of magnitude <= 1 drifts by ~K·ε from
+    // the oracle's own order (measured 8e-5 at K=1024, the same on NN), so the
+    // absolute tolerance scales with K; the relative one stays.
+    const float rtol = 1e-4f, atol = std::max(1e-5f, 2e-7f * (float)s.k);
+    CHECK(matches_gpu_oracle([&] { return A.dot(B); }, rtol, atol));
+    CHECK(matches_gpu_oracle([&] { return A.dot(Bt.transpose()); }, rtol, atol));
+    CHECK(matches_gpu_oracle([&] { return At.transpose().dot(B); }, rtol, atol));
+    CHECK(matches_gpu_oracle([&] { return At.transpose().dot(Bt.transpose()); }, rtol, atol));
+    // the fused affine epilogue, which the split-K path must decline
+    CHECK(matches_gpu_oracle([&] { return A.dot(Bt.transpose()) * 0.5f + 1.0f; }, rtol, atol));
+  }
+}
+
 TEST_CASE("affine fusion composes scalar chains") {
   auto a = array::from({1, 2, 3, 4}, {2, 2});
 
