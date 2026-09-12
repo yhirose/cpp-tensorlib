@@ -153,7 +153,9 @@ Selection is a process-wide switch, and which GPU backend you get is decided
 at compile time. When no device is present, `use_gpu()` and `use_auto()`
 silently run on the CPU. The `auto` thresholds are measured per kernel class
 and per backend; `TL_BATCH_MATMUL_BIAS` overrides the batched-matmul one at
-runtime.
+runtime. The CPU gemm splits across threads only when each would get
+`TL_CPU_MIN_WORK` multiply-adds (default 2e6, from `misc/census_cpu_threads.cpp`);
+below that it runs on the calling thread.
 
 New ops sometimes land on one backend (usually CUDA) before the others catch
 up. `tools/check_backend_parity.py` reports, per op, which of CUDA/Metal/

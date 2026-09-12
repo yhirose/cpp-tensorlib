@@ -28,6 +28,7 @@
 // see docs/roadmap.md and docs/performance-notes.md.
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -95,6 +96,27 @@ inline bool enabled_ = true;
 #endif
 constexpr int MR = 8, NR = 8;
 constexpr int64_t MC = TL_CPU_MC, KC = TL_CPU_KC, NC = TL_CPU_NC;
+
+// How much of a gemm (M*N*K multiply-adds) each thread must get before the
+// split is worth a thread: a gemm below this runs on the calling thread, and
+// a medium one wakes only the workers it can feed. Waking a worker and
+// joining it costs tens of µs on a WSL2 box; below the floor that is the
+// gemm. misc/census_cpu_threads.cpp on a 20-thread Zen (2026-09-12):
+// 128^3 (2.1e6) 37 µs on one thread vs 48 on two; 192^3 (7.1e6) 114 µs on
+// one vs 60 on three; 256^3 (1.7e7) 264 on one vs 114 on five, and 20
+// threads lose to 5-8 up to 256^3. Env TL_CPU_MIN_WORK re-calibrates on a
+// host, like TL_BATCH_MATMUL_BIAS.
+inline int64_t min_work_per_thread_() {
+  static const int64_t v = []() -> int64_t {
+    if (const char* e = std::getenv("TL_CPU_MIN_WORK")) {
+      char* end = nullptr;
+      long long x = std::strtoll(e, &end, 10);
+      if (end != e && x > 0) return static_cast<int64_t>(x);
+    }
+    return 2'000'000;
+  }();
+  return v;
+}
 
 namespace detail {
 
@@ -365,6 +387,8 @@ inline void sgemm(const float* A, int64_t as0, int64_t as1, const float* B,
   // resolve to each worker's own (empty) thread_local instance.
   float* bpack_p = bpack.data();
   auto& pool = thread_pool::instance();
+  const int max_threads = static_cast<int>(
+      std::min<int64_t>(m * n * k / min_work_per_thread_(), 1 << 30));
 
   for (int64_t jc = 0; jc < n; jc += NC) {
     int64_t nc = std::min<int64_t>(NC, n - jc);
@@ -381,7 +405,8 @@ inline void sgemm(const float* A, int64_t as0, int64_t as1, const float* B,
       // Parallelize the M dimension at mrt-panel granularity (not MC-block):
       // small m (e.g. 256 → 2 MC blocks) would otherwise use only 1-2
       // threads. Each thread packs+computes its contiguous panel range in
-      // MC-row groups, preserving the L2 blocking.
+      // MC-row groups, preserving the L2 blocking. max_threads caps the
+      // split by the gemm's work (min_work_per_thread_ above).
       int64_t mpanels = (m + mrt - 1) / mrt;
       const int64_t panels_per_mc = MC / mrt;
       pool.parallel_for(mpanels, [&](int64_t ip0, int64_t ip1) {
@@ -409,7 +434,7 @@ inline void sgemm(const float* A, int64_t as0, int64_t as1, const float* B,
             }
           }
         }
-      });
+      }, max_threads);
     }
   }
 }

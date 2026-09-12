@@ -243,6 +243,11 @@ target_link_libraries(tensorlib_bench PRIVATE tensorlib)
 add_executable(tensorlib_census misc/census.cpp)
 target_link_libraries(tensorlib_census PRIVATE tensorlib)
 
+# CPU gemm thread-count census (misc/census_cpu_threads.cpp): the work-per-
+# thread floor cpu::sgemm splits by. CPU only; nothing to embed.
+add_executable(tensorlib_census_cpu_threads misc/census_cpu_threads.cpp)
+target_link_libraries(tensorlib_census_cpu_threads PRIVATE tensorlib)
+
 # Local-LLM shape bench — the dev harness for M7-M9 (decode/prefill GEMM +
 # attention at real decoder-layer shapes). Same backend-agnostic array API.
 add_executable(tensorlib_bench_llm bench/shared/speed/bench_llm.cpp)
