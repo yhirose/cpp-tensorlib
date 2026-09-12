@@ -1136,13 +1136,21 @@ TEST_CASE("fused prefill attention matches an explicit causal softmax(qKt)V") {
     }
   }
 
-  // the own-CPU path (sgemm scores, causal softmax, sgemm context) against
-  // the scalar reference it replaces, at a size past the tiny-tensor cutoffs
-  CHECK(cpu_matches_ref([&] {
-    return tl::array::attn_prefill(random_array({3, 40, 64}, 813),
-                                   random_array({3, 40, 64}, 814),
-                                   random_array({3, 40, 64}, 815), scale);
-  }));
+  // the own-CPU path (query tiles of 64 rows across the pool, each a sgemm
+  // for its scores, a causal softmax, a sgemm for its context) against the
+  // scalar reference, at a size past the tiny-tensor cutoffs and at the tile
+  // edges: one head, fewer rows than a tile, rows off the tile, one row, and
+  // enough rows that the work splits across threads.
+  struct { int64_t h, t; } shapes[] = {{3, 40}, {1, 64}, {2, 130}, {1, 1}, {4, 200}};
+  int seed = 813;
+  for (auto s : shapes) {
+    const int sq = seed++, sk = seed++, sv = seed++;  // fixed: build() runs twice
+    CHECK(cpu_matches_ref([&] {
+      return tl::array::attn_prefill(random_array({s.h, s.t, 64}, sq),
+                                     random_array({s.h, s.t, 64}, sk),
+                                     random_array({s.h, s.t, 64}, sv), scale);
+    }));
+  }
 
   // shape validation: q, K, V must all be [H,T,D] and agree
   CHECK_THROWS(tl::array::attn_prefill(q.reshape({H * T, D}), K, V, scale));

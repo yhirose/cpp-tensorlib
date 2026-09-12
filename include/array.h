@@ -2611,12 +2611,20 @@ struct graph {
     return out;
   }
 
-  // Causal prefill attention on the own CPU backend: per head, the scores
-  // [T,T] as one stride-aware cpu::sgemm against Kᵀ (a stride pair, no copy),
-  // a causal softmax over each row's keys 0..t (the rest set to 0), and the
-  // context as a second sgemm. Auto mode sends the small shapes here, so this
-  // is the path a modest model trains on — 3x the composed dot/softmax/dot
-  // the scalar reference below sat at. Gated by cpu::enabled_ like cpu_gemm.
+  // Causal prefill attention on the own CPU backend, tiled over (head × a
+  // block of BQ query rows) and run across the thread pool. A tile [t0,t1)
+  // attends keys [0,t1) only — causality halves the work — as S = scale ·
+  // Q_tile · Kᵀ (one stride-aware cpu::sgemm_, Kᵀ a stride pair, no copy), a
+  // causal softmax over each row's keys 0..t (the rest set to 0), and the
+  // context as a second sgemm_. The tile's gemms run inline on the worker
+  // (max_threads = 1 never touches the pool, so nesting is fine) through the
+  // same packed microkernel cpu::sgemm uses, and its BQ×T score block is a
+  // thread-local scratch that stays in L2 — no online softmax needed at the
+  // prefill lengths this serves. Later tiles see more keys, so the work
+  // items alternate from both ends (0, n-1, 1, n-2, …) and the pool's static
+  // split gets an even load. The single-threaded version of this (one head
+  // at a time, T² scalar exps in series) sat at 7 ms for H=8 T=512 D=64,
+  // 7x torch's CPU SDPA. Gated by cpu::enabled_ like cpu_gemm.
   static std::optional<array> cpu_attn_prefill_(const array& q, const array& K,
                                                 const array& V, float scale) {
     if (!cpu::enabled_) return std::nullopt;
@@ -2627,28 +2635,45 @@ struct graph {
     const float* pk = K.raw();
     const float* pv = V.raw();
     float* po = out.data();
-    std::vector<float> s(static_cast<size_t>(T * T));
-    for (int64_t h = 0; h < H; h++) {
-      const float* qh = pq + h * T * D;
-      const float* Kh = pk + h * T * D;
-      const float* Vh = pv + h * T * D;
-      // S = scale · q_h · K_hᵀ: B(p, j) = K_h[j*D + p], i.e. strides (1, D).
-      cpu::sgemm(qh, D, 1, Kh, 1, D, s.data(), T, T, D, scale);
-      for (int64_t t = 0; t < T; t++) {
-        float* row = s.data() + t * T;
-        float mx = -std::numeric_limits<float>::infinity();
-        for (int64_t j = 0; j <= t; j++) mx = std::max(mx, row[j]);
-        float sum = 0;
-        for (int64_t j = 0; j <= t; j++) {
-          row[j] = std::exp(row[j] - mx);
-          sum += row[j];
-        }
-        float inv = 1.0f / sum;
-        for (int64_t j = 0; j <= t; j++) row[j] *= inv;
-        for (int64_t j = t + 1; j < T; j++) row[j] = 0.0f;
-      }
-      cpu::sgemm(s.data(), T, 1, Vh, D, 1, po + h * T * D, T, D, T, 1.0f);
-    }
+    constexpr int64_t BQ = 64;
+    const int64_t ntiles = (T + BQ - 1) / BQ, items = H * ntiles;
+    // Both gemms over the causal half: H·T²·D multiply-adds, split like
+    // cpu::sgemm splits its own.
+    const int max_threads = static_cast<int>(std::min<int64_t>(
+        H * T * T * D / cpu::min_work_per_thread_(), 1 << 30));
+    cpu::thread_pool::instance().parallel_for(
+        items,
+        [&](int64_t i0, int64_t i1) {
+          static thread_local std::vector<float> s;
+          s.resize(static_cast<size_t>(BQ * T));
+          for (int64_t i = i0; i < i1; i++) {
+            const int64_t slot = i / H, h = i % H;
+            const int64_t tile = slot % 2 == 0 ? slot / 2 : ntiles - 1 - slot / 2;
+            const int64_t t0 = tile * BQ, t1 = std::min(T, t0 + BQ), rows = t1 - t0;
+            const float* qh = pq + (h * T + t0) * D;
+            const float* Kh = pk + h * T * D;
+            const float* Vh = pv + h * T * D;
+            // S = scale · Q_tile · K[0:t1]ᵀ: B(p, j) = K_h[j*D + p], strides (1, D).
+            cpu::sgemm_(qh, D, 1, Kh, 1, D, s.data(), rows, t1, D, scale, 1);
+            for (int64_t r = 0; r < rows; r++) {
+              const int64_t t = t0 + r;
+              float* row = s.data() + r * t1;
+              float mx = -std::numeric_limits<float>::infinity();
+              for (int64_t j = 0; j <= t; j++) mx = std::max(mx, row[j]);
+              float sum = 0;
+              for (int64_t j = 0; j <= t; j++) {
+                row[j] = std::exp(row[j] - mx);
+                sum += row[j];
+              }
+              float inv = 1.0f / sum;
+              for (int64_t j = 0; j <= t; j++) row[j] *= inv;
+              for (int64_t j = t + 1; j < t1; j++) row[j] = 0.0f;
+            }
+            cpu::sgemm_(s.data(), t1, 1, Vh, D, 1, po + (h * T + t0) * D, rows, D,
+                        t1, 1.0f, 1);
+          }
+        },
+        max_threads);
     return out;
   }
 
