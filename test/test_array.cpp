@@ -1566,3 +1566,42 @@ TEST_CASE("pow: GPU dispatch matches the ref oracle") {
     return tl::pow(x, 0.5f);
   }));
 }
+
+// --- host/device coherence on the CPU fast paths (CUDA's mirror storage).
+// A buffer the GPU last wrote lives on the device until a CPU access pulls
+// it back; the tiny-tensor fast paths and add_ used to read/write the host
+// mirror directly, so in auto mode an MNIST step's small gradient gemms
+// consumed stale activations. Producing on the GPU and consuming in cpu
+// mode is the same hand-off without depending on the auto thresholds.
+
+TEST_CASE("CPU fast paths see what the GPU last wrote") {
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+
+  tl::use_gpu();
+  auto x = array::ones({784, 10});
+  auto q = array::ones({30, 784}).dot(x).eval();  // [30, 10] of 784
+
+  tl::use_cpu();
+  auto s = array::ones({10, 30}).dot(q).eval();  // tiny gemm: fast-dot path
+  CHECK(s.at({0, 0}) == 30.0f * 784.0f);
+  auto e = (q + array::ones({30, 10})).eval();   // tiny same-shape: fast-ew
+  CHECK(e.at({0, 0}) == 785.0f);
+
+  tl::device_ = prev;
+}
+
+TEST_CASE("add_ invalidates the device copy the GPU will read next") {
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+
+  tl::use_gpu();
+  auto x = array::ones({784, 10});
+  auto w = array::ones({30, 784});
+  w.dot(x).eval();                   // the GPU reads w: mirror now BOTH
+  w.add_(array::ones({30, 784}));    // CPU write: host 2, device must not stay 1
+  auto c = w.dot(x).eval();
+  CHECK(c.at({0, 0}) == 2.0f * 784.0f);
+
+  tl::device_ = prev;
+}

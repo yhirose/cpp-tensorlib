@@ -671,6 +671,22 @@ inline void host_sync_(void* native, bool for_write) {
 #endif
 }
 
+// The two CPU-side accessors for a buffer that may live on the device: a
+// read gets the current bytes, a write also marks the device copy stale.
+// Every CPU loop over storage goes through one of these (or array::raw /
+// array::data, which do the same) — a bare `stor.data()` on a buffer the
+// GPU last wrote reads whatever the host mirror held before.
+inline const float* host_read_(const storage& s, int64_t off) {
+  barrier_();
+  host_sync_(s.native, /*for_write=*/false);
+  return s.data() + off;
+}
+inline float* host_write_(storage& s, int64_t off) {
+  barrier_();
+  host_sync_(s.native, /*for_write=*/true);
+  return s.data() + off;
+}
+
 }  // namespace detail
 
 inline const float* array::raw() const {
@@ -2871,7 +2887,7 @@ struct graph {
     const node& a = *n.inputs[0];
     if (a.stor.dt != tl::dtype::f32) return false;  // bf16 widens in eval_one
     if (a.shape != n.shape || !node_contig_(a)) return false;
-    const float* pa = a.stor.data() + a.soffset;
+    const float* pa = detail::host_read_(a.stor, a.soffset);
     const float s = n.scale, o = n.offset;
     const bool epi = s != 1.0f || o != 0.0f;
 
@@ -2901,7 +2917,7 @@ struct graph {
       case op_t::ne: {
         const node& b = *n.inputs[1];
         if (b.shape != n.shape || !node_contig_(b)) return false;
-        const float* pb = b.stor.data() + b.soffset;
+        const float* pb = detail::host_read_(b.stor, b.soffset);
         auto binary_loop = [&](auto f) {
           detail::barrier_();
           storage out = storage::make(numel);
@@ -2946,10 +2962,9 @@ struct graph {
     int64_t m = a.shape[0], k = a.shape[1], nn = b.shape[1];
     if (m * nn * k > kCutoff || m * nn == 0) return false;
     if (gpu_mode_(m * nn * k, kernel_class::matmul)) return false;
-    detail::barrier_();
     storage out = storage::make(m * nn);
-    const float* pa = a.stor.data() + a.soffset;
-    const float* pb = b.stor.data() + b.soffset;
+    const float* pa = detail::host_read_(a.stor, a.soffset);
+    const float* pb = detail::host_read_(b.stor, b.soffset);
     float* po = out.data();
     int64_t as0 = a.strides[0], as1 = a.strides[1];
     int64_t bs0 = b.strides[0], bs1 = b.strides[1];
@@ -3484,7 +3499,7 @@ inline array& array::add_(const array& b) {
   // on tiny tensors, where the generic walker's setup would dominate.
   if (shape_ == b.shape() && contiguous() && b.contiguous()) {
     const auto* pb = b.raw();
-    auto* po = storage_.data() + offset_;
+    auto* po = detail::host_write_(storage_, offset_);
     int64_t n = size();
     for (int64_t i = 0; i < n; i++) po[i] += pb[i];
     return *this;
@@ -3495,7 +3510,7 @@ inline array& array::add_(const array& b) {
                                 detail::shape_str(shape_));
   }
   const auto* pb = b.raw();
-  auto* po = storage_.data() + offset_;
+  auto* po = detail::host_write_(storage_, offset_);
   detail::for_each_index(
       shape_,
       {strides_, detail::broadcast_strides(b.shape(), b.strides(), shape_)},
