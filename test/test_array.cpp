@@ -259,6 +259,32 @@ TEST_CASE("batched dot: GPU dispatch matches the ref oracle") {
     auto b = random_array({2, 3, 8, 5}, 14);
     return a.dot(b);
   }));
+  // Permuted (transposed-slice) operands — attention's q·kᵀ — take the
+  // kernel's transposed operand instead of declining to the scalar oracle.
+  CHECK(matches_gpu_oracle([&] {
+    auto q = random_array({4, 6, 8}, 15);
+    auto k = random_array({4, 6, 8}, 16);
+    return q.dot(k.transpose({0, 2, 1}));
+  }));
+  CHECK(matches_gpu_oracle([&] {
+    auto a = random_array({2, 3, 8, 6}, 17);
+    auto b = random_array({2, 3, 8, 5}, 18);
+    return a.transpose({0, 1, 3, 2}).dot(b);
+  }));
+}
+
+TEST_CASE("batched dot: own CPU gemm per slice matches the ref oracle") {
+  // The same shapes through cpu_bdot_ (cpu::sgemm per slice, strides passed
+  // through) against ref::bdot, plain and with permuted operands.
+  auto a = random_array({4, 6, 8}, 21);
+  auto b = random_array({4, 8, 5}, 22);
+  auto k = random_array({4, 6, 8}, 23);
+  auto a4 = random_array({2, 3, 8, 6}, 24);
+  auto b4 = random_array({2, 3, 8, 5}, 25);
+  CHECK(cpu_matches_ref([&] { return a.dot(b); }));
+  CHECK(cpu_matches_ref([&] { return a.dot(k.transpose({0, 2, 1})); }));
+  CHECK(cpu_matches_ref([&] { return a4.transpose({0, 1, 3, 2}).dot(b4); }));
+  CHECK(cpu_matches_ref([&] { return a.dot(b) * 0.5f + 1.0f; }));  // epilogue
 }
 
 TEST_CASE("reductions") {

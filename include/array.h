@@ -1521,9 +1521,12 @@ struct gemm_layout {
   bool trans;
   int64_t ld;
 };
+// Reads the trailing two dims of any rank, so a batched matmul classifies each
+// slice by the same rule and a permuted view (attention's kᵀ) is "transposed".
 inline std::optional<gemm_layout> gemm_classify_(const array& x) {
-  int64_t r = x.shape()[0], c = x.shape()[1];
-  int64_t s0 = x.strides()[0], s1 = x.strides()[1];
+  size_t n = x.rank();
+  int64_t r = x.shape()[n - 2], c = x.shape()[n - 1];
+  int64_t s0 = x.strides()[n - 2], s1 = x.strides()[n - 1];
   if (s1 == 1 && s0 >= std::max<int64_t>(c, 1)) return gemm_layout{false, s0};
   if (s0 == 1 && s1 >= std::max<int64_t>(r, 1)) return gemm_layout{true, s1};
   return std::nullopt;
@@ -2326,17 +2329,35 @@ struct graph {
     return out.reshape(n.shape);
   }
 
-  // Batched matmul, GPU dispatch (v1): a per-slice loop over the same
-  // gpu::gemm single-matmul entry point above, one launch per batch element
-  // on the same device queue — real backend acceleration per slice, not yet
-  // one fused batched kernel (no backend has one; a future optimization if
-  // profiling shows the per-slice launch count matters more than the FLOPs
-  // do). Requires both operands fully contiguous (batch dims included), not
-  // just gemm_classify_'s "2-D contiguous-or-transposed" — gpu::gemm only
-  // takes a flat byte offset per call, so a non-contiguous batch axis has no
-  // single stride to compute that offset from; falls back to the CPU oracle
-  // (ref::bdot) honestly rather than guessing. No scale/offset (matching
-  // gpu_gemm's caller): eval_one's shared epilogue applies those afterward.
+  // The batch walk gpu_bdot_/cpu_bdot_ share with ref::bdot: the batch axes
+  // may carry any strides (a permuted view, a slice), so each slice's element
+  // offset is the batch index dotted with them. `step` advances the odometer.
+  struct batch_walk_ {
+    std::vector<int64_t> idx;
+    explicit batch_walk_(size_t batch_rank) : idx(batch_rank, 0) {}
+    int64_t offset(const array& x) const {
+      int64_t off = x.offset_;
+      for (size_t d = 0; d < idx.size(); d++) off += idx[d] * x.strides()[d];
+      return off;
+    }
+    void step(const array& x) {
+      for (size_t d = idx.size(); d-- > 0;) {
+        if (++idx[d] < x.shape()[d]) return;
+        idx[d] = 0;
+      }
+    }
+  };
+
+  // Batched matmul, GPU dispatch: a per-slice loop over the same gpu::gemm
+  // single-matmul entry point above, one launch per batch element on the same
+  // device queue — real backend acceleration per slice, not yet one fused
+  // batched kernel (no backend has one; a future optimization if profiling
+  // shows the per-slice launch count matters more than the FLOPs do). Each
+  // slice's 2-D layout is gemm_classify_'s "row-major or its transpose", so a
+  // permuted view goes to the kernel's transposed operand rather than
+  // declining — attention's q·kᵀ used to fall all the way to ref::bdot over
+  // that (57 ms against 0.1 for the same product plain). No scale/offset
+  // (matching gpu_gemm's caller): eval_one's shared epilogue applies those.
   static std::optional<array> gpu_bdot_(const array& a, const array& b) {
     size_t r = a.rank();
     int64_t m = a.shape()[r - 2], k = a.shape()[r - 1], nn = b.shape().back();
@@ -2346,24 +2367,51 @@ struct graph {
                    kernel_class::matmul)) {
       return std::nullopt;
     }
-    if (!a.contiguous() || !b.contiguous()) return std::nullopt;
     if (!a.storage_.native || !b.storage_.native) return std::nullopt;
+    auto la = detail::gemm_classify_(a), lb = detail::gemm_classify_(b);
+    if (!la || !lb) return std::nullopt;
     shape_t out_shape(a.shape().begin(), a.shape().end() - 2);
     out_shape.push_back(m);
     out_shape.push_back(nn);
     auto out = array::empty(out_shape);
     if (!out.storage_.native) return std::nullopt;
     if (m == 0 || nn == 0 || batch == 0) return out;
-    int64_t a_stride = m * k, b_stride = k * nn, out_stride = m * nn;
-    for (int64_t bi = 0; bi < batch; bi++) {
-      int64_t a_off = (a.offset_ + bi * a_stride) * 4;
-      int64_t b_off = (b.offset_ + bi * b_stride) * 4;
-      int64_t out_off = (out.offset_ + bi * out_stride) * 4;
-      if (!gpu::gemm(a.storage_.native, a_off, k, false, b.storage_.native,
-                     b_off, nn, false, out.storage_.native, out_off, m, nn,
-                     k, 1.0f, 0.0f)) {
+    batch_walk_ w(r - 2);
+    for (int64_t bi = 0; bi < batch; bi++, w.step(a)) {
+      if (!gpu::gemm(a.storage_.native, w.offset(a) * 4, la->ld, la->trans,
+                     b.storage_.native, w.offset(b) * 4, lb->ld, lb->trans,
+                     out.storage_.native, (out.offset_ + bi * m * nn) * 4, m,
+                     nn, k, 1.0f, 0.0f)) {
         return std::nullopt;
       }
+    }
+    return out;
+  }
+
+  // Batched matmul on the own CPU backend: one stride-aware cpu::sgemm per
+  // slice (a transposed view passes its strides through, no packing detour),
+  // walking the batch like gpu_bdot_. Gated by cpu::enabled_ as cpu_gemm is,
+  // so oracle tests can force ref::bdot.
+  static std::optional<array> cpu_bdot_(const array& a, const array& b) {
+    if (!cpu::enabled_) return std::nullopt;
+    size_t r = a.rank();
+    int64_t m = a.shape()[r - 2], k = a.shape()[r - 1], nn = b.shape().back();
+    int64_t batch = 1;
+    for (size_t i = 0; i + 2 < r; i++) batch *= a.shape()[i];
+    shape_t out_shape(a.shape().begin(), a.shape().end() - 2);
+    out_shape.push_back(m);
+    out_shape.push_back(nn);
+    auto out = array::empty(out_shape);
+    if (m == 0 || nn == 0 || batch == 0) return out;
+    const float* pa = a.raw();
+    const float* pb = b.raw();
+    float* po = out.data();
+    const auto& as = a.strides();
+    const auto& bs = b.strides();
+    batch_walk_ w(r - 2);
+    for (int64_t bi = 0; bi < batch; bi++, w.step(a)) {
+      cpu::sgemm(pa + w.offset(a), as[r - 2], as[r - 1], pb + w.offset(b),
+                 bs[r - 2], bs[r - 1], po + bi * m * nn, m, nn, k, 1.0f);
     }
     return out;
   }
@@ -3295,13 +3343,15 @@ struct graph {
       case op_t::dot: {
         // Batched (rank >= 3, graph::dot already required matching batch
         // dims): none of the GEMV/GEMM fast paths below know about a batch
-        // axis, so this branches off before them entirely. gpu_bdot_ tries
-        // real per-slice GPU dispatch first (see its own comment); ref::bdot
-        // is the CPU-correct fallback when it declines.
+        // axis, so this branches off before them entirely. Per-slice GPU
+        // dispatch first, then the own CPU gemm per slice; ref::bdot is the
+        // scalar oracle when both decline.
         if (n.inputs[0]->shape.size() > 2 || n.inputs[1]->shape.size() > 2) {
           auto a = in(0), b = in(1);
           if (auto g = gpu_bdot_(a, b)) {
             r = std::move(*g);
+          } else if (auto c = cpu_bdot_(a, b)) {
+            r = std::move(*c);
           } else {
             r = ref::bdot(a, b);
           }
