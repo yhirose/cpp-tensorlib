@@ -1038,6 +1038,43 @@ TEST_CASE("fused decode attention matches an explicit softmax(qKt)V") {
   CHECK_THROWS(tl::array::attn_decode(q, K, q.reshape({H, D}), scale));  // V rank 2
 }
 
+TEST_CASE("fused prefill attention matches an explicit causal softmax(qKt)V") {
+  // D=64 (a kernel head dim), 2 heads, T=7: row t attends the keys 0..t and
+  // no further. Same explicit expectation as the decode test, once per row.
+  const int64_t H = 2, T = 7, D = 64;
+  auto q = random_array({H, T, D}, 810), K = random_array({H, T, D}, 811),
+       V = random_array({H, T, D}, 812);
+  float scale = 1.0f / std::sqrt((float)D);
+
+  auto got = tl::array::attn_prefill(q, K, V, scale);
+  CHECK(got.shape() == tl::shape_t{H, T, D});
+
+  for (int64_t h = 0; h < H; h++) {
+    for (int64_t t = 0; t < T; t++) {
+      std::vector<float> s(t + 1);
+      float mx = -1e30f;
+      for (int64_t j = 0; j <= t; j++) {
+        float acc = 0;
+        for (int64_t d = 0; d < D; d++) acc += q.at({h, t, d}) * K.at({h, j, d});
+        s[j] = acc * scale;
+        mx = std::max(mx, s[j]);
+      }
+      float sum = 0;
+      for (int64_t j = 0; j <= t; j++) { s[j] = std::exp(s[j] - mx); sum += s[j]; }
+      for (int64_t d : {0, 31, 63}) {
+        float e = 0;
+        for (int64_t j = 0; j <= t; j++) e += s[j] * V.at({h, j, d});
+        e /= sum;
+        CHECK(got.at({h, t, d}) == doctest::Approx(e).epsilon(1e-4));
+      }
+    }
+  }
+
+  // shape validation: q, K, V must all be [H,T,D] and agree
+  CHECK_THROWS(tl::array::attn_prefill(q.reshape({H * T, D}), K, V, scale));
+  CHECK_THROWS(tl::array::attn_prefill(q, K, V.reshape({H, D, T}), scale));
+}
+
 TEST_CASE("q4 weight storage: decode dot + widen fallback vs dequant oracle") {
   // W [K,N], K a multiple of 256; a [1,K]. int4 quant error on random data is
   // large (a small weight in a big-maxabs group rounds coarsely), so the right

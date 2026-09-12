@@ -12,3 +12,4 @@ gemv_f32
 gemv_bf16
 gemv_q4
 attn_decode
+attn_prefill

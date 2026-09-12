@@ -172,6 +172,8 @@ struct node {
     where_,
     dot,
     attn_dec,  // fused decode attention: softmax(arg0 · q·Kᵀ)·V
+    attn_pre,  // fused causal prefill attention: row t is softmax(arg0 ·
+               // q_t·K[..t]ᵀ)·V[..t]
     rope,      // rotary position embedding (arg0=base, axis=position offset)
     sum_ax, mean_ax, max_ax, argmax_ax, sum_to_,
     pad_,   // zero-pad axis `axis` by `arg0` (=before) elements; `shape` is
@@ -429,6 +431,13 @@ class array {
   // D==128 this is the fused flash-attention kernel; otherwise a CPU reference.
   static array attn_decode(const array& q, const array& K, const array& V,
                            float scale);
+
+  // Fused causal prefill attention (M9): out(h,t,:) = softmax(scale ·
+  // q(h,t,:)·K(h,≤t)ᵀ)·V(h,≤t) — every query row of a prompt at once, each
+  // attending the keys up to itself. q, K, V and out all [H,T,D]. On CUDA with
+  // D ∈ {64,128} this is the tiled prefill kernel; otherwise a CPU reference.
+  static array attn_prefill(const array& q, const array& K, const array& V,
+                            float scale);
 
   // Transformer building blocks (M9 model surface). RoPE is a fused op (needs
   // cos/sin); RMSNorm/SiLU/SwiGLU are pure compositions of existing ops (so they
@@ -1988,6 +1997,23 @@ struct graph {
     return from_node(std::move(n));
   }
 
+  static array attn_prefill(const array& q, const array& K, const array& V,
+                            float scale) {
+    const auto& sq = q.shape();
+    if (sq.size() != 3 || K.shape() != sq || V.shape() != sq) {
+      throw std::invalid_argument(
+          "tl::attn_prefill: expect q, K, V all [H,T,D] — got q " +
+          shape_str(sq) + ", K " + shape_str(K.shape()) + ", V " +
+          shape_str(V.shape()));
+    }
+    auto n = std::make_shared<node>();
+    n->op = op_t::attn_pre;
+    n->shape = sq;  // [H, T, D]
+    n->arg0 = scale;
+    n->inputs = {as_node(q), as_node(K), as_node(V)};
+    return from_node(std::move(n));
+  }
+
   static array rope(const array& x, int64_t pos, float base) {
     const auto& s = x.shape();
     if (s.size() < 2 || (s.back() & 1))
@@ -2450,6 +2476,69 @@ struct graph {
         float acc = 0;
         for (int64_t j = 0; j < ctx; j++) acc += s[j] * Vh[j * D + d];
         oh[d] = acc / sum;
+      }
+    }
+    return out;
+  }
+
+  // M9 fused causal prefill attention on the GPU. q/K/V [H,T,D] contiguous,
+  // D ∈ {64,128}. Returns nullopt (→ CPU ref) when the kernel declines.
+  static std::optional<array> gpu_attn_prefill_(const node& n, const array& q,
+                                                const array& K,
+                                                const array& V) {
+    int64_t H = q.shape()[0], T = q.shape()[1], D = q.shape()[2];
+    if (!gpu_mode_(H * T * T * D, kernel_class::matmul)) return std::nullopt;
+    if (!q.contiguous() || q.offset_ != 0 || !K.contiguous() ||
+        K.offset_ != 0 || !V.contiguous() || V.offset_ != 0)
+      return std::nullopt;
+    if (!q.storage_.native || !K.storage_.native || !V.storage_.native)
+      return std::nullopt;
+    array out = array::empty({H, T, D});
+    if (!out.storage_.native) return std::nullopt;
+    // No persistent cache on the array path: K/V are [H,T,D], so n_kv_heads==H
+    // (no GQA) and kv_max==T (the whole buffer is the cache, filled from 0).
+    if (!gpu::attn_prefill(q.storage_.native, K.storage_.native,
+                           V.storage_.native, out.storage_.native, H, H, T, T,
+                           D, n.arg0)) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
+  // CPU reference causal prefill attention (fallback / non-GPU builds): row t
+  // of head h is the decode reference over the keys 0..t.
+  static array ref_attn_prefill_(const array& q, const array& K,
+                                 const array& V, float scale) {
+    int64_t H = q.shape()[0], T = q.shape()[1], D = q.shape()[2];
+    array out = array::empty({H, T, D});
+    const float* pq = q.raw();
+    const float* pk = K.raw();
+    const float* pv = V.raw();
+    float* po = out.data();
+    std::vector<float> s(T);
+    for (int64_t h = 0; h < H; h++) {
+      const float* Kh = pk + h * T * D;
+      const float* Vh = pv + h * T * D;
+      for (int64_t t = 0; t < T; t++) {
+        const float* qt = pq + (h * T + t) * D;
+        float mx = -std::numeric_limits<float>::infinity();
+        for (int64_t j = 0; j <= t; j++) {
+          float acc = 0;
+          for (int64_t d = 0; d < D; d++) acc += qt[d] * Kh[j * D + d];
+          s[j] = acc * scale;
+          mx = std::max(mx, s[j]);
+        }
+        float sum = 0;
+        for (int64_t j = 0; j <= t; j++) {
+          s[j] = std::exp(s[j] - mx);
+          sum += s[j];
+        }
+        float* ot = po + (h * T + t) * D;
+        for (int64_t d = 0; d < D; d++) {
+          float acc = 0;
+          for (int64_t j = 0; j <= t; j++) acc += s[j] * Vh[j * D + d];
+          ot[d] = acc / sum;
+        }
       }
     }
     return out;
@@ -3255,6 +3344,16 @@ struct graph {
         }
         break;
       }
+      case op_t::attn_pre: {
+        if (auto g = gpu_attn_prefill_(n, wrap(*n.inputs[0]),
+                                       wrap(*n.inputs[1]),
+                                       wrap(*n.inputs[2]))) {
+          r = std::move(*g);
+        } else {
+          r = ref_attn_prefill_(in(0), in(1), in(2), n.arg0);
+        }
+        break;
+      }
       case op_t::rope: {
         if (auto g = gpu_rope_(n, wrap(*n.inputs[0]))) {
           r = std::move(*g);
@@ -3642,6 +3741,11 @@ inline array array::dot(const array& b) const {
 inline array array::attn_decode(const array& q, const array& K, const array& V,
                                 float scale) {
   return detail::graph::attn_decode(q, K, V, scale);
+}
+
+inline array array::attn_prefill(const array& q, const array& K,
+                                 const array& V, float scale) {
+  return detail::graph::attn_prefill(q, K, V, scale);
 }
 
 inline array array::rope(const array& x, int64_t pos, float base) {

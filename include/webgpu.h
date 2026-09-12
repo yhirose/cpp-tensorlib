@@ -1306,6 +1306,10 @@ inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
                         int64_t, int64_t, float) {
   return false;
 }
+inline bool attn_prefill(void*, void*, void*, void*, int64_t, int64_t, int64_t,
+                         int64_t, int64_t, float, bool = false, int64_t = 0) {
+  return false;
+}
 inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
   return false;
 }
