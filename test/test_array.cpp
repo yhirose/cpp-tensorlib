@@ -622,6 +622,21 @@ TEST_CASE("GPU GEMM: transposed operands take the fast path and match the ref or
   }
 }
 
+TEST_CASE("auto mode derives its matmul threshold on the first eval") {
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+  tl::use_auto();
+  // a graph eval (a constant plus a scalar folds eagerly and never reaches run_)
+  random_array({8, 8}, 500).dot(random_array({8, 8}, 501)).eval();
+  int64_t t = tl::auto_matmul_threshold();
+  tl::device_ = prev;
+  // one of the census sizes, or the baked value when the GPU won none of them
+  CHECK((t == 96 * 96 * 96 || t == 128 * 128 * 128 || t == 192 * 192 * 192 ||
+         t == 256 * 256 * 256 ||
+         t == tl::auto_threshold_(tl::kernel_class::matmul)));
+  CHECK(tl::cpu::min_work_per_thread_() > 0);
+}
+
 TEST_CASE("affine fusion composes scalar chains") {
   auto a = array::from({1, 2, 3, 4}, {2, 2});
 

@@ -3,10 +3,11 @@
 // back-to-back (the training-step pattern) and after a 1 ms idle. Then the
 // thread floor this implies: a second thread pays for itself only when the
 // work it takes over outlasts the round trip, i.e. work > 2 x latency x
-// single-thread throughput; compare that against cpu::min_work_per_thread_().
-// On a 20-thread Zen under WSL2 (2026-09-12): 2 threads 20 µs, +7 µs per
-// extra thread, 20 threads 146 µs; 54k MAC/µs -> floor 2.1e6, the census
-// value. Medians (misc/census.cpp discipline).
+// single-thread throughput. cpu::min_work_per_thread_() derives its floor by
+// the same arithmetic on first use, so the two figures printed last should
+// agree (TL_CPU_MIN_WORK pins the runtime's). On a 20-thread Zen under WSL2
+// (2026-09-12): 2 threads 20 µs, +7 µs per extra thread, 20 threads 146 µs;
+// 54k MAC/µs -> floor 2.1e6. Medians (misc/census.cpp discipline).
 #include <tensorlib.h>
 
 #include <algorithm>

@@ -25,8 +25,10 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <initializer_list>
@@ -2030,7 +2032,76 @@ struct graph {
     if (device_ != device_type::auto_) return false;
     if (gpu::pending()) return true;
     if (batch_gpu_bias_) return true;  // batch pinned to GPU (see run_)
-    return n >= auto_threshold_(kc);
+    return n >= (kc == kernel_class::matmul ? auto_matmul_threshold_()
+                                            : auto_threshold_(kc));
+  }
+
+  // The matmul threshold in force: the one derived on this host by the first
+  // auto-mode graph eval (calibrate_auto_ below) or pinned by TL_AUTO_MATMUL,
+  // else types.h's census value. -1 = not derived yet.
+  static inline int64_t auto_matmul_ = -1;
+  static int64_t auto_matmul_threshold_() {
+    return auto_matmul_ > 0 ? auto_matmul_
+                            : auto_threshold_(kernel_class::matmul);
+  }
+
+  // Derive the matmul crossover on this host, once, at the first graph eval
+  // in auto mode (TL_AUTO_TRACE=1 prints the census to stderr). The baked
+  // value is a census of one box, and it moved 30x on the
+  // same GPU when the CPU gemm stopped paying its pool's wake-up on every
+  // call: the crossover is where THIS CPU meets THIS GPU, so measure it.
+  // Square gemms at 96/128/192/256 (0.9e6..1.7e7 MAC), 2 warm-ups then 5
+  // timings per device, medians; the threshold is the smallest size the GPU
+  // wins at, or the baked value when it wins none (Accelerate's AMX holds
+  // the CPU past 256^3, so that box keeps its 5e8). A few ms once the
+  // context is up; the RTX 3090 lands on 192^3 = 7.1e6 (baked 6e6) run after
+  // run. Called from the top of run_ only — evaluation is not re-entrant, so
+  // never from an op — under forced cpu/gpu modes, so nothing below consults
+  // the threshold being derived.
+  static void calibrate_auto_() {
+    if (auto_matmul_ > 0) return;
+    if (const char* e = std::getenv("TL_AUTO_MATMUL")) {
+      char* end = nullptr;
+      long long x = std::strtoll(e, &end, 10);
+      if (end != e && x > 0) {
+        auto_matmul_ = static_cast<int64_t>(x);
+        return;
+      }
+    }
+    using clk = std::chrono::steady_clock;
+    auto median_us = [](auto&& f) {
+      f();
+      f();
+      double ts[5];
+      for (double& t : ts) {
+        auto t0 = clk::now();
+        f();
+        t = std::chrono::duration<double, std::micro>(clk::now() - t0).count();
+      }
+      std::sort(std::begin(ts), std::end(ts));
+      return ts[2];
+    };
+    const device_type saved = device_;
+    const bool trace = std::getenv("TL_AUTO_TRACE") != nullptr;
+    int64_t chosen = auto_threshold_(kernel_class::matmul);
+    for (int64_t m : {96, 128, 192, 256}) {
+      auto a = array::full({m, m}, 0.5f), b = array::full({m, m}, 0.25f);
+      use_cpu();
+      double cpu = median_us([&] { a.dot(b).eval(); });
+      use_gpu();
+      double gpu = median_us([&] { a.dot(b).eval(); });
+      if (trace)
+        std::fprintf(stderr, "tl: auto census %lld^3 cpu %.1f us gpu %.1f us\n",
+                     (long long)m, cpu, gpu);
+      if (gpu < cpu) {
+        chosen = m * m * m;
+        break;
+      }
+    }
+    device_ = saved;
+    auto_matmul_ = chosen;
+    if (trace)
+      std::fprintf(stderr, "tl: auto matmul threshold %lld\n", (long long)chosen);
   }
 
   // The GPU kernel for an op, or nullopt when the backend has none (masks,
@@ -2803,9 +2874,21 @@ struct graph {
     run_(roots, false);
   }
   static void run_(const std::vector<node_ptr>& roots, bool do_flush) {
+    // First auto-mode eval on a host with a GPU: derive the matmul crossover
+    // first. Its census evals each nest a run_, and `roots` may be
+    // materialize_'s own thread-local scratch, which those evals reuse — so
+    // hold a copy across them and start this eval over with it.
+    if (device_ == device_type::auto_ && auto_matmul_ < 0 &&
+        gpu::available() && !gpu::pending()) {
+      std::vector<node_ptr> held(roots);
+      calibrate_auto_();
+      run_(held, do_flush);
+      return;
+    }
     // Thread-local scratch: run() fires once per eval batch and tiny-graph
     // workloads are per-op-allocation-bound. Nested evaluation cannot happen
-    // (kernels never build or evaluate graphs), so reuse is safe. Visited
+    // (kernels never build or evaluate graphs; the one-time census above
+    // runs before this scratch is touched), so reuse is safe. Visited
     // marking is a per-run stamp on the node — O(1), allocation-free.
     thread_local std::vector<node*> order;
     thread_local std::vector<std::pair<node*, size_t>> stack;
@@ -3654,6 +3737,13 @@ inline void install_runtime_hooks() {
 
 inline bool array_equal(const array& a, const array& b) {
   return allclose(a, b, 0.0f, 0.0f);
+}
+
+// The auto-mode matmul threshold in force (M*N*K): derived on this host by
+// the first auto-mode eval, pinned by TL_AUTO_MATMUL, or types.h's census
+// value until either happens.
+inline int64_t auto_matmul_threshold() {
+  return detail::graph::auto_matmul_threshold_();
 }
 
 inline bool allclose(const array& a, const array& b, float rtol, float atol) {

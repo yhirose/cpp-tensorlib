@@ -27,9 +27,12 @@
 // layout). AVX-512 (also NR=16) reuses the 6×16 pack layout and is deferred;
 // see docs/roadmap.md and docs/performance-notes.md.
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -97,6 +100,12 @@ inline bool enabled_ = true;
 constexpr int MR = 8, NR = 8;
 constexpr int64_t MC = TL_CPU_MC, KC = TL_CPU_KC, NC = TL_CPU_NC;
 
+// The gemm proper, with the thread cap chosen by the caller (defined after
+// the packers; declared here for the floor probe below).
+inline void sgemm_(const float* A, int64_t as0, int64_t as1, const float* B,
+                   int64_t bs0, int64_t bs1, float* C, int64_t m, int64_t n,
+                   int64_t k, float alpha, int max_threads);
+
 // How much of a gemm (M*N*K multiply-adds) each thread must get before the
 // split is worth a thread: a gemm below this runs on the calling thread, and
 // a medium one wakes only the workers it can feed. Waking a worker and
@@ -104,8 +113,18 @@ constexpr int64_t MC = TL_CPU_MC, KC = TL_CPU_KC, NC = TL_CPU_NC;
 // gemm. misc/census_cpu_threads.cpp on a 20-thread Zen (2026-09-12):
 // 128^3 (2.1e6) 37 µs on one thread vs 48 on two; 192^3 (7.1e6) 114 µs on
 // one vs 60 on three; 256^3 (1.7e7) 264 on one vs 114 on five, and 20
-// threads lose to 5-8 up to 256^3. Env TL_CPU_MIN_WORK re-calibrates on a
-// host, like TL_BATCH_MATMUL_BIAS.
+// threads lose to 5-8 up to 256^3.
+//
+// The floor is a property of the host's thread wake-up, not of the gemm, so
+// it is derived on first use rather than baked: a second thread pays for
+// itself only when the work it takes over outlasts the round trip, i.e.
+//   floor = 2 × round_trip(2 threads) × single-thread MAC/µs
+// (misc/census_pool_latency.cpp prints the same arithmetic). About 1 ms,
+// once, on the first gemm: 25 empty two-thread parallel_fors and 5
+// single-thread 128^3 gemms, medians. The Zen box above derives 2.0e6, its
+// census value; a host that wakes threads faster gets a lower floor, a
+// noisier VM a higher one. Env TL_CPU_MIN_WORK pins it, like
+// TL_BATCH_MATMUL_BIAS.
 inline int64_t min_work_per_thread_() {
   static const int64_t v = []() -> int64_t {
     if (const char* e = std::getenv("TL_CPU_MIN_WORK")) {
@@ -113,7 +132,31 @@ inline int64_t min_work_per_thread_() {
       long long x = std::strtoll(e, &end, 10);
       if (end != e && x > 0) return static_cast<int64_t>(x);
     }
-    return 2'000'000;
+    auto& pool = thread_pool::instance();
+    if (pool.size() < 2) return 2'000'000;  // nothing to split across
+    using clk = std::chrono::steady_clock;
+    auto median_us = [](int trials, auto&& f) {
+      std::vector<double> ts(static_cast<size_t>(trials));
+      for (double& t : ts) {
+        auto t0 = clk::now();
+        f();
+        t = std::chrono::duration<double, std::micro>(clk::now() - t0).count();
+      }
+      std::nth_element(ts.begin(), ts.begin() + trials / 2, ts.end());
+      return ts[static_cast<size_t>(trials / 2)];
+    };
+    std::function<void(int64_t, int64_t)> nop = [](int64_t, int64_t) {};
+    for (int i = 0; i < 5; i++) pool.parallel_for(2, nop, 2);  // warm
+    double round_trip = median_us(25, [&] { pool.parallel_for(2, nop, 2); });
+    constexpr int64_t N = 128;
+    std::vector<float> a(N * N, 1.0f), b(N * N, 1.0f), c(N * N);
+    auto probe = [&] {
+      sgemm_(a.data(), N, 1, b.data(), N, 1, c.data(), N, N, N, 1.0f, 1);
+    };
+    probe();
+    double mac_per_us = static_cast<double>(N * N * N) / median_us(5, probe);
+    return static_cast<int64_t>(
+        std::clamp(2.0 * round_trip * mac_per_us, 1e5, 1e9));
   }();
   return v;
 }
@@ -364,6 +407,14 @@ inline ukernel_desc select_ukernel() {
 inline void sgemm(const float* A, int64_t as0, int64_t as1, const float* B,
                   int64_t bs0, int64_t bs1, float* C, int64_t m, int64_t n,
                   int64_t k, float alpha) {
+  const int max_threads = static_cast<int>(
+      std::min<int64_t>(m * n * k / min_work_per_thread_(), 1 << 30));
+  sgemm_(A, as0, as1, B, bs0, bs1, C, m, n, k, alpha, max_threads);
+}
+
+inline void sgemm_(const float* A, int64_t as0, int64_t as1, const float* B,
+                   int64_t bs0, int64_t bs1, float* C, int64_t m, int64_t n,
+                   int64_t k, float alpha, int max_threads) {
   if (m == 0 || n == 0) return;
   std::memset(C, 0, static_cast<size_t>(m) * static_cast<size_t>(n) *
                         sizeof(float));
@@ -387,8 +438,6 @@ inline void sgemm(const float* A, int64_t as0, int64_t as1, const float* B,
   // resolve to each worker's own (empty) thread_local instance.
   float* bpack_p = bpack.data();
   auto& pool = thread_pool::instance();
-  const int max_threads = static_cast<int>(
-      std::min<int64_t>(m * n * k / min_work_per_thread_(), 1 << 30));
 
   for (int64_t jc = 0; jc < n; jc += NC) {
     int64_t nc = std::min<int64_t>(NC, n - jc);

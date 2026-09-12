@@ -152,10 +152,14 @@ bool ok = tl::gpu_available();   // compiled in AND a device is present
 Selection is a process-wide switch, and which GPU backend you get is decided
 at compile time. When no device is present, `use_gpu()` and `use_auto()`
 silently run on the CPU. The `auto` thresholds are measured per kernel class
-and per backend; `TL_BATCH_MATMUL_BIAS` overrides the batched-matmul one at
-runtime. The CPU gemm splits across threads only when each would get
-`TL_CPU_MIN_WORK` multiply-adds (default 2e6, from `misc/census_cpu_threads.cpp`);
-below that it runs on the calling thread.
+and per backend; the matmul one is re-derived on the host at the first
+`auto`-mode graph eval (a four-point CPU-vs-GPU census, a few ms;
+`TL_AUTO_MATMUL` pins it, `TL_AUTO_TRACE=1` prints the census) and
+`TL_BATCH_MATMUL_BIAS` overrides the batched-matmul one. The CPU
+gemm splits across threads only when each would get a floor of multiply-adds
+that is derived from the pool's measured wake-up on first use
+(`TL_CPU_MIN_WORK` pins it; `misc/census_pool_latency.cpp` shows the
+arithmetic); below that it runs on the calling thread.
 
 New ops sometimes land on one backend (usually CUDA) before the others catch
 up. `tools/check_backend_parity.py` reports, per op, which of CUDA/Metal/

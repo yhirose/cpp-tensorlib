@@ -67,5 +67,14 @@ int main() {
       row(buf, (double)rows*cols, cpu, gpu);
     }
   }
+  // What the runtime derives for itself on this host (array.h calibrate_auto_,
+  // cpu.h min_work_per_thread_) — the values the tables above are checked against.
+  tl::use_auto();
+  rnd({8, 8}, 6).dot(rnd({8, 8}, 7)).eval();  // a graph eval, so run_ fires
+  std::printf("== DERIVED ON THIS HOST (first auto-mode graph eval; TL_AUTO_TRACE=1 shows the census) ==\n"
+              "  matmul threshold %lld   cpu thread floor %lld\n",
+              (long long)tl::auto_matmul_threshold(),
+              (long long)tl::cpu::min_work_per_thread_());
+  tl::use_cpu();
   return 0;
 }
