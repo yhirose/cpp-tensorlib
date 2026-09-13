@@ -23,7 +23,7 @@
 //  - Sleeping workers are woken through a shared counter of "next worker to
 //    wake": the caller wakes the first, every woken worker helps wake the
 //    rest before it takes chunks, so a cold P-way start costs about log2(P)
-//    wake latencies instead of P-1 sequential futex calls (140 → 85 µs for
+//    wake latencies instead of P-1 sequential futex calls (140 → 58 µs for
 //    20 threads on a WSL2 box).
 //  - The join counts finished elements, not finished workers: a worker the
 //    scheduler holds back (a vCPU the hypervisor took, a core a host process
@@ -42,6 +42,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -102,7 +103,9 @@ class thread_pool {
     help_wake_();
     run_chunks_();  // the caller is a worker too
     wait_done_();
-    task_.ctx = nullptr;
+    // ctx stays as it is: a late worker may still read the fields (it finds
+    // no chunk and never calls fn), and the next call rewrites them only
+    // after the close/readers handshake above.
   }
 
   ~thread_pool() {
@@ -113,7 +116,7 @@ class thread_pool {
 
  private:
   using clk = std::chrono::steady_clock;
-  enum : int { kAwake = 0, kSleeping = 1 };
+  static constexpr size_t kLine = 64;  // cache line: what the alignas below separates
 
   // One per worker: its wake-up signal. Heap-allocated so the vector can
   // grow without moving a mutex.
@@ -121,22 +124,25 @@ class thread_pool {
     std::mutex m;
     std::condition_variable cv;
     std::atomic<uint64_t> generation{0};
-    std::atomic<int> state{kAwake};  // kSleeping only around cv.wait
+    std::atomic<bool> sleeping{false};  // true only around cv.wait
   };
 
   // The current parallel_for. Workers enter through readers/open so the
   // caller can tell when nobody is reading before it rewrites the fields.
+  // The fields every chunk reads sit on their own line, away from the
+  // counters every chunk bumps: a contended fetch_add on `next` or `done`
+  // must not evict `fn`/`n`/`grain` from the other workers' caches.
   struct task {
-    void* ctx = nullptr;  // the caller's callable, borrowed for the call
+    alignas(kLine) void* ctx = nullptr;  // the caller's callable, borrowed for the call
     void (*fn)(void*, int64_t, int64_t) = nullptr;
     int64_t n = 0;
     int64_t grain = 1;
     int p = 1;
-    std::atomic<int64_t> next{0};  // first element not yet handed out
-    std::atomic<int64_t> done{0};  // elements finished
     std::atomic<int> wake_next{1};  // next worker owed a wake-up
     std::atomic<int> readers{0};
     std::atomic<bool> open{false};
+    alignas(kLine) std::atomic<int64_t> next{0};  // first element not yet handed out
+    alignas(kLine) std::atomic<int64_t> done{0};  // elements finished
   };
 
   thread_pool() {
@@ -162,10 +168,12 @@ class thread_pool {
   }
 
   // Spin on `ready` for the spin window; true when it held before the
-  // window ran out.
+  // window ran out. The first look is free of the clock read: a caller whose
+  // own chunk was the last one, or a worker signalled before it got here,
+  // never pays for the timer.
   template <class Pred>
   bool spin_until_(Pred&& ready) const {
-    if (spin_.count() == 0) return ready();
+    if (ready() || spin_.count() == 0) return ready();
     auto t0 = clk::now();
     for (;;) {
       for (int i = 0; i < 64; i++) {
@@ -176,25 +184,32 @@ class thread_pool {
     }
   }
 
-  // Signal worker t: bump its generation, and only if it is asleep take the
-  // futex path. Bump (seq_cst) then read state, against the worker's write
-  // state then read generation: one side always sees the other, so a worker
-  // going to sleep either sees the bump in its wait predicate or is found
-  // sleeping and notified. Taking the mutex before notify orders the notify
-  // after the worker is inside cv.wait.
+  // Wake a sleeper: the signal itself (a generation bump, a finished count)
+  // has already been stored seq_cst, and the sleeper stores its flag seq_cst
+  // before it re-reads the signal — one side always sees the other, so a
+  // thread going to sleep either sees the signal in its wait predicate or is
+  // found sleeping and notified. Taking the mutex before notify orders the
+  // notify after the sleeper is inside cv.wait.
+  static void notify_if_sleeping_(const std::atomic<bool>& sleeping, std::mutex& m,
+                                  std::condition_variable& cv) {
+    if (!sleeping.load(std::memory_order_seq_cst)) return;
+    { std::lock_guard<std::mutex> lk(m); }
+    cv.notify_one();
+  }
+
+  // Signal worker t: bump its generation; the futex path only if it sleeps.
   void wake_(int t) {
     auto& s = *slots_[t - 1];
     s.generation.fetch_add(1, std::memory_order_seq_cst);
-    if (s.state.load(std::memory_order_seq_cst) == kSleeping) {
-      { std::lock_guard<std::mutex> lk(s.m); }
-      s.cv.notify_one();
-    }
+    notify_if_sleeping_(s.sleeping, s.m, s.cv);
   }
 
   // Wake the workers this task still owes a signal to, sharing the list with
-  // every worker already awake (each calls this before taking chunks).
+  // every worker already awake (each calls this before taking chunks). The
+  // plain load first: once the list is drained (the common hot case) no
+  // worker pays a contended fetch_add to learn so.
   void help_wake_() {
-    for (;;) {
+    while (task_.wake_next.load(std::memory_order_relaxed) < task_.p) {
       int t = task_.wake_next.fetch_add(1, std::memory_order_relaxed);
       if (t >= task_.p) return;
       wake_(t);
@@ -202,19 +217,18 @@ class thread_pool {
   }
 
   // Take chunks off the shared counter until the range is exhausted; count
-  // each finished chunk, and wake the caller if the last one finds it asleep
-  // (same write-flag-then-read protocol as wake_).
+  // each finished chunk, and wake the caller if the last one finds it asleep.
   void run_chunks_() {
+    const int64_t n = task_.n, grain = task_.grain;
+    auto* const fn = task_.fn;
+    void* const ctx = task_.ctx;
     for (;;) {
-      int64_t b = task_.next.fetch_add(task_.grain, std::memory_order_relaxed);
-      if (b >= task_.n) return;
-      int64_t e = std::min(task_.n, b + task_.grain);
-      task_.fn(task_.ctx, b, e);
-      if (task_.done.fetch_add(e - b, std::memory_order_seq_cst) + (e - b) == task_.n &&
-          caller_sleeping_.load(std::memory_order_seq_cst)) {
-        { std::lock_guard<std::mutex> lk(done_m_); }
-        done_cv_.notify_one();
-      }
+      int64_t b = task_.next.fetch_add(grain, std::memory_order_relaxed);
+      if (b >= n) return;
+      int64_t e = std::min(n, b + grain);
+      fn(ctx, b, e);
+      if (task_.done.fetch_add(e - b, std::memory_order_seq_cst) + (e - b) == n)
+        notify_if_sleeping_(caller_sleeping_, done_m_, done_cv_);
     }
   }
 
@@ -237,9 +251,9 @@ class thread_pool {
       };
       if (!spin_until_(signalled)) {
         std::unique_lock<std::mutex> lk(s.m);
-        s.state.store(kSleeping, std::memory_order_seq_cst);
+        s.sleeping.store(true, std::memory_order_seq_cst);
         s.cv.wait(lk, [&] { return s.generation.load(std::memory_order_seq_cst) != seen; });
-        s.state.store(kAwake, std::memory_order_relaxed);
+        s.sleeping.store(false, std::memory_order_relaxed);
       }
       seen = s.generation.load(std::memory_order_acquire);
       if (stop_.load(std::memory_order_relaxed)) return;
@@ -262,7 +276,7 @@ class thread_pool {
   std::vector<std::unique_ptr<slot>> slots_;  // slots_[t - 1] belongs to worker t
   std::vector<std::thread> workers_;
   task task_;
-  std::mutex done_m_;
+  alignas(kLine) std::mutex done_m_;
   std::condition_variable done_cv_;
   std::atomic<bool> caller_sleeping_{false};
   std::atomic<bool> stop_{false};

@@ -600,20 +600,171 @@ __global__ void tl_sgemm(const float* A, const float* B, float* C, unsigned m,
 // strides is the plain GEMM.
 }  // close extern "C": the __device__ core template below can't have C linkage;
    // each __global__ wrapper re-declares its own for a stable symbol.
-// Two kernels share one tiling: a BM×BN output per block of 256 threads,
-// BK-deep K slabs in shared memory, 8 warps as 2×4 tiles of (BM/2)×(BN/4),
-// each thread a TM×TN microtile in two column sub-iterations. They differ in
-// how a slab reaches shared memory (the host picks, cuda.h sgemm_tile_):
-//   sgemm_rb_core — staged through registers, double-buffered; the 64² BK-16
-//     4×4 instantiation, for the grids a 128² tile leaves at a dozen blocks
-//     (about half the registers, so it also packs more blocks per SM);
-//   sgemm_cp_core — cp.async into a 4-deep ring; the 128² BK-8 8×8
-//     instantiation, for everything that fills the GPU. Its register-staged
-//     twin (the same tile, once tl_sgemm_rb) measured 0.53-0.83 of cuBLAS
-//     against this one's 0.59-0.90 over the transformer block's shapes.
-// Both templates keep the general parameters: a census that wants another
-// tile instantiates it (TL_TILE forces the index for measurement).
-template <bool TA, bool TB, int BM, int BN, int BK, int TM, int TN>
+// Two kernels share one tiling: a BM×BM output per block of 256 threads,
+// BK = 1024/BM deep K slabs in shared memory (one float4 per thread per
+// operand per slab), 8 warps as 2×4 tiles of (BM/2)×(BM/4), each thread a
+// (BM/16)² microtile in two column sub-iterations. They differ in how a slab
+// reaches shared memory (the host picks, cuda.h sgemm_tile_):
+//   sgemm_rb_core — staged through registers, double-buffered; the 64² tile
+//     (BK 16, 4×4), for the grids a 128² tile leaves at a dozen blocks —
+//     about half the registers, so it also packs more blocks per SM;
+//   sgemm_cp_core — cp.async into a 4-deep ring; the 128² tile (BK 8, 8×8),
+//     for everything that fills the GPU. Its register-staged twin (the same
+//     tile, once tl_sgemm_rb) measured 0.53-0.83 of cuBLAS against this one's
+//     0.59-0.90 over the transformer block's shapes. (A 256×128 16×8 tile at
+//     215 registers and one block per SM, 16-deep slabs, and a 3-deep ring
+//     were all tried and measured at or below it.)
+// The pieces both use — placement, the split-K range, the global-load index
+// map, the slab's fragment loads + FMAs, and the epilogue — live in the
+// helpers below, so the two cores are only their staging.
+
+// Where this block and thread sit: block tile, warp tile in the block, thread
+// microtile in the warp.
+template <int BM>
+struct sgemm_geom {
+  static constexpr int BK = 1024 / BM;
+  static constexpr int WM = BM / 2, WN = BM / 4;  // warp tile: 8 warps as 2 × 4
+  static constexpr int TM = BM / 16, TN = BM / 16;  // thread microtile
+  static constexpr int WNI = 2, TNSUB = TN / WNI;   // column sub-iterations per warp
+  static_assert(BM == 128 || BM == 64, "the two tiles the host knows");
+  static_assert((WM / TM) * (WN / WNI / TNSUB) == 32, "32 threads per warp");
+  unsigned blockRow, blockCol, warpRow, warpCol, threadRowInWarp, threadColInWarp;
+  __device__ __forceinline__ sgemm_geom() {
+    blockRow = blockIdx.y * BM;
+    blockCol = blockIdx.x * BM;
+    const unsigned warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    warpRow = warp / (BM / WN);
+    warpCol = warp % (BM / WN);
+    threadRowInWarp = lane / (WN / WNI / TNSUB);
+    threadColInWarp = lane % (WN / WNI / TNSUB);
+  }
+  __device__ __forceinline__ unsigned row0() const {
+    return blockRow + warpRow * WM + threadRowInWarp * TM;
+  }
+  __device__ __forceinline__ unsigned col0(unsigned wn) const {
+    return blockCol + warpCol * WN + wn * (WN / WNI) + threadColInWarp * TNSUB;
+  }
+};
+
+// z = batch element × K split: bi is this block's batch element (the cores
+// step A/B/C by it), [k0, k1) its K-range (a multiple of BK; the whole K when
+// S==1). sz < S = ceil(k/ksplit) keeps k0 < k, so every split has work.
+struct sgemm_split {
+  unsigned bi, sz, k0, k1;
+  __device__ __forceinline__ sgemm_split(unsigned k, unsigned ksplit) {
+    const unsigned S = (k + ksplit - 1) / ksplit;
+    bi = blockIdx.z / S;
+    sz = blockIdx.z % S;
+    k0 = sz * ksplit;
+    k1 = (k0 + ksplit < k) ? (k0 + ksplit) : k;
+  }
+};
+
+// This thread's float4 of each operand per slab. A K-contiguous operand: one
+// row (A) / column (B), 4 along K. An M/N-contiguous one: one k, 4 along M/N.
+// gArow/gBcol are the M/N index the float4 sits at (the load's guard).
+template <bool TA, bool TB, int BM>
+struct sgemm_ldmap {
+  static constexpr int BK = 1024 / BM;
+  unsigned aRow, aCol, bRow, bCol, gArow, gBcol;
+  __device__ __forceinline__ sgemm_ldmap(unsigned blockRow, unsigned blockCol) {
+    const unsigned tid = threadIdx.x;
+    aRow = TA ? tid / (BM / 4) : tid / (BK / 4);        // k | m
+    aCol = (TA ? tid % (BM / 4) : tid % (BK / 4)) * 4;  // m | k
+    bRow = TB ? tid / (BK / 4) : tid / (BM / 4);        // n | k
+    bCol = (TB ? tid % (BK / 4) : tid % (BM / 4)) * 4;  // k | n
+    gArow = blockRow + (TA ? aCol : aRow);
+    gBcol = blockCol + (TB ? bRow : bCol);
+  }
+  __device__ __forceinline__ const float* a_src(const float* A, unsigned m, unsigned k,
+                                                unsigned kt) const {
+    return TA ? &A[(size_t)(kt + aRow) * m + gArow] : &A[(size_t)gArow * k + kt + aCol];
+  }
+  __device__ __forceinline__ const float* b_src(const float* B, unsigned n, unsigned k,
+                                                unsigned kt) const {
+    return TB ? &B[(size_t)gBcol * k + kt + bCol] : &B[(size_t)(kt + bRow) * n + gBcol];
+  }
+};
+
+// Scatter a K-contiguous operand's float4 (4 along k) into the [k][m|n]
+// compute layout. 2-way bank conflict inherited from the original: the two
+// lanes sharing a row write columns 4 apart.
+template <int BM>
+__device__ __forceinline__ void sgemm_scatter_(float* dst, unsigned row, unsigned col,
+                                               float4 v) {
+  dst[(col + 0) * BM + row] = v.x;
+  dst[(col + 1) * BM + row] = v.y;
+  dst[(col + 2) * BM + row] = v.z;
+  dst[(col + 3) * BM + row] = v.w;
+}
+
+// One slab's FMAs from compute-layout tiles As/Bs ([BK][BM], flat).
+template <int BM>
+__device__ __forceinline__ void sgemm_slab_fma_(
+    const float* As, const float* Bs, const sgemm_geom<BM>& g,
+    float (&acc)[sgemm_geom<BM>::TM][sgemm_geom<BM>::TN]) {
+  using G = sgemm_geom<BM>;
+  float regM[G::TM];
+  float regN[G::TN];
+  const unsigned aBase = g.warpRow * G::WM + g.threadRowInWarp * G::TM;
+#pragma unroll
+  for (unsigned kk = 0; kk < G::BK; kk++) {
+#pragma unroll
+    for (int q = 0; q < G::TM / 4; q++)
+      reinterpret_cast<float4*>(regM)[q] =
+          *reinterpret_cast<const float4*>(&As[kk * BM + aBase + 4 * q]);
+#pragma unroll
+    for (unsigned wn = 0; wn < G::WNI; wn++) {
+      const unsigned bBase =
+          g.warpCol * G::WN + wn * (G::WN / G::WNI) + g.threadColInWarp * G::TNSUB;
+      if constexpr (G::TNSUB == 4)
+        reinterpret_cast<float4*>(regN)[wn] =
+            *reinterpret_cast<const float4*>(&Bs[kk * BM + bBase]);
+      else
+        reinterpret_cast<float2*>(regN)[wn] =
+            *reinterpret_cast<const float2*>(&Bs[kk * BM + bBase]);
+    }
+#pragma unroll
+    for (unsigned i = 0; i < G::TM; i++)
+#pragma unroll
+      for (unsigned j = 0; j < G::TN; j++) acc[i][j] += regM[i] * regN[j];
+  }
+}
+
+// Epilogue: guarded store (mirroring the load map's edges). S==1: fused
+// affine store. S>1: atomicAdd this split's share of the affine result into a
+// pre-zeroed C — scale on every partial, offset from split 0 only. ksplit is
+// uniform across the block, so the branch never diverges.
+template <int BM>
+__device__ __forceinline__ void sgemm_store_(
+    float* __restrict__ C, unsigned m, unsigned n, float scale, float offset,
+    bool split, unsigned sz, const sgemm_geom<BM>& g,
+    const float (&acc)[sgemm_geom<BM>::TM][sgemm_geom<BM>::TN]) {
+  using G = sgemm_geom<BM>;
+  const float part_offset = sz == 0 ? offset : 0.0f;
+#pragma unroll
+  for (unsigned i = 0; i < G::TM; i++) {
+    const unsigned gRow = g.row0() + i;
+    if (gRow >= m) continue;
+#pragma unroll
+    for (unsigned wn = 0; wn < G::WNI; wn++) {
+#pragma unroll
+      for (unsigned js = 0; js < G::TNSUB; js++) {
+        const unsigned gCol = g.col0(wn) + js;
+        if (gCol >= n) continue;
+        const size_t idx = (size_t)gRow * n + gCol;
+        const float v = acc[i][wn * G::TNSUB + js];
+        if (split)
+          atomicAdd(&C[idx], v * scale + part_offset);
+        else
+          C[idx] = v * scale + offset;
+      }
+    }
+  }
+}
+
+// ---- register-staged core: global → registers → double-buffered shared ----
+template <bool TA, bool TB, int BM>
 __device__ __forceinline__ void sgemm_rb_core(const float* __restrict__ A,
                                               const float* __restrict__ B,
                                               float* __restrict__ C, unsigned m,
@@ -621,197 +772,60 @@ __device__ __forceinline__ void sgemm_rb_core(const float* __restrict__ A,
                                               float offset, unsigned ksplit,
                                               unsigned sa, unsigned sb,
                                               unsigned sc) {
-  constexpr int WM = BM / 2, WN = BN / 4;   // warp tile: 8 warps as 2 × 4
-  constexpr int WNI = 2, TNSUB = TN / WNI;   // column sub-iterations per warp
-  constexpr int LA = BM * BK / 1024, LB = BN * BK / 1024;  // float4 per thread per slab
-  static_assert(LA >= 1 && LB >= 1 && BM * BK % 1024 == 0 && BN * BK % 1024 == 0,
-                "every thread stages whole float4s");
-  static_assert((WM / TM) * (WN / WNI / TNSUB) == 32, "32 threads per warp");
-  static_assert(TM % 4 == 0 && (TNSUB == 4 || TNSUB == 2), "vector fragment loads");
-  __shared__ __align__(16) float As[2][BK][BM];  // double-buffered, transposed
-  __shared__ __align__(16) float Bs[2][BK][BN];
+  using G = sgemm_geom<BM>;
+  constexpr int BK = G::BK;
+  __shared__ __align__(16) float As[2][BK * BM];  // compute layout [k][m]
+  __shared__ __align__(16) float Bs[2][BK * BM];
+  const G g;
+  const sgemm_split sp(k, ksplit);
+  A += (size_t)sp.bi * sa;
+  B += (size_t)sp.bi * sb;
+  C += (size_t)sp.bi * sc;
+  const sgemm_ldmap<TA, TB, BM> ld(g.blockRow, g.blockCol);
 
-  const unsigned blockRow = blockIdx.y * BM;
-  const unsigned blockCol = blockIdx.x * BN;
-  const unsigned tid = threadIdx.x;  // 0..255
-
-  // z = batch element × K split: step the operands to this batch element,
-  // then take the split's K-range (a multiple of BK; identity when S==1).
-  // sz < S = ceil(k/ksplit) keeps k0 < k, so every split has work.
-  const unsigned S = (k + ksplit - 1) / ksplit;
-  const unsigned bi = blockIdx.z / S;
-  const unsigned sz = blockIdx.z % S;
-  A += (size_t)bi * sa;
-  B += (size_t)bi * sb;
-  C += (size_t)bi * sc;
-  const unsigned k0 = sz * ksplit;
-  const unsigned k1 = (k0 + ksplit < k) ? (k0 + ksplit) : k;
-
-  // warp placement in the block: (BM/WM) rows × (BN/WN) cols of WM×WN tiles
-  const unsigned warp = tid / 32;
-  const unsigned lane = tid % 32;
-  const unsigned warpRow = warp / (BN / WN);
-  const unsigned warpCol = warp % (BN / WN);
-  // thread placement in the warp tile: (WM/TM) rows × (WN/WNI/TNSUB) cols
-  const unsigned threadRowInWarp = lane / (WN / WNI / TNSUB);
-  const unsigned threadColInWarp = lane % (WN / WNI / TNSUB);
-
-  // global-load index maps (float4 number i of this thread is element
-  // tid + 256·i of the slab). A K-contiguous operand: one row (A) / column
-  // (B) per float4, 4 along K. An M/N-contiguous one: one k, 4 along M / N.
-  float4 ldgA[LA], ldgB[LB];
+  float acc[G::TM][G::TN] = {};
+  // global loads staged in registers → overlap with compute (double buffer).
+  float4 ldgA, ldgB;
   auto load_regs = [&](unsigned kt) {
-#pragma unroll
-    for (int i = 0; i < LA; i++) {
-      const unsigned e = tid + 256 * i;
-      const unsigned aRow = TA ? e / (BM / 4) : e / (BK / 4);        // k | m
-      const unsigned aCol = (TA ? e % (BM / 4) : e % (BK / 4)) * 4;  // m | k
-      const unsigned gArow = blockRow + (TA ? aCol : aRow);
-      ldgA[i] = (gArow < m)
-          ? *reinterpret_cast<const float4*>(
-                TA ? &A[(size_t)(kt + aRow) * m + gArow]
-                   : &A[(size_t)gArow * k + kt + aCol])
-          : make_float4(0, 0, 0, 0);
-    }
-#pragma unroll
-    for (int i = 0; i < LB; i++) {
-      const unsigned e = tid + 256 * i;
-      const unsigned bRow = TB ? e / (BK / 4) : e / (BN / 4);        // n | k
-      const unsigned bCol = (TB ? e % (BK / 4) : e % (BN / 4)) * 4;  // k | n
-      const unsigned gBcol = blockCol + (TB ? bRow : bCol);
-      ldgB[i] = (gBcol < n)
-          ? *reinterpret_cast<const float4*>(
-                TB ? &B[(size_t)gBcol * k + kt + bCol]
-                   : &B[(size_t)(kt + bRow) * n + gBcol])
-          : make_float4(0, 0, 0, 0);
-    }
+    ldgA = ld.gArow < m ? *reinterpret_cast<const float4*>(ld.a_src(A, m, k, kt))
+                        : make_float4(0, 0, 0, 0);
+    ldgB = ld.gBcol < n ? *reinterpret_cast<const float4*>(ld.b_src(B, n, k, kt))
+                        : make_float4(0, 0, 0, 0);
   };
   auto store_smem = [&](int buf) {
-#pragma unroll
-    for (int i = 0; i < LA; i++) {
-      const unsigned e = tid + 256 * i;
-      const unsigned aRow = TA ? e / (BM / 4) : e / (BK / 4);
-      const unsigned aCol = (TA ? e % (BM / 4) : e % (BK / 4)) * 4;
-      if constexpr (TA) {
-        *reinterpret_cast<float4*>(&As[buf][aRow][aCol]) = ldgA[i];
-      } else {
-        As[buf][aCol + 0][aRow] = ldgA[i].x;
-        As[buf][aCol + 1][aRow] = ldgA[i].y;
-        As[buf][aCol + 2][aRow] = ldgA[i].z;
-        As[buf][aCol + 3][aRow] = ldgA[i].w;
-      }
-    }
-#pragma unroll
-    for (int i = 0; i < LB; i++) {
-      const unsigned e = tid + 256 * i;
-      const unsigned bRow = TB ? e / (BK / 4) : e / (BN / 4);
-      const unsigned bCol = (TB ? e % (BK / 4) : e % (BN / 4)) * 4;
-      if constexpr (TB) {
-        Bs[buf][bCol + 0][bRow] = ldgB[i].x;
-        Bs[buf][bCol + 1][bRow] = ldgB[i].y;
-        Bs[buf][bCol + 2][bRow] = ldgB[i].z;
-        Bs[buf][bCol + 3][bRow] = ldgB[i].w;
-      } else {
-        *reinterpret_cast<float4*>(&Bs[buf][bRow][bCol]) = ldgB[i];
-      }
-    }
+    if constexpr (TA)
+      *reinterpret_cast<float4*>(&As[buf][ld.aRow * BM + ld.aCol]) = ldgA;
+    else
+      sgemm_scatter_<BM>(As[buf], ld.aRow, ld.aCol, ldgA);
+    if constexpr (TB)
+      sgemm_scatter_<BM>(Bs[buf], ld.bRow, ld.bCol, ldgB);
+    else
+      *reinterpret_cast<float4*>(&Bs[buf][ld.bRow * BM + ld.bCol]) = ldgB;
   };
 
-  float acc[TM][TN] = {};
-  float regM[TM];
-  float regN[TN];
-
-  load_regs(k0);
+  load_regs(sp.k0);
   store_smem(0);
   __syncthreads();
   int buf = 0;
-  for (unsigned kt = k0; kt < k1; kt += BK) {
-    bool has_next = kt + BK < k1;
+  for (unsigned kt = sp.k0; kt < sp.k1; kt += BK) {
+    const bool has_next = kt + BK < sp.k1;
     if (has_next) load_regs(kt + BK);  // prefetch next slab into registers
-#pragma unroll
-    for (unsigned kk = 0; kk < BK; kk++) {
-      unsigned aBase = warpRow * WM + threadRowInWarp * TM;
-#pragma unroll
-      for (int q = 0; q < TM / 4; q++)
-        reinterpret_cast<float4*>(regM)[q] =
-            *reinterpret_cast<float4*>(&As[buf][kk][aBase + 4 * q]);
-#pragma unroll
-      for (unsigned wn = 0; wn < WNI; wn++) {
-        unsigned bBase = warpCol * WN + wn * (WN / WNI) + threadColInWarp * TNSUB;
-        if constexpr (TNSUB == 4)
-          reinterpret_cast<float4*>(regN)[wn] =
-              *reinterpret_cast<float4*>(&Bs[buf][kk][bBase]);
-        else
-          reinterpret_cast<float2*>(regN)[wn] =
-              *reinterpret_cast<float2*>(&Bs[buf][kk][bBase]);
-      }
-#pragma unroll
-      for (unsigned i = 0; i < TM; i++)
-#pragma unroll
-        for (unsigned j = 0; j < TN; j++) acc[i][j] += regM[i] * regN[j];
-    }
+    sgemm_slab_fma_<BM>(As[buf], Bs[buf], g, acc);
     if (has_next) store_smem(buf ^ 1);  // regs → other buffer after compute
     __syncthreads();
     buf ^= 1;
   }
-
-  // --- epilogue: guarded store (mirror the load map) ---
-  // S==1: fused affine store. S>1: atomicAdd this split's share of the affine
-  // result into a pre-zeroed C — scale on every partial, offset from split 0
-  // only. ksplit is uniform across the block, so the branch never diverges.
-  const bool split = ksplit < k;
-  const float part_offset = sz == 0 ? offset : 0.0f;
-#pragma unroll
-  for (unsigned i = 0; i < TM; i++) {
-    unsigned gRow = blockRow + warpRow * WM + threadRowInWarp * TM + i;
-    if (gRow >= m) continue;
-#pragma unroll
-    for (unsigned wn = 0; wn < WNI; wn++) {
-#pragma unroll
-      for (unsigned js = 0; js < TNSUB; js++) {
-        unsigned j = wn * TNSUB + js;
-        unsigned gCol = blockCol + warpCol * WN + wn * (WN / WNI) +
-                        threadColInWarp * TNSUB + js;
-        if (gCol >= n) continue;
-        size_t idx = (size_t)gRow * n + gCol;
-        if (split)
-          atomicAdd(&C[idx], acc[i][j] * scale + part_offset);
-        else
-          C[idx] = acc[i][j] * scale + offset;
-      }
-    }
-  }
+  sgemm_store_<BM>(C, m, n, scale, offset, ksplit < k, sp.sz, g, acc);
 }
-// The tiles, one __global__ per operand layout each (extern "C" for a stable
-// symbol the host looks up by name).
-#define TL_SGEMM_RB_TILE(NAME, TA, TB, BM, BN, BK, TM, TN)                     \
-  extern "C" __global__ void NAME(                                             \
-      const float* __restrict__ A, const float* __restrict__ B,                \
-      float* __restrict__ C, unsigned m, unsigned n, unsigned k, float scale,   \
-      float offset, unsigned ksplit, unsigned sa, unsigned sb, unsigned sc) {   \
-    sgemm_rb_core<TA, TB, BM, BN, BK, TM, TN>(A, B, C, m, n, k, scale, offset, \
-                                              ksplit, sa, sb, sc);             \
-  }
-#define TL_SGEMM_RB_LAYOUTS(NAME, BM, BN, BK, TM, TN)                \
-  TL_SGEMM_RB_TILE(NAME, false, false, BM, BN, BK, TM, TN)          \
-  TL_SGEMM_RB_TILE(NAME##_nt, false, true, BM, BN, BK, TM, TN)      \
-  TL_SGEMM_RB_TILE(NAME##_tn, true, false, BM, BN, BK, TM, TN)      \
-  TL_SGEMM_RB_TILE(NAME##_tt, true, true, BM, BN, BK, TM, TN)
-TL_SGEMM_RB_LAYOUTS(tl_sgemm_rb64, 64, 64, 16, 4, 4)
-#undef TL_SGEMM_RB_LAYOUTS
-#undef TL_SGEMM_RB_TILE
 
-// ---- cp.async-pipelined variant of the same tiling ----
-// Same block/warp/thread tiling and epilogue as sgemm_rb_core, different
-// staging: global slabs stream straight into a STAGES-deep shared ring with
-// cp.async (no registers in the path, STAGES-1 slabs in flight), and an
-// operand that arrives K-contiguous is turned to the [k][m] compute layout by
-// a shared-to-shared step (float4 in, four scalars out) into a
-// double-buffered compute tile — the register-staged kernel did that
-// transpose on the way in, which tied its prefetch depth to registers. The
-// transpose runs one slab ahead of the compute, so a slab costs one barrier.
-// (A 256×128 16×8 instantiation, 215 registers and one block per SM, measured
-// below the 128² one everywhere; a 3-deep ring matched the 4-deep.)
+// ---- cp.async-pipelined core ----
+// Global slabs stream straight into a STAGES-deep shared ring with cp.async
+// (no registers in the path, STAGES-1 slabs in flight), and an operand that
+// arrives K-contiguous is turned to the [k][m] compute layout by a
+// shared-to-shared step (float4 in, four scalars out) into a double-buffered
+// compute tile — the register-staged kernel did that transpose on the way
+// in, which tied its prefetch depth to registers. The transpose runs one
+// slab ahead of the compute, so a slab costs one barrier.
 __device__ __forceinline__ void cp_async16_(void* smem, const void* gmem, bool valid) {
   unsigned s = (unsigned)__cvta_generic_to_shared(smem);
   int bytes = valid ? 16 : 0;  // src-size 0: zero-fill, gmem still a valid address
@@ -826,7 +840,7 @@ __device__ __forceinline__ void cp_async_wait_() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
-template <bool TA, bool TB, int BM, int BN, int BK, int TM, int TN, int STAGES>
+template <bool TA, bool TB, int BM, int STAGES>
 __device__ __forceinline__ void sgemm_cp_core(const float* __restrict__ A,
                                               const float* __restrict__ B,
                                               float* __restrict__ C, unsigned m,
@@ -834,107 +848,44 @@ __device__ __forceinline__ void sgemm_cp_core(const float* __restrict__ A,
                                               float offset, unsigned ksplit,
                                               unsigned sa, unsigned sb,
                                               unsigned sc) {
-  constexpr int WM = BM / 2, WN = BN / 4;
-  constexpr int WNI = 2, TNSUB = TN / WNI;
-  constexpr int LA = BM * BK / 1024, LB = BN * BK / 1024;
-  static_assert(LA >= 1 && LB >= 1 && BM * BK % 1024 == 0 && BN * BK % 1024 == 0,
-                "every thread copies whole float4s");
-  static_assert((WM / TM) * (WN / WNI / TNSUB) == 32, "32 threads per warp");
-  static_assert(TM % 4 == 0 && (TNSUB == 4 || TNSUB == 2), "vector fragment loads");
+  using G = sgemm_geom<BM>;
+  constexpr int BK = G::BK;
   static_assert(STAGES >= 3, "slab i+1 must have landed while slab i computes");
   // Ring stages hold an M/N-contiguous operand in compute layout [k][m|n]
-  // and a K-contiguous one raw as [m|n][k]; the raw ones get a compute-layout
-  // buffer of their own.
+  // and a K-contiguous one raw as [m|n][k]; the raw ones get a double-
+  // buffered compute-layout tile of their own.
   __shared__ __align__(16) float ringA[STAGES][BK * BM];
-  __shared__ __align__(16) float ringB[STAGES][BK * BN];
-  __shared__ __align__(16) float compA[TA ? 4 : 2 * BK * BM];  // double-buffered
-  __shared__ __align__(16) float compB[TB ? 2 * BK * BN : 4];
-
-  const unsigned blockRow = blockIdx.y * BM;
-  const unsigned blockCol = blockIdx.x * BN;
-  const unsigned tid = threadIdx.x;
-
-  const unsigned S = (k + ksplit - 1) / ksplit;
-  const unsigned bi = blockIdx.z / S;
-  const unsigned sz = blockIdx.z % S;
-  A += (size_t)bi * sa;
-  B += (size_t)bi * sb;
-  C += (size_t)bi * sc;
-  const unsigned k0 = sz * ksplit;
-  const unsigned k1 = (k0 + ksplit < k) ? (k0 + ksplit) : k;
-  const unsigned nslabs = (k1 - k0) / BK;
-
-  const unsigned warp = tid / 32;
-  const unsigned lane = tid % 32;
-  const unsigned warpRow = warp / (BN / WN);
-  const unsigned warpCol = warp % (BN / WN);
-  const unsigned threadRowInWarp = lane / (WN / WNI / TNSUB);
-  const unsigned threadColInWarp = lane % (WN / WNI / TNSUB);
+  __shared__ __align__(16) float ringB[STAGES][BK * BM];
+  __shared__ __align__(16) float compA[TA ? 4 : 2 * BK * BM];
+  __shared__ __align__(16) float compB[TB ? 2 * BK * BM : 4];
+  const G g;
+  const sgemm_split sp(k, ksplit);
+  A += (size_t)sp.bi * sa;
+  B += (size_t)sp.bi * sb;
+  C += (size_t)sp.bi * sc;
+  const sgemm_ldmap<TA, TB, BM> ld(g.blockRow, g.blockCol);
+  const unsigned nslabs = (sp.k1 - sp.k0) / BK;
 
   // Issue slab `slab` (k offset k0 + slab·BK) into ring stage `st`.
   auto issue = [&](unsigned slab, int st) {
-    const unsigned kt = k0 + slab * BK;
-#pragma unroll
-    for (int i = 0; i < LA; i++) {
-      const unsigned e = tid + 256 * i;
-      const unsigned aRow = TA ? e / (BM / 4) : e / (BK / 4);        // k | m
-      const unsigned aCol = (TA ? e % (BM / 4) : e % (BK / 4)) * 4;  // m | k
-      const unsigned gArow = blockRow + (TA ? aCol : aRow);
-      const bool ok = gArow < m;
-      const float* src = ok ? (TA ? &A[(size_t)(kt + aRow) * m + gArow]
-                                  : &A[(size_t)gArow * k + kt + aCol])
-                            : A;
-      float* dst = TA ? &ringA[st][aRow * BM + aCol] : &ringA[st][aRow * BK + aCol];
-      cp_async16_(dst, src, ok);
-    }
-#pragma unroll
-    for (int i = 0; i < LB; i++) {
-      const unsigned e = tid + 256 * i;
-      const unsigned bRow = TB ? e / (BK / 4) : e / (BN / 4);        // n | k
-      const unsigned bCol = (TB ? e % (BK / 4) : e % (BN / 4)) * 4;  // k | n
-      const unsigned gBcol = blockCol + (TB ? bRow : bCol);
-      const bool ok = gBcol < n;
-      const float* src = ok ? (TB ? &B[(size_t)gBcol * k + kt + bCol]
-                                  : &B[(size_t)(kt + bRow) * n + gBcol])
-                            : B;
-      float* dst = TB ? &ringB[st][bRow * BK + bCol] : &ringB[st][bRow * BN + bCol];
-      cp_async16_(dst, src, ok);
-    }
+    const unsigned kt = sp.k0 + slab * BK;
+    const bool a_ok = ld.gArow < m, b_ok = ld.gBcol < n;
+    cp_async16_(&ringA[st][TA ? ld.aRow * BM + ld.aCol : ld.aRow * BK + ld.aCol],
+                a_ok ? ld.a_src(A, m, k, kt) : A, a_ok);
+    cp_async16_(&ringB[st][TB ? ld.bRow * BK + ld.bCol : ld.bRow * BM + ld.bCol],
+                b_ok ? ld.b_src(B, n, k, kt) : B, b_ok);
   };
   // Turn the raw [m|n][k] stage into compute-layout buffer `cb`.
   auto transpose = [&](int st, int cb) {
-    if constexpr (!TA) {
-      float* ca = compA + cb * (BK * BM);
-#pragma unroll
-      for (int i = 0; i < LA; i++) {
-        const unsigned e = tid + 256 * i;
-        const unsigned aRow = e / (BK / 4), aCol = (e % (BK / 4)) * 4;
-        float4 v = *reinterpret_cast<const float4*>(&ringA[st][aRow * BK + aCol]);
-        ca[(aCol + 0) * BM + aRow] = v.x;
-        ca[(aCol + 1) * BM + aRow] = v.y;
-        ca[(aCol + 2) * BM + aRow] = v.z;
-        ca[(aCol + 3) * BM + aRow] = v.w;
-      }
-    }
-    if constexpr (TB) {
-      float* cbp = compB + cb * (BK * BN);
-#pragma unroll
-      for (int i = 0; i < LB; i++) {
-        const unsigned e = tid + 256 * i;
-        const unsigned bRow = e / (BK / 4), bCol = (e % (BK / 4)) * 4;
-        float4 v = *reinterpret_cast<const float4*>(&ringB[st][bRow * BK + bCol]);
-        cbp[(bCol + 0) * BN + bRow] = v.x;
-        cbp[(bCol + 1) * BN + bRow] = v.y;
-        cbp[(bCol + 2) * BN + bRow] = v.z;
-        cbp[(bCol + 3) * BN + bRow] = v.w;
-      }
-    }
+    if constexpr (!TA)
+      sgemm_scatter_<BM>(compA + cb * (BK * BM), ld.aRow, ld.aCol,
+                         *reinterpret_cast<const float4*>(&ringA[st][ld.aRow * BK + ld.aCol]));
+    if constexpr (TB)
+      sgemm_scatter_<BM>(compB + cb * (BK * BM), ld.bRow, ld.bCol,
+                         *reinterpret_cast<const float4*>(&ringB[st][ld.bRow * BK + ld.bCol]));
   };
 
-  float acc[TM][TN] = {};
-  float regM[TM];
-  float regN[TN];
-
+  float acc[G::TM][G::TN] = {};
   // Prologue: the first STAGES-1 slabs in flight (one commit group each, empty
   // groups past the end keep the wait arithmetic uniform), slab 0 transposed.
 #pragma unroll
@@ -950,84 +901,39 @@ __device__ __forceinline__ void sgemm_cp_core(const float* __restrict__ A,
   // slab i+1 into the other compute buffer, compute slab i. Compute and the
   // next slab's transpose share the phase, so one barrier per slab.
   for (unsigned i = 0; i < nslabs; i++) {
-    if (STAGES > 2)
-      cp_async_wait_<STAGES - 3>();  // slab i+1 landed (this thread's copies)
-    else
-      cp_async_wait_<0>();
-    __syncthreads();  // ...everyone's; and slab i-1 fully consumed
-    {
-      const unsigned nx = i + STAGES - 1;
-      if (nx < nslabs) issue(nx, nx % STAGES);
-      cp_async_commit_();
-    }
+    cp_async_wait_<STAGES - 3>();  // slab i+1 landed (this thread's copies)
+    __syncthreads();               // ...everyone's; and slab i-1 fully consumed
+    const unsigned nx = i + STAGES - 1;
+    if (nx < nslabs) issue(nx, nx % STAGES);
+    cp_async_commit_();
     if (i + 1 < nslabs) transpose((i + 1) % STAGES, (i + 1) & 1);
     const int st = i % STAGES;
-    const float* As = TA ? ringA[st] : compA + (i & 1) * (BK * BM);
-    const float* Bs = TB ? compB + (i & 1) * (BK * BN) : ringB[st];
-#pragma unroll
-    for (unsigned kk = 0; kk < BK; kk++) {
-      unsigned aBase = warpRow * WM + threadRowInWarp * TM;
-#pragma unroll
-      for (int q = 0; q < TM / 4; q++)
-        reinterpret_cast<float4*>(regM)[q] =
-            *reinterpret_cast<const float4*>(&As[kk * BM + aBase + 4 * q]);
-#pragma unroll
-      for (unsigned wn = 0; wn < WNI; wn++) {
-        unsigned bBase = warpCol * WN + wn * (WN / WNI) + threadColInWarp * TNSUB;
-        if constexpr (TNSUB == 4)
-          reinterpret_cast<float4*>(regN)[wn] =
-              *reinterpret_cast<const float4*>(&Bs[kk * BN + bBase]);
-        else
-          reinterpret_cast<float2*>(regN)[wn] =
-              *reinterpret_cast<const float2*>(&Bs[kk * BN + bBase]);
-      }
-#pragma unroll
-      for (unsigned i2 = 0; i2 < TM; i2++)
-#pragma unroll
-        for (unsigned j = 0; j < TN; j++) acc[i2][j] += regM[i2] * regN[j];
-    }
+    sgemm_slab_fma_<BM>(TA ? ringA[st] : compA + (i & 1) * (BK * BM),
+                        TB ? compB + (i & 1) * (BK * BM) : ringB[st], g, acc);
   }
   cp_async_wait_<0>();  // drain the trailing empty groups
-
-  const bool split = ksplit < k;
-  const float part_offset = sz == 0 ? offset : 0.0f;
-#pragma unroll
-  for (unsigned i = 0; i < TM; i++) {
-    unsigned gRow = blockRow + warpRow * WM + threadRowInWarp * TM + i;
-    if (gRow >= m) continue;
-#pragma unroll
-    for (unsigned wn = 0; wn < WNI; wn++) {
-#pragma unroll
-      for (unsigned js = 0; js < TNSUB; js++) {
-        unsigned j = wn * TNSUB + js;
-        unsigned gCol = blockCol + warpCol * WN + wn * (WN / WNI) +
-                        threadColInWarp * TNSUB + js;
-        if (gCol >= n) continue;
-        size_t idx = (size_t)gRow * n + gCol;
-        if (split)
-          atomicAdd(&C[idx], acc[i][j] * scale + part_offset);
-        else
-          C[idx] = acc[i][j] * scale + offset;
-      }
-    }
-  }
+  sgemm_store_<BM>(C, m, n, scale, offset, ksplit < k, sp.sz, g, acc);
 }
-#define TL_SGEMM_CP_TILE(NAME, TA, TB, BM, BN, BK, TM, TN, ST)                  \
+
+// One __global__ per operand layout per tile (extern "C" for a stable symbol
+// the host looks up by name — cuda.h context::sgemm_).
+#define TL_SGEMM_KERNEL(NAME, CORE, TA, TB, ...)                                 \
   extern "C" __global__ void NAME(                                             \
       const float* __restrict__ A, const float* __restrict__ B,                \
       float* __restrict__ C, unsigned m, unsigned n, unsigned k, float scale,   \
       float offset, unsigned ksplit, unsigned sa, unsigned sb, unsigned sc) {   \
-    sgemm_cp_core<TA, TB, BM, BN, BK, TM, TN, ST>(A, B, C, m, n, k, scale,     \
-                                                  offset, ksplit, sa, sb, sc); \
+    CORE<TA, TB, __VA_ARGS__>(A, B, C, m, n, k, scale, offset, ksplit, sa, sb, \
+                              sc);                                             \
   }
-#define TL_SGEMM_CP_LAYOUTS(NAME, BM, BN, BK, TM, TN, ST)            \
-  TL_SGEMM_CP_TILE(NAME, false, false, BM, BN, BK, TM, TN, ST)      \
-  TL_SGEMM_CP_TILE(NAME##_nt, false, true, BM, BN, BK, TM, TN, ST)  \
-  TL_SGEMM_CP_TILE(NAME##_tn, true, false, BM, BN, BK, TM, TN, ST)  \
-  TL_SGEMM_CP_TILE(NAME##_tt, true, true, BM, BN, BK, TM, TN, ST)
-TL_SGEMM_CP_LAYOUTS(tl_sgemm_cp128, 128, 128, 8, 8, 8, 4)
-#undef TL_SGEMM_CP_LAYOUTS
-#undef TL_SGEMM_CP_TILE
+#define TL_SGEMM_LAYOUTS(NAME, CORE, ...)                   \
+  TL_SGEMM_KERNEL(NAME, CORE, false, false, __VA_ARGS__)    \
+  TL_SGEMM_KERNEL(NAME##_nt, CORE, false, true, __VA_ARGS__) \
+  TL_SGEMM_KERNEL(NAME##_tn, CORE, true, false, __VA_ARGS__) \
+  TL_SGEMM_KERNEL(NAME##_tt, CORE, true, true, __VA_ARGS__)
+TL_SGEMM_LAYOUTS(tl_sgemm_rb64, sgemm_rb_core, 64)
+TL_SGEMM_LAYOUTS(tl_sgemm_cp128, sgemm_cp_core, 128, 4)
+#undef TL_SGEMM_LAYOUTS
+#undef TL_SGEMM_KERNEL
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 
 // ---- M9 batched-prefill GEMM: C[M,N] f32 = A[M,K] f32 @ B[N,K]^T bf16 ----

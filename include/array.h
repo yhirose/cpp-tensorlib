@@ -3548,19 +3548,10 @@ struct graph {
         }
         break;
       }
-      case op_t::affine: {
-        float s = n.scale, o = n.offset;
-        auto a = in(0);
-        if (auto g = gpu_unary(gpu::kop::affine, a, s, o)) {
-          r = std::move(*g);
-        } else if (auto out = accel::affine(a, s, o)) {
-          r = std::move(*out);
-        } else {
-          r = map_unary(a, [s, o](float x) { return x * s + o; });
-        }
+      case op_t::affine:
+        r = affine_(in(0), n.scale, n.offset);
         epi_done = true;
         break;
-      }
       case op_t::recip:
       case op_t::exp_:
       case op_t::log_:
@@ -3844,21 +3835,22 @@ struct graph {
       }
     }
     if (!epi_done && (n.scale != 1.0f || n.offset != 0.0f)) {
-      // The GPU kernel first: a view of GPU-resident data that had a scale/
-      // offset fused onto it (`x.mean(1).reshape({seq, 1}) + eps`) must not
-      // drop to the host here — that drains the pipeline and pulls the data
-      // back mid-graph, and every consumer after it lands on the CPU too
-      // (layer_norm written that way ran 2.5x slower than with keepdims).
-      float s = n.scale, o = n.offset;
-      if (auto g = gpu_unary(gpu::kop::affine, r, s, o)) {
-        r = std::move(*g);
-      } else if (auto out = accel::affine(r, s, o)) {
-        r = std::move(*out);
-      } else {
-        r = map_unary(r, [s, o](float x) { return x * s + o; });
-      }
+      r = affine_(r, n.scale, n.offset);
     }
     store(n, r);
+  }
+
+  // y = a * s + o on evaluated data: the op_t::affine body, and the epilogue
+  // of every op whose kernel did not fold the fused scale/offset in. The GPU
+  // kernel comes first: a view of GPU-resident data with an affine fused onto
+  // it (`x.mean(1).reshape({seq, 1}) + eps`) must not drop to the host here —
+  // that drains the pipeline and pulls the data back mid-graph, and every
+  // consumer after it lands on the CPU too (layer_norm written that way ran
+  // 2.5x slower than with keepdims).
+  static array affine_(const array& a, float s, float o) {
+    if (auto g = gpu_unary(gpu::kop::affine, a, s, o)) return std::move(*g);
+    if (auto out = accel::affine(a, s, o)) return std::move(*out);
+    return map_unary(a, [s, o](float x) { return x * s + o; });
   }
 
   static void eval_arrays(std::initializer_list<const array*> arrays) {

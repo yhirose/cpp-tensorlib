@@ -112,19 +112,56 @@ inline void sgemm_(const float* A, int64_t as0, int64_t as1, const float* B,
 // thread: a job below this runs on the calling thread, and a medium one
 // signals only the workers it can feed.
 //
-// The floor is a property of the pool's dispatch, not of the job, so it is
-// derived on first use rather than baked: a thread pays for itself only when
-// its share outlasts a full-width round of the pool (signalling every
-// worker, each taking and finishing its chunks, the join), i.e.
-//   floor = round_trip(all threads, pool hot) × single-thread MAC/µs
-// (misc/census_pool_latency.cpp prints the same arithmetic). About 1 ms,
-// once, on the first job: 25 empty full-width parallel_fors and 5
-// single-thread 128^3 gemms, medians. Workers spin between jobs
-// (cpu_threadpool.h), so the round trip is a few µs on a 20-thread box and
-// the floor lands on its 1e5 clamp; the transformer block census
-// (2026-09-13) reads the same at 1e5 and 3e5 and loses on layer_norm from
-// 1e6 up, where its 9 elementwise ops fall back to one or two threads. Env
+// kMinWorkFloor is the design point: workers spin between jobs
+// (cpu_threadpool.h), so a hot full-width round costs a few µs and the
+// transformer block census (2026-09-13) reads the same at 1e5 and 3e5 and
+// loses on layer_norm from 1e6 up, where its 9 elementwise ops fall back to
+// one or two threads. The derivation below is the escape for a host whose
+// round trip is not a few µs (spinning off with TL_CPU_SPIN_US=0, a VM that
+// deschedules spinners): a thread pays for itself only when its share
+// outlasts a full-width round of the pool (signalling every worker, each
+// taking and finishing its chunks, the join), i.e.
+//   floor = max(kMinWorkFloor, round_trip(all threads, pool hot) × MAC/µs)
+// (misc/census_pool_latency.cpp prints the same arithmetic from the two
+// probes below). About 1 ms, once, on the first job. The model charges a
+// two-thread split the full-width round; harmless while both are µs. Env
 // TL_CPU_MIN_WORK pins it, like TL_BATCH_MATMUL_BIAS.
+constexpr int64_t kMinWorkFloor = 100'000;
+
+// Median µs of `trials` calls.
+template <class F>
+inline double median_us_(int trials, F&& f) {
+  using clk = std::chrono::steady_clock;
+  std::vector<double> ts(static_cast<size_t>(trials));
+  for (double& t : ts) {
+    auto t0 = clk::now();
+    f();
+    t = std::chrono::duration<double, std::micro>(clk::now() - t0).count();
+  }
+  std::nth_element(ts.begin(), ts.begin() + trials / 2, ts.end());
+  return ts[static_cast<size_t>(trials / 2)];
+}
+
+// A hot full-width empty parallel_for, median of 25 after 5 warm-ups.
+inline double pool_round_trip_us_() {
+  auto& pool = thread_pool::instance();
+  const int p = pool.size();
+  auto nop = [](int64_t, int64_t) {};
+  for (int i = 0; i < 5; i++) pool.parallel_for(p, nop, p);
+  return median_us_(25, [&] { pool.parallel_for(p, nop, p); });
+}
+
+// Single-thread gemm throughput at 128^3, median of 5.
+inline double single_thread_mac_per_us_() {
+  constexpr int64_t N = 128;
+  std::vector<float> a(N * N, 1.0f), b(N * N, 1.0f), c(N * N);
+  auto probe = [&] {
+    sgemm_(a.data(), N, 1, b.data(), N, 1, c.data(), N, N, N, 1.0f, 1);
+  };
+  probe();
+  return static_cast<double>(N * N * N) / median_us_(5, probe);
+}
+
 inline int64_t min_work_per_thread_() {
   static const int64_t v = []() -> int64_t {
     if (const char* e = std::getenv("TL_CPU_MIN_WORK")) {
@@ -132,31 +169,10 @@ inline int64_t min_work_per_thread_() {
       long long x = std::strtoll(e, &end, 10);
       if (end != e && x > 0) return static_cast<int64_t>(x);
     }
-    auto& pool = thread_pool::instance();
-    if (pool.size() < 2) return 2'000'000;  // nothing to split across
-    using clk = std::chrono::steady_clock;
-    auto median_us = [](int trials, auto&& f) {
-      std::vector<double> ts(static_cast<size_t>(trials));
-      for (double& t : ts) {
-        auto t0 = clk::now();
-        f();
-        t = std::chrono::duration<double, std::micro>(clk::now() - t0).count();
-      }
-      std::nth_element(ts.begin(), ts.begin() + trials / 2, ts.end());
-      return ts[static_cast<size_t>(trials / 2)];
-    };
-    const int p = pool.size();
-    auto nop = [](int64_t, int64_t) {};
-    for (int i = 0; i < 5; i++) pool.parallel_for(p, nop, p);  // warm
-    double round_trip = median_us(25, [&] { pool.parallel_for(p, nop, p); });
-    constexpr int64_t N = 128;
-    std::vector<float> a(N * N, 1.0f), b(N * N, 1.0f), c(N * N);
-    auto probe = [&] {
-      sgemm_(a.data(), N, 1, b.data(), N, 1, c.data(), N, N, N, 1.0f, 1);
-    };
-    probe();
-    double mac_per_us = static_cast<double>(N * N * N) / median_us(5, probe);
-    return static_cast<int64_t>(std::clamp(round_trip * mac_per_us, 1e5, 1e9));
+    if (thread_pool::instance().size() < 2) return 2'000'000;  // nothing to split across
+    double derived = pool_round_trip_us_() * single_thread_mac_per_us_();
+    return static_cast<int64_t>(
+        std::clamp(derived, static_cast<double>(kMinWorkFloor), 1e9));
   }();
   return v;
 }
