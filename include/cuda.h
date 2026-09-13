@@ -348,16 +348,15 @@ struct context {
     return slot;
   }
 
-  // The register-blocked SGEMM fast path, one instantiation per operand layout
-  // and tile (tl_sgemm_rb / _nt / _tn / _tt for the 128² tile, tl_sgemm_rb64*
-  // for the 64² one), cached separately from the kop table since it has no
-  // kop of its own.
+  // The f32 SGEMM fast path, one instantiation per operand layout (NAME /
+  // _nt / _tn / _tt) and tile (sgemm_tiles, same order), cached separately
+  // from the kop table since it has no kop of its own.
   CUfunction sgemm_rb_fn[8] = {};
-  CUfunction sgemm_rb_(bool ta, bool tb, bool small) {
+  CUfunction sgemm_rb_(bool ta, bool tb, int tile) {
     static const char* const names[8] = {
-        "tl_sgemm_rb",   "tl_sgemm_rb_nt",   "tl_sgemm_rb_tn",   "tl_sgemm_rb_tt",
-        "tl_sgemm_rb64", "tl_sgemm_rb64_nt", "tl_sgemm_rb64_tn", "tl_sgemm_rb64_tt"};
-    int i = (small ? 4 : 0) | (ta ? 2 : 0) | (tb ? 1 : 0);
+        "tl_sgemm_rb64",  "tl_sgemm_rb64_nt",  "tl_sgemm_rb64_tn",  "tl_sgemm_rb64_tt",
+        "tl_sgemm_cp128", "tl_sgemm_cp128_nt", "tl_sgemm_cp128_tn", "tl_sgemm_cp128_tt"};
+    int i = tile * 4 | (ta ? 2 : 0) | (tb ? 1 : 0);
     return cached_(sgemm_rb_fn[i], names[i]);
   }
 
@@ -642,15 +641,38 @@ inline bool available() { return context::get().ready; }
 // threshold every tile and split-K choice below measures its grid against.
 constexpr long kFillBlocks = 164;
 
-// The f32 and bf16 gemms' tile choice: the 128² tile is the more
-// arithmetically efficient, but a few-hundred-row activation against a
-// projection (256×768: 12 blocks) leaves most SMs idle, and the 64² tile
-// makes that 48 at half the FMA per shared float and about half the
-// registers per thread. Take the big tile only when its grid (batch counted)
-// already fills, or when K is not a multiple of the small tile's 16-deep slab.
+// The bf16 gemm's tile choice: the 128² tile is the more arithmetically
+// efficient, but a few-hundred-row activation against a projection (256×768:
+// 12 blocks) leaves most SMs idle, and the 64² tile makes that 48 at half the
+// FMA per shared float and about half the registers per thread. Take the big
+// tile only when its grid (batch counted) already fills, or when K is not a
+// multiple of the small tile's 16-deep slab.
 inline bool big_tile_(int64_t m, int64_t n, int64_t k, int64_t batch = 1) {
   long blocks = (long)((n + 127) / 128) * ((m + 127) / 128) * batch;
   return blocks >= kFillBlocks || k % 16 != 0;
+}
+
+// The f32 gemm's tiles (kernels/tensorlib_cuda.cu, same order): block tile
+// bm×bn, K slab bk (K must be a multiple). Index = the `tile` argument of
+// context::sgemm_rb_ — 0 the 64² register-staged tile, 1 the 128² cp.async
+// pipelined one.
+struct sgemm_tile {
+  unsigned bm, bn, bk;
+};
+constexpr sgemm_tile sgemm_tiles[] = {{64, 64, 16}, {128, 128, 8}};
+
+// Which f32 tile: the pipelined 128² whenever its grid has a wave's worth of
+// blocks, or the K is long enough for its pipeline to matter, or M is at
+// least 512 (four 128-rows against any N); the 64² for the short-K
+// few-hundred-row projections whose grid it quadruples — and always when K
+// is not a multiple of the 64² tile's 16-deep slab. From bench_cuda_gemm over
+// the transformer block's shapes (own GF/s, 64² vs 128²): 256×768×768
+// 9.6k vs 7.2k, 256×768×3072 13.4k vs 12.1k, 256×1024×4096 13.9k vs 15.4k,
+// 512×1024×1024 12.4k vs 13.5k, 256×3072×768 12.3k vs 15.0k, 512×1024×4096
+// 15.2k vs 17.9k, 2048³ 14.6k vs 19.2k.
+inline int sgemm_tile_(int64_t m, int64_t n, int64_t k, int64_t batch = 1) {
+  long blocks = (long)((n + 127) / 128) * ((m + 127) / 128) * batch;
+  return (blocks >= 64 || k >= 2048 || m >= 512 || k % 16 != 0) ? 1 : 0;
 }
 
 // Diagnostic knob: force gemv to skip split-K (gy=1). See context::no_splitk.
@@ -1868,28 +1890,31 @@ struct kv_cache {
   }
 };
 
-// Split-K (ladder ②) for the f32 register-blocked gemm: when the 128² tiling
-// leaves the 82 SMs underfilled, partition K into S z-slices so S× more blocks
-// run concurrently. Split-K partitions K (not replicates it), so A/B global
+// Split-K (ladder ②) for the f32 gemm: when the tiling leaves the 82 SMs
+// underfilled, partition K into S z-slices so S× more blocks run
+// concurrently. Split-K partitions K (not replicates it), so A/B global
 // traffic is unchanged — the only cost is C written S× via atomicAdd into a
 // pre-zeroed buffer (the kernel folds scale/offset into the partials, so a
 // fused epilogue splits too). S comes from the fill: enough splits to reach
-// ~64 blocks (one wave) with each at least 96 deep, and a long K keeps
-// splitting up to ~512 blocks in slices of ≥512. Against cuBLAS
-// (bench_cuda_gemm, RTX 3090, own/cuBLAS, the old fixed S=2 rule → this):
+// ~64 blocks (one wave) with each at least 96 deep; then a long K keeps
+// splitting — the register-staged 64² tile up to ~512 blocks in slices of
+// ≥512, the pipelined 128² only up to ~128 blocks in slices of ≥1024, since
+// its deeper slabs are what its pipeline pays off on (bench_cuda_gemm, own
+// GF/s: 512×1024×4096 S=1 17.9k vs S=2 15.4k; 512×4096×1024 S=4 17.4k vs
+// S=8 16.4k; 512×1024×1024 S=2 13.5k vs S=4 12.3k). Against cuBLAS
+// (RTX 3090, own/cuBLAS, the old fixed S=2 rule → the fill rule, 64² era):
 // 256×768×256 0.26→0.65, 256×768×768 0.44→0.62, 256×3072×768 0.35→0.86,
-// 512×1024×512 0.50→0.73, 512×4096×1024 0.63→0.79, 512³ 0.50→0.61;
-// 256×768×3072 (48 blocks) and 1024³/2048³ keep their S=2, 4096³ (1024
-// blocks) stays unsplit. `base_blocks` counts the batch too, so a batched
-// product that already fills the GPU declines to split. chunk is a whole
-// number of `slab`-deep K slabs (the tile's BK); S == 1 leaves chunk == k (the
-// kernel reads that as "no split"). TL_SPLITK forces S for the census, read
-// once like the other TL_* knobs.
+// 512×1024×512 0.50→0.73, 512×4096×1024 0.63→0.79, 512³ 0.50→0.61.
+// `base_blocks` counts the batch too, so a batched product that already fills
+// the GPU declines to split. chunk is a whole number of `slab`-deep K slabs
+// (the tile's BK); S == 1 leaves chunk == k (the kernel reads that as "no
+// split"). TL_SPLITK forces S for the census, read once like the other TL_*
+// knobs.
 struct sgemm_splitk {
   unsigned S, chunk;
 };
 inline sgemm_splitk sgemm_rb_splitk_(long base_blocks, unsigned k,
-                                     unsigned slab) {
+                                     unsigned slab, bool pipelined) {
   static const long forced = [] {
     const char* e = std::getenv("TL_SPLITK");
     return e ? std::atol(e) : -1L;
@@ -1898,7 +1923,9 @@ inline sgemm_splitk sgemm_rb_splitk_(long base_blocks, unsigned k,
   if (want < 0) {
     long by_fill = std::min((63 + base_blocks) / base_blocks,
                             std::max<long>(1, k / 96));
-    long by_k = std::min<long>(k / 512, (511 + base_blocks) / base_blocks);
+    long by_k = pipelined
+                    ? std::min<long>(k / 1024, (127 + base_blocks) / base_blocks)
+                    : std::min<long>(k / 512, (511 + base_blocks) / base_blocks);
     want = std::max(by_fill, by_k);
   }
   sgemm_splitk plan{1, k};
@@ -1950,15 +1977,21 @@ inline bool gemm_batched(void* a, int64_t ao, int64_t lda, bool ta, int64_t sa,
                   (batch == 1 || m * n <= (int64_t)UINT32_MAX);
   if (a_ok && b_ok && batch_ok && k % 8 == 0 && aligned && m > 0 && n > 0 &&
       k > 0) {
-    // Tile choice = whichever fills the GPU (gemm_bf16_nt's rule): the 128²
-    // tile is the more arithmetically efficient, but a 256×768 output is 12
-    // of them against 82 SMs; the 64² tile makes that 48 at half the FMA per
-    // shared float and about half the registers per thread. Split-K then
-    // fills what is left.
-    const unsigned bm = big_tile_(m, n, k, batch) ? 128 : 64, bk = 1024 / bm;
-    unsigned gx = (un + bm - 1) / bm, gy = (um + bm - 1) / bm;
-    if (CUfunction f = c.sgemm_rb_(ta, tb, bm == 64)) {
-      auto [S, ksplit] = sgemm_rb_splitk_((long)gx * gy * batch, uk, bk);
+    // Tile choice: sgemm_tile_ (TL_TILE forces an index for the census).
+    // Split-K then fills what the grid leaves.
+    static const int forced_tile = [] {
+      const char* e = std::getenv("TL_TILE");
+      return e ? std::atoi(e) : -1;
+    }();
+    int tile = forced_tile;
+    if (tile < 0 || tile >= (int)(sizeof(sgemm_tiles) / sizeof(sgemm_tiles[0])) ||
+        k % sgemm_tiles[tile].bk != 0)
+      tile = sgemm_tile_(m, n, k, batch);
+    const unsigned bm = sgemm_tiles[tile].bm, bn = sgemm_tiles[tile].bn,
+                   bk = sgemm_tiles[tile].bk;
+    unsigned gx = (un + bn - 1) / bn, gy = (um + bm - 1) / bm;
+    if (CUfunction f = c.sgemm_rb_(ta, tb, tile)) {
+      auto [S, ksplit] = sgemm_rb_splitk_((long)gx * gy * batch, uk, bk, tile == 1);
       // gridDim.z carries batch × S; the driver caps it at 65535.
       if ((int64_t)S * batch <= 65535) {
         if (S > 1) {
