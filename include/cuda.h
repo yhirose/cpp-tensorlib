@@ -259,10 +259,12 @@ struct context {
   // mid-graph (pow's scalar exponent is a 0-d array) stalled the pipeline
   // twice per transformer block. The driver stages a pageable source during
   // the call, so the host buffer may change or go away once it returns.
+  // Inside a graph capture (stream set) the copy stays blocking, as it was:
+  // a recorded copy would be replayed, and captures stage inputs with upload().
   void device_read_(void* native) {
     mirror* m = mirror_(native);
     if (m && m->where == HOST) {
-      if (d.MemcpyHtoDAsync) d.MemcpyHtoDAsync(m->dev, m->host, m->bytes, stream);
+      if (!stream && d.MemcpyHtoDAsync) d.MemcpyHtoDAsync(m->dev, m->host, m->bytes, nullptr);
       else d.MemcpyHtoD(m->dev, m->host, m->bytes);
       m->where = BOTH;
     }
