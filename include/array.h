@@ -996,6 +996,14 @@ namespace detail {
 // vectorizes. Everything here is fixed-size — no allocation but the output —
 // since an MLP's [10,30] op is a microsecond. Gated by cpu::enabled_ like the
 // other own-CPU kernels, so the oracle tests compare against the walker.
+// Threads for an own-CPU kernel over `macs` multiply-adds of work; the oracle
+// (cpu::enabled_ off) runs one. A streaming pass (elementwise, a reduction)
+// costs about kStreamMacs of a gemm's multiply-add per element.
+constexpr int64_t kStreamMacs = 8;
+inline int own_threads_(int64_t macs) {
+  return cpu::enabled_ ? cpu::threads_for_(macs) : 1;
+}
+
 constexpr size_t kEwMaxSrc = 4;  // for_each_index's operand limit too
 struct ew_strides {
   size_t n = 0;
@@ -1059,40 +1067,30 @@ void ew_run(const shape_t& shape, const ew_strides& st, const ew_plan& p,
   if (p.rows == 0 || p.inner == 0) return;
   // The thread cap sizes the work items too: when there are fewer runs than
   // threads, each run is cut into enough chunks to hand every thread one.
-  const int nt = cpu::threads_for_(p.rows * p.inner * 8);
+  const int nt = cpu::threads_for_(p.rows * p.inner * kStreamMacs);
   int64_t chunk = p.inner;
   if (p.rows < nt) {
     int64_t want = (nt + p.rows - 1) / p.rows;  // chunks per run
     chunk = (p.inner + want - 1) / want;
   }
   const int64_t cpr = (p.inner + chunk - 1) / chunk;
-  struct ctx_t {
-    const shape_t& shape;
-    const ew_strides& st;
-    const ew_plan& p;
-    int64_t cpr, chunk;
-    Body& body;
-  } ctx{shape, st, p, cpr, chunk, body};
-  // One pointer captured: the std::function parallel_for takes stays in its
-  // inline storage instead of heap-allocating the closure.
   cpu::thread_pool::instance().parallel_for(
       p.rows * cpr,
-      [&ctx](int64_t i0, int64_t i1) {
-        const ew_plan& p = ctx.p;
+      [&](int64_t i0, int64_t i1) {
         int64_t offs[kEwMaxSrc];
         for (int64_t it = i0; it < i1; it++) {
-          int64_t row = it / ctx.cpr, c = it % ctx.cpr;
+          int64_t row = it / cpr, c = it % cpr;
           // The run's operand offsets: its index decomposed over the outer
           // axes, once per run (a few divisions against `inner` elements).
-          for (size_t k = 0; k < ctx.st.n; k++) offs[k] = 0;
+          for (size_t k = 0; k < st.n; k++) offs[k] = 0;
           for (int64_t rem = row, d = static_cast<int64_t>(p.outer_rank);
                d-- > 0;) {
-            int64_t idx = rem % ctx.shape[d];
-            rem /= ctx.shape[d];
-            for (size_t k = 0; k < ctx.st.n; k++) offs[k] += idx * ctx.st.s[k][d];
+            int64_t idx = rem % shape[d];
+            rem /= shape[d];
+            for (size_t k = 0; k < st.n; k++) offs[k] += idx * st.s[k][d];
           }
-          int64_t j0 = c * ctx.chunk, j1 = std::min(p.inner, j0 + ctx.chunk);
-          ctx.body(row * p.inner, offs, j0, j1);
+          int64_t j0 = c * chunk, j1 = std::min(p.inner, j0 + chunk);
+          body(row * p.inner, offs, j0, j1);
         }
       },
       nt);
@@ -1208,9 +1206,33 @@ array map_ternary(const array& a, const array& b, const array& c, F f) {
   return out;
 }
 
-// Shared axis-reduction driver: for each input element, f(acc_slot, value).
+// Fold a strided run of `n` floats with f in eight independent lanes, then
+// fold the lanes: a single accumulator is a serial chain at the FP add
+// latency (a 768-wide row took 0.26 µs, 3 GB/s), eight lanes run at the
+// throughput. f must be associative and commutative (sum, max) — the lane
+// order is not the element order.
 template <typename F>
-array reduce_axis(const array& a, int axis, bool keepdims, float init, F f) {
+inline float fold_lanes(const float* src, int64_t stride, int64_t n, float init,
+                        F f) {
+  constexpr int L = 8;
+  float lanes[L];
+  for (int l = 0; l < L; l++) lanes[l] = init;
+  int64_t k = 0;
+  for (; k + L <= n; k += L)
+    for (int l = 0; l < L; l++) f(lanes[l], src[(k + l) * stride]);
+  for (; k < n; k++) f(lanes[0], src[k * stride]);
+  float acc = lanes[0];
+  for (int l = 1; l < L; l++) f(acc, lanes[l]);
+  return acc;
+}
+
+// Shared axis-reduction driver: for each input element, f(acc_slot, value).
+// The output slots are independent, so `max_threads` spreads them across the
+// thread pool on the contiguous path (the own-CPU dispatch passes its work
+// cap; the default runs one thread, the oracle).
+template <typename F>
+array reduce_axis(const array& a, int axis, bool keepdims, float init, F f,
+                  int max_threads = 1) {
   auto out_shape = reduce_shape(a.shape(), axis, keepdims);
   int r = static_cast<int>(a.rank());
   auto out = array::full(out_shape, init);
@@ -1227,29 +1249,41 @@ array reduce_axis(const array& a, int axis, bool keepdims, float init, F f) {
     int64_t inner = 1, outer = 1;
     for (int i = axis + 1; i < r; i++) inner *= sh[i];
     for (int i = 0; i < axis; i++) outer *= sh[i];
+    auto& pool = cpu::thread_pool::instance();
     if (inner == 1) {
-      // Last-axis reduction: accumulate each contiguous run into a LOCAL, then
-      // store once. Accumulating straight into po[o] instead carries the
-      // dependency through memory (store-to-load per element, no vectorize) —
-      // ~40x slower here, and this is the common case (softmax denominators,
-      // bias/feature-sum gradients, per-row norms).
-      for (int64_t o = 0; o < outer; o++) {
-        const float* base = pi + o * axis_len;
-        float acc = init;
-        for (int64_t k = 0; k < axis_len; k++) f(acc, base[k]);
-        po[o] = acc;
-      }
+      // Last-axis reduction: each contiguous run folded into locals, stored
+      // once. Accumulating straight into po[o] instead carries the dependency
+      // through memory (store-to-load per element, no vectorize) — ~40x slower
+      // here, and this is the common case (softmax denominators, bias/
+      // feature-sum gradients, per-row norms). Rows across the pool.
+      pool.parallel_for(outer, [&](int64_t o0, int64_t o1) {
+        for (int64_t o = o0; o < o1; o++)
+          po[o] = fold_lanes(pi + o * axis_len, 1, axis_len, init, f);
+      }, max_threads);
       return out;
     }
     // inner > 1: each po[j] is an independent accumulator, so the contiguous
-    // inner loop vectorizes with no cross-element dependency.
-    for (int64_t o = 0; o < outer; o++) {
-      const float* base = pi + o * axis_len * inner;
-      float* od = po + o * inner;
-      for (int64_t k = 0; k < axis_len; k++) {
-        const float* src = base + k * inner;
-        for (int64_t j = 0; j < inner; j++) f(od[j], src[j]);
-      }
+    // inner loop vectorizes with no cross-element dependency. Split the outer
+    // slabs when there are several, else the inner columns (a matrix reduced
+    // over axis 0 — the bias gradient — has one slab).
+    if (outer > 1) {
+      pool.parallel_for(outer, [&](int64_t o0, int64_t o1) {
+        for (int64_t o = o0; o < o1; o++) {
+          const float* base = pi + o * axis_len * inner;
+          float* od = po + o * inner;
+          for (int64_t k = 0; k < axis_len; k++) {
+            const float* src = base + k * inner;
+            for (int64_t j = 0; j < inner; j++) f(od[j], src[j]);
+          }
+        }
+      }, max_threads);
+    } else {
+      pool.parallel_for(inner, [&](int64_t j0, int64_t j1) {
+        for (int64_t k = 0; k < axis_len; k++) {
+          const float* src = pi + k * inner;
+          for (int64_t j = j0; j < j1; j++) f(po[j], src[j]);
+        }
+      }, max_threads);
     }
     return out;
   }
@@ -1302,13 +1336,11 @@ inline array softmax(const array& a, int max_threads = 1) {
     for (int64_t r = r0; r < r1; r++) {
       const float* src = pi + row_off[r];
       float* dst = po + r * cols;
-      float m = src[0];
-      for (int64_t c = 1; c < cols; c++) m = std::max(m, src[c * col_stride]);
-      float denom = 0;
-      for (int64_t c = 0; c < cols; c++) {
-        dst[c] = std::exp(src[c * col_stride] - m);
-        denom += dst[c];
-      }
+      float m = detail::fold_lanes(src, col_stride, cols, src[0],
+                                   [](float& a, float v) { a = std::max(a, v); });
+      for (int64_t c = 0; c < cols; c++) dst[c] = std::exp(src[c * col_stride] - m);
+      float denom = detail::fold_lanes(dst, 1, cols, 0.0f,
+                                       [](float& a, float v) { a += v; });
       for (int64_t c = 0; c < cols; c++) dst[c] /= denom;
     }
   };
@@ -1395,23 +1427,23 @@ inline array bdot(const array& a, const array& b) {
   return out;
 }
 
-inline array sum(const array& a, int axis, bool keepdims) {
+inline array sum(const array& a, int axis, bool keepdims, int max_threads = 1) {
   return detail::reduce_axis(a, axis, keepdims, 0.0f,
-                             [](float& acc, float v) { acc += v; });
+                             [](float& acc, float v) { acc += v; }, max_threads);
 }
 
-inline array mean(const array& a, int axis, bool keepdims) {
+inline array mean(const array& a, int axis, bool keepdims, int max_threads = 1) {
   int r = static_cast<int>(a.rank());
   int64_t n = a.shape()[axis < 0 ? axis + r : axis];
-  auto s = sum(a, axis, keepdims);
+  auto s = sum(a, axis, keepdims, max_threads);
   float inv = 1.0f / static_cast<float>(n);
   return detail::map_unary(s, [inv](float x) { return x * inv; });
 }
 
-inline array max(const array& a, int axis, bool keepdims) {
+inline array max(const array& a, int axis, bool keepdims, int max_threads = 1) {
   return detail::reduce_axis(
       a, axis, keepdims, -std::numeric_limits<float>::infinity(),
-      [](float& acc, float v) { acc = std::max(acc, v); });
+      [](float& acc, float v) { acc = std::max(acc, v); }, max_threads);
 }
 
 inline array argmax(const array& a, int axis, bool keepdims) {
@@ -3580,11 +3612,8 @@ struct graph {
           r = std::move(*g);
         } else {
           // An element costs about a hundred multiply-adds of time (the exp
-          // plus the max and normalise passes), so the split is capped like a
-          // gemm of that much work; the oracle tests (cpu::enabled_ off) keep
-          // the single thread.
-          r = ref::softmax(a, cpu::enabled_ ? cpu::threads_for_(a.size() * 128)
-                                            : 1);
+          // plus the max and normalise passes).
+          r = ref::softmax(a, own_threads_(a.size() * 128));
         }
         break;
       }
@@ -3683,8 +3712,9 @@ struct graph {
             break;
           }
         }
-        r = n.op == op_t::sum_ax ? ref::sum(a, n.axis, n.keepdims)
-                                 : ref::max(a, n.axis, n.keepdims);
+        const int nt = own_threads_(a.size() * kStreamMacs);
+        r = n.op == op_t::sum_ax ? ref::sum(a, n.axis, n.keepdims, nt)
+                                 : ref::max(a, n.axis, n.keepdims, nt);
         break;
       }
       case op_t::mean_ax: {
@@ -3702,7 +3732,7 @@ struct graph {
             break;
           }
         }
-        r = ref::mean(a, n.axis, n.keepdims);
+        r = ref::mean(a, n.axis, n.keepdims, own_threads_(a.size() * kStreamMacs));
         break;
       }
       case op_t::argmax_ax:

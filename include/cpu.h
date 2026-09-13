@@ -401,6 +401,57 @@ inline ukernel_desc select_ukernel() {
 #endif
 }
 
+// The three loops both split paths of sgemm_ are made of. Panels are the
+// microkernel's tile: mrt rows of A (an mrt×KC slot each, alpha folded in) and
+// nrt columns of B (a kc×nrt slot each — kc, not KC, so a shallow K block does
+// not scatter 640 B panels 32 KB apart). Edge panels are clamped to mr/nr and
+// zero-padded by the packers.
+inline void pack_a_panels(const float* A, int64_t as0, int64_t as1, int64_t m,
+                          int64_t pc, int64_t kc, float alpha, int mrt,
+                          int64_t ip0, int64_t ip1, float* dst) {
+  for (int64_t ip = ip0; ip < ip1; ip++) {
+    int64_t i0 = ip * mrt;
+    int mr = static_cast<int>(std::min<int64_t>(mrt, m - i0));
+    pack_a_panel(A + i0 * as0 + pc * as1, as0, as1, mr, mrt, kc, alpha,
+                 dst + (ip - ip0) * mrt * KC);
+  }
+}
+// `np` panels of B starting at column col0, clamped at col_end.
+inline void pack_b_panels(const float* B, int64_t bs0, int64_t bs1, int64_t pc,
+                          int64_t kc, int nrt, int64_t col0, int64_t col_end,
+                          int64_t np, float* dst) {
+  for (int64_t q = 0; q < np; q++) {
+    int64_t j0 = col0 + q * nrt;
+    int nr = static_cast<int>(std::min<int64_t>(nrt, col_end - j0));
+    pack_b_panel(B + pc * bs0 + j0 * bs1, bs0, bs1, nr, nrt, kc,
+                 dst + q * kc * nrt);
+  }
+}
+// C[rows of panels ip0..ip1, cols col0..] += packed A panels × packed B
+// panels: a B panel stays in L1 across the A panels (BLIS's order).
+inline void macrokernel(ukernel_fn uk, int64_t kc, const float* apack, int mrt,
+                        int64_t m, int64_t ip0, int64_t ip1, const float* bpack,
+                        int nrt, int64_t col0, int64_t col_end, int64_t np,
+                        float* C, int64_t n) {
+  for (int64_t q = 0; q < np; q++) {
+    int64_t j0 = col0 + q * nrt;
+    int nr = static_cast<int>(std::min<int64_t>(nrt, col_end - j0));
+    for (int64_t ip = ip0; ip < ip1; ip++) {
+      int64_t i0 = ip * mrt;
+      int mr = static_cast<int>(std::min<int64_t>(mrt, m - i0));
+      uk(kc, apack + (ip - ip0) * mrt * KC, bpack + q * kc * nrt,
+         C + i0 * n + j0, n, mr, nr);
+    }
+  }
+}
+// Grow-only scratch: the packers write every element they use (edge panels
+// zero-padded by hand), so a resize's value-initialisation is wasted work, and
+// a shrink-then-grow across gemms of alternating shapes was a memset per call.
+inline float* scratch_(std::vector<float>& v, size_t need) {
+  if (v.size() < need) v.resize(need);
+  return v.data();
+}
+
 }  // namespace detail
 
 // How many threads `macs` multiply-adds are worth: one per floor of work
@@ -434,68 +485,92 @@ inline void sgemm_(const float* A, int64_t as0, int64_t as1, const float* B,
   static const detail::ukernel_desc ukr = detail::select_ukernel();
   const detail::ukernel_fn ukernel = ukr.fn;
   const int mrt = ukr.mr, nrt = ukr.nr;
-
-  // Reusable pack buffers: thread-local so no per-call allocation (a
-  // per-call std::vector dominated small sizes in the first cut). bpack
-  // lives on the calling thread (packed once per (jc,pc), read by all);
-  // apack lives on each worker thread. Grow-only: the packers write every
-  // element they use (edge panels zero-padded by hand), so a resize's
-  // value-initialisation is wasted work, and a shrink-then-grow across gemms
-  // of alternating shapes was a memset per call. The sizes are bounded by the
-  // blocking constants (KC×NC and MC×KC), which is where grow-only settles.
-  static thread_local std::vector<float> bpack;
-  const size_t bneed = static_cast<size_t>(KC) *
-                       ((std::min<int64_t>(NC, n) + nrt - 1) / nrt) * nrt;
-  if (bpack.size() < bneed) bpack.resize(bneed);
-  // Raw pointer for the workers: naming `bpack` inside the lambda would
-  // resolve to each worker's own (empty) thread_local instance.
-  float* bpack_p = bpack.data();
   auto& pool = thread_pool::instance();
+  const int64_t mpanels = (m + mrt - 1) / mrt;
 
+  // Which axis the threads split. Over M (a tall A) the caller packs a B
+  // block once and each thread packs and streams its own A panels. A short M
+  // against a wide N (a 256-row activation into a 3072-wide FFN weight) is the
+  // other case: every thread would stream the whole 4 MB packed B block, which
+  // no L2 holds, for a few rows of A, and each (jc, pc) block would be a fresh
+  // round with a serial B pack in front of it — on 8 threads that left them
+  // busy 56% of the time. So when A's K block fits a core's L2 and A is the
+  // smaller operand to share, split N: per K block one round packs all of A,
+  // then one round over the N panels in which each thread packs and owns a
+  // slice of B, which fits its L2, and runs all of A against it.
+  const bool split_n =
+      static_cast<size_t>(m) * KC * sizeof(float) <= (1u << 20) &&
+      m <= std::min<int64_t>(n, NC);
+  if (split_n) {
+    // A's K blocks are packed in groups of as many as fit kApackBudget (all
+    // of them for the usual k), each group two rounds: every round costs the
+    // pool's wake (~140 µs at 20 threads), so a 3072-deep K in six per-block
+    // pairs would spend more waking than a 256×3072×768 gemm computes.
+    static thread_local std::vector<float> apack_all;  // [kblock][panel]
+    constexpr size_t kApackBudget = 8u << 20;
+    const size_t block_floats = static_cast<size_t>(mpanels) * mrt * KC;
+    const int64_t kblocks = (k + KC - 1) / KC;
+    const int64_t group = std::max<int64_t>(
+        1, std::min<int64_t>(kblocks,
+                             kApackBudget / (block_floats * sizeof(float))));
+    float* apack_p = detail::scratch_(apack_all, group * block_floats);
+    const int64_t npanels = (n + nrt - 1) / nrt;
+    constexpr int64_t kMaxPanels = NC / 16;  // a thread's B slice at a time
+    for (int64_t b0 = 0; b0 < kblocks; b0 += group) {
+      const int64_t b1 = std::min(kblocks, b0 + group);
+      pool.parallel_for((b1 - b0) * mpanels, [&](int64_t t0, int64_t t1) {
+        for (int64_t t = t0; t < t1; t++) {
+          const int64_t b = b0 + t / mpanels, ip = t % mpanels;
+          const int64_t pc = b * KC, kc = std::min<int64_t>(KC, k - pc);
+          detail::pack_a_panels(A, as0, as1, m, pc, kc, alpha, mrt, ip, ip + 1,
+                                apack_p + t * mrt * KC);
+        }
+      }, max_threads);
+      pool.parallel_for(npanels, [&](int64_t jp0, int64_t jp1) {
+        static thread_local std::vector<float> bpack_w;
+        for (int64_t jq = jp0; jq < jp1; jq += kMaxPanels) {
+          const int64_t np = std::min(kMaxPanels, jp1 - jq);
+          for (int64_t b = b0; b < b1; b++) {
+            const int64_t pc = b * KC, kc = std::min<int64_t>(KC, k - pc);
+            float* bp = detail::scratch_(bpack_w, np * kc * nrt);
+            detail::pack_b_panels(B, bs0, bs1, pc, kc, nrt, jq * nrt, n, np, bp);
+            detail::macrokernel(ukernel, kc, apack_p + (b - b0) * block_floats,
+                                mrt, m, 0, mpanels, bp, nrt, jq * nrt, n, np, C,
+                                n);
+          }
+        }
+      }, max_threads);
+    }
+    return;
+  }
+
+  // Split M. bpack lives on the calling thread (packed once per (jc, pc),
+  // read by all); apack on each worker. Raw pointer for the workers: naming
+  // `bpack` inside the lambda would resolve to each worker's own (empty)
+  // thread_local instance.
+  static thread_local std::vector<float> bpack;
+  float* bpack_p = detail::scratch_(
+      bpack, static_cast<size_t>(KC) * ((std::min<int64_t>(NC, n) + nrt - 1) / nrt) * nrt);
+  const int64_t panels_per_mc = MC / mrt;
   for (int64_t jc = 0; jc < n; jc += NC) {
-    int64_t nc = std::min<int64_t>(NC, n - jc);
+    const int64_t nc = std::min<int64_t>(NC, n - jc);
+    const int64_t npanels = (nc + nrt - 1) / nrt;
     for (int64_t pc = 0; pc < k; pc += KC) {
-      int64_t kc = std::min<int64_t>(KC, k - pc);
-      // Pack B[pc:pc+kc, jc:jc+nc] into nrt-wide row-major micropanels.
-      int64_t npanels = (nc + nrt - 1) / nrt;
-      for (int64_t jp = 0; jp < npanels; jp++) {
-        int64_t j0 = jp * nrt;
-        int nr = static_cast<int>(std::min<int64_t>(nrt, nc - j0));
-        detail::pack_b_panel(B + (pc)*bs0 + (jc + j0) * bs1, bs0, bs1, nr, nrt,
-                             kc, bpack_p + jp * KC * nrt);
-      }
-      // Parallelize the M dimension at mrt-panel granularity (not MC-block):
-      // small m (e.g. 256 → 2 MC blocks) would otherwise use only 1-2
-      // threads. Each thread packs+computes its contiguous panel range in
-      // MC-row groups, preserving the L2 blocking. max_threads caps the
-      // split by the gemm's work (min_work_per_thread_ above).
-      int64_t mpanels = (m + mrt - 1) / mrt;
-      const int64_t panels_per_mc = MC / mrt;
+      const int64_t kc = std::min<int64_t>(KC, k - pc);
+      detail::pack_b_panels(B, bs0, bs1, pc, kc, nrt, jc, jc + nc, npanels,
+                            bpack_p);
+      // The M dimension at mrt-panel granularity, each thread packing and
+      // running its panels in MC-row groups at most (the pool's chunks are
+      // usually smaller: on this box balance across unequal cores beat the B
+      // traffic a coarser chunk would have saved).
       pool.parallel_for(mpanels, [&](int64_t ip0, int64_t ip1) {
         static thread_local std::vector<float> apack;
-        const size_t aneed = static_cast<size_t>(panels_per_mc) * mrt * KC;
-        if (apack.size() < aneed) apack.resize(aneed);
+        float* ap = detail::scratch_(apack, panels_per_mc * mrt * KC);
         for (int64_t g0 = ip0; g0 < ip1; g0 += panels_per_mc) {
-          int64_t g1 = std::min<int64_t>(g0 + panels_per_mc, ip1);
-          // Pack A[g0*mrt : ..., pc:pc+kc] * alpha into mrt-tall panels.
-          for (int64_t ip = g0; ip < g1; ip++) {
-            int64_t i0 = ip * mrt;
-            int mr = static_cast<int>(std::min<int64_t>(mrt, m - i0));
-            detail::pack_a_panel(A + i0 * as0 + pc * as1, as0, as1, mr, mrt, kc,
-                                 alpha, apack.data() + (ip - g0) * mrt * KC);
-          }
-          // Macrokernel: mrt×nrt microkernel over the packed panels.
-          for (int64_t jp = 0; jp < npanels; jp++) {
-            int64_t j0 = jp * nrt;
-            int nr = static_cast<int>(std::min<int64_t>(nrt, nc - j0));
-            for (int64_t ip = g0; ip < g1; ip++) {
-              int64_t i0 = ip * mrt;
-              int mr = static_cast<int>(std::min<int64_t>(mrt, m - i0));
-              ukernel(kc, apack.data() + (ip - g0) * mrt * KC,
-                      bpack_p + jp * KC * nrt, C + i0 * n + (jc + j0), n, mr,
-                      nr);
-            }
-          }
+          const int64_t g1 = std::min<int64_t>(g0 + panels_per_mc, ip1);
+          detail::pack_a_panels(A, as0, as1, m, pc, kc, alpha, mrt, g0, g1, ap);
+          detail::macrokernel(ukernel, kc, ap, mrt, m, g0, g1, bpack_p, nrt, jc,
+                              jc + nc, npanels, C, n);
         }
       }, max_threads);
     }

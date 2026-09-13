@@ -357,6 +357,22 @@ TEST_CASE("elementwise: own CPU runs across the pool match the walker oracle") {
   CHECK(cpu_matches_ref([&] { return tl::where(m > 0.0f, t.transpose(), m); }));
 }
 
+TEST_CASE("axis reductions: own CPU slabs across the pool match the oracle") {
+  // The contiguous reduce driver split over the pool: the last axis (rows),
+  // a middle axis (outer slabs), axis 0 of a matrix (inner columns, one
+  // slab), sum / mean / max, at sizes past the thread cap; a strided view
+  // stays on the walker.
+  auto a = random_array({8, 256, 256}, 941), m = random_array({512, 512}, 942);
+  CHECK(cpu_matches_ref([&] { return a.sum(2); }));
+  CHECK(cpu_matches_ref([&] { return a.mean(2, true); }));
+  CHECK(cpu_matches_ref([&] { return a.max(2); }));
+  CHECK(cpu_matches_ref([&] { return a.sum(1); }));
+  CHECK(cpu_matches_ref([&] { return a.max(0); }));
+  CHECK(cpu_matches_ref([&] { return m.sum(0); }));
+  CHECK(cpu_matches_ref([&] { return m.mean(0, true); }));
+  CHECK(cpu_matches_ref([&] { return m.transpose().sum(1); }));
+}
+
 TEST_CASE("softmax: own CPU rows across the pool match the ref oracle") {
   // rank 1, 2 and 3, a transposed (strided) view, and a shape big enough to
   // split across threads

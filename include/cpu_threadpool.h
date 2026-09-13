@@ -3,12 +3,13 @@
 // Minimal persistent thread pool for the CPU backend's parallel loops.
 // One process-wide pool of (hardware_concurrency - 1) workers; the calling
 // thread participates too, so a P-way split uses P threads with no idle
-// caller. parallel_for statically partitions [0, n) and blocks until done.
+// caller. parallel_for hands [0, n) out in chunks from one shared counter
+// and blocks until done.
 //
-// Deliberately simple (static partitioning, no work stealing): GEMM's M-loop
-// blocks are near-equal cost, so a balanced static split is close to optimal
-// and avoids per-task queue overhead. A lazy singleton so tensor-free
-// binaries never spawn threads.
+// Deliberately simple (one atomic counter, no queues or stealing): the chunks
+// are near-equal cost, so a counter is all the balancing a hybrid or
+// SMT-shared set of cores needs — the fast threads simply take more of them.
+// A lazy singleton so tensor-free binaries never spawn threads.
 //
 // Each worker sleeps on its own condition variable, and a P-way split wakes
 // exactly P-1 of them. With one shared variable every call woke the whole
@@ -19,7 +20,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <functional>
+#include <type_traits>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -37,22 +38,35 @@ class thread_pool {
 
   int size() const { return nthreads_; }
 
-  // Run fn(begin, end) over a static partition of [0, n) across up to
-  // min(size(), max_threads) threads (caller runs one share). Blocks until
-  // all shares complete. A caller that knows its work is small caps the
-  // split with max_threads, so a tiny job never pays for threads it cannot
-  // feed; max_threads <= 1 runs inline.
-  void parallel_for(int64_t n, const std::function<void(int64_t, int64_t)>& fn,
-                    int max_threads = 1 << 30) {
+  // Run fn(begin, end) over [0, n) across up to min(size(), max_threads)
+  // threads (the caller works too). Blocks until the whole range is done. A
+  // caller that knows its work is small caps the split with max_threads, so a
+  // tiny job never pays for threads it cannot feed; max_threads <= 1 runs
+  // inline. The range is handed out from a shared counter in chunks of about
+  // n/(4p), not as p equal slices: the cores are not equal — a hybrid part's
+  // efficiency cores run a gemm chunk at a fraction of a performance core's
+  // pace, and two SMT threads share one core's units — so an equal split
+  // waits for its slowest thread (measured 2.7x on 8 threads for a gemm that
+  // reaches 7x when the fast threads take the slow ones' leftovers; a coarser
+  // grain that kept gemm's MC row groups whole measured slower — balance
+  // beats the extra B traffic). fn may run more than once per thread, each
+  // time on a disjoint range. Any callable: it is held by pointer for the
+  // call's duration, never copied, so no std::function and no allocation.
+  template <class F>
+  void parallel_for(int64_t n, F&& fn, int max_threads = 1 << 30) {
     if (n <= 0) return;
     int p = static_cast<int>(std::min<int64_t>(std::min(nthreads_, max_threads), n));
     if (p <= 1) {
       fn(0, n);
       return;
     }
-    task_ = &fn;
+    task_ctx_ = const_cast<void*>(static_cast<const void*>(&fn));
+    task_fn_ = [](void* ctx, int64_t b, int64_t e) {
+      (*static_cast<std::remove_reference_t<F>*>(ctx))(b, e);
+    };
     task_n_ = n;
-    task_p_ = p;
+    task_grain_ = (n + 4 * p - 1) / (4 * p);
+    task_next_.store(0, std::memory_order_relaxed);
     remaining_.store(p - 1, std::memory_order_relaxed);
     // Publish the task through each worker's own mutex: the lock/unlock pair
     // orders the writes above before that worker's reads of them.
@@ -64,13 +78,11 @@ class thread_pool {
       }
       s.cv.notify_one();
     }
-    // Caller runs chunk 0.
-    auto [b0, e0] = chunk_(0, n, p);
-    fn(b0, e0);
-    // Wait for workers to finish their chunks.
+    run_chunks_();  // the caller is a worker too
+    // Wait for the workers to drain the counter.
     std::unique_lock<std::mutex> lk(done_m_);
     done_cv_.wait(lk, [&] { return remaining_.load(std::memory_order_acquire) == 0; });
-    task_ = nullptr;
+    task_ctx_ = nullptr;
   }
 
   ~thread_pool() {
@@ -103,11 +115,13 @@ class thread_pool {
     }
   }
 
-  static std::pair<int64_t, int64_t> chunk_(int t, int64_t n, int p) {
-    int64_t base = n / p, rem = n % p;
-    int64_t b = t * base + std::min<int64_t>(t, rem);
-    int64_t e = b + base + (t < rem ? 1 : 0);
-    return {b, e};
+  // Take chunks off the shared counter until the range is exhausted.
+  void run_chunks_() {
+    for (;;) {
+      int64_t b = task_next_.fetch_add(task_grain_, std::memory_order_relaxed);
+      if (b >= task_n_) return;
+      task_fn_(task_ctx_, b, std::min(task_n_, b + task_grain_));
+    }
   }
 
   void worker_(int t) {
@@ -120,8 +134,7 @@ class thread_pool {
         seen = s.generation;
       }
       if (stop_.load(std::memory_order_relaxed)) return;
-      auto [b, e] = chunk_(t, task_n_, task_p_);
-      (*task_)(b, e);
+      run_chunks_();
       // The decrement happens under done_m_ so the caller's predicate cannot
       // miss it between its check and its wait.
       std::lock_guard<std::mutex> lk(done_m_);
@@ -137,9 +150,11 @@ class thread_pool {
   std::mutex done_m_;
   std::condition_variable done_cv_;
   std::atomic<int> remaining_{0};
-  const std::function<void(int64_t, int64_t)>* task_ = nullptr;
+  void* task_ctx_ = nullptr;  // the caller's callable, borrowed for the call
+  void (*task_fn_)(void*, int64_t, int64_t) = nullptr;
   int64_t task_n_ = 0;
-  int task_p_ = 0;
+  int64_t task_grain_ = 1;
+  std::atomic<int64_t> task_next_{0};
   std::atomic<bool> stop_{false};
 };
 
