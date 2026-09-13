@@ -1895,27 +1895,32 @@ inline bool gemm_batched(void* a, int64_t ao, int64_t lda, bool ta, int64_t sa,
     unsigned gx = (un + 127) / 128, gy = (um + 127) / 128;
 
     if (CUfunction f = c.sgemm_rb_(ta, tb)) {
-      // Split-K (ladder ②): when the 128² tiling underfills the 82 SMs (base
-      // blocks < ~3 waves of 82×2 slots), partition K into S z-slices so S× more
-      // blocks run concurrently. Split-K partitions K (not replicates it), so
-      // A/B global traffic is unchanged — the only cost is C written S× via
-      // atomicAdd into a pre-zeroed buffer, so it applies only when scale/offset
-      // are identity (plain GEMM; the host gates on that). The census (RTX 3090)
-      // shows S=2 is the robust optimum for the underfilled sizes (1024³
-      // 0.63→0.75, 2048³ 0.74→0.76); S≥4 regresses as C-atomic traffic + short-K
-      // per-block overhead overtake the occupancy gain, and 4096³ (6 waves) wants
-      // S=1. So auto uses S=2 for base<512 with K≥512 (each half ≥256, enough to
-      // amortize the smem pipeline). The batch counts toward the base blocks, so
-      // a batched product that already fills the GPU declines to split.
+      // Split-K (ladder ②): when the 128² tiling underfills the 82 SMs,
+      // partition K into S z-slices so S× more blocks run concurrently. Split-K
+      // partitions K (not replicates it), so A/B global traffic is unchanged —
+      // the only cost is C written S× via atomicAdd into a pre-zeroed buffer
+      // (the kernel folds scale/offset into the partials, so a fused epilogue
+      // splits too). S comes from the fill: enough splits to reach ~64 blocks
+      // (one wave of the 82 SMs) with each split at least 96 deep, and a long K
+      // keeps splitting up to ~512 blocks in slices of ≥512. Against cuBLAS
+      // (bench_cuda_gemm, RTX 3090, own/cuBLAS, old fixed S=2 rule → this):
+      // 256×768×256 0.26→0.65, 256×768×768 0.44→0.62, 256×3072×768 0.35→0.86,
+      // 512×1024×512 0.50→0.73, 512×4096×1024 0.63→0.79, 512³ 0.50→0.61;
+      // 256×768×3072 (48 blocks) and 1024³/2048³ keep their S=2, 4096³ (1024
+      // blocks) stays unsplit. The batch counts toward the base blocks, so a
+      // batched product that already fills the GPU declines to split.
       // TL_SPLITK forces S for the census.
       unsigned S = 1, ksplit = uk;
-      if (scale == 1.0f && offset == 0.0f) {
+      {
         long base = (long)gx * gy * batch;
-        long want = -1;
-        if (const char* e = std::getenv("TL_SPLITK"))
+        long want;
+        if (const char* e = std::getenv("TL_SPLITK")) {
           want = std::atol(e);
-        else if (base < 512 && uk >= 512)
-          want = 2;
+        } else {
+          long by_fill = std::min((63 + base) / base, std::max<long>(1, uk / 96));
+          long by_k = std::min<long>(uk / 512, (511 + base) / base);
+          want = std::max(by_fill, by_k);
+        }
         if (want > 1) {
           unsigned chunk = (uk + (unsigned)want - 1) / (unsigned)want;
           chunk = (chunk + 7u) & ~7u;  // multiple of TL_BK=8

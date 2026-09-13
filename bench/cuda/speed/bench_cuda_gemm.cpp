@@ -51,10 +51,21 @@ int main(int argc, char** argv) {
   // Time each shape with R fused launches between one event pair, ROUNDS times,
   // report the median GFLOP/s. Reduce R for the biggest shapes (they are slow).
   const int ROUNDS = 7;
-  std::vector<int> sizes = {256, 512, 1024, 2048, 4096};
-  if (argc > 1) {  // optional: bench_cuda_gemm 1024 2048 ...
+  // A shape is a square side, or m×k×n spelled "256x768x3072" (the transformer
+  // block's projections and FFN, where the 128² tiling underfills the GPU and
+  // split-K decides the ratio).
+  struct shape { int64_t m, k, n; };
+  std::vector<shape> sizes = {{256, 256, 256}, {512, 512, 512}, {1024, 1024, 1024},
+                              {2048, 2048, 2048}, {4096, 4096, 4096}};
+  if (argc > 1) {  // optional: bench_cuda_gemm 1024 2048 256x768x3072 ...
     sizes.clear();
-    for (int i = 1; i < argc; i++) sizes.push_back(std::atoi(argv[i]));
+    for (int i = 1; i < argc; i++) {
+      long long m = 0, k = 0, n = 0;
+      if (std::sscanf(argv[i], "%lldx%lldx%lld", &m, &k, &n) == 3)
+        sizes.push_back({m, k, n});
+      else
+        sizes.push_back({std::atoi(argv[i]), std::atoi(argv[i]), std::atoi(argv[i])});
+    }
   }
 
   cublasHandle_t cub = nullptr;
@@ -63,10 +74,11 @@ int main(int argc, char** argv) {
   std::mt19937 g(11);
   std::uniform_real_distribution<float> dist(-1, 1);
 
-  std::printf("%-7s %10s %10s %8s   %8s\n", "size", "own GF/s", "cuBLAS", "own/cuB",
+  std::printf("%-16s %10s %10s %8s   %8s\n", "mxkxn", "own GF/s", "cuBLAS", "own/cuB",
               "maxrel");
-  for (int S : sizes) {
-    int64_t m = S, n = S, k = S;
+  for (const shape& sh : sizes) {
+    int64_t m = sh.m, n = sh.n, k = sh.k;
+    const int64_t S = std::max(m, std::max(n, k));  // sizes the timing batch
     float* ca = nullptr;
     float* cb = nullptr;
     float* cc = nullptr;
@@ -135,7 +147,10 @@ int main(int argc, char** argv) {
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
 
-    std::printf("%-7d %10.0f %10.0f %8.2f   %8.1e\n", S, own_gf, cub_gf,
+    char label[48];
+    std::snprintf(label, sizeof label, "%lldx%lldx%lld", (long long)m,
+                  (long long)k, (long long)n);
+    std::printf("%-16s %10.0f %10.0f %8.2f   %8.1e\n", label, own_gf, cub_gf,
                 own_gf / cub_gf, maxrel);
     release(A, 0, nullptr);
     release(B, 0, nullptr);

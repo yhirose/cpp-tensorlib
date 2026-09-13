@@ -275,13 +275,13 @@ TEST_CASE("batched dot: GPU dispatch matches the ref oracle") {
 
 TEST_CASE("batched dot: one-launch GPU gemm matches the ref oracle") {
   // Shapes the register-blocked kernel takes whole, with the batch folded into
-  // its grid: a whole tile per slice; m and n off the tile; the split-K
-  // trigger (base blocks × batch < 512 with K >= 512, so z = batch × 2); the
-  // attention probs·v shape (NN) and scores shape (NT); and rank 4 whose two
-  // batch axes collapse to one stride. Then the layouts the one-launch path
-  // must hand back to the per-slice loop: n not a multiple of 4 on NN, K odd,
-  // a permuted batch axis, a size-1 batch axis in the middle (which still
-  // collapses), and the fused epilogue (which the split-K path declines).
+  // its grid: a whole tile per slice; m and n off the tile; an underfilled
+  // grid with a long K (split-K, so z = batch × S); the attention probs·v
+  // shape (NN) and scores shape (NT); and rank 4 whose two batch axes
+  // collapse to one stride. Then the layouts the one-launch path must hand
+  // back to the per-slice loop: n not a multiple of 4 on NN, K odd, a
+  // permuted batch axis, a size-1 batch axis in the middle (which still
+  // collapses), and the fused epilogue (which split-K folds into its partials).
   struct { int64_t batch, m, k, n; } shapes[] = {
       {4, 128, 64, 128}, {3, 129, 64, 130}, {4, 200, 1024, 136},
       {8, 256, 256, 64}, {2, 96, 8, 32},
@@ -663,10 +663,10 @@ TEST_CASE("GPU GEMM: transposed operands take the fast path and match the ref or
   // The CUDA register-blocked kernel takes each operand plain or as the
   // transposed view of a contiguous array (NN/NT/TN/TT), predicated at the M
   // and N block edges and, on an underfilled grid, split over K. One shape per
-  // class: a whole tile; m and n off the tile; the split-K trigger (base blocks
-  // < 512 with K >= 512); n not a multiple of 4 (NT still qualifies — B's
-  // float4 runs along K); the attention-scores shape; and K odd, which every
-  // layout must hand to the plain kernel.
+  // class: a whole tile; m and n off the tile; an underfilled grid with a long
+  // K (4 blocks, K=1024: split 8 ways); n not a multiple of 4 (NT still
+  // qualifies — B's float4 runs along K); the attention-scores shape; and K
+  // odd, which every layout must hand to the plain kernel.
   struct { int64_t m, k, n; } shapes[] = {
       {128, 64, 128}, {129, 64, 130}, {200, 1024, 136},
       {64, 8, 33},    {512, 1024, 512}, {33, 17, 31},
@@ -683,7 +683,8 @@ TEST_CASE("GPU GEMM: transposed operands take the fast path and match the ref or
     CHECK(matches_gpu_oracle([&] { return A.dot(Bt.transpose()); }, rtol, atol));
     CHECK(matches_gpu_oracle([&] { return At.transpose().dot(B); }, rtol, atol));
     CHECK(matches_gpu_oracle([&] { return At.transpose().dot(Bt.transpose()); }, rtol, atol));
-    // the fused affine epilogue, which the split-K path must decline
+    // the fused affine epilogue: split-K scales every partial and adds the
+    // offset from split 0 only, so the split shapes check it too
     CHECK(matches_gpu_oracle([&] { return A.dot(Bt.transpose()) * 0.5f + 1.0f; }, rtol, atol));
   }
 }

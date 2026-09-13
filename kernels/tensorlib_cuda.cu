@@ -582,10 +582,12 @@ __global__ void tl_sgemm(const float* A, const float* B, float* C, unsigned m,
 // block edges are predicated (zero-filled loads, guarded stores).
 //
 // Split-K (ladder ②): S = ceil(k/ksplit) partitions the K axis so S× more
-// blocks fill the SMs at mid sizes (1024³/2048³ underfill 82 SMs with 128²
-// tiles). ksplit is the per-split K chunk (a multiple of TL_BK, so slab
-// boundaries stay aligned). When S>1 each split atomicAdds its partial into a
-// pre-zeroed C (scale/offset must be identity — the host gates on that); when
+// blocks fill the SMs when the 128² tiling leaves most of them idle (a 256×768
+// output is 12 blocks on 82 SMs; a 1024³ product 64). ksplit is the per-split
+// K chunk (a multiple of TL_BK, so slab boundaries stay aligned). When S>1
+// each split atomicAdds its partial into a pre-zeroed C: the affine epilogue
+// is linear in the partials, so every split adds `acc·scale` and split 0
+// alone adds `offset` — a fused `q·kᵀ·scale` splits like a plain GEMM. When
 // S==1 (ksplit>=k) the epilogue is the normal fused store, so the non-split
 // path is bit-identical to before.
 //
@@ -624,10 +626,11 @@ __device__ __forceinline__ void sgemm_rb_core(const float* __restrict__ A,
   // then take the split's K-range (a multiple of TL_BK; identity when S==1)
   const unsigned S = (k + ksplit - 1) / ksplit;
   const unsigned bi = blockIdx.z / S;
+  const unsigned sz = blockIdx.z % S;
   A += (size_t)bi * sa;
   B += (size_t)bi * sb;
   C += (size_t)bi * sc;
-  const unsigned k0 = (blockIdx.z % S) * ksplit;
+  const unsigned k0 = sz * ksplit;
   if (k0 >= k) return;
   const unsigned k1 = (k0 + ksplit < k) ? (k0 + ksplit) : k;
 
@@ -720,10 +723,11 @@ __device__ __forceinline__ void sgemm_rb_core(const float* __restrict__ A,
   }
 
   // --- epilogue: guarded store (mirror the load map) ---
-  // S==1: fused affine store. S>1: atomicAdd the raw partial into a pre-zeroed
-  // C (scale/offset are identity on this path, gated host-side). ksplit is
-  // uniform across the block, so the branch never diverges.
+  // S==1: fused affine store. S>1: atomicAdd this split's share of the affine
+  // result into a pre-zeroed C — scale on every partial, offset from split 0
+  // only. ksplit is uniform across the block, so the branch never diverges.
   const bool split = ksplit < k;
+  const float part_offset = sz == 0 ? offset : 0.0f;
 #pragma unroll
   for (unsigned i = 0; i < TL_TM; i++) {
     unsigned gRow = blockRow + warpRow * TL_WM + threadRowInWarp * TL_TM + i;
@@ -738,7 +742,7 @@ __device__ __forceinline__ void sgemm_rb_core(const float* __restrict__ A,
         if (gCol >= n) continue;
         size_t idx = (size_t)gRow * n + gCol;
         if (split)
-          atomicAdd(&C[idx], acc[i][j]);
+          atomicAdd(&C[idx], acc[i][j] * scale + part_offset);
         else
           C[idx] = acc[i][j] * scale + offset;
       }
