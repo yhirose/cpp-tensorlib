@@ -54,15 +54,18 @@ int main(int argc, char** argv) {
   // A shape is a square side, or m×k×n spelled "256x768x3072" (the transformer
   // block's projections and FFN, where the 128² tiling underfills the GPU and
   // split-K decides the ratio).
-  struct shape { int64_t m, k, n; };
+  // A ":tn"-style suffix stores A and/or B transposed and reads them through
+  // the NT/TN/TT kernels, so the layouts' staging costs compare on one product.
+  struct shape { int64_t m, k, n; bool ta = false, tb = false; };
   std::vector<shape> sizes = {{256, 256, 256}, {512, 512, 512}, {1024, 1024, 1024},
                               {2048, 2048, 2048}, {4096, 4096, 4096}};
-  if (argc > 1) {  // optional: bench_cuda_gemm 1024 2048 256x768x3072 ...
+  if (argc > 1) {  // optional: bench_cuda_gemm 1024 2048 256x768x3072:nt ...
     sizes.clear();
     for (int i = 1; i < argc; i++) {
       long long m = 0, k = 0, n = 0;
-      if (std::sscanf(argv[i], "%lldx%lldx%lld", &m, &k, &n) == 3)
-        sizes.push_back({m, k, n});
+      char lay[3] = "nn";
+      if (std::sscanf(argv[i], "%lldx%lldx%lld:%2s", &m, &k, &n, lay) >= 3)
+        sizes.push_back({m, k, n, lay[0] == 't', lay[1] == 't'});
       else
         sizes.push_back({std::atoi(argv[i]), std::atoi(argv[i]), std::atoi(argv[i])});
     }
@@ -89,6 +92,18 @@ int main(int argc, char** argv) {
     void* Cref = alloc(m * n * 4, &cref);
     for (int64_t i = 0; i < m * k; i++) ca[i] = dist(g);
     for (int64_t i = 0; i < k * n; i++) cb[i] = dist(g);
+    // The operands own reads: A as [k][m] (lda = m) when ta, B as [n][k]
+    // (ldb = k) when tb; otherwise the same buffers cuBLAS reads.
+    float* cat = nullptr;
+    float* cbt = nullptr;
+    void* At = sh.ta ? alloc(m * k * 4, &cat) : A;
+    void* Bt = sh.tb ? alloc(k * n * 4, &cbt) : B;
+    if (sh.ta)
+      for (int64_t i = 0; i < m; i++)
+        for (int64_t p = 0; p < k; p++) cat[p * m + i] = ca[i * k + p];
+    if (sh.tb)
+      for (int64_t p = 0; p < k; p++)
+        for (int64_t j = 0; j < n; j++) cbt[j * k + p] = cb[p * n + j];
 
     // native handles are the DEVICE pointers (device-mirror model). Both own
     // and cuBLAS operate on device memory. run_own's first call H2D-uploads the
@@ -105,11 +120,14 @@ int main(int argc, char** argv) {
                   dB, (int)n, dA, (int)k, &beta, (float*)out, (int)n);
     };
     auto run_own = [&](void* out) {
-      gemm(A, 0, k, false, B, 0, n, false, out, 0, m, n, k, 1.0f, 0.0f);
+      gemm(At, 0, sh.ta ? m : k, sh.ta, Bt, 0, sh.tb ? k : n, sh.tb, out, 0, m, n, k,
+           1.0f, 0.0f);
     };
 
     // ---- correctness: own vs cuBLAS (cuBLAS is the trusted oracle here) ----
-    run_own(C);        // also uploads A,B to device
+    run_own(C);        // also uploads A,B to device (unless ta/tb)
+    if (sh.ta || sh.tb)  // own read At/Bt: upload A,B through a plain NN gemm
+      gemm(A, 0, k, false, B, 0, n, false, Cref, 0, m, n, k, 1.0f, 0.0f);
     run_cublas(Cref);  // reads the same device A,B
     cudaDeviceSynchronize();
     std::vector<float> ownv(m * n), refv(m * n);
@@ -148,10 +166,13 @@ int main(int argc, char** argv) {
     cudaEventDestroy(e1);
 
     char label[48];
-    std::snprintf(label, sizeof label, "%lldx%lldx%lld", (long long)m,
-                  (long long)k, (long long)n);
+    std::snprintf(label, sizeof label, "%lldx%lldx%lld%s", (long long)m,
+                  (long long)k, (long long)n,
+                  sh.ta ? (sh.tb ? ":tt" : ":tn") : (sh.tb ? ":nt" : ""));
     std::printf("%-16s %10.0f %10.0f %8.2f   %8.1e\n", label, own_gf, cub_gf,
                 own_gf / cub_gf, maxrel);
+    if (sh.ta) release(At, 0, nullptr);
+    if (sh.tb) release(Bt, 0, nullptr);
     release(A, 0, nullptr);
     release(B, 0, nullptr);
     release(C, 0, nullptr);
