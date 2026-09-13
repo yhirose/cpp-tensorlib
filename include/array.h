@@ -2675,6 +2675,53 @@ struct graph {
     return out;
   }
 
+  // Softmax over the last axis on the own CPU backend: ref::softmax's row
+  // walk, the rows spread across the thread pool. The reference is one
+  // thread of scalar exps — 5.4 ms at [8,512,512] against torch's 0.2, the
+  // whole remaining gap of a hand-written attention once its gemms were
+  // even, and what causal_attention's backward pays to rebuild its
+  // probabilities. An element costs about a hundred multiply-adds of time
+  // (the exp plus the max and normalise passes), so the split is capped like
+  // a gemm of that much work. Gated by cpu::enabled_ like cpu_gemm, so the
+  // oracle tests still reach ref::softmax.
+  static std::optional<array> cpu_softmax_(const array& a) {
+    if (!cpu::enabled_) return std::nullopt;
+    int64_t cols = a.shape().back();
+    int64_t rows = a.size() / (cols ? cols : 1);
+    if (rows == 0 || cols == 0) return std::nullopt;
+    auto out = array::empty(a.shape());
+    int64_t col_stride = a.strides().back();
+    shape_t outer(a.shape().begin(), a.shape().end() - 1);
+    std::vector<int64_t> outer_strides(a.strides().begin(),
+                                       a.strides().end() - 1);
+    std::vector<int64_t> row_off(rows);
+    detail::for_each_index(outer, {outer_strides},
+                           [&](int64_t i, const std::vector<int64_t>& off) {
+                             row_off[i] = off[0];
+                           });
+    const float* pi = a.raw();
+    float* po = out.data();
+    cpu::thread_pool::instance().parallel_for(
+        rows,
+        [&](int64_t r0, int64_t r1) {
+          for (int64_t r = r0; r < r1; r++) {
+            const float* src = pi + row_off[r];
+            float* dst = po + r * cols;
+            float m = src[0];
+            for (int64_t c = 1; c < cols; c++)
+              m = std::max(m, src[c * col_stride]);
+            float denom = 0;
+            for (int64_t c = 0; c < cols; c++) {
+              dst[c] = std::exp(src[c * col_stride] - m);
+              denom += dst[c];
+            }
+            for (int64_t c = 0; c < cols; c++) dst[c] /= denom;
+          }
+        },
+        cpu::threads_for_(rows * cols * 128));
+    return out;
+  }
+
   // CPU reference causal prefill attention (the oracle, and the fallback when
   // cpu::enabled_ is off): row t of head h is the decode reference over the
   // keys 0..t.
@@ -3437,6 +3484,8 @@ struct graph {
         auto a = in(0);
         if (auto g = gpu_row(gpu::kop::softmax, a, a.shape(), 1.0f, 0.0f)) {
           r = std::move(*g);
+        } else if (auto c = cpu_softmax_(a)) {
+          r = std::move(*c);
         } else {
           r = ref::softmax(a);
         }

@@ -327,6 +327,16 @@ TEST_CASE("batched dot: own CPU gemm per slice matches the ref oracle") {
   CHECK(cpu_matches_ref([&] { return a.dot(b) * 0.5f + 1.0f; }));  // epilogue
 }
 
+TEST_CASE("softmax: own CPU rows across the pool match the ref oracle") {
+  // rank 1, 2 and 3, a transposed (strided) view, and a shape big enough to
+  // split across threads
+  CHECK(cpu_matches_ref([&] { return random_array({5}, 901).softmax(); }));
+  CHECK(cpu_matches_ref([&] { return random_array({7, 33}, 902).softmax(); }));
+  CHECK(cpu_matches_ref([&] { return random_array({4, 6, 40}, 903).softmax(); }));
+  CHECK(cpu_matches_ref([&] { return random_array({40, 6}, 904).transpose().softmax(); }));
+  CHECK(cpu_matches_ref([&] { return random_array({8, 256, 256}, 905).softmax(); }));
+}
+
 TEST_CASE("reductions") {
   auto a = array::from({1, 2, 3, 4, 5, 6}, {2, 3});
   CHECK(a.sum() == 21.0f);
