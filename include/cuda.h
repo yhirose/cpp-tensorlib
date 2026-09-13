@@ -1854,6 +1854,49 @@ struct kv_cache {
   }
 };
 
+// Split-K (ladder ②) for the f32 register-blocked gemm: when the 128² tiling
+// leaves the 82 SMs underfilled, partition K into S z-slices so S× more blocks
+// run concurrently. Split-K partitions K (not replicates it), so A/B global
+// traffic is unchanged — the only cost is C written S× via atomicAdd into a
+// pre-zeroed buffer (the kernel folds scale/offset into the partials, so a
+// fused epilogue splits too). S comes from the fill: enough splits to reach
+// ~64 blocks (one wave) with each at least 96 deep, and a long K keeps
+// splitting up to ~512 blocks in slices of ≥512. Against cuBLAS
+// (bench_cuda_gemm, RTX 3090, own/cuBLAS, the old fixed S=2 rule → this):
+// 256×768×256 0.26→0.65, 256×768×768 0.44→0.62, 256×3072×768 0.35→0.86,
+// 512×1024×512 0.50→0.73, 512×4096×1024 0.63→0.79, 512³ 0.50→0.61;
+// 256×768×3072 (48 blocks) and 1024³/2048³ keep their S=2, 4096³ (1024
+// blocks) stays unsplit. `base_blocks` counts the batch too, so a batched
+// product that already fills the GPU declines to split. chunk is a whole
+// number of TL_BK=8 slabs; S == 1 leaves chunk == k (the kernel reads that as
+// "no split"). TL_SPLITK forces S for the census, read once like the other
+// TL_* knobs.
+struct sgemm_splitk {
+  unsigned S, chunk;
+};
+inline sgemm_splitk sgemm_rb_splitk_(long base_blocks, unsigned k) {
+  static const long forced = [] {
+    const char* e = std::getenv("TL_SPLITK");
+    return e ? std::atol(e) : -1L;
+  }();
+  long want = forced;
+  if (want < 0) {
+    long by_fill = std::min((63 + base_blocks) / base_blocks,
+                            std::max<long>(1, k / 96));
+    long by_k = std::min<long>(k / 512, (511 + base_blocks) / base_blocks);
+    want = std::max(by_fill, by_k);
+  }
+  sgemm_splitk plan{1, k};
+  if (want > 1) {
+    unsigned chunk = (k + (unsigned)want - 1) / (unsigned)want;
+    chunk = (chunk + 7u) & ~7u;
+    if (chunk == 0) chunk = 8;
+    unsigned s = (k + chunk - 1) / chunk;
+    if (s > 1) plan = {s, chunk};
+  }
+  return plan;
+}
+
 // C[bi](m,n) = (A[bi] @ B[bi]) * scale + offset for bi < batch, the batch
 // elements sa/sb floats apart (0 broadcasts) and C's packed at m·n. lda/ldb
 // row strides; trans reads a transposed view in place. One launch: the batch
@@ -1879,60 +1922,33 @@ inline bool gemm_batched(void* a, int64_t ao, int64_t lda, bool ta, int64_t sa,
   // operand contiguous in its own layout (lda == k, or == m for a transposed
   // view; ldb == n, or == k transposed), K%8==0 for the 8-slab, the dim a
   // float4 load runs along a multiple of 4 (N for NN's B, M for TN's A; K%8
-  // covers the K-contiguous operands), and 16B-aligned bases — for every
-  // batch element, so the A/B batch strides are multiples of 4 floats (C is
-  // stored per element) and fit the kernel's 32-bit stride. M and N block
-  // edges are predicated in-kernel. Strided views, odd K and unaligned
-  // offsets fall to tl_sgemm.
-  bool aligned = (ao % 16 == 0) && (bo % 16 == 0) && (oo % 16 == 0) &&
-                 sa % 4 == 0 && sb % 4 == 0;
+  // covers the K-contiguous operands), and 16B-aligned bases. The batch
+  // strides ride in the kernel's 32-bit arguments and must keep every slice
+  // 16B-aligned: multiples of 4 floats (C is stored per element, so only its
+  // m·n stride has to fit). M and N block edges are predicated in-kernel.
+  // Strided views, odd K and unaligned offsets fall to tl_sgemm.
+  bool aligned = (ao % 16 == 0) && (bo % 16 == 0) && (oo % 16 == 0);
   bool a_ok = ta ? (lda == m && m % 4 == 0) : (lda == k);
   bool b_ok = tb ? (ldb == k) : (ldb == n && n % 4 == 0);
-  bool strides_fit = sa >= 0 && sb >= 0 && sa <= (int64_t)UINT32_MAX &&
-                     sb <= (int64_t)UINT32_MAX && m * n <= (int64_t)UINT32_MAX;
-  if (a_ok && b_ok && k % 8 == 0 && aligned && strides_fit && m > 0 && n > 0 &&
+  bool batch_ok = sa % 4 == 0 && sb % 4 == 0 && sa <= (int64_t)UINT32_MAX &&
+                  sb <= (int64_t)UINT32_MAX &&
+                  (batch == 1 || m * n <= (int64_t)UINT32_MAX);
+  if (a_ok && b_ok && batch_ok && k % 8 == 0 && aligned && m > 0 && n > 0 &&
       k > 0) {
     unsigned gx = (un + 127) / 128, gy = (um + 127) / 128;
-
     if (CUfunction f = c.sgemm_rb_(ta, tb)) {
-      // Split-K (ladder ②): when the 128² tiling underfills the 82 SMs,
-      // partition K into S z-slices so S× more blocks run concurrently. Split-K
-      // partitions K (not replicates it), so A/B global traffic is unchanged —
-      // the only cost is C written S× via atomicAdd into a pre-zeroed buffer
-      // (the kernel folds scale/offset into the partials, so a fused epilogue
-      // splits too). S comes from the fill: enough splits to reach ~64 blocks
-      // (one wave of the 82 SMs) with each split at least 96 deep, and a long K
-      // keeps splitting up to ~512 blocks in slices of ≥512. Against cuBLAS
-      // (bench_cuda_gemm, RTX 3090, own/cuBLAS, old fixed S=2 rule → this):
-      // 256×768×256 0.26→0.65, 256×768×768 0.44→0.62, 256×3072×768 0.35→0.86,
-      // 512×1024×512 0.50→0.73, 512×4096×1024 0.63→0.79, 512³ 0.50→0.61;
-      // 256×768×3072 (48 blocks) and 1024³/2048³ keep their S=2, 4096³ (1024
-      // blocks) stays unsplit. The batch counts toward the base blocks, so a
-      // batched product that already fills the GPU declines to split.
-      // TL_SPLITK forces S for the census.
-      unsigned S = 1, ksplit = uk;
-      {
-        long base = (long)gx * gy * batch;
-        long want;
-        if (const char* e = std::getenv("TL_SPLITK")) {
-          want = std::atol(e);
-        } else {
-          long by_fill = std::min((63 + base) / base, std::max<long>(1, uk / 96));
-          long by_k = std::min<long>(uk / 512, (511 + base) / base);
-          want = std::max(by_fill, by_k);
-        }
-        if (want > 1) {
-          unsigned chunk = (uk + (unsigned)want - 1) / (unsigned)want;
-          chunk = (chunk + 7u) & ~7u;  // multiple of TL_BK=8
-          if (chunk == 0) chunk = 8;
-          unsigned s = (uk + chunk - 1) / chunk;
-          if (s > 1) { S = s; ksplit = chunk; }
-        }
-      }
+      auto [S, ksplit] = sgemm_rb_splitk_((long)gx * gy * batch, uk);
       // gridDim.z carries batch × S; the driver caps it at 65535.
       if ((int64_t)S * batch <= 65535) {
-        if (S > 1) c.d.MemsetD8(reinterpret_cast<CUdeviceptr>(po), 0,
-                                (size_t)batch * m * n * 4);  // zero C for atomicAdd
+        if (S > 1) {
+          // atomicAdd needs a zeroed C. Async on the stream where the driver
+          // has it (ordered before the launch, no host sync, capturable — as
+          // gemm_bf16_nt's is); the plain memset otherwise.
+          CUdeviceptr pc = reinterpret_cast<CUdeviceptr>(po);
+          size_t bytes = (size_t)batch * m * n * 4;
+          if (c.d.MemsetD8Async) c.d.MemsetD8Async(pc, 0, bytes, c.stream);
+          else c.d.MemsetD8(pc, 0, bytes);
+        }
         unsigned usa = (unsigned)sa, usb = (unsigned)sb, usc = (unsigned)(m * n),
                  uz = (unsigned)(S * batch);
         return c.launch_(f, {gx, gy, uz}, {256}, 0, pa, pb, po, um, un, uk, scale,

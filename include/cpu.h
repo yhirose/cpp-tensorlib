@@ -401,15 +401,21 @@ inline ukernel_desc select_ukernel() {
 
 }  // namespace detail
 
+// How many threads `macs` multiply-adds are worth: one per floor of work
+// (min_work_per_thread_), so a small job never pays for threads it cannot
+// feed. The cap every pool split in this backend goes through.
+inline int threads_for_(int64_t macs) {
+  return static_cast<int>(
+      std::min<int64_t>(macs / min_work_per_thread_(), 1 << 30));
+}
+
 // C[m×n] = alpha · A · B, C row-major (ld = n), beta = 0 (C overwritten).
 // A is m×k with strides (as0, as1); B is k×n with strides (bs0, bs1) — any
 // layout, so a transposed view passes its base strides in place.
 inline void sgemm(const float* A, int64_t as0, int64_t as1, const float* B,
                   int64_t bs0, int64_t bs1, float* C, int64_t m, int64_t n,
                   int64_t k, float alpha) {
-  const int max_threads = static_cast<int>(
-      std::min<int64_t>(m * n * k / min_work_per_thread_(), 1 << 30));
-  sgemm_(A, as0, as1, B, bs0, bs1, C, m, n, k, alpha, max_threads);
+  sgemm_(A, as0, as1, B, bs0, bs1, C, m, n, k, alpha, threads_for_(m * n * k));
 }
 
 inline void sgemm_(const float* A, int64_t as0, int64_t as1, const float* B,

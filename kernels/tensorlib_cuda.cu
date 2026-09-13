@@ -623,7 +623,8 @@ __device__ __forceinline__ void sgemm_rb_core(const float* __restrict__ A,
   const unsigned tid = threadIdx.x;  // 0..255
 
   // z = batch element × K split: step the operands to this batch element,
-  // then take the split's K-range (a multiple of TL_BK; identity when S==1)
+  // then take the split's K-range (a multiple of TL_BK; identity when S==1).
+  // sz < S = ceil(k/ksplit) keeps k0 < k, so every split has work.
   const unsigned S = (k + ksplit - 1) / ksplit;
   const unsigned bi = blockIdx.z / S;
   const unsigned sz = blockIdx.z % S;
@@ -631,7 +632,6 @@ __device__ __forceinline__ void sgemm_rb_core(const float* __restrict__ A,
   B += (size_t)bi * sb;
   C += (size_t)bi * sc;
   const unsigned k0 = sz * ksplit;
-  if (k0 >= k) return;
   const unsigned k1 = (k0 + ksplit < k) ? (k0 + ksplit) : k;
 
   // warp placement in the block: 8 warps as 2 rows × 4 cols of 64×32 tiles

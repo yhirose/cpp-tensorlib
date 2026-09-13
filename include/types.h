@@ -76,6 +76,11 @@ inline void use_auto() { device_ = device_type::auto_; }
 // backend results against the oracle in-process.
 inline bool use_accelerate_ = true;
 
+// Benchmark toggle: when false, a batched matmul on the GPU launches one gemm
+// per slice instead of the single batched launch, so the census can put the
+// two side by side in one process (misc/census_gemm_batched.cpp).
+inline bool bdot_one_launch_ = true;
+
 // Kernel families with distinct CPU/GPU crossover points (silarray's
 // use_gpu_(n, class) design). auto_ mode compares an op's work size against
 // one threshold per family; the manual cpu/gpu modes ignore them.

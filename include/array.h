@@ -2351,9 +2351,10 @@ struct graph {
   // The batch axes of x as one linear stride, when they walk like a single
   // axis (each stride the product of the inner batch extents — the array's
   // own layout, or a slice of it; size-1 axes don't count): what a backend's
-  // one-launch batched gemm can step by. nullopt for a permuted batch (a
-  // [B,H,…] view transposed to [H,B,…]) and for a broadcast one, which walk
-  // the batch_walk_ odometer per slice instead.
+  // one-launch batched gemm can step by. A broadcast batch (stride 0
+  // throughout) collapses to 0, which the backend reads as "the same slice
+  // every time". nullopt for a permuted batch (a [B,H,…] view transposed to
+  // [H,B,…]), which walks the batch_walk_ odometer per slice instead.
   static std::optional<int64_t> batch_stride_(const array& x) {
     size_t r = x.rank();
     int64_t stride = 0, extent = 1;
@@ -2381,7 +2382,7 @@ struct graph {
   // (H launches for attention's probs·v cost 0.43 ms against 0.1 fused).
   // The fused scale/offset go into the launch's epilogue like gpu_gemm's, so
   // `q·kᵀ * scale` never round-trips 2M scores through the host affine tail.
-  // TL_BDOT_PER_SLICE forces the loop, for the census.
+  // bdot_one_launch_ (types.h) off forces the loop, for the census.
   static std::optional<array> gpu_bdot_(const node& n, const array& a,
                                         const array& b) {
     size_t r = a.rank();
@@ -2401,9 +2402,8 @@ struct graph {
     auto out = array::empty(out_shape);
     if (!out.storage_.native) return std::nullopt;
     if (m == 0 || nn == 0 || batch == 0) return out;
-    static const bool per_slice = std::getenv("TL_BDOT_PER_SLICE") != nullptr;
     auto sa = batch_stride_(a), sb = batch_stride_(b);
-    if (!per_slice && sa && sb &&
+    if (bdot_one_launch_ && sa && sb &&
         gpu::gemm_batched(a.storage_.native, a.offset_ * 4, la->ld, la->trans,
                           *sa, b.storage_.native, b.offset_ * 4, lb->ld,
                           lb->trans, *sb, out.storage_.native, out.offset_ * 4,
@@ -2637,10 +2637,8 @@ struct graph {
     float* po = out.data();
     constexpr int64_t BQ = 64;
     const int64_t ntiles = (T + BQ - 1) / BQ, items = H * ntiles;
-    // Both gemms over the causal half: H·T²·D multiply-adds, split like
-    // cpu::sgemm splits its own.
-    const int max_threads = static_cast<int>(std::min<int64_t>(
-        H * T * T * D / cpu::min_work_per_thread_(), 1 << 30));
+    // Both gemms over the causal half: H·T²·D multiply-adds.
+    const int max_threads = cpu::threads_for_(H * T * T * D);
     cpu::thread_pool::instance().parallel_for(
         items,
         [&](int64_t i0, int64_t i1) {
