@@ -37,6 +37,7 @@ namespace cuda {
 using kop = tl::metal::kop;
 using cmp_op = tl::metal::cmp_op;
 using unary_ext_op = tl::metal::unary_ext_op;
+using scalar_op = tl::metal::scalar_op;
 
 #if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
 
@@ -478,6 +479,23 @@ struct context {
     }
   }
   CUfunction clamp_() { return cached_(clamp_fn, "tl_clamp"); }
+
+  // Tensor-scalar ops (pow(x, s), x > s, ...): the scalar is a kernel argument.
+  CUfunction pow_s_fn = nullptr, gt_s_fn = nullptr, lt_s_fn = nullptr,
+             ge_s_fn = nullptr, le_s_fn = nullptr, eq_s_fn = nullptr,
+             ne_s_fn = nullptr;
+  CUfunction scalar_binary_(scalar_op op) {
+    switch (op) {
+      case scalar_op::pow: return cached_(pow_s_fn, "tl_pow_s");
+      case scalar_op::gt: return cached_(gt_s_fn, "tl_gt_s");
+      case scalar_op::lt: return cached_(lt_s_fn, "tl_lt_s");
+      case scalar_op::ge: return cached_(ge_s_fn, "tl_ge_s");
+      case scalar_op::le: return cached_(le_s_fn, "tl_le_s");
+      case scalar_op::eq: return cached_(eq_s_fn, "tl_eq_s");
+      case scalar_op::ne: return cached_(ne_s_fn, "tl_ne_s");
+      default: return nullptr;
+    }
+  }
 
   // M9 batched-prefill GEMM (bf16 [N,K] weights, the decode GEMV's own layout).
   CUfunction gemm_bf16_nt_fn = nullptr, gemm_bf16_nt_s_fn = nullptr,
@@ -1101,6 +1119,23 @@ inline bool clamp(void* a_native, int64_t ao, void* out_native, int64_t oo,
   float* po = context::off_(out_native, oo);
   unsigned un = static_cast<unsigned>(n);
   return c.launch1d_(f, un, pa, po, un, lo, hi);
+}
+
+// Tensor-scalar ops: out = f(a, s) * scale + offset, s a kernel argument
+// (pow(x, s), x > s, ...) rather than a rank-0 operand buffer.
+inline bool scalar_binary(scalar_op op, void* a_native, int64_t ao,
+                          void* out_native, int64_t oo, int64_t n, float s,
+                          float scale, float offset) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  CUfunction f = c.scalar_binary_(op);
+  if (!f) return false;
+  c.device_read_(a_native);
+  c.device_write_(out_native);
+  float* pa = context::off_(a_native, ao);
+  float* po = context::off_(out_native, oo);
+  unsigned un = static_cast<unsigned>(n);
+  return c.launch1d_(f, un, pa, po, un, s, scale, offset);
 }
 
 // Places `a` (contiguous) into a zero buffer of out_shape (array.h's
@@ -2144,6 +2179,10 @@ inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
   return false;
 }
 inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {
+  return false;
+}
+inline bool scalar_binary(scalar_op, void*, int64_t, void*, int64_t, int64_t,
+                          float, float, float) {
   return false;
 }
 inline void sync_to_host(void*, bool) {}

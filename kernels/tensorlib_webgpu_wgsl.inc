@@ -49,7 +49,7 @@ struct Params {
   _pad2 : u32,
   _pad3 : u32,
   _pad4 : u32,
-  _pad5 : u32,
+  arg : f32,      // a scalar operand (ew_scalar's s)
 };
 
 @group(0) @binding(0) var<storage, read>       A : array<f32>;
@@ -283,6 +283,24 @@ fn clamp_(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
   if (i >= p.M) { return; }
   C[p.c_off + i] = clamp(A[p.a_off + i], p.scale, p.offset);
+}
+
+// Tensor-scalar over p.M elements: out = f(a, s) * scale + offset, the scalar
+// operand in p.arg (pow(x, s), x > s) rather than a rank-0 buffer. Mirrors
+// tensorlib_cuda.cu's TL_EW_SCALAR; op 0 is pow, 1.. the comparisons in
+// cmp_op's order.
+fn scalar_op(op : u32, av : f32, s : f32) -> f32 {
+  switch (op) {
+    case 0u: { return pow(av, s); }
+    default: { return cmp_op(op - 1u, av, s); }
+  }
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn ew_scalar(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= p.M) { return; }
+  C[p.c_off + i] = fma(scalar_op(p.op, A[p.a_off + i], p.arg), p.scale, p.offset);
 }
 
 // Rank-2 broadcast binary: out[r,c] = f(a[r*ars + c*acs], b[r*brs + c*bcs])

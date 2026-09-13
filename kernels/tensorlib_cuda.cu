@@ -218,6 +218,24 @@ __global__ void tl_clamp(const float* a, float* out, unsigned n, float lo,
   out[i] = v < lo ? lo : (v > hi ? hi : v);
 }
 
+// ---- tensor-scalar: out = f(a, s) * scale + offset. The scalar operand is a
+// kernel argument (pow(x, s), x > s), not a rank-0 buffer -- that cost an
+// allocation and an upload per call. Masks take the epilogue like the unaries.
+#define TL_EW_SCALAR(NAME, EXPR)                                            \
+  __global__ void NAME(const float* a, float* out, unsigned n, float s,     \
+                       float scale, float offset) {                         \
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;                     \
+    if (i < n) out[i] = (EXPR) * scale + offset;                           \
+  }
+TL_EW_SCALAR(tl_pow_s, powf(a[i], s))
+TL_EW_SCALAR(tl_gt_s, a[i] > s ? 1.0f : 0.0f)
+TL_EW_SCALAR(tl_lt_s, a[i] < s ? 1.0f : 0.0f)
+TL_EW_SCALAR(tl_ge_s, a[i] >= s ? 1.0f : 0.0f)
+TL_EW_SCALAR(tl_le_s, a[i] <= s ? 1.0f : 0.0f)
+TL_EW_SCALAR(tl_eq_s, a[i] == s ? 1.0f : 0.0f)
+TL_EW_SCALAR(tl_ne_s, a[i] != s ? 1.0f : 0.0f)
+#undef TL_EW_SCALAR
+
 // ---- row reductions over the last axis (cols); one block per row ----
 // Block-wide tree reduction in shared memory; cols may exceed blockDim, so
 // grid-stride accumulate first. One output per row, affine epilogue.

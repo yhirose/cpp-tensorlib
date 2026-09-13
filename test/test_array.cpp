@@ -1787,6 +1787,44 @@ TEST_CASE("pow: GPU dispatch matches the ref oracle") {
   }));
 }
 
+// --- tensor-scalar ops: pow(x, s) and x OP s carry s in the node and as a
+// kernel argument, not as a rank-0 operand (an allocation and an upload per
+// call, which used to block the pipeline).
+
+TEST_CASE("tensor-scalar ops match the ref oracle on every path") {
+  auto x = random_array({64, 32}, 83).relu() + 0.1f;
+  auto p = array::from({-3, -1, 0, 2, 4, -5, 6, 1}, {2, 4});
+  for (float s : {2.0f, 0.5f, -0.5f, -1.0f, 3.0f}) {
+    CHECK(matches_gpu_oracle([&] { return tl::pow(x, s); }));
+    CHECK(cpu_matches_ref([&] { return tl::pow(x, s); }));
+  }
+  // The fused epilogue: LayerNorm's `(var + eps).pow(-0.5)` then an affine.
+  CHECK(matches_gpu_oracle([&] { return tl::pow(x + 1e-5f, -0.5f) * 2.0f + 1.0f; }));
+  CHECK(matches_gpu_oracle([&] { return (p >= 1.0f) * 3.0f - 1.0f; }));
+  CHECK(matches_gpu_oracle([&] { return (x < 0.5f) * x; }));
+
+  // Against std::pow directly, past the tiny-tensor cutoff (eval_one's path).
+  auto big = random_array({128, 64}, 84).relu() + 0.1f;
+  auto got = tl::pow(big, -0.5f).eval();
+  auto src = big.eval();
+  bool ok = true;
+  for (int64_t i = 0; i < 128 && ok; i++) {
+    for (int64_t j = 0; j < 64 && ok; j++) {
+      float want = std::pow(src.at({i, j}), -0.5f);
+      ok = std::abs(got.at({i, j}) - want) <= 1e-5f * std::abs(want) + 1e-6f;
+    }
+  }
+  CHECK(ok);
+
+  // The eager tiny path.
+  auto t = tl::pow(array::from({4.0f, 9.0f}, {2}), -0.5f).eval();
+  CHECK(t.at({0}) == doctest::Approx(0.5f));
+  CHECK(t.at({1}) == doctest::Approx(1.0f / 3.0f));
+  auto m = (p >= 0.0f).eval();
+  CHECK(m.at({0, 0}) == 0.0f);
+  CHECK(m.at({0, 2}) == 1.0f);
+}
+
 // --- host/device coherence on the CPU fast paths (CUDA's mirror storage).
 // A buffer the GPU last wrote lives on the device until a CPU access pulls
 // it back; the tiny-tensor fast paths and add_ used to read/write the host

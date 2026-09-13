@@ -50,7 +50,8 @@ enum class kop {
   gt_, lt_, ge_, le_, eq_, ne_,  // comparisons -- cmp_op maps onto these
   tanh_, sin_, cos_,             // unary_ext_op maps onto these
   clamp_, sum_to_,               // dedicated ops, mirroring cuda.h's own
-  concat_part_, rope_            // ditto -- Tensor.concat / RoPE's own dispatch
+  concat_part_, rope_,           // ditto -- Tensor.concat / RoPE's own dispatch
+  pow_s_, gt_s_, lt_s_, ge_s_, le_s_, eq_s_, ne_s_  // scalar_op maps onto these
 };
 
 // Comparisons (gt/lt/ge/le/eq/ne) are deliberately NOT kop values: kop is
@@ -67,6 +68,11 @@ enum class cmp_op { gt, lt, ge, le, eq, ne };
 // scalars, no epilogue) gets its own dedicated function below instead of
 // an enum value, same as index_select/sum_to's own dedicated functions.
 enum class unary_ext_op { tanh_, sin_, cos_ };
+
+// Tensor-scalar ops: pow(x, s) and the comparisons against a scalar, with s a
+// kernel argument instead of a rank-0 operand buffer (an allocation and an
+// upload per call). Own vocabulary, like cmp_op.
+enum class scalar_op { pow, gt, lt, ge, le, eq, ne };
 
 #ifdef __APPLE__
 
@@ -159,6 +165,13 @@ struct context {
       case kop::sum_to_: return "sum_to_";
       case kop::concat_part_: return "concat_part_";
       case kop::rope_: return "rope_";
+      case kop::pow_s_: return "pow_s_";
+      case kop::gt_s_: return "gt_s_";
+      case kop::lt_s_: return "lt_s_";
+      case kop::ge_s_: return "ge_s_";
+      case kop::le_s_: return "le_s_";
+      case kop::eq_s_: return "eq_s_";
+      case kop::ne_s_: return "ne_s_";
     }
     return "";
   }
@@ -759,6 +772,22 @@ struct clamp_params {
   float lo, hi;
   uint32_t n;
 };
+struct scalar_params {
+  float s, scale, offset;
+  uint32_t n;
+};
+inline kop to_scalar_(scalar_op op) {
+  switch (op) {
+    case scalar_op::pow: return kop::pow_s_;
+    case scalar_op::gt: return kop::gt_s_;
+    case scalar_op::lt: return kop::lt_s_;
+    case scalar_op::ge: return kop::ge_s_;
+    case scalar_op::le: return kop::le_s_;
+    case scalar_op::eq: return kop::eq_s_;
+    case scalar_op::ne: return kop::ne_s_;
+  }
+  return kop::pow_s_;
+}
 struct sum_to_params {
   uint32_t a_shape[kPadFoldMaxRank];
   uint32_t a_strides[kPadFoldMaxRank];
@@ -812,6 +841,25 @@ inline bool clamp(void* a, int64_t ao, void* out, int64_t oo, int64_t n,
   detail_::set_buf_(c.enc, a, ao, 0ul);
   detail_::set_buf_(c.enc, out, oo, 1ul);
   detail_::clamp_params p{lo, hi, static_cast<uint32_t>(n)};
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), 2ul);
+  unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
+  detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
+  return true;
+}
+// Tensor-scalar ops (pow(x, s), x > s, ...): s a kernel argument rather than a
+// rank-0 operand buffer (mirrors cuda.h's own scalar_binary).
+inline bool scalar_binary(scalar_op op, void* a, int64_t ao, void* out,
+                          int64_t oo, int64_t n, float s, float scale,
+                          float offset) {
+  auto& c = context::get();
+  if (!c.device) return false;
+  auto pso = c.pso_(detail_::to_scalar_(op));
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  detail_::set_buf_(c.enc, a, ao, 0ul);
+  detail_::set_buf_(c.enc, out, oo, 1ul);
+  detail_::scalar_params p{s, scale, offset, static_cast<uint32_t>(n)};
   objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
              static_cast<unsigned long>(sizeof(p)), 2ul);
   unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
@@ -1014,6 +1062,10 @@ inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
   return false;
 }
 inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {
+  return false;
+}
+inline bool scalar_binary(scalar_op, void*, int64_t, void*, int64_t, int64_t,
+                          float, float, float) {
   return false;
 }
 inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,

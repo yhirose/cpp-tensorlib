@@ -9,7 +9,7 @@
 //   kernels    binary / binary_bcast / binary_bcast_nd / where_nd / unary /
 //              gemm / gemm_batched / row_op / pad / fold / index_select /
 //              index_add / scatter_to_axis / sum_to / compare / unary_ext /
-//              clamp / concat_part / rope
+//              clamp / scalar_binary / concat_part / rope
 //   LLM path   gemv_f32 / gemv_bf16 / gemv_q4 / attn_decode / attn_prefill
 // A backend with no kernel for one of these returns false and the evaluator
 // falls back to the CPU — so the LLM row is real on CUDA and stubs elsewhere

@@ -46,6 +46,7 @@ namespace webgpu {
 using kop = tl::metal::kop;
 using cmp_op = tl::metal::cmp_op;
 using unary_ext_op = tl::metal::unary_ext_op;
+using scalar_op = tl::metal::scalar_op;
 
 #if defined(TENSORLIB_WEBGPU) && defined(__EMSCRIPTEN__)
 
@@ -87,7 +88,8 @@ struct params {
   uint32_t ars, acs, brs, bcs;
   uint32_t op;
   float scale, offset;
-  uint32_t pad0, pad1, pad2, pad3, pad4, pad5;
+  uint32_t pad0, pad1, pad2, pad3, pad4;
+  float arg;  // a scalar operand (ew_scalar's s)
 };
 
 // WGSL gives a uniform-address-space struct align 16, so Params is 96 bytes
@@ -143,7 +145,7 @@ inline constexpr const char* kEntryPoints[] = {
     "softmax",      "row_reduce",  "pad",          "fold",
     "index_select", "index_add",  "scatter_axis", "ew_bcast_nd",
     "where_nd",     "cmp",        "clamp_",       "sum_to",
-    "concat_part",  "rope"};
+    "concat_part",  "rope",        "ew_scalar"};
 
 // emscripten_webgpu_get_device() does not report "no device" — it hands
 // Module.preinitializedWebGPUDevice straight to importJsDevice, which reads
@@ -1144,6 +1146,26 @@ inline bool clamp(void* a, int64_t ao, void* out, int64_t oo, int64_t n,
   return c.encode_("clamp_", ma, mb, mo, p, (n + 255) / 256, 1);
 }
 
+// Tensor-scalar ops (pow(x, s), x > s, ...): s rides in p.arg rather than a
+// rank-0 operand buffer; p.op is scalar_op's value (0 pow, then cmp_op's order).
+inline bool scalar_binary(scalar_op op, void* a, int64_t ao, void* out,
+                          int64_t oo, int64_t n, float s, float scale,
+                          float offset) {
+  auto& c = context::get();
+  if (!c.ready || n <= 0) return false;
+  params p = {};
+  if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
+  context::mirror *ma, *mb, *mo;
+  if (!operands_(c, a, nullptr, out, &ma, &mb, &mo)) return false;
+  p.b_off = p.a_off;  // the kernel binds its one input twice
+  p.M = static_cast<uint32_t>(n);
+  p.op = static_cast<uint32_t>(op);
+  p.arg = s;
+  p.scale = scale;
+  p.offset = offset;
+  return c.encode_("ew_scalar", ma, mb, mo, p, (n + 255) / 256, 1);
+}
+
 // concat_part (Tensor.concat along an arbitrary axis, KV-cache append):
 // scatters `a` (this part) into `out` at a flat element shift along one
 // axis -- see kernels/tensorlib_webgpu.wgsl's own concat_part for why this
@@ -1297,6 +1319,10 @@ inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
   return false;
 }
 inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {
+  return false;
+}
+inline bool scalar_binary(scalar_op, void*, int64_t, void*, int64_t, int64_t,
+                          float, float, float) {
   return false;
 }
 inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,

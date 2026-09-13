@@ -164,6 +164,8 @@ struct node {
     constant,
     add, sub, mul, div, pow_,
     gt, lt, ge, le, eq, ne,  // masks as F32 (0/1)
+    pow_s, gt_s, lt_s, ge_s, le_s, eq_s, ne_s,  // x OP arg0: the scalar operand
+                                                // lives in the node, not an input
     affine, recip, exp_, log_, sqrt_, sigmoid, relu,
     tanh_, sin_, cos_,
     clamp_,  // clip(x, arg0=min, arg1=max) — the only unary op needing two
@@ -292,6 +294,23 @@ bool visit_unary_op(node::op_t op, F&& f) {
     case op_t::tanh_: f(ew_tanh); return true;
     case op_t::sin_: f(ew_sin); return true;
     case op_t::cos_: f(ew_cos); return true;
+    default: return false;
+  }
+}
+
+// The tensor-scalar ops (x OP s, s in the node's arg0) as unary functors over
+// the scalar math above, so they cannot drift from their binary forms.
+template <typename F>
+bool visit_scalar_op(node::op_t op, float s, F&& f) {
+  using op_t = node::op_t;
+  switch (op) {
+    case op_t::pow_s: f([s](float x) { return ew_pow(x, s); }); return true;
+    case op_t::gt_s: f([s](float x) { return ew_gt(x, s); }); return true;
+    case op_t::lt_s: f([s](float x) { return ew_lt(x, s); }); return true;
+    case op_t::ge_s: f([s](float x) { return ew_ge(x, s); }); return true;
+    case op_t::le_s: f([s](float x) { return ew_le(x, s); }); return true;
+    case op_t::eq_s: f([s](float x) { return ew_eq(x, s); }); return true;
+    case op_t::ne_s: f([s](float x) { return ew_ne(x, s); }); return true;
     default: return false;
   }
 }
@@ -2026,6 +2045,24 @@ struct graph {
     return from_node(std::move(n));
   }
 
+  // x OP s with the scalar in the node (arg0), not a rank-0 input: the
+  // tensor-scalar kernels take it as an argument, and an epilogue fuses onto
+  // the node like any unary's.
+  static array scalar_binary(op_t op, const array& a, float s) {
+    if (num_elements(a.shape()) <= kEagerTiny && eager_operand_(a) &&
+        eager_cpu_ok_()) {
+      array r;
+      visit_scalar_op(op, s, [&](auto f) { r = map_unary(a, f); });
+      return r;
+    }
+    auto n = std::make_shared<node>();
+    n->op = op;
+    n->shape = a.shape();
+    n->arg0 = s;
+    n->inputs = {as_node(a)};
+    return from_node(std::move(n));
+  }
+
   // N-ary: no generic binary()/unary() builder fits, same reason clamp above
   // has its own. Every part must share rank and every dim but `axis`.
   static array concat(const std::vector<array>& parts, int axis) {
@@ -3279,6 +3316,35 @@ struct graph {
     return out;
   }
 
+  // GPU dispatch for the tensor-scalar ops: s rides as a kernel argument and
+  // the node's epilogue fuses into the store, as in gpu_unary.
+  static std::optional<array> gpu_scalar_binary_(const node& n, const array& a) {
+    if (!gpu_mode_(a.size(), kernel_class::elementwise) || !a.contiguous()) {
+      return std::nullopt;
+    }
+    if (!a.storage_.native) return std::nullopt;
+    gpu::scalar_op k;
+    switch (n.op) {
+      case op_t::pow_s: k = gpu::scalar_op::pow; break;
+      case op_t::gt_s: k = gpu::scalar_op::gt; break;
+      case op_t::lt_s: k = gpu::scalar_op::lt; break;
+      case op_t::ge_s: k = gpu::scalar_op::ge; break;
+      case op_t::le_s: k = gpu::scalar_op::le; break;
+      case op_t::eq_s: k = gpu::scalar_op::eq; break;
+      case op_t::ne_s: k = gpu::scalar_op::ne; break;
+      default: return std::nullopt;
+    }
+    auto out = array::empty(a.shape());
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    if (!gpu::scalar_binary(k, a.storage_.native, a.offset_ * 4,
+                            out.storage_.native, out.offset_ * 4, out.size(),
+                            n.arg0, n.scale, n.offset)) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
   // One topological pass over all roots (MLX-style batch eval), then each
   // node evaluates through eval_one. Iterative DFS: recursion depth must not
   // bound graph depth. do_flush=false leaves the launched kernels in flight on
@@ -3441,8 +3507,9 @@ struct graph {
         unary_loop([lo, hi](float x) { return x < lo ? lo : (x > hi ? hi : x); });
         return true;
       }
-      default:  // unary ops the table knows; everything else declines
-        return visit_unary_op(n.op, unary_loop);
+      default:  // unary and tensor-scalar ops the tables know; the rest decline
+        return visit_unary_op(n.op, unary_loop) ||
+               visit_scalar_op(n.op, n.arg0, unary_loop);
     }
   }
 
@@ -3582,6 +3649,22 @@ struct graph {
           r = std::move(*o);
         } else {
           visit_unary_op(n.op, [&](auto f) { r = map_unary(a, f); });
+        }
+        break;
+      }
+      case op_t::pow_s:
+      case op_t::gt_s:
+      case op_t::lt_s:
+      case op_t::ge_s:
+      case op_t::le_s:
+      case op_t::eq_s:
+      case op_t::ne_s: {
+        auto a = in(0);
+        if (auto g = gpu_scalar_binary_(n, a)) {
+          r = std::move(*g);
+          epi_done = true;  // the kernels apply the epilogue in the store
+        } else {
+          visit_scalar_op(n.op, n.arg0, [&](auto f) { r = map_unary(a, f); });
         }
         break;
       }
@@ -3930,7 +4013,7 @@ inline array pow(const array& a, const array& b) {
   return detail::graph::binary(detail::node::op_t::pow_, a, b);
 }
 inline array pow(const array& a, float s) {
-  return pow(a, array::full({}, s));
+  return detail::graph::scalar_binary(detail::node::op_t::pow_s, a, s);
 }
 
 inline array operator+(const array& a, float s) {
@@ -3973,12 +4056,24 @@ inline array operator==(const array& a, const array& b) {
 inline array operator!=(const array& a, const array& b) {
   return detail::graph::binary(detail::node::op_t::ne, a, b);
 }
-inline array operator>(const array& a, float s) { return a > array::full({}, s); }
-inline array operator<(const array& a, float s) { return a < array::full({}, s); }
-inline array operator>=(const array& a, float s) { return a >= array::full({}, s); }
-inline array operator<=(const array& a, float s) { return a <= array::full({}, s); }
-inline array operator==(const array& a, float s) { return a == array::full({}, s); }
-inline array operator!=(const array& a, float s) { return a != array::full({}, s); }
+inline array operator>(const array& a, float s) {
+  return detail::graph::scalar_binary(detail::node::op_t::gt_s, a, s);
+}
+inline array operator<(const array& a, float s) {
+  return detail::graph::scalar_binary(detail::node::op_t::lt_s, a, s);
+}
+inline array operator>=(const array& a, float s) {
+  return detail::graph::scalar_binary(detail::node::op_t::ge_s, a, s);
+}
+inline array operator<=(const array& a, float s) {
+  return detail::graph::scalar_binary(detail::node::op_t::le_s, a, s);
+}
+inline array operator==(const array& a, float s) {
+  return detail::graph::scalar_binary(detail::node::op_t::eq_s, a, s);
+}
+inline array operator!=(const array& a, float s) {
+  return detail::graph::scalar_binary(detail::node::op_t::ne_s, a, s);
+}
 
 inline array where(const array& cond, const array& a, const array& b) {
   return detail::graph::where(cond, a, b);

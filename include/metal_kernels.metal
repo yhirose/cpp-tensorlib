@@ -127,6 +127,32 @@ kernel void clamp_(device const float* a [[buffer(0)]],
   out[i] = clamp(a[i], p.lo, p.hi);
 }
 
+// Tensor-scalar: out = f(a, s) * scale + offset, the scalar operand a kernel
+// argument rather than a rank-0 buffer -- mirrors tensorlib_cuda.cu's
+// TL_EW_SCALAR.
+struct scalar_params {
+  float s, scale, offset;
+  uint n;
+};
+
+#define EW_SCALAR(name, expr)                                  \
+  kernel void name(device const float* a [[buffer(0)]],        \
+                   device float* out [[buffer(1)]],            \
+                   constant scalar_params& p [[buffer(2)]],    \
+                   uint i [[thread_position_in_grid]]) {       \
+    if (i >= p.n) return;                                      \
+    out[i] = fma(expr, p.scale, p.offset);                     \
+  }
+
+EW_SCALAR(pow_s_, pow(a[i], p.s))
+EW_SCALAR(gt_s_, a[i] > p.s ? 1.0f : 0.0f)
+EW_SCALAR(lt_s_, a[i] < p.s ? 1.0f : 0.0f)
+EW_SCALAR(ge_s_, a[i] >= p.s ? 1.0f : 0.0f)
+EW_SCALAR(le_s_, a[i] <= p.s ? 1.0f : 0.0f)
+EW_SCALAR(eq_s_, a[i] == p.s ? 1.0f : 0.0f)
+EW_SCALAR(ne_s_, a[i] != p.s ? 1.0f : 0.0f)
+#undef EW_SCALAR
+
 // ---------------------------------------------------------------------------
 // Tiled SGEMM — simdgroup_matrix 8×8 MMA. One shared template body
 // (sgemm_body_) instantiated at 32×32×16 and 64×64×16; the 64 band is the
