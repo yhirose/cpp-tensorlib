@@ -253,10 +253,16 @@ struct context {
     return it == mirrors.end() ? nullptr : &it->second;
   }
   // A kernel is about to READ this buffer: ensure the device copy is current.
+  // Async on the stream, ordered before the launch that reads it: a blocking
+  // copy here waits out every kernel already queued, so a host-side constant
+  // mid-graph (pow's scalar exponent is a 0-d array) stalled the pipeline
+  // twice per transformer block. The driver stages a pageable source during
+  // the call, so the host buffer may change or go away once it returns.
   void device_read_(void* native) {
     mirror* m = mirror_(native);
     if (m && m->where == HOST) {
-      d.MemcpyHtoD(m->dev, m->host, m->bytes);  // sync; serializes on null stream
+      if (d.MemcpyHtoDAsync) d.MemcpyHtoDAsync(m->dev, m->host, m->bytes, stream);
+      else d.MemcpyHtoD(m->dev, m->host, m->bytes);
       m->where = BOTH;
     }
   }
