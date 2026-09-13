@@ -1,13 +1,15 @@
 // Thread-pool round-trip census: what a parallel_for costs with nothing to
-// do — the wake + join of p threads (empty body) — per thread count, both
-// back-to-back (the training-step pattern) and after a 1 ms idle. Then the
-// thread floor this implies: a second thread pays for itself only when the
-// work it takes over outlasts the round trip, i.e. work > 2 x latency x
-// single-thread throughput. cpu::min_work_per_thread_() derives its floor by
-// the same arithmetic on first use, so the two figures printed last should
-// agree (TL_CPU_MIN_WORK pins the runtime's). On a 20-thread Zen under WSL2
-// (2026-09-12): 2 threads 20 µs, +7 µs per extra thread, 20 threads 146 µs;
-// 54k MAC/µs -> floor 2.1e6. Medians (misc/census.cpp discipline).
+// do — signalling p threads and joining (empty body) — per thread count,
+// both back-to-back (the pool hot, workers still spinning: the op-chain
+// pattern) and after a 1 ms idle (workers asleep: the cold wake through the
+// helping tree). Then the thread floor this implies: a thread pays for
+// itself only when its share outlasts the full-width hot round, i.e. work >
+// latency(all) x single-thread throughput. cpu::min_work_per_thread_()
+// derives its floor by the same arithmetic on first use, so the two figures
+// printed last should agree up to its 1e5 clamp (TL_CPU_MIN_WORK pins the
+// runtime's). On a 20-thread i7-12700KF under WSL2 (2026-09-13): hot 2
+// threads 0.2 µs, 20 threads 3 µs; cold 20 threads 47 µs (was 146 with
+// sequential wakes). Medians (misc/census.cpp discipline).
 #include <tensorlib.h>
 
 #include <algorithm>
@@ -37,7 +39,7 @@ int main() {
   const double sleep_only =
       median_us(50, [] { std::this_thread::sleep_for(std::chrono::milliseconds(1)); });
   std::printf("  %-8s %14s %14s\n", "threads", "back-to-back", "after 1ms idle");
-  double latency2 = 0;
+  double latency_all = 0;
   for (int p : {2, 3, 4, 6, 8, 12, 16, 20, 32, 64}) {
     if (p > pool.size()) break;
     double hot = median_us(200, [&] { pool.parallel_for(p, nop, p); });
@@ -45,20 +47,23 @@ int main() {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
       pool.parallel_for(p, nop, p);
     });
-    if (p == 2) latency2 = hot;
+    latency_all = hot;
     std::printf("  %-8d %11.1f us %11.1f us\n", p, hot, cold - sleep_only);
   }
-  // Single-thread gemm throughput at 128^3 (below the default floor, so it
-  // runs on the calling thread whatever the pool says).
-  tl::use_cpu();
-  auto a = tl::array::ones({128, 128}), b = tl::array::ones({128, 128});
-  a.dot(b).eval();
-  double t = median_us(31, [&] { a.dot(b).eval(); });
-  double mac_per_us = 2097152.0 / t;
+  // Single-thread gemm throughput at 128^3 (pinned to one thread: the floor
+  // is derived from it, so it must not depend on the floor).
+  constexpr int64_t N = 128;
+  std::vector<float> a(N * N, 1.0f), b(N * N, 1.0f), c(N * N);
+  auto probe = [&] {
+    tl::cpu::sgemm_(a.data(), N, 1, b.data(), N, 1, c.data(), N, N, N, 1.0f, 1);
+  };
+  probe();
+  double t = median_us(31, probe);
+  double mac_per_us = (double)(N * N * N) / t;
   std::printf("128^3 single-thread: %.1f us -> %.0f MAC/us\n", t, mac_per_us);
-  std::printf("implied floor 2 x %.1f us x %.0f = %.2e MAC/thread "
+  std::printf("implied floor %.1f us x %.0f = %.2e MAC/thread "
               "(cpu::min_work_per_thread_() = %.2e)\n",
-              latency2, mac_per_us, 2.0 * latency2 * mac_per_us,
+              latency_all, mac_per_us, latency_all * mac_per_us,
               (double)tl::cpu::min_work_per_thread_());
   return 0;
 }

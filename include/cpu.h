@@ -32,7 +32,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <functional>
 #include <vector>
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -108,25 +107,24 @@ inline void sgemm_(const float* A, int64_t as0, int64_t as1, const float* B,
                    int64_t bs0, int64_t bs1, float* C, int64_t m, int64_t n,
                    int64_t k, float alpha, int max_threads);
 
-// How much of a gemm (M*N*K multiply-adds) each thread must get before the
-// split is worth a thread: a gemm below this runs on the calling thread, and
-// a medium one wakes only the workers it can feed. Waking a worker and
-// joining it costs tens of µs on a WSL2 box; below the floor that is the
-// gemm. misc/census_cpu_threads.cpp on a 20-thread Zen (2026-09-12):
-// 128^3 (2.1e6) 37 µs on one thread vs 48 on two; 192^3 (7.1e6) 114 µs on
-// one vs 60 on three; 256^3 (1.7e7) 264 on one vs 114 on five, and 20
-// threads lose to 5-8 up to 256^3.
+// How much of a job (M*N*K multiply-adds, or an elementwise op's elements
+// weighted by kStreamMacs) each thread must get before the split is worth a
+// thread: a job below this runs on the calling thread, and a medium one
+// signals only the workers it can feed.
 //
-// The floor is a property of the host's thread wake-up, not of the gemm, so
-// it is derived on first use rather than baked: a second thread pays for
-// itself only when the work it takes over outlasts the round trip, i.e.
-//   floor = 2 × round_trip(2 threads) × single-thread MAC/µs
+// The floor is a property of the pool's dispatch, not of the job, so it is
+// derived on first use rather than baked: a thread pays for itself only when
+// its share outlasts a full-width round of the pool (signalling every
+// worker, each taking and finishing its chunks, the join), i.e.
+//   floor = round_trip(all threads, pool hot) × single-thread MAC/µs
 // (misc/census_pool_latency.cpp prints the same arithmetic). About 1 ms,
-// once, on the first gemm: 25 empty two-thread parallel_fors and 5
-// single-thread 128^3 gemms, medians. The Zen box above derives 2.0e6, its
-// census value; a host that wakes threads faster gets a lower floor, a
-// noisier VM a higher one. Env TL_CPU_MIN_WORK pins it, like
-// TL_BATCH_MATMUL_BIAS.
+// once, on the first job: 25 empty full-width parallel_fors and 5
+// single-thread 128^3 gemms, medians. Workers spin between jobs
+// (cpu_threadpool.h), so the round trip is a few µs on a 20-thread box and
+// the floor lands on its 1e5 clamp; the transformer block census
+// (2026-09-13) reads the same at 1e5 and 3e5 and loses on layer_norm from
+// 1e6 up, where its 9 elementwise ops fall back to one or two threads. Env
+// TL_CPU_MIN_WORK pins it, like TL_BATCH_MATMUL_BIAS.
 inline int64_t min_work_per_thread_() {
   static const int64_t v = []() -> int64_t {
     if (const char* e = std::getenv("TL_CPU_MIN_WORK")) {
@@ -147,9 +145,10 @@ inline int64_t min_work_per_thread_() {
       std::nth_element(ts.begin(), ts.begin() + trials / 2, ts.end());
       return ts[static_cast<size_t>(trials / 2)];
     };
-    std::function<void(int64_t, int64_t)> nop = [](int64_t, int64_t) {};
-    for (int i = 0; i < 5; i++) pool.parallel_for(2, nop, 2);  // warm
-    double round_trip = median_us(25, [&] { pool.parallel_for(2, nop, 2); });
+    const int p = pool.size();
+    auto nop = [](int64_t, int64_t) {};
+    for (int i = 0; i < 5; i++) pool.parallel_for(p, nop, p);  // warm
+    double round_trip = median_us(25, [&] { pool.parallel_for(p, nop, p); });
     constexpr int64_t N = 128;
     std::vector<float> a(N * N, 1.0f), b(N * N, 1.0f), c(N * N);
     auto probe = [&] {
@@ -157,8 +156,7 @@ inline int64_t min_work_per_thread_() {
     };
     probe();
     double mac_per_us = static_cast<double>(N * N * N) / median_us(5, probe);
-    return static_cast<int64_t>(
-        std::clamp(2.0 * round_trip * mac_per_us, 1e5, 1e9));
+    return static_cast<int64_t>(std::clamp(round_trip * mac_per_us, 1e5, 1e9));
   }();
   return v;
 }
