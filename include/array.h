@@ -3844,8 +3844,15 @@ struct graph {
       }
     }
     if (!epi_done && (n.scale != 1.0f || n.offset != 0.0f)) {
+      // The GPU kernel first: a view of GPU-resident data that had a scale/
+      // offset fused onto it (`x.mean(1).reshape({seq, 1}) + eps`) must not
+      // drop to the host here — that drains the pipeline and pulls the data
+      // back mid-graph, and every consumer after it lands on the CPU too
+      // (layer_norm written that way ran 2.5x slower than with keepdims).
       float s = n.scale, o = n.offset;
-      if (auto out = accel::affine(r, s, o)) {
+      if (auto g = gpu_unary(gpu::kop::affine, r, s, o)) {
+        r = std::move(*g);
+      } else if (auto out = accel::affine(r, s, o)) {
         r = std::move(*out);
       } else {
         r = map_unary(r, [s, o](float x) { return x * s + o; });
