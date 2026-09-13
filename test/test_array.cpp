@@ -327,6 +327,36 @@ TEST_CASE("batched dot: own CPU gemm per slice matches the ref oracle") {
   CHECK(cpu_matches_ref([&] { return a.dot(b) * 0.5f + 1.0f; }));  // epilogue
 }
 
+TEST_CASE("elementwise: own CPU runs across the pool match the walker oracle") {
+  // Every layout ew_plan_for collapses to runs — same shape, a scalar, a row
+  // and a column vector, a leading broadcast axis (the attention mask), a
+  // size-1 axis in the middle, a slice with a gap between rows, rank 0 — and
+  // the transposed view it hands back to the walker; a shape big enough to
+  // split across threads; unary through the same driver.
+  auto a = random_array({6, 7, 40}, 921), b = random_array({6, 7, 40}, 922);
+  auto lead = random_array({1, 7, 40}, 923), mid = random_array({6, 1, 40}, 924);
+  auto m = random_array({30, 33}, 925), rowv = random_array({1, 33}, 926);
+  auto colv = random_array({30, 1}, 927), t = random_array({33, 30}, 928);
+  CHECK(cpu_matches_ref([&] { return a + b; }));
+  CHECK(cpu_matches_ref([&] { return a * 0.5f; }));
+  CHECK(cpu_matches_ref([&] { return a + lead; }));
+  CHECK(cpu_matches_ref([&] { return mid * a; }));
+  CHECK(cpu_matches_ref([&] { return m + rowv; }));
+  CHECK(cpu_matches_ref([&] { return colv - m; }));
+  CHECK(cpu_matches_ref([&] { return m.slice(1, 3, 20) + rowv.slice(1, 3, 20); }));
+  CHECK(cpu_matches_ref([&] { return m + t.transpose(); }));
+  CHECK(cpu_matches_ref([&] { return random_array({}, 929) + random_array({}, 930); }));
+  CHECK(cpu_matches_ref([&] { return random_array({8, 256, 256}, 931) + random_array({1, 256, 256}, 932); }));
+  CHECK(cpu_matches_ref([&] { return a.exp(); }));
+  CHECK(cpu_matches_ref([&] { return t.transpose().exp(); }));
+  CHECK(cpu_matches_ref([&] { return m.slice(1, 3, 20).exp(); }));
+  // where through the same driver: a broadcast mask over both branches, a
+  // scalar branch, and a transposed branch (walker)
+  CHECK(cpu_matches_ref([&] { return tl::where(lead > 0.0f, a, b); }));
+  CHECK(cpu_matches_ref([&] { return tl::where(a > 0.0f, a, array::full({}, -1.0f)); }));
+  CHECK(cpu_matches_ref([&] { return tl::where(m > 0.0f, t.transpose(), m); }));
+}
+
 TEST_CASE("softmax: own CPU rows across the pool match the ref oracle") {
   // rank 1, 2 and 3, a transposed (strided) view, and a shape big enough to
   // split across threads

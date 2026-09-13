@@ -78,10 +78,12 @@
 namespace tl {
 namespace cpu {
 
-// Gates the own-CPU GEMM in the eval dispatch. Default on: it is the
-// primary CPU GEMM off-Apple, and on Apple it sits below Accelerate (only
-// reached when use_accelerate_ is off). Oracle tests set it false (with
-// use_accelerate_ false) to force the ref:: path.
+// Gates every own-CPU kernel in the eval dispatch — the GEMMs, the batched
+// and attention paths, and the pool-parallel elementwise/softmax drivers in
+// array.h. Default on: it is the primary CPU backend off-Apple, and on Apple
+// it sits below Accelerate (only reached when use_accelerate_ is off). Oracle
+// tests set it false (with use_accelerate_ false) so the ref:: walkers, single
+// threaded and strided, are what the fast paths are compared against.
 inline bool enabled_ = true;
 
 // Register-block tile and cache-block sizes. MC/KC from the 2026-07-03
@@ -436,10 +438,15 @@ inline void sgemm_(const float* A, int64_t as0, int64_t as1, const float* B,
   // Reusable pack buffers: thread-local so no per-call allocation (a
   // per-call std::vector dominated small sizes in the first cut). bpack
   // lives on the calling thread (packed once per (jc,pc), read by all);
-  // apack lives on each worker thread.
+  // apack lives on each worker thread. Grow-only: the packers write every
+  // element they use (edge panels zero-padded by hand), so a resize's
+  // value-initialisation is wasted work, and a shrink-then-grow across gemms
+  // of alternating shapes was a memset per call. The sizes are bounded by the
+  // blocking constants (KC×NC and MC×KC), which is where grow-only settles.
   static thread_local std::vector<float> bpack;
-  bpack.resize(static_cast<size_t>(KC) *
-               ((std::min<int64_t>(NC, n) + nrt - 1) / nrt) * nrt);
+  const size_t bneed = static_cast<size_t>(KC) *
+                       ((std::min<int64_t>(NC, n) + nrt - 1) / nrt) * nrt;
+  if (bpack.size() < bneed) bpack.resize(bneed);
   // Raw pointer for the workers: naming `bpack` inside the lambda would
   // resolve to each worker's own (empty) thread_local instance.
   float* bpack_p = bpack.data();
@@ -466,7 +473,8 @@ inline void sgemm_(const float* A, int64_t as0, int64_t as1, const float* B,
       const int64_t panels_per_mc = MC / mrt;
       pool.parallel_for(mpanels, [&](int64_t ip0, int64_t ip1) {
         static thread_local std::vector<float> apack;
-        apack.resize(static_cast<size_t>(panels_per_mc) * mrt * KC);
+        const size_t aneed = static_cast<size_t>(panels_per_mc) * mrt * KC;
+        if (apack.size() < aneed) apack.resize(aneed);
         for (int64_t g0 = ip0; g0 < ip1; g0 += panels_per_mc) {
           int64_t g1 = std::min<int64_t>(g0 + panels_per_mc, ip1);
           // Pack A[g0*mrt : ..., pc:pc+kc] * alpha into mrt-tall panels.

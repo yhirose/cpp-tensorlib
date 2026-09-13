@@ -984,17 +984,143 @@ inline array array::to_q4() const {
 
 namespace detail {
 
+// The own-CPU elementwise driver: the output as `rows` runs of `inner`
+// consecutive elements along which every operand is either contiguous
+// (step 1) or constant (step 0), the runs spread across the thread pool (a
+// lone long run is cut into chunks). One loop shape covers same-shape
+// operands, a scalar, a row or column vector, a leading broadcast axis (the
+// attention mask over [H,T,T]) and a slice with a gap between rows; the
+// per-element walker (for_each_index) is left to transposed views, whose
+// innermost stride is neither 0 nor 1. A run's operand offsets are derived
+// once per run, and the inner loop is stride-1 or a hoisted constant, so it
+// vectorizes. Everything here is fixed-size — no allocation but the output —
+// since an MLP's [10,30] op is a microsecond. Gated by cpu::enabled_ like the
+// other own-CPU kernels, so the oracle tests compare against the walker.
+constexpr size_t kEwMaxSrc = 4;  // for_each_index's operand limit too
+struct ew_strides {
+  size_t n = 0;
+  int64_t s[kEwMaxSrc][kMaxRank] = {};
+  // Add `src` viewed as `out_shape` (broadcast_strides' rule: missing leading
+  // dims and size-1 dims step 0).
+  void add(const array& src, const shape_t& out_shape) {
+    size_t rank = out_shape.size(), lead = rank - src.rank();
+    for (size_t i = 0; i < src.rank(); i++)
+      s[n][lead + i] = src.shape()[i] == 1 ? 0 : src.strides()[i];
+    n++;
+  }
+  std::vector<std::vector<int64_t>> as_vectors(size_t rank) const {
+    std::vector<std::vector<int64_t>> v(n);
+    for (size_t k = 0; k < n; k++) v[k].assign(s[k], s[k] + rank);
+    return v;
+  }
+};
+struct ew_plan {
+  bool ok = false;
+  size_t outer_rank = 0;  // axes above the run
+  int64_t rows = 0, inner = 0;
+  int step[kEwMaxSrc] = {};  // per operand along the run: 1 contiguous, 0 constant
+};
+inline ew_plan ew_plan_for(const shape_t& shape, const ew_strides& st) {
+  ew_plan p;
+  size_t rank = shape.size();
+  if (rank > kMaxRank || st.n > kEwMaxSrc) return p;
+  if (rank == 0) {
+    p.ok = true;
+    p.rows = p.inner = 1;
+    return p;
+  }
+  for (size_t k = 0; k < st.n; k++) {
+    int64_t s = st.s[k][rank - 1];
+    if (s != 0 && s != 1) return p;
+    p.step[k] = static_cast<int>(s);
+  }
+  int64_t inner = shape[rank - 1];
+  size_t d = rank - 1;
+  while (d > 0) {
+    bool extends = true;
+    for (size_t k = 0; k < st.n && extends; k++)
+      extends = shape[d - 1] == 1 || st.s[k][d - 1] == p.step[k] * inner;
+    if (!extends) break;
+    inner *= shape[--d];
+  }
+  p.ok = true;
+  p.outer_rank = d;
+  p.inner = inner;
+  p.rows = inner ? num_elements(shape) / inner : 0;
+  return p;
+}
+
+// Runs body(out_offset, operand_offsets, j0, j1) for every chunk of every run;
+// the body writes out[out_offset + j0 .. + j1) reading each operand at its
+// offset plus j·step.
+template <typename Body>
+void ew_run(const shape_t& shape, const ew_strides& st, const ew_plan& p,
+            Body body) {
+  if (p.rows == 0 || p.inner == 0) return;
+  // The thread cap sizes the work items too: when there are fewer runs than
+  // threads, each run is cut into enough chunks to hand every thread one.
+  const int nt = cpu::threads_for_(p.rows * p.inner * 8);
+  int64_t chunk = p.inner;
+  if (p.rows < nt) {
+    int64_t want = (nt + p.rows - 1) / p.rows;  // chunks per run
+    chunk = (p.inner + want - 1) / want;
+  }
+  const int64_t cpr = (p.inner + chunk - 1) / chunk;
+  struct ctx_t {
+    const shape_t& shape;
+    const ew_strides& st;
+    const ew_plan& p;
+    int64_t cpr, chunk;
+    Body& body;
+  } ctx{shape, st, p, cpr, chunk, body};
+  // One pointer captured: the std::function parallel_for takes stays in its
+  // inline storage instead of heap-allocating the closure.
+  cpu::thread_pool::instance().parallel_for(
+      p.rows * cpr,
+      [&ctx](int64_t i0, int64_t i1) {
+        const ew_plan& p = ctx.p;
+        int64_t offs[kEwMaxSrc];
+        for (int64_t it = i0; it < i1; it++) {
+          int64_t row = it / ctx.cpr, c = it % ctx.cpr;
+          // The run's operand offsets: its index decomposed over the outer
+          // axes, once per run (a few divisions against `inner` elements).
+          for (size_t k = 0; k < ctx.st.n; k++) offs[k] = 0;
+          for (int64_t rem = row, d = static_cast<int64_t>(p.outer_rank);
+               d-- > 0;) {
+            int64_t idx = rem % ctx.shape[d];
+            rem /= ctx.shape[d];
+            for (size_t k = 0; k < ctx.st.n; k++) offs[k] += idx * ctx.st.s[k][d];
+          }
+          int64_t j0 = c * ctx.chunk, j1 = std::min(p.inner, j0 + ctx.chunk);
+          ctx.body(row * p.inner, offs, j0, j1);
+        }
+      },
+      nt);
+}
+
 template <typename F>
 array map_unary(const array& a, F f) {
   auto out = array::empty(a.shape());
   auto* po = out.data();
   const auto* pa = a.raw();
-  if (a.contiguous()) {  // flat loop: no walker, autovectorizes
-    int64_t n = out.size();
-    for (int64_t i = 0; i < n; i++) po[i] = f(pa[i]);
-    return out;
+  ew_strides st;
+  st.add(a, a.shape());
+  if (cpu::enabled_) {
+    if (auto p = ew_plan_for(a.shape(), st); p.ok) {
+      ew_run(a.shape(), st, p,
+             [&](int64_t o, const int64_t* offs, int64_t j0, int64_t j1) {
+               const float* pai = pa + offs[0];
+               if (p.step[0] == 1) {
+                 for (int64_t j = j0; j < j1; j++) po[o + j] = f(pai[j]);
+               } else {
+                 float v = f(pai[0]);
+                 for (int64_t j = j0; j < j1; j++) po[o + j] = v;
+               }
+             });
+      return out;
+    }
   }
-  for_each_index(a.shape(), {a.strides()},
+  for_each_index(a.shape(), st.as_vectors(a.rank()),
                  [&](int64_t i, const std::vector<int64_t>& off) {
                    po[i] = f(pa[off[0]]);
                  });
@@ -1003,58 +1129,43 @@ array map_unary(const array& a, F f) {
 
 template <typename F>
 array map_binary(const array& a, const array& b, F f) {
-  if (a.shape() == b.shape() && a.contiguous() && b.contiguous()) {
-    auto out = array::empty(a.shape());
-    auto* po = out.data();
-    const auto* pa = a.raw();
-    const auto* pb = b.raw();
-    int64_t n = out.size();
-    for (int64_t i = 0; i < n; i++) po[i] = f(pa[i], pb[i]);
-    return out;
-  }
   auto shape = broadcast_shape(a.shape(), b.shape());
   auto out = array::empty(shape);
   auto* po = out.data();
   const auto* pa = a.raw();
   const auto* pb = b.raw();
-
-  // Rank-2 contiguous broadcast fast path: covers the common matrix cases —
-  // bias/row-vector [1,N], column-vector [M,1], and scalar broadcasts — with
-  // flat row/col loops instead of the coordinate walker. broadcast_strides
-  // already yields a 0 step on each broadcast axis, so a full operand steps
-  // (N,1), a column vector (1,0), a row vector (0,1), a scalar (0,0). When the
-  // inner step is 1 the inner loop is contiguous and vectorizes.
-  if (shape.size() == 2 && a.contiguous() && b.contiguous()) {
-    auto ra = broadcast_strides(a.shape(), a.strides(), shape);
-    auto rb = broadcast_strides(b.shape(), b.strides(), shape);
-    int64_t M = shape[0], N = shape[1];
-    int64_t sa = ra[1], sb = rb[1];
-    int64_t o = 0;
-    for (int64_t i = 0; i < M; i++) {
-      const float* pai = pa + i * ra[0];
-      const float* pbi = pb + i * rb[0];
-      // Hoist a broadcast operand's per-row value and split on the inner stride
-      // so each variant is a stride-1 (or constant) inner loop that vectorizes;
-      // the generic j*stride form is an unpredictable gather to the compiler.
-      if (sa == 1 && sb == 1) {
-        for (int64_t j = 0; j < N; j++, o++) po[o] = f(pai[j], pbi[j]);
-      } else if (sa == 1 && sb == 0) {  // b constant within each row ([M,1])
-        float bv = pbi[0];
-        for (int64_t j = 0; j < N; j++, o++) po[o] = f(pai[j], bv);
-      } else if (sa == 0 && sb == 1) {
-        float av = pai[0];
-        for (int64_t j = 0; j < N; j++, o++) po[o] = f(av, pbi[j]);
-      } else {  // (0,0): both per-row scalars
-        float av = pai[0], bv = pbi[0];
-        for (int64_t j = 0; j < N; j++, o++) po[o] = f(av, bv);
-      }
+  // A broadcast axis steps 0, so a scalar, a row vector, a column vector and a
+  // leading broadcast axis all read as "constant along the run" or
+  // "contiguous along the run" to ew_plan_for.
+  ew_strides st;
+  st.add(a, shape);
+  st.add(b, shape);
+  if (cpu::enabled_) {
+    if (auto p = ew_plan_for(shape, st); p.ok) {
+      ew_run(shape, st, p,
+             [&](int64_t o, const int64_t* offs, int64_t j0, int64_t j1) {
+               const float* pai = pa + offs[0];
+               const float* pbi = pb + offs[1];
+               // Hoist a constant operand and split on the steps so each variant
+               // is a stride-1 (or constant) inner loop that vectorizes; the
+               // generic j*stride form is an unpredictable gather to the compiler.
+               if (p.step[0] == 1 && p.step[1] == 1) {
+                 for (int64_t j = j0; j < j1; j++) po[o + j] = f(pai[j], pbi[j]);
+               } else if (p.step[0] == 1) {
+                 float bv = pbi[0];
+                 for (int64_t j = j0; j < j1; j++) po[o + j] = f(pai[j], bv);
+               } else if (p.step[1] == 1) {
+                 float av = pai[0];
+                 for (int64_t j = j0; j < j1; j++) po[o + j] = f(av, pbi[j]);
+               } else {
+                 float v = f(pai[0], pbi[0]);
+                 for (int64_t j = j0; j < j1; j++) po[o + j] = v;
+               }
+             });
+      return out;
     }
-    return out;
   }
-
-  for_each_index(shape,
-                 {broadcast_strides(a.shape(), a.strides(), shape),
-                  broadcast_strides(b.shape(), b.strides(), shape)},
+  for_each_index(shape, st.as_vectors(shape.size()),
                  [&](int64_t i, const std::vector<int64_t>& off) {
                    po[i] = f(pa[off[0]], pb[off[1]]);
                  });
@@ -1069,10 +1180,28 @@ array map_ternary(const array& a, const array& b, const array& c, F f) {
   const auto* pa = a.raw();
   const auto* pb = b.raw();
   const auto* pc = c.raw();
-  for_each_index(shape,
-                 {broadcast_strides(a.shape(), a.strides(), shape),
-                  broadcast_strides(b.shape(), b.strides(), shape),
-                  broadcast_strides(c.shape(), c.strides(), shape)},
+  ew_strides st;
+  st.add(a, shape);
+  st.add(b, shape);
+  st.add(c, shape);
+  if (cpu::enabled_) {
+    if (auto p = ew_plan_for(shape, st); p.ok) {
+      // Three operands make eight step patterns; the strided inner loop is
+      // still a run at a time across the pool, which is where the walker
+      // lost (a where over a broadcast mask is the same shape as its add).
+      const int64_t sa = p.step[0], sb = p.step[1], sc = p.step[2];
+      ew_run(shape, st, p,
+             [&](int64_t o, const int64_t* offs, int64_t j0, int64_t j1) {
+               const float* pai = pa + offs[0];
+               const float* pbi = pb + offs[1];
+               const float* pci = pc + offs[2];
+               for (int64_t j = j0; j < j1; j++)
+                 po[o + j] = f(pai[j * sa], pbi[j * sb], pci[j * sc]);
+             });
+      return out;
+    }
+  }
+  for_each_index(shape, st.as_vectors(shape.size()),
                  [&](int64_t i, const std::vector<int64_t>& off) {
                    po[i] = f(pa[off[0]], pb[off[1]], pc[off[2]]);
                  });
@@ -1147,7 +1276,13 @@ array reduce_axis(const array& a, int axis, bool keepdims, float init, F f) {
 
 namespace ref {
 
-inline array softmax(const array& a) {
+// Softmax over the last axis. Rows are independent, so `max_threads` spreads
+// them across the thread pool (the own-CPU dispatch passes its work cap; the
+// default runs one thread, the oracle). Off the GPU this had been one thread
+// of scalar exps whatever the size — the whole remaining gap of a hand-written
+// attention once its gemms were even, and what causal_attention's backward
+// pays to rebuild its probabilities.
+inline array softmax(const array& a, int max_threads = 1) {
   auto out = array::empty(a.shape());
   int64_t cols = a.shape().back();
   int64_t rows = a.size() / (cols ? cols : 1);
@@ -1163,18 +1298,24 @@ inline array softmax(const array& a) {
                          });
   const auto* pi = a.raw();
   auto* po = out.data();
-  for (int64_t r = 0; r < rows; r++) {
-    const float* src = pi + row_off[r];
-    float* dst = po + r * cols;
-    float m = src[0];
-    for (int64_t c = 1; c < cols; c++) m = std::max(m, src[c * col_stride]);
-    float denom = 0;
-    for (int64_t c = 0; c < cols; c++) {
-      dst[c] = std::exp(src[c * col_stride] - m);
-      denom += dst[c];
+  auto rows_fn = [&](int64_t r0, int64_t r1) {
+    for (int64_t r = r0; r < r1; r++) {
+      const float* src = pi + row_off[r];
+      float* dst = po + r * cols;
+      float m = src[0];
+      for (int64_t c = 1; c < cols; c++) m = std::max(m, src[c * col_stride]);
+      float denom = 0;
+      for (int64_t c = 0; c < cols; c++) {
+        dst[c] = std::exp(src[c * col_stride] - m);
+        denom += dst[c];
+      }
+      for (int64_t c = 0; c < cols; c++) dst[c] /= denom;
     }
-    for (int64_t c = 0; c < cols; c++) dst[c] /= denom;
-  }
+  };
+  if (max_threads > 1)
+    cpu::thread_pool::instance().parallel_for(rows, rows_fn, max_threads);
+  else
+    rows_fn(0, rows);
   return out;
 }
 
@@ -2642,8 +2783,8 @@ struct graph {
     cpu::thread_pool::instance().parallel_for(
         items,
         [&](int64_t i0, int64_t i1) {
-          static thread_local std::vector<float> s;
-          s.resize(static_cast<size_t>(BQ * T));
+          static thread_local std::vector<float> s;  // grow-only, like sgemm_'s packs
+          if (s.size() < static_cast<size_t>(BQ * T)) s.resize(BQ * T);
           for (int64_t i = i0; i < i1; i++) {
             const int64_t slot = i / H, h = i % H;
             const int64_t tile = slot % 2 == 0 ? slot / 2 : ntiles - 1 - slot / 2;
@@ -2672,53 +2813,6 @@ struct graph {
           }
         },
         max_threads);
-    return out;
-  }
-
-  // Softmax over the last axis on the own CPU backend: ref::softmax's row
-  // walk, the rows spread across the thread pool. The reference is one
-  // thread of scalar exps — 5.4 ms at [8,512,512] against torch's 0.2, the
-  // whole remaining gap of a hand-written attention once its gemms were
-  // even, and what causal_attention's backward pays to rebuild its
-  // probabilities. An element costs about a hundred multiply-adds of time
-  // (the exp plus the max and normalise passes), so the split is capped like
-  // a gemm of that much work. Gated by cpu::enabled_ like cpu_gemm, so the
-  // oracle tests still reach ref::softmax.
-  static std::optional<array> cpu_softmax_(const array& a) {
-    if (!cpu::enabled_) return std::nullopt;
-    int64_t cols = a.shape().back();
-    int64_t rows = a.size() / (cols ? cols : 1);
-    if (rows == 0 || cols == 0) return std::nullopt;
-    auto out = array::empty(a.shape());
-    int64_t col_stride = a.strides().back();
-    shape_t outer(a.shape().begin(), a.shape().end() - 1);
-    std::vector<int64_t> outer_strides(a.strides().begin(),
-                                       a.strides().end() - 1);
-    std::vector<int64_t> row_off(rows);
-    detail::for_each_index(outer, {outer_strides},
-                           [&](int64_t i, const std::vector<int64_t>& off) {
-                             row_off[i] = off[0];
-                           });
-    const float* pi = a.raw();
-    float* po = out.data();
-    cpu::thread_pool::instance().parallel_for(
-        rows,
-        [&](int64_t r0, int64_t r1) {
-          for (int64_t r = r0; r < r1; r++) {
-            const float* src = pi + row_off[r];
-            float* dst = po + r * cols;
-            float m = src[0];
-            for (int64_t c = 1; c < cols; c++)
-              m = std::max(m, src[c * col_stride]);
-            float denom = 0;
-            for (int64_t c = 0; c < cols; c++) {
-              dst[c] = std::exp(src[c * col_stride] - m);
-              denom += dst[c];
-            }
-            for (int64_t c = 0; c < cols; c++) dst[c] /= denom;
-          }
-        },
-        cpu::threads_for_(rows * cols * 128));
     return out;
   }
 
@@ -3484,10 +3578,13 @@ struct graph {
         auto a = in(0);
         if (auto g = gpu_row(gpu::kop::softmax, a, a.shape(), 1.0f, 0.0f)) {
           r = std::move(*g);
-        } else if (auto c = cpu_softmax_(a)) {
-          r = std::move(*c);
         } else {
-          r = ref::softmax(a);
+          // An element costs about a hundred multiply-adds of time (the exp
+          // plus the max and normalise passes), so the split is capped like a
+          // gemm of that much work; the oracle tests (cpu::enabled_ off) keep
+          // the single thread.
+          r = ref::softmax(a, cpu::enabled_ ? cpu::threads_for_(a.size() * 128)
+                                            : 1);
         }
         break;
       }
