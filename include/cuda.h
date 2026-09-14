@@ -254,17 +254,13 @@ struct context {
     return it == mirrors.end() ? nullptr : &it->second;
   }
   // A kernel is about to READ this buffer: ensure the device copy is current.
-  // Async on the stream, ordered before the launch that reads it: a blocking
-  // copy here waits out every kernel already queued, so a host-side constant
-  // mid-graph (pow's scalar exponent is a 0-d array) stalled the pipeline
-  // twice per transformer block. The driver stages a pageable source during
-  // the call, so the host buffer may change or go away once it returns.
-  // Inside a graph capture (stream set) the copy stays blocking, as it was:
-  // a recorded copy would be replayed, and captures stage inputs with upload().
+  // Async on the stream like the meta uploads (a blocking copy would wait out
+  // every kernel already queued and stall the pipeline mid-graph); the driver
+  // stages a pageable source during the call.
   void device_read_(void* native) {
     mirror* m = mirror_(native);
     if (m && m->where == HOST) {
-      if (!stream && d.MemcpyHtoDAsync) d.MemcpyHtoDAsync(m->dev, m->host, m->bytes, nullptr);
+      if (d.MemcpyHtoDAsync) d.MemcpyHtoDAsync(m->dev, m->host, m->bytes, stream);
       else d.MemcpyHtoD(m->dev, m->host, m->bytes);
       m->where = BOTH;
     }
@@ -1123,8 +1119,7 @@ inline bool clamp(void* a_native, int64_t ao, void* out_native, int64_t oo,
   return c.launch1d_(f, un, pa, po, un, lo, hi);
 }
 
-// Tensor-scalar ops: out = f(a, s) * scale + offset, s a kernel argument
-// (pow(x, s), x > s, ...) rather than a rank-0 operand buffer.
+// Tensor-scalar ops: out = f(a, s) * scale + offset (see metal.h's scalar_op).
 inline bool scalar_binary(scalar_op op, void* a_native, int64_t ao,
                           void* out_native, int64_t oo, int64_t n, float s,
                           float scale, float offset) {

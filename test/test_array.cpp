@@ -908,9 +908,12 @@ TEST_CASE("comparisons GPU dispatch matches the CPU oracle") {
   auto p = array::from({-3, -1, 0, 2, 4, -5, 6, 1}, {2, 4});
   auto q = array::from({1, -1, 0, 1, 3, -5, 7, 0}, {2, 4});
 
-  // scalar b (bstride=0): the concrete ReLU/LeakyReLU/Clip backward-gate
-  // shape (`x > 0.0f` broadcasts a rank-0 scalar, see operator>(a, float)).
+  // scalar s: the tensor-scalar kernels (gt_s ...), the ReLU/LeakyReLU/Clip
+  // backward-gate shape.
   CHECK(matches_gpu_oracle([&] { return p > 0.0f; }));
+  // an explicit size-1 b (bstride=0), which stays a binary compare.
+  CHECK(matches_gpu_oracle([&] { return p > array::full({}, 0.0f); }));
+  CHECK(matches_gpu_oracle([&] { return p <= array::full({1}, 1.0f); }));
   CHECK(matches_gpu_oracle([&] { return p < 0.0f; }));
   CHECK(matches_gpu_oracle([&] { return p >= 1.0f; }));
   CHECK(matches_gpu_oracle([&] { return p <= -1.0f; }));
@@ -1777,19 +1780,8 @@ TEST_CASE("where: GPU dispatch matches the ref oracle (rank 4, attention-"
   }));
 }
 
-// --- pow: had no CUDA kernel at all (binary()'s own pow_ case always
-// returned false) -- LayerNorm's own sqrt (`.pow(0.5)`) goes through this.
-
-TEST_CASE("pow: GPU dispatch matches the ref oracle") {
-  CHECK(matches_gpu_oracle([&] {
-    auto x = random_array({64, 32}, 81).relu() + 0.1f;
-    return tl::pow(x, 0.5f);
-  }));
-}
-
 // --- tensor-scalar ops: pow(x, s) and x OP s carry s in the node and as a
-// kernel argument, not as a rank-0 operand (an allocation and an upload per
-// call, which used to block the pipeline).
+// kernel argument, not as a rank-0 operand.
 
 TEST_CASE("tensor-scalar ops match the ref oracle on every path") {
   auto x = random_array({64, 32}, 83).relu() + 0.1f;
@@ -1805,16 +1797,12 @@ TEST_CASE("tensor-scalar ops match the ref oracle on every path") {
 
   // Against std::pow directly, past the tiny-tensor cutoff (eval_one's path).
   auto big = random_array({128, 64}, 84).relu() + 0.1f;
-  auto got = tl::pow(big, -0.5f).eval();
   auto src = big.eval();
-  bool ok = true;
-  for (int64_t i = 0; i < 128 && ok; i++) {
-    for (int64_t j = 0; j < 64 && ok; j++) {
-      float want = std::pow(src.at({i, j}), -0.5f);
-      ok = std::abs(got.at({i, j}) - want) <= 1e-5f * std::abs(want) + 1e-6f;
-    }
+  std::vector<float> want;
+  for (int64_t i = 0; i < 128; i++) {
+    for (int64_t j = 0; j < 64; j++) want.push_back(std::pow(src.at({i, j}), -0.5f));
   }
-  CHECK(ok);
+  CHECK(tl::allclose(tl::pow(big, -0.5f), array::from(want, {128, 64}), 1e-5f, 1e-6f));
 
   // The eager tiny path.
   auto t = tl::pow(array::from({4.0f, 9.0f}, {2}), -0.5f).eval();

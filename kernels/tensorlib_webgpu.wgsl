@@ -260,10 +260,9 @@ fn ew_unary(@builtin(global_invocation_id) gid : vec3<u32>) {
 
 // Elementwise comparison over p.M elements: out = (a OP b) ? 1.0 : 0.0
 // (no epilogue -- masks don't compose with scale/offset). p.ars carries the
-// bstride webgpu.h's compare() receives: 1 for a same-shape b, 0 for a
-// scalar b (the concrete ReLU-style masked-gate shape array.h's `x > 0.0f`
-// produces) -- an unused field for this family, repurposed rather than
-// widening Params.
+// bstride webgpu.h's compare() receives: 1 for a same-shape b, 0 for an
+// explicit size-1 b (`x > s` itself is ew_scalar) -- an unused field for
+// this family, repurposed rather than widening Params.
 @compute @workgroup_size(256, 1, 1)
 fn cmp(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
@@ -283,10 +282,9 @@ fn clamp_(@builtin(global_invocation_id) gid : vec3<u32>) {
   C[p.c_off + i] = clamp(A[p.a_off + i], p.scale, p.offset);
 }
 
-// Tensor-scalar over p.M elements: out = f(a, s) * scale + offset, the scalar
-// operand in p.arg (pow(x, s), x > s) rather than a rank-0 buffer. Mirrors
-// tensorlib_cuda.cu's TL_EW_SCALAR; op 0 is pow, 1.. the comparisons in
-// cmp_op's order.
+// Tensor-scalar over p.M elements: out = f(a, s) * scale + offset, s in p.arg.
+// Mirrors tensorlib_cuda.cu's TL_EW_SCALAR; op 0 is pow, 1.. the comparisons
+// in cmp_op's order.
 fn scalar_op(op : u32, av : f32, s : f32) -> f32 {
   switch (op) {
     case 0u: { return pow(av, s); }

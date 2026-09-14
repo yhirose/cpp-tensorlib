@@ -37,9 +37,9 @@ TL_EW_BINARY(tl_pow, powf(a[i], b[i]))
 
 // ---- elementwise comparison: out = (a OP b) ? 1.0f : 0.0f (no scale/offset
 // -- masks don't compose with the affine epilogue). `bstride` is 1 for a
-// same-shape `b` and 0 for a scalar `b` (array.h's `x > 0.0f` broadcasts a
-// rank-0 scalar, ReLU/LeakyReLU/Clip's backward gate's own shape) -- one
-// kernel covers both, the only two shapes array.h's gpu_compare_ dispatches.
+// same-shape `b` and 0 for an explicit size-1 `b` (`x > s` itself is
+// tl_gt_s below) -- one kernel covers both, the only two shapes array.h's
+// gpu_compare_ dispatches.
 #define TL_EW_CMP(NAME, EXPR)                                               \
   __global__ void NAME(const float* a, const float* b, float* out,         \
                        unsigned n, unsigned bstride) {                     \
@@ -218,9 +218,8 @@ __global__ void tl_clamp(const float* a, float* out, unsigned n, float lo,
   out[i] = v < lo ? lo : (v > hi ? hi : v);
 }
 
-// ---- tensor-scalar: out = f(a, s) * scale + offset. The scalar operand is a
-// kernel argument (pow(x, s), x > s), not a rank-0 buffer -- that cost an
-// allocation and an upload per call. Masks take the epilogue like the unaries.
+// ---- tensor-scalar: out = f(a, s) * scale + offset, s a kernel argument
+// (metal.h's scalar_op). Masks take the epilogue like the unaries.
 #define TL_EW_SCALAR(NAME, EXPR)                                            \
   __global__ void NAME(const float* a, float* out, unsigned n, float s,     \
                        float scale, float offset) {                         \

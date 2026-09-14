@@ -2045,15 +2045,21 @@ struct graph {
     return from_node(std::move(n));
   }
 
-  // x OP s with the scalar in the node (arg0), not a rank-0 input: the
-  // tensor-scalar kernels take it as an argument, and an epilogue fuses onto
-  // the node like any unary's.
+  // x OP s with the scalar in the node (arg0), not a rank-0 input; an
+  // epilogue fuses onto it like any unary's.
   static array scalar_binary(op_t op, const array& a, float s) {
     if (num_elements(a.shape()) <= kEagerTiny && eager_operand_(a) &&
         eager_cpu_ok_()) {
-      array r;
-      visit_scalar_op(op, s, [&](auto f) { r = map_unary(a, f); });
-      return r;
+      switch (op) {  // direct switch, see graph::binary
+        case op_t::pow_s: return map_unary(a, [s](float x) { return ew_pow(x, s); });
+        case op_t::gt_s: return map_unary(a, [s](float x) { return ew_gt(x, s); });
+        case op_t::lt_s: return map_unary(a, [s](float x) { return ew_lt(x, s); });
+        case op_t::ge_s: return map_unary(a, [s](float x) { return ew_ge(x, s); });
+        case op_t::le_s: return map_unary(a, [s](float x) { return ew_le(x, s); });
+        case op_t::eq_s: return map_unary(a, [s](float x) { return ew_eq(x, s); });
+        case op_t::ne_s: return map_unary(a, [s](float x) { return ew_ne(x, s); });
+        default: break;
+      }
     }
     auto n = std::make_shared<node>();
     n->op = op;
@@ -2978,10 +2984,10 @@ struct graph {
     return out;
   }
 
-  static std::optional<array> gpu_unary(std::optional<gpu::kop> k,
-                                        const array& a, float scale,
-                                        float offset) {
-    if (!k) return std::nullopt;  // no kernel for this op on this backend
+  // The one-input elementwise GPU dispatches share this gate and output:
+  // `call(a_native, a_off, out_native, out_off, n)` is the backend call.
+  template <typename Call>
+  static std::optional<array> gpu_one_input_(const array& a, Call&& call) {
     if (!gpu_mode_(a.size(), kernel_class::elementwise) || !a.contiguous()) {
       return std::nullopt;
     }
@@ -2989,11 +2995,20 @@ struct graph {
     auto out = array::empty(a.shape());
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
-    if (!gpu::unary(*k, a.storage_.native, a.offset_ * 4, out.storage_.native,
-                      out.offset_ * 4, out.size(), scale, offset)) {
+    if (!call(a.storage_.native, a.offset_ * 4, out.storage_.native,
+              out.offset_ * 4, out.size())) {
       return std::nullopt;
     }
     return out;
+  }
+
+  static std::optional<array> gpu_unary(std::optional<gpu::kop> k,
+                                        const array& a, float scale,
+                                        float offset) {
+    if (!k) return std::nullopt;  // no kernel for this op on this backend
+    return gpu_one_input_(a, [&](void* an, int64_t ao, void* on, int64_t oo, int64_t n) {
+      return gpu::unary(*k, an, ao, on, oo, n, scale, offset);
+    });
   }
 
   // Shared setup for gpu_pad_/gpu_fold_ below: validates the gate + `a`'s
@@ -3275,10 +3290,6 @@ struct graph {
   // same reasoning applied to unary ops).
   static std::optional<array> gpu_unary_ext_(op_t op, const array& a,
                                              float scale, float offset) {
-    if (!gpu_mode_(a.size(), kernel_class::elementwise) || !a.contiguous()) {
-      return std::nullopt;
-    }
-    if (!a.storage_.native) return std::nullopt;
     gpu::unary_ext_op u;
     switch (op) {
       case op_t::tanh_: u = gpu::unary_ext_op::tanh_; break;
@@ -3286,15 +3297,9 @@ struct graph {
       case op_t::cos_: u = gpu::unary_ext_op::cos_; break;
       default: return std::nullopt;
     }
-    auto out = array::empty(a.shape());
-    if (out.size() == 0) return out;
-    if (!out.storage_.native) return std::nullopt;
-    if (!gpu::unary_ext(u, a.storage_.native, a.offset_ * 4,
-                        out.storage_.native, out.offset_ * 4, out.size(),
-                        scale, offset)) {
-      return std::nullopt;
-    }
-    return out;
+    return gpu_one_input_(a, [&](void* an, int64_t ao, void* on, int64_t oo, int64_t n) {
+      return gpu::unary_ext(u, an, ao, on, oo, n, scale, offset);
+    });
   }
 
   // GPU dispatch for clamp_ (Clip's forward -- Culebra's dz.raw_elementwise
@@ -3302,27 +3307,14 @@ struct graph {
   // role scale/offset play elsewhere, and nothing composes a further affine
   // onto it today.
   static std::optional<array> gpu_clamp_(const array& a, float lo, float hi) {
-    if (!gpu_mode_(a.size(), kernel_class::elementwise) || !a.contiguous()) {
-      return std::nullopt;
-    }
-    if (!a.storage_.native) return std::nullopt;
-    auto out = array::empty(a.shape());
-    if (out.size() == 0) return out;
-    if (!out.storage_.native) return std::nullopt;
-    if (!gpu::clamp(a.storage_.native, a.offset_ * 4, out.storage_.native,
-                    out.offset_ * 4, out.size(), lo, hi)) {
-      return std::nullopt;
-    }
-    return out;
+    return gpu_one_input_(a, [&](void* an, int64_t ao, void* on, int64_t oo, int64_t n) {
+      return gpu::clamp(an, ao, on, oo, n, lo, hi);
+    });
   }
 
-  // GPU dispatch for the tensor-scalar ops: s rides as a kernel argument and
-  // the node's epilogue fuses into the store, as in gpu_unary.
+  // GPU dispatch for the tensor-scalar ops; the node's epilogue fuses into the
+  // store, as in gpu_unary.
   static std::optional<array> gpu_scalar_binary_(const node& n, const array& a) {
-    if (!gpu_mode_(a.size(), kernel_class::elementwise) || !a.contiguous()) {
-      return std::nullopt;
-    }
-    if (!a.storage_.native) return std::nullopt;
     gpu::scalar_op k;
     switch (n.op) {
       case op_t::pow_s: k = gpu::scalar_op::pow; break;
@@ -3334,15 +3326,9 @@ struct graph {
       case op_t::ne_s: k = gpu::scalar_op::ne; break;
       default: return std::nullopt;
     }
-    auto out = array::empty(a.shape());
-    if (out.size() == 0) return out;
-    if (!out.storage_.native) return std::nullopt;
-    if (!gpu::scalar_binary(k, a.storage_.native, a.offset_ * 4,
-                            out.storage_.native, out.offset_ * 4, out.size(),
-                            n.arg0, n.scale, n.offset)) {
-      return std::nullopt;
-    }
-    return out;
+    return gpu_one_input_(a, [&](void* an, int64_t ao, void* on, int64_t oo, int64_t len) {
+      return gpu::scalar_binary(k, an, ao, on, oo, len, n.arg0, n.scale, n.offset);
+    });
   }
 
   // One topological pass over all roots (MLX-style batch eval), then each

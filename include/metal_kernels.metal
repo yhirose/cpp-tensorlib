@@ -85,9 +85,8 @@ EW_UNARY(cos_, cos(a[i]))
 
 // Elementwise comparison: out = (a OP b) ? 1.0 : 0.0 (no scale/offset --
 // masks don't compose with the affine epilogue). `bstride` is 1 for a
-// same-shape `b` and 0 for a scalar `b` (the concrete ReLU-style masked-gate
-// shape array.h's `x > 0.0f` produces) -- mirrors tensorlib_cuda.cu's
-// TL_EW_CMP exactly.
+// same-shape `b` and 0 for an explicit size-1 `b` (`x > s` itself is gt_s_
+// below) -- mirrors tensorlib_cuda.cu's TL_EW_CMP exactly.
 struct cmp_params {
   uint n;
   uint bstride;
@@ -127,8 +126,7 @@ kernel void clamp_(device const float* a [[buffer(0)]],
   out[i] = clamp(a[i], p.lo, p.hi);
 }
 
-// Tensor-scalar: out = f(a, s) * scale + offset, the scalar operand a kernel
-// argument rather than a rank-0 buffer -- mirrors tensorlib_cuda.cu's
+// Tensor-scalar: out = f(a, s) * scale + offset -- mirrors tensorlib_cuda.cu's
 // TL_EW_SCALAR.
 struct scalar_params {
   float s, scale, offset;

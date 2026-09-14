@@ -847,8 +847,7 @@ inline bool clamp(void* a, int64_t ao, void* out, int64_t oo, int64_t n,
   detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
   return true;
 }
-// Tensor-scalar ops (pow(x, s), x > s, ...): s a kernel argument rather than a
-// rank-0 operand buffer (mirrors cuda.h's own scalar_binary).
+// Tensor-scalar ops (scalar_op): mirrors cuda.h's own scalar_binary.
 inline bool scalar_binary(scalar_op op, void* a, int64_t ao, void* out,
                           int64_t oo, int64_t n, float s, float scale,
                           float offset) {

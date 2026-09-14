@@ -634,21 +634,30 @@ inline bool binary(kop op, void* a, int64_t ao, void* b, int64_t bo, void* out,
   return c.encode_("ew_binary", ma, mb, mo, p, (n + 255) / 256, 1);
 }
 
-inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo, int64_t n,
-                  float scale, float offset) {
+// A one-input elementwise dispatch over n elements: the kernel binds its one
+// input twice, and `fill` sets the family's own fields.
+template <typename Fill>
+inline bool encode_one_input_(const char* entry, void* a, int64_t ao, void* out,
+                              int64_t oo, int64_t n, Fill&& fill) {
   auto& c = context::get();
   if (!c.ready || n <= 0) return false;
   params p = {};
   if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
   context::mirror *ma, *mb, *mo;
   if (!operands_(c, a, nullptr, out, &ma, &mb, &mo)) return false;
+  p.b_off = p.a_off;
+  p.M = static_cast<uint32_t>(n);
+  fill(p);
+  return c.encode_(entry, ma, mb, mo, p, (n + 255) / 256, 1);
+}
 
-  p.b_off = p.a_off;  // the kernel binds its one input twice
-  p.M = (uint32_t)n;
-  p.op = kernel_op_(op);
-  p.scale = scale;
-  p.offset = offset;
-  return c.encode_("ew_unary", ma, mb, mo, p, (n + 255) / 256, 1);
+inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo, int64_t n,
+                  float scale, float offset) {
+  return encode_one_input_("ew_unary", a, ao, out, oo, n, [&](params& p) {
+    p.op = kernel_op_(op);
+    p.scale = scale;
+    p.offset = offset;
+  });
 }
 
 // Rank-2 broadcast binary: out[r,c] = f(a[r*ars + c*acs], b[r*brs + c*bcs])
@@ -1133,37 +1142,23 @@ inline bool unary_ext(unary_ext_op op, void* a, int64_t ao, void* out,
 // lo/hi instead (mirrors cuda.h's/metal.h's own clamp).
 inline bool clamp(void* a, int64_t ao, void* out, int64_t oo, int64_t n,
                   float lo, float hi) {
-  auto& c = context::get();
-  if (!c.ready || n <= 0) return false;
-  params p = {};
-  if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
-  context::mirror *ma, *mb, *mo;
-  if (!operands_(c, a, nullptr, out, &ma, &mb, &mo)) return false;
-  p.b_off = p.a_off;  // the kernel binds its one input twice
-  p.M = static_cast<uint32_t>(n);
-  p.scale = lo;
-  p.offset = hi;
-  return c.encode_("clamp_", ma, mb, mo, p, (n + 255) / 256, 1);
+  return encode_one_input_("clamp_", a, ao, out, oo, n, [&](params& p) {
+    p.scale = lo;
+    p.offset = hi;
+  });
 }
 
-// Tensor-scalar ops (pow(x, s), x > s, ...): s rides in p.arg rather than a
-// rank-0 operand buffer; p.op is scalar_op's value (0 pow, then cmp_op's order).
+// Tensor-scalar ops (metal.h's scalar_op): s rides in p.arg; p.op is
+// scalar_op's value (0 pow, then cmp_op's order).
 inline bool scalar_binary(scalar_op op, void* a, int64_t ao, void* out,
                           int64_t oo, int64_t n, float s, float scale,
                           float offset) {
-  auto& c = context::get();
-  if (!c.ready || n <= 0) return false;
-  params p = {};
-  if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
-  context::mirror *ma, *mb, *mo;
-  if (!operands_(c, a, nullptr, out, &ma, &mb, &mo)) return false;
-  p.b_off = p.a_off;  // the kernel binds its one input twice
-  p.M = static_cast<uint32_t>(n);
-  p.op = static_cast<uint32_t>(op);
-  p.arg = s;
-  p.scale = scale;
-  p.offset = offset;
-  return c.encode_("ew_scalar", ma, mb, mo, p, (n + 255) / 256, 1);
+  return encode_one_input_("ew_scalar", a, ao, out, oo, n, [&](params& p) {
+    p.op = static_cast<uint32_t>(op);
+    p.arg = s;
+    p.scale = scale;
+    p.offset = offset;
+  });
 }
 
 // concat_part (Tensor.concat along an arbitrary axis, KV-cache append):
