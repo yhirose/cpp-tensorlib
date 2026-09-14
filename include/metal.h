@@ -1112,18 +1112,20 @@ inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
 
 #endif
 
-// ---- LLM decode ops with no MSL kernel yet (M7/M8/M9) -----------------------
-// Outside the #if/#else on purpose: both branches would define them identically,
-// and returning false is the whole implementation either way — it sends the
-// evaluator down the widen-to-F32 CPU fallback. Keeps the gpu:: facade
-// symmetric with CUDA, so the one platform #ifdef stays the namespace alias.
 // A gemm with its row bias added in the store: CUDA-first; the evaluator adds
-// the bias with the broadcast kernel after gemm here.
+// the bias with the broadcast kernel after gemm here. Outside the #if/#else
+// like the ops below.
 inline bool gemm_bias(void*, int64_t, int64_t, bool, void*, int64_t, int64_t,
                       bool, void*, int64_t, void*, int64_t, int64_t, int64_t,
                       int64_t, float, float) {
   return false;
 }
+
+// ---- LLM decode ops with no MSL kernel yet (M7/M8/M9) -----------------------
+// Outside the #if/#else on purpose: both branches would define them identically,
+// and returning false is the whole implementation either way — it sends the
+// evaluator down the widen-to-F32 CPU fallback. Keeps the gpu:: facade
+// symmetric with CUDA, so the one platform #ifdef stays the namespace alias.
 inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,

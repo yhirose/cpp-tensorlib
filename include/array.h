@@ -1945,16 +1945,22 @@ struct graph {
     return x.materialized() && x.contiguous();
   }
 
+  // The row bias fuse_dot_bias_ composed into a dot node, or null.
+  static const node* fused_bias_(const node& n) {
+    return n.op == op_t::dot && n.inputs.size() == 3 ? n.inputs[2].get() : nullptr;
+  }
+
   // `dot + bias` with a row-vector bias ([n] or [1, n], n the product's
   // columns) composes into a copy of the unevaluated rank-2 dot node as its
   // third input, added after the scale/offset epilogue: addmm's shape, so a
   // backend adds it in the gemm's own store instead of a second pass over the
   // output. The original dot is left for any other consumer, as in affine.
+  // Batched dots don't fuse yet (gemm_batched takes the bias pointer for when a
+  // batched linear needs it).
   static std::optional<array> fuse_dot_bias_(const array& d, const array& bias) {
     const node* dn = d.node_.get();
     if (!dn || dn->evaluated || dn->op != op_t::dot || dn->inputs.size() != 2 ||
-        dn->shape.size() != 2 || dn->inputs[0]->shape.size() != 2 ||
-        dn->inputs[1]->shape.size() != 2) {
+        dn->inputs[0]->shape.size() != 2 || dn->inputs[1]->shape.size() != 2) {
       return std::nullopt;
     }
     const auto& bs = bias.shape();
@@ -2032,7 +2038,7 @@ struct graph {
   // an affine on it stays a node of its own.
   static array affine(const array& a, float s, float o) {
     if (a.node_ && !a.node_->evaluated && a.node_->op != op_t::constant &&
-        !(a.node_->op == op_t::dot && a.node_->inputs.size() == 3)) {
+        !fused_bias_(*a.node_)) {
       auto c = std::make_shared<node>(*a.node_);
       c->scale = a.node_->scale * s;
       c->offset = a.node_->offset * s + o;
@@ -2617,23 +2623,34 @@ struct graph {
     return true;
   }
 
-  // r + bias for a fused dot whose backend took no bias: the add node's own
-  // chain (the GPU broadcast kernel, accel, the CPU table), so the numbers are
-  // the unfused sum's.
+  // The elementwise binaries' one chain: the GPU kernel (which applies the
+  // epilogue in its store, so it sets epi_done), accel, the CPU table.
+  static array eval_binary_(const node& n, const array& a, const array& b,
+                            bool& epi_done) {
+    if (auto g = gpu_binary(n, a, b)) {
+      epi_done = true;
+      return std::move(*g);
+    }
+    if (auto o = accel::binary(n.op, a, b)) return std::move(*o);
+    array r;
+    visit_binary_op(n.op, [&](auto f) { r = map_binary(a, b, f); });
+    return r;
+  }
+
+  // r + bias for a fused dot whose backend took no bias: an add node's own
+  // chain, so the numbers are the unfused sum's.
   static array add_row_bias_(const array& r, const array& bias) {
     node add;
     add.op = op_t::add;
     add.shape = r.shape();
-    if (auto g = gpu_binary(add, r, bias)) return std::move(*g);
-    if (auto o = accel::binary(op_t::add, r, bias)) return std::move(*o);
-    return map_binary(r, bias, std::plus<float>());
+    bool epi_done = false;  // an identity epilogue either way
+    return eval_binary_(add, r, bias, epi_done);
   }
 
-  // `bias` (a fused row bias, or null) goes into the gemm's store when the
-  // backend takes it (gpu::gemm_bias), which sets bias_done.
+  // A fused row bias still owed goes into the gemm's store when the backend
+  // takes it (gpu::gemm_bias), which clears bias_owed.
   static std::optional<array> gpu_gemm(const node& n, const array& a_in,
-                                         const array& b_in, const array* bias,
-                                         bool& bias_done) {
+                                         const array& b_in, bool& bias_owed) {
     int64_t k_dim = a_in.shape().back();
     if (!gpu_mode_(num_elements(n.shape) * (k_dim > 0 ? k_dim : 1),
                      kernel_class::matmul)) {
@@ -2648,14 +2665,18 @@ struct graph {
     array out = array::empty({m, nn});
     if (!out.storage_.native) return std::nullopt;
     if (m == 0 || nn == 0) return out.reshape(n.shape);
-    if (bias && bias->contiguous() && bias->storage_.native && bias->size() == nn &&
-        gpu::gemm_bias(a.storage_.native, a.offset_ * 4, la->ld, la->trans,
-                       b.storage_.native, b.offset_ * 4, lb->ld, lb->trans,
-                       bias->storage_.native, bias->offset_ * 4,
-                       out.storage_.native, out.offset_ * 4, m, nn, k, n.scale,
-                       n.offset)) {
-      bias_done = true;
-      return out.reshape(n.shape);
+    if (bias_owed) {
+      const array bias = wrap(*n.inputs[2]);
+      if (bias.storage_.dt == tl::dtype::f32 && bias.contiguous() &&
+          bias.storage_.native &&
+          gpu::gemm_bias(a.storage_.native, a.offset_ * 4, la->ld, la->trans,
+                         b.storage_.native, b.offset_ * 4, lb->ld, lb->trans,
+                         bias.storage_.native, bias.offset_ * 4,
+                         out.storage_.native, out.offset_ * 4, m, nn, k, n.scale,
+                         n.offset)) {
+        bias_owed = false;
+        return out.reshape(n.shape);
+      }
     }
     if (!gpu::gemm(a.storage_.native, a.offset_ * 4, la->ld, la->trans,
                      b.storage_.native, b.offset_ * 4, lb->ld, lb->trans,
@@ -3534,7 +3555,7 @@ struct graph {
     if (device_ == device_type::auto_ && gpu::available() && !gpu::pending()) {
       int64_t work = 0;
       for (const node* n : order) {
-        if (n->op != node::op_t::dot || n->inputs.size() < 2) continue;
+        if (n->op != node::op_t::dot) continue;
         const auto& sa = n->inputs[0]->shape;
         const auto& sb = n->inputs[1]->shape;
         if (sa.size() == 2 && sb.size() == 2) work += sa[0] * sa[1] * sb[1];
@@ -3650,7 +3671,7 @@ struct graph {
     constexpr int64_t kCutoff = 16384;  // M*N*K
     const node& a = *n.inputs[0];
     const node& b = *n.inputs[1];
-    const node* bias = n.inputs.size() == 3 ? n.inputs[2].get() : nullptr;
+    const node* bias = fused_bias_(n);
     if (a.stor.dt != tl::dtype::f32 || b.stor.dt != tl::dtype::f32 ||
         (bias && bias->stor.dt != tl::dtype::f32))
       return false;  // bf16 operands take the eval_one dot path
@@ -3694,6 +3715,7 @@ struct graph {
     };
     array r;
     bool epi_done = false;  // epilogue already applied inside the op body
+    bool bias_owed = false;  // a fused dot bias not yet added (fused_bias_)
     switch (n.op) {
       case op_t::constant:
         return;
@@ -3706,15 +3728,7 @@ struct graph {
         // has no kernel for (gpu_binary via to_kop_, accel::binary via its own
         // switch), so pow_ falls through to the CPU table without needing an
         // arm of its own.
-        auto a = in(0), b = in(1);
-        if (auto g = gpu_binary(n, a, b)) {
-          r = std::move(*g);
-          epi_done = true;  // kernels apply the epilogue in the store
-        } else if (auto o = accel::binary(n.op, a, b)) {
-          r = std::move(*o);
-        } else {
-          visit_binary_op(n.op, [&](auto f) { r = map_binary(a, b, f); });
-        }
+        r = eval_binary_(n, in(0), in(1), epi_done);
         break;
       }
       case op_t::gt:   // comparisons yield F32 masks
@@ -3843,44 +3857,38 @@ struct graph {
           }
           break;
         }
-        // A fused row bias (graph::fuse_dot_bias_) rides as a third input: the
-        // CUDA gemm adds it in its store, every other path after the epilogue.
-        const bool biased = n.inputs.size() == 3;
-        bool bias_done = false;
+        // A fused row bias (fused_bias_) is owed until the CUDA gemm adds it in
+        // its store; the tail adds it after the epilogue otherwise.
+        bias_owed = fused_bias_(n) != nullptr;
         // Decode GEMV fast path first (M=1; f32/bf16/q4 weights), on the
-        // un-widened inputs. Its kernel is epilogue-free (the tail applies it).
+        // un-widened inputs.
         if (auto g = gpu_gemv(n, wrap(*n.inputs[0]), wrap(*n.inputs[1]))) {
           r = std::move(*g);
-        } else if (auto g = gpu_gemv_q4(n, wrap(*n.inputs[0]), wrap(*n.inputs[1]))) {
-          r = std::move(*g);
-        } else {
-          auto a = in(0), b = in(1);
-          const array bias = biased ? in(2) : array{};
-          if (auto g = gpu_gemm(n, a, b, biased ? &bias : nullptr, bias_done)) {
-            r = std::move(*g);
-            epi_done = true;
-          } else {
-            array a2 = a.rank() == 1 ? a.reshape({1, a.size()}) : a;
-            array b2 = b.rank() == 1 ? b.reshape({b.size(), 1}) : b;
-            array out = array::empty({a2.shape()[0], b2.shape()[1]});
-            if (accel::gemm(a2, b2, out, n.scale)) {  // epilogue scale = alpha
-              apply_dot_offset_(out, n.offset);
-              r = out.reshape(n.shape);
-              epi_done = true;
-            } else if (cpu_gemm(a2, b2, out, n.scale)) {  // own CPU backend
-              apply_dot_offset_(out, n.offset);
-              r = out.reshape(n.shape);
-              epi_done = true;
-            } else {
-              r = ref::dot(a, b);
-            }
-          }
+          break;  // kernel is epilogue-free; generic tail applies scale/offset
         }
-        if (biased && !bias_done) {
-          if (!epi_done && (n.scale != 1.0f || n.offset != 0.0f))
-            r = affine_(r, n.scale, n.offset);
+        if (auto g = gpu_gemv_q4(n, wrap(*n.inputs[0]), wrap(*n.inputs[1]))) {
+          r = std::move(*g);
+          break;
+        }
+        auto a = in(0), b = in(1);
+        if (auto g = gpu_gemm(n, a, b, bias_owed)) {
+          r = std::move(*g);
           epi_done = true;
-          r = add_row_bias_(r, in(2));
+          break;
+        }
+        array a2 = a.rank() == 1 ? a.reshape({1, a.size()}) : a;
+        array b2 = b.rank() == 1 ? b.reshape({b.size(), 1}) : b;
+        array out = array::empty({a2.shape()[0], b2.shape()[1]});
+        if (accel::gemm(a2, b2, out, n.scale)) {  // epilogue scale = alpha
+          apply_dot_offset_(out, n.offset);
+          r = out.reshape(n.shape);
+          epi_done = true;
+        } else if (cpu_gemm(a2, b2, out, n.scale)) {  // own CPU backend
+          apply_dot_offset_(out, n.offset);
+          r = out.reshape(n.shape);
+          epi_done = true;
+        } else {
+          r = ref::dot(a, b);
         }
         break;
       }
@@ -4074,6 +4082,7 @@ struct graph {
     if (!epi_done && (n.scale != 1.0f || n.offset != 0.0f)) {
       r = affine_(r, n.scale, n.offset);
     }
+    if (bias_owed) r = add_row_bias_(r, in(2));
     store(n, r);
   }
 

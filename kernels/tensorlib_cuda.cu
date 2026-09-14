@@ -609,6 +609,8 @@ __global__ void tl_fill_rows(float* __restrict__ C, const float* __restrict__ bi
 //   A(i,k) = trans_a ? A[k*lda + i] : A[i*lda + k]
 //   B(k,j) = trans_b ? B[j*ldb + k] : B[k*ldb + j]
 // One output element per thread. Correctness-first; stage 2 tiles/shared-mem.
+// The one-output-per-thread fallback: its runtime bias test is cheap next to
+// the K-long loop (the tiled kernels template it — see sgemm_store_).
 __global__ void tl_sgemm(const float* A, const float* B, float* C,
                          const float* bias, unsigned m, unsigned n, unsigned k,
                          unsigned lda, unsigned ldb, unsigned trans_a,
