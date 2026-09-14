@@ -660,23 +660,21 @@ __global__ void tl_sgemm(const float* A, const float* B, float* C, unsigned m,
 // strides is the plain GEMM.
 }  // close extern "C": the __device__ core template below can't have C linkage;
    // each __global__ wrapper re-declares its own for a stable symbol.
-// Two kernels share one tiling: a BM×BM output per block of 256 threads,
-// BK = 1024/BM deep K slabs in shared memory (one float4 per thread per
-// operand per slab), 8 warps as 2×4 tiles of (BM/2)×(BM/4), each thread a
-// (BM/16)² microtile in two column sub-iterations. They differ in how a slab
-// reaches shared memory (the host picks, cuda.h sgemm_tile_):
-//   sgemm_rb_core — staged through registers, double-buffered; the 64² tile
-//     (BK 16, 4×4), for the grids a 128² tile leaves at a dozen blocks —
-//     about half the registers, so it also packs more blocks per SM;
-//   sgemm_cp_core — cp.async into a 4-deep ring; the 128² tile (BK 8, 8×8),
-//     for everything that fills the GPU. Its register-staged twin (the same
-//     tile, once tl_sgemm_rb) measured 0.53-0.83 of cuBLAS against this one's
-//     0.59-0.90 over the transformer block's shapes. (A 256×128 16×8 tile at
-//     215 registers and one block per SM, 16-deep slabs, and a 3-deep ring
-//     were all tried and measured at or below it.)
-// The pieces both use — placement, the split-K range, the global-load index
-// map, the slab's fragment loads + FMAs, and the epilogue — live in the
-// helpers below, so the two cores are only their staging.
+// One kernel at two tiles: a BM×BM output per block of 256 threads, BK =
+// 1024/BM deep K slabs in shared memory (one float4 per thread per operand
+// per slab), 8 warps as 2×4 tiles of (BM/2)×(BM/4), each thread a (BM/16)²
+// microtile in two column sub-iterations, slabs streamed into shared memory
+// by cp.async through a 4-deep ring (sgemm_cp_core). The 128² tile (BK 8,
+// 8×8) is for everything that fills the GPU, the 64² (BK 16, 4×4) for the
+// grids a 128² tile leaves at a dozen blocks (the host picks, cuda.h
+// sgemm_tile_). Register-staged cores measured below it at both tiles: 0.53-
+// 0.83 of cuBLAS against 0.59-0.90 at 128² over the transformer block's
+// shapes, and at 64² 9.2k against 11.9k GF/s on an 80-block grid
+// (256×1024×1280). (A 256×128 16×8 tile at 215 registers and one block per
+// SM, 16-deep slabs, and a 3-deep ring were also tried and measured at or
+// below the 128² one.) The pieces — placement, the split-K range, the
+// global-load index map, the slab's fragment loads + FMAs, and the epilogue —
+// live in the helpers below.
 
 // Where this block and thread sit: block tile, warp tile in the block, thread
 // microtile in the warp.
@@ -823,69 +821,14 @@ __device__ __forceinline__ void sgemm_store_(
   }
 }
 
-// ---- register-staged core: global → registers → double-buffered shared ----
-template <bool TA, bool TB, int BM>
-__device__ __forceinline__ void sgemm_rb_core(const float* __restrict__ A,
-                                              const float* __restrict__ B,
-                                              float* __restrict__ C, unsigned m,
-                                              unsigned n, unsigned k, float scale,
-                                              float offset, unsigned ksplit,
-                                              unsigned sa, unsigned sb,
-                                              unsigned sc) {
-  using G = sgemm_geom<BM>;
-  constexpr int BK = G::BK;
-  __shared__ __align__(16) float As[2][BK * BM];  // compute layout [k][m]
-  __shared__ __align__(16) float Bs[2][BK * BM];
-  const G g;
-  const sgemm_split sp(k, ksplit);
-  A += (size_t)sp.bi * sa;
-  B += (size_t)sp.bi * sb;
-  C += (size_t)sp.bi * sc;
-  const sgemm_ldmap<TA, TB, BM> ld(g.blockRow, g.blockCol);
-
-  float acc[G::TM][G::TN] = {};
-  // global loads staged in registers → overlap with compute (double buffer).
-  float4 ldgA, ldgB;
-  auto load_regs = [&](unsigned kt) {
-    ldgA = ld.gArow < m ? *reinterpret_cast<const float4*>(ld.a_src(A, m, k, kt))
-                        : make_float4(0, 0, 0, 0);
-    ldgB = ld.gBcol < n ? *reinterpret_cast<const float4*>(ld.b_src(B, n, k, kt))
-                        : make_float4(0, 0, 0, 0);
-  };
-  auto store_smem = [&](int buf) {
-    if constexpr (TA)
-      *reinterpret_cast<float4*>(&As[buf][ld.aRow * BM + ld.aCol]) = ldgA;
-    else
-      sgemm_scatter_<BM>(As[buf], ld.aRow, ld.aCol, ldgA);
-    if constexpr (TB)
-      sgemm_scatter_<BM>(Bs[buf], ld.bRow, ld.bCol, ldgB);
-    else
-      *reinterpret_cast<float4*>(&Bs[buf][ld.bRow * BM + ld.bCol]) = ldgB;
-  };
-
-  load_regs(sp.k0);
-  store_smem(0);
-  __syncthreads();
-  int buf = 0;
-  for (unsigned kt = sp.k0; kt < sp.k1; kt += BK) {
-    const bool has_next = kt + BK < sp.k1;
-    if (has_next) load_regs(kt + BK);  // prefetch next slab into registers
-    sgemm_slab_fma_<BM>(As[buf], Bs[buf], g, acc);
-    if (has_next) store_smem(buf ^ 1);  // regs → other buffer after compute
-    __syncthreads();
-    buf ^= 1;
-  }
-  sgemm_store_<BM>(C, m, n, scale, offset, ksplit < k, sp.sz, g, acc);
-}
-
 // ---- cp.async-pipelined core ----
 // Global slabs stream straight into a STAGES-deep shared ring with cp.async
 // (no registers in the path, STAGES-1 slabs in flight), and an operand that
 // arrives K-contiguous is turned to the [k][m] compute layout by a
 // shared-to-shared step (float4 in, four scalars out) into a double-buffered
-// compute tile — the register-staged kernel did that transpose on the way
-// in, which tied its prefetch depth to registers. The transpose runs one
-// slab ahead of the compute, so a slab costs one barrier.
+// compute tile — transposing on the way in, through registers, would tie the
+// prefetch depth to registers. The transpose runs one slab ahead of the
+// compute, so a slab costs one barrier.
 __device__ __forceinline__ void cp_async16_(void* smem, const void* gmem, bool valid) {
   unsigned s = (unsigned)__cvta_generic_to_shared(smem);
   int bytes = valid ? 16 : 0;  // src-size 0: zero-fill, gmem still a valid address
@@ -990,7 +933,7 @@ __device__ __forceinline__ void sgemm_cp_core(const float* __restrict__ A,
   TL_SGEMM_KERNEL(NAME##_nt, CORE, false, true, __VA_ARGS__) \
   TL_SGEMM_KERNEL(NAME##_tn, CORE, true, false, __VA_ARGS__) \
   TL_SGEMM_KERNEL(NAME##_tt, CORE, true, true, __VA_ARGS__)
-TL_SGEMM_LAYOUTS(tl_sgemm_rb64, sgemm_rb_core, 64)
+TL_SGEMM_LAYOUTS(tl_sgemm_cp64, sgemm_cp_core, 64, 4)
 TL_SGEMM_LAYOUTS(tl_sgemm_cp128, sgemm_cp_core, 128, 4)
 #undef TL_SGEMM_LAYOUTS
 #undef TL_SGEMM_KERNEL

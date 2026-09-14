@@ -190,25 +190,20 @@ inline const char* kernel_name_(kop op) {
 }
 
 // The f32 gemm's tiles (kernels/tensorlib_cuda.cu): a bm² block tile with a
-// bk-deep K slab (K must be a multiple), the kernel per operand layout (NN,
-// NT, TN, TT), and its long-K split-K policy (sgemm_splitk_): keep splitting
-// a long K into slices at least `long_k_slice` deep up to `long_k_blocks`
-// blocks. The register-staged 64² takes slices of ≥512 up to ~512 blocks; the
-// pipelined 128² only ≥1024 up to ~128, since deeper slabs are what its
-// pipeline pays off on (bench_cuda_gemm, own GF/s: 512×1024×4096 S=1 17.9k
-// vs S=2 15.4k; 512×4096×1024 S=4 17.4k vs S=8 16.4k; 512×1024×1024 S=2
-// 13.5k vs S=4 12.3k). `id` is the kernel cache slot (context::sgemm_).
+// bk-deep K slab (K must be a multiple) and the kernel per operand layout (NN,
+// NT, TN, TT). `single_fill` lets the wave plan (sgemm_wave_chunk_) cut
+// shallower layers to fill the SMs one block each when a wave's worth will not
+// come. `id` is the kernel cache slot (context::sgemm_).
 struct sgemm_tile {
   int id;
   unsigned bm, bk;
-  unsigned long_k_slice;
-  long long_k_blocks;
+  bool single_fill;
   const char* names[4];
 };
 constexpr sgemm_tile sgemm_tiles[] = {
-    {0, 64, 16, 512, 512,
-     {"tl_sgemm_rb64", "tl_sgemm_rb64_nt", "tl_sgemm_rb64_tn", "tl_sgemm_rb64_tt"}},
-    {1, 128, 8, 1024, 128,
+    {0, 64, 16, true,
+     {"tl_sgemm_cp64", "tl_sgemm_cp64_nt", "tl_sgemm_cp64_tn", "tl_sgemm_cp64_tt"}},
+    {1, 128, 8, false,
      {"tl_sgemm_cp128", "tl_sgemm_cp128_nt", "tl_sgemm_cp128_tn", "tl_sgemm_cp128_tt"}},
 };
 
@@ -385,7 +380,7 @@ struct context {
     return cached_(sgemm_fn[t.id * 4 | layout], t.names[layout]);
   }
 
-  // M7 decode GEMV (f32 and bf16-weight variants), cached like sgemm_rb.
+  // M7 decode GEMV (f32 and bf16-weight variants), cached like sgemm_.
   CUfunction gemv_f32_fn = nullptr, gemv_bf16_fn = nullptr, gemv_bf16v8_fn = nullptr;
   CUfunction gemv_f32_() { return cached_(gemv_f32_fn, "tl_gemv_f32"); }
   CUfunction gemv_bf16_() { return cached_(gemv_bf16_fn, "tl_gemv_bf16"); }
@@ -701,50 +696,54 @@ inline bool big_tile_(int64_t m, int64_t n, int64_t k, int64_t batch = 1) {
   return blocks128_(m, n, batch) >= kFillBlocks || k % 16 != 0;
 }
 
-// The pipelined tile's wave plan. A launch places one block per SM up to 82
-// blocks and two per SM past that, so a wave is kFillBlocks slots; a block
-// takes time in proportion to its slabs, and a launch lasts as long as its
-// busiest slot. So split K into `full` equal layers that fit the wave (each at
-// least kWaveMinSlabs deep: a block's fixed cost is some twenty slabs), and when
+// The wave plan. A launch places one block per SM up to kWaveSingles blocks
+// and two per SM past that, so a wave is kFillBlocks slots; a block takes time
+// in proportion to its slabs, and a launch lasts as long as its busiest slot.
+// So split K into `full` equal layers that fit the wave, each at least
+// kWaveMinK deep (a block's fixed cost is some twenty 128² slabs), and when
 // slots stay spare, into full layers plus a shorter tail layer that cycles
-// `rounds` times through the spare slots while the full layers run. Returns
-// the chunk, k when unsplit. bench_cuda_gemm (RTX 3090, own GF/s, the fill
-// heuristic → this, one shape per process): 512×1024×4096 16.2k → 18.1k,
-// 512×4096×1024 15.8k → 19.0k (cuBLAS 18.9k), 256×4096×1024 13.5k → 16.2k,
-// 256×1024×4096 13.7k → 15.7k, 512×1024×512:nt 9.0k → 10.1k, 1024³ 13.6k →
-// 15.9k.
-constexpr long kWaveMinSlabs = 24;
-inline unsigned sgemm_wave_chunk_(long tiles, unsigned k, unsigned bk) {
-  const long slabs = k / bk;
+// `rounds` times through the spare slots while the full layers run. A
+// single_fill tile then cuts shallower layers, down to kSingleMinK, to fill the
+// SMs one block each when the wave plan leaves fewer. Returns the chunk, k when
+// unsplit. bench_cuda_gemm (RTX 3090, own GF/s, one shape per process, the fill
+// heuristics → this): 512×1024×4096 16.2k → 18.1k, 512×4096×1024 15.8k →
+// 19.0k (cuBLAS 18.9k), 256×4096×1024 13.5k → 16.2k, 1024³ 13.6k → 15.9k; and
+// with the pipelined 64² over the register-staged one, 256×768×768 7.0k →
+// 8.7k, 256×256×768 4.3k → 5.7k, 256×1024×256:nt 5.1k → 6.5k, single fill
+// 256×768×256:nt 5.1k → 5.6k and 256×512×256:nt 3.9k → 4.5k.
+constexpr long kWaveSingles = 80;
+constexpr unsigned kWaveMinK = 192, kSingleMinK = 96;
+inline unsigned sgemm_wave_chunk_(long tiles, unsigned k, const sgemm_tile& t) {
   if (tiles >= kFillBlocks) return k;
-  const long full =
-      std::max<long>(1, std::min(kFillBlocks / tiles, slabs / kWaveMinSlabs));
+  const long slabs = k / t.bk, min_slabs = kWaveMinK / t.bk;
+  const long full = std::max<long>(1, std::min(kFillBlocks / tiles, slabs / min_slabs));
   long chunk_slabs = (slabs + full - 1) / full;
   if (const long spare = kFillBlocks - full * tiles; spare > 0) {
     const long rounds = (tiles + spare - 1) / spare;
     const long parts = full * rounds + 1;  // a full layer is `rounds` tails
-    if (slabs >= kWaveMinSlabs * parts)
-      chunk_slabs = (slabs * rounds + parts - 1) / parts;
+    if (slabs >= min_slabs * parts) chunk_slabs = (slabs * rounds + parts - 1) / parts;
   }
-  const unsigned chunk = (unsigned)chunk_slabs * bk;
+  const long layers = (slabs + chunk_slabs - 1) / chunk_slabs;
+  if (t.single_fill && tiles * layers < kWaveSingles) {
+    const long singles = std::min(kWaveSingles / tiles, slabs / (kSingleMinK / t.bk));
+    if (singles > layers) chunk_slabs = (slabs + singles - 1) / singles;
+  }
+  const unsigned chunk = (unsigned)chunk_slabs * t.bk;
   return chunk < k ? chunk : k;
 }
-// The plan pays off once it puts a single-placement wave's worth of blocks on
-// the grid: 80 blocks measured a win over the heuristics (256×2048×512 +8%,
-// 256×1024×1024 +11%), 64 a loss to the 64² tile (256×512×2048 -9%).
-constexpr long kWaveMinBlocks = 80;
-inline long sgemm_wave_blocks_(long tiles, unsigned k, unsigned bk) {
-  const unsigned chunk = sgemm_wave_chunk_(tiles, k, bk);
+inline long sgemm_wave_blocks_(long tiles, unsigned k, const sgemm_tile& t) {
+  const unsigned chunk = sgemm_wave_chunk_(tiles, k, t);
   return tiles * (long)((k + chunk - 1) / chunk);
 }
 
-// Which f32 tile: the pipelined 128² whenever its wave plan fills
-// (sgemm_wave_chunk_), or its grid has a wave's worth of
+// Which f32 tile: the 128² whenever its wave plan fills the SMs one block each
+// (80 blocks measured a win over the heuristics, 256×2048×512 +8%; 64 a loss
+// to the 64² tile, 256×512×2048 -9%), or its grid has a wave's worth of
 // blocks, or the K is long enough for its pipeline to matter, or M is at
 // least 512 (four 128-rows against any N); the 64² for the short-K
 // few-hundred-row projections whose grid it quadruples — and always when K
 // is not a multiple of the 64² tile's 16-deep slab. From bench_cuda_gemm over
-// the transformer block's shapes (own GF/s, 64² vs 128²): 256×768×768
+// the transformer block's shapes (own GF/s, register-staged 64² vs 128²): 256×768×768
 // 9.6k vs 7.2k, 256×768×3072 13.4k vs 12.1k, 256×1024×4096 13.9k vs 15.4k,
 // 512×1024×1024 12.4k vs 13.5k, 256×3072×768 12.3k vs 15.0k, 512×1024×4096
 // 15.2k vs 17.9k, 2048³ 14.6k vs 19.2k. TL_TILE forces an index for the
@@ -759,7 +758,7 @@ inline const sgemm_tile& sgemm_tile_(int64_t m, int64_t n, int64_t k,
   if (forced >= 0 && forced < ntiles && k % sgemm_tiles[forced].bk == 0)
     return sgemm_tiles[forced];
   const long tiles = blocks128_(m, n, batch);
-  bool big = sgemm_wave_blocks_(tiles, (unsigned)k, sgemm_tiles[1].bk) >= kWaveMinBlocks ||
+  bool big = sgemm_wave_blocks_(tiles, (unsigned)k, sgemm_tiles[1]) >= kWaveSingles ||
              tiles >= 64 || k >= 2048 || m >= 512 || k % 16 != 0;
   return sgemm_tiles[big ? 1 : 0];
 }
@@ -1995,24 +1994,21 @@ struct kv_cache {
   }
 };
 
-// Split-K (ladder ②) for the f32 gemm: when the tiling leaves the 82 SMs
-// underfilled, partition K into S z-slices so S× more blocks run
-// concurrently. Split-K partitions K (not replicates it), so A/B global
-// traffic is unchanged — the only cost is C written S× via atomicAdd into a
-// pre-zeroed buffer (the kernel folds scale/offset into the partials, so a
-// fused epilogue splits too). S comes from the fill: enough splits to reach
-// ~64 blocks (one wave) with each at least 96 deep; then a long K keeps
-// splitting by the tile's own policy (sgemm_tile long_k_slice/long_k_blocks).
-// Against cuBLAS (RTX 3090, own/cuBLAS, the old fixed S=2 rule → the fill
-// rule, 64² era): 256×768×256 0.26→0.65, 256×768×768 0.44→0.62,
-// 256×3072×768 0.35→0.86, 512×1024×512 0.50→0.73, 512×4096×1024 0.63→0.79,
-// 512³ 0.50→0.61. `base_blocks` counts the batch too, so a batched product
-// that already fills the GPU declines to split. chunk is a whole number of
-// the tile's bk-deep K slabs; S == 1 leaves chunk == k (the kernel reads that
-// as "no split"). The 128² tile takes its wave plan instead whenever that
-// fills (sgemm_wave_chunk_); these heuristics are for the grids it does not.
-// TL_SPLITK forces S and TL_KSPLIT the chunk (a last layer may be shorter) for
-// the census, read once like the other TL_* knobs.
+// Split-K (ladder ②) for the f32 gemm: partition K into S z-slices so S× more
+// blocks run concurrently. Split-K partitions K (not replicates it), so A/B
+// global traffic is unchanged — the only cost is C written S× via atomicAdd
+// into a pre-zeroed buffer (the kernel folds scale/offset into the partials,
+// so a fused epilogue splits too). The wave plan (sgemm_wave_chunk_) sets S
+// for the 64² tile always, and for the 128² tile when it fills the SMs one
+// block each. The 128² grids it does not fill keep the fill heuristics: enough
+// splits to reach ~64 blocks with each at least 96 deep, then a long K keeps
+// splitting in slices of at least 1024 up to ~128 blocks (own GF/s:
+// 512×1024×4096 S=1 17.9k vs S=2 15.4k; 512×1024×1024 S=2 13.5k vs S=4
+// 12.3k). `base_blocks` counts the batch too, so a batched product that
+// already fills the GPU declines to split. chunk is a whole number of the
+// tile's bk-deep K slabs; S == 1 leaves chunk == k (the kernel reads that as
+// "no split"). TL_SPLITK forces S and TL_KSPLIT the chunk (a last layer may be
+// shorter) for the census, read once like the other TL_* knobs.
 struct sgemm_splitk {
   unsigned S, chunk;
 };
@@ -2029,15 +2025,14 @@ inline sgemm_splitk sgemm_splitk_(long base_blocks, unsigned k, const sgemm_tile
   static const long forced = knob("TL_SPLITK");
   if (forced_chunk > 0)
     return by_chunk(((unsigned)forced_chunk + t.bk - 1) / t.bk * t.bk);
-  if (forced < 0 && t.bm == 128 &&
-      sgemm_wave_blocks_(base_blocks, k, t.bk) >= kWaveMinBlocks)
-    return by_chunk(sgemm_wave_chunk_(base_blocks, k, t.bk));
+  if (forced < 0 &&
+      (t.bm == 64 || sgemm_wave_blocks_(base_blocks, k, t) >= kWaveSingles))
+    return by_chunk(sgemm_wave_chunk_(base_blocks, k, t));
   long want = forced;
   if (want < 0) {
     long by_fill = std::min((63 + base_blocks) / base_blocks,
                             std::max<long>(1, k / 96));
-    long by_k = std::min<long>(k / t.long_k_slice,
-                               (t.long_k_blocks - 1 + base_blocks) / base_blocks);
+    long by_k = std::min<long>(k / 1024, (127 + base_blocks) / base_blocks);
     want = std::max(by_fill, by_k);
   }
   if (want <= 1) return {1, k};
@@ -2066,7 +2061,7 @@ inline bool gemm_batched(void* a, int64_t ao, int64_t lda, bool ta, int64_t sa,
   float* po = context::off_(out, oo);
   unsigned um = (unsigned)m, un = (unsigned)n, uk = (unsigned)k;
 
-  // Register-blocked fast path (tl_sgemm_rb*, one per operand layout): each
+  // Tiled fast path (tl_sgemm_cp*, one per tile per operand layout): each
   // operand contiguous in its own layout (lda == k, or == m for a transposed
   // view; ldb == n, or == k transposed), K%8==0 for the 8-slab, the dim a
   // float4 load runs along a multiple of 4 (N for NN's B, M for TN's A; K%8
