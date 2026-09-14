@@ -17,3 +17,8 @@ attn_prefill
 # One-launch batched GEMM (the batch on gridDim.z next to split-K). CUDA-first
 # for attention's probs·v; Metal/WebGPU loop gemm per slice meanwhile.
 gemm_batched
+
+# GEMM with a fused row bias added in its store (addmm's shape). CUDA-first
+# for the transformer's projections and FFN; Metal/WebGPU add the bias with
+# their broadcast kernel after gemm meanwhile.
+gemm_bias

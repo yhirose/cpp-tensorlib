@@ -7,7 +7,7 @@
 //   lifecycle  available / pending / flush / cpu_barrier
 //   memory     alloc / release / sync_to_host
 //   kernels    binary / binary_bcast / binary_bcast_nd / where_nd / unary /
-//              gemm / gemm_batched / row_op / pad / fold / index_select /
+//              gemm / gemm_batched / gemm_bias / row_op / pad / fold / index_select /
 //              index_add / scatter_to_axis / sum_to / compare / unary_ext /
 //              clamp / scalar_binary / concat_part / rope / layer_norm
 //   LLM path   gemv_f32 / gemv_bf16 / gemv_q4 / attn_decode / attn_prefill

@@ -592,16 +592,27 @@ __global__ void tl_layer_norm(const float* x, const float* g, const float* b,
     dst[c] = ((src[c] - mu) * inv * g[c] + b[c]) * scale + offset;
 }
 
+// ---- C(i, j) = bias[j]: the row bias laid under a split gemm's partials ----
+// One element per thread, a block per 256 columns of a row (grid y = rows): a
+// thread per row streaming its row ran 512×4096 in 1 ms on two blocks.
+__global__ void tl_fill_rows(float* __restrict__ C, const float* __restrict__ bias,
+                             unsigned m, unsigned n) {
+  unsigned j = blockIdx.x * blockDim.x + threadIdx.x;
+  unsigned i = blockIdx.y;
+  if (i >= m || j >= n) return;
+  C[(size_t)i * n + j] = bias[j];
+}
+
 // ---- SGEMM: C(m,n) = (A @ B) * scale + offset ----
 // lda/ldb are row strides; trans flags let a transposed (col-major) view be
 // read in place — same layout contract as metal::gemm / accel::gemm:
 //   A(i,k) = trans_a ? A[k*lda + i] : A[i*lda + k]
 //   B(k,j) = trans_b ? B[j*ldb + k] : B[k*ldb + j]
 // One output element per thread. Correctness-first; stage 2 tiles/shared-mem.
-__global__ void tl_sgemm(const float* A, const float* B, float* C, unsigned m,
-                         unsigned n, unsigned k, unsigned lda, unsigned ldb,
-                         unsigned trans_a, unsigned trans_b, float scale,
-                         float offset) {
+__global__ void tl_sgemm(const float* A, const float* B, float* C,
+                         const float* bias, unsigned m, unsigned n, unsigned k,
+                         unsigned lda, unsigned ldb, unsigned trans_a,
+                         unsigned trans_b, float scale, float offset) {
   unsigned j = blockIdx.x * blockDim.x + threadIdx.x;
   unsigned i = blockIdx.y * blockDim.y + threadIdx.y;
   if (i >= m || j >= n) return;
@@ -611,7 +622,8 @@ __global__ void tl_sgemm(const float* A, const float* B, float* C, unsigned m,
     float bv = trans_b ? B[(size_t)j * ldb + p] : B[(size_t)p * ldb + j];
     acc += av * bv;
   }
-  C[(size_t)i * n + j] = acc * scale + offset;
+  const float y = acc * scale + offset;
+  C[(size_t)i * n + j] = bias ? y + bias[j] : y;
 }
 
 // ---- warp-tiled SGEMM fast path (contiguous operands, any transpose) ----
@@ -790,13 +802,19 @@ __device__ __forceinline__ void sgemm_slab_fma_(
 }
 
 // Epilogue: guarded store (mirroring the load map's edges). S==1: fused
-// affine store. S>1: atomicAdd this split's share of the affine result into a
-// pre-zeroed C — scale on every partial, offset from split 0 only. ksplit is
-// uniform across the block, so the branch never diverges.
-template <int BM>
+// affine store, then the row bias (BIAS). S>1: atomicAdd this split's share of
+// the result into a pre-set C — scale on every partial, offset from split 0
+// only; a fused bias is already in C (the host lays the bias rows down with
+// tl_fill_rows in place of the zeroing), so a split never reads it here. ksplit
+// is uniform across the block, so the branch never diverges. BIAS is a template
+// parameter so the plain kernels compile without it: a runtime bias test in
+// this store cost 512×1024×4096 14% unbiased, and a bias read in the split
+// store 16% biased.
+template <int BM, bool BIAS>
 __device__ __forceinline__ void sgemm_store_(
-    float* __restrict__ C, unsigned m, unsigned n, float scale, float offset,
-    bool split, unsigned sz, const sgemm_geom<BM>& g,
+    float* __restrict__ C, const float* __restrict__ bias, unsigned m,
+    unsigned n, float scale, float offset, bool split, unsigned sz,
+    const sgemm_geom<BM>& g,
     const float (&acc)[sgemm_geom<BM>::TM][sgemm_geom<BM>::TN]) {
   using G = sgemm_geom<BM>;
   const float part_offset = sz == 0 ? offset : 0.0f;
@@ -814,6 +832,8 @@ __device__ __forceinline__ void sgemm_store_(
         const float v = acc[i][wn * G::TNSUB + js];
         if (split)
           atomicAdd(&C[idx], v * scale + part_offset);
+        else if constexpr (BIAS)
+          C[idx] = v * scale + offset + bias[gCol];
         else
           C[idx] = v * scale + offset;
       }
@@ -843,10 +863,12 @@ __device__ __forceinline__ void cp_async_wait_() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
-template <bool TA, bool TB, int BM>
+template <bool TA, bool TB, int BM, bool BIAS>
 __device__ __forceinline__ void sgemm_cp_core(const float* __restrict__ A,
                                               const float* __restrict__ B,
-                                              float* __restrict__ C, unsigned m,
+                                              float* __restrict__ C,
+                                              const float* __restrict__ bias,
+                                              unsigned m,
                                               unsigned n, unsigned k, float scale,
                                               float offset, unsigned ksplit,
                                               unsigned sa, unsigned sb,
@@ -917,26 +939,30 @@ __device__ __forceinline__ void sgemm_cp_core(const float* __restrict__ A,
                         TB ? compB + (i & 1) * (BK * BM) : ringB[st], g, acc);
   }
   cp_async_wait_<0>();  // drain the trailing empty groups
-  sgemm_store_<BM>(C, m, n, scale, offset, ksplit < k, sp.sz, g, acc);
+  sgemm_store_<BM, BIAS>(C, bias, m, n, scale, offset, ksplit < k, sp.sz, g, acc);
 }
 
-// One __global__ per operand layout per tile (extern "C" for a stable symbol
-// the host looks up by name — cuda.h context::sgemm_).
-#define TL_SGEMM_KERNEL(NAME, TA, TB, BM)                                        \
+// One __global__ per operand layout per tile, plain and with a fused row bias
+// (extern "C" for a stable symbol the host looks up by name — cuda.h
+// context::sgemm_).
+#define TL_SGEMM_KERNEL(NAME, TA, TB, BM, BIAS)                                  \
   extern "C" __global__ void NAME(                                             \
       const float* __restrict__ A, const float* __restrict__ B,                \
-      float* __restrict__ C, unsigned m, unsigned n, unsigned k, float scale,   \
-      float offset, unsigned ksplit, unsigned sa, unsigned sb, unsigned sc) {   \
-    sgemm_cp_core<TA, TB, BM>(A, B, C, m, n, k, scale, offset, ksplit, sa, sb, \
-                              sc);                                             \
+      float* __restrict__ C, const float* __restrict__ bias, unsigned m,       \
+      unsigned n, unsigned k, float scale, float offset, unsigned ksplit,      \
+      unsigned sa, unsigned sb, unsigned sc) {                                 \
+    sgemm_cp_core<TA, TB, BM, BIAS>(A, B, C, bias, m, n, k, scale, offset,     \
+                                    ksplit, sa, sb, sc);                       \
   }
-#define TL_SGEMM_LAYOUTS(NAME, BM)           \
-  TL_SGEMM_KERNEL(NAME, false, false, BM)    \
-  TL_SGEMM_KERNEL(NAME##_nt, false, true, BM) \
-  TL_SGEMM_KERNEL(NAME##_tn, true, false, BM) \
-  TL_SGEMM_KERNEL(NAME##_tt, true, true, BM)
-TL_SGEMM_LAYOUTS(tl_sgemm_cp64, 64)
-TL_SGEMM_LAYOUTS(tl_sgemm_cp128, 128)
+#define TL_SGEMM_LAYOUTS(NAME, BM, BIAS)           \
+  TL_SGEMM_KERNEL(NAME, false, false, BM, BIAS)    \
+  TL_SGEMM_KERNEL(NAME##_nt, false, true, BM, BIAS) \
+  TL_SGEMM_KERNEL(NAME##_tn, true, false, BM, BIAS) \
+  TL_SGEMM_KERNEL(NAME##_tt, true, true, BM, BIAS)
+TL_SGEMM_LAYOUTS(tl_sgemm_cp64, 64, false)
+TL_SGEMM_LAYOUTS(tl_sgemm_cp128, 128, false)
+TL_SGEMM_LAYOUTS(tl_sgemm_cp64_bias, 64, true)
+TL_SGEMM_LAYOUTS(tl_sgemm_cp128_bias, 128, true)
 #undef TL_SGEMM_LAYOUTS
 #undef TL_SGEMM_KERNEL
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage

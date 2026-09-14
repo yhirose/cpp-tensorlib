@@ -205,13 +205,17 @@ struct sgemm_tile {
   unsigned bm, bk;
   long wave_min_blocks;
   unsigned single_min_k;
-  const char* names[4];
+  const char* names[8];  // NN, NT, TN, TT; then the same with a fused row bias
 };
 constexpr sgemm_tile sgemm_tiles[] = {
     {0, 64, 16, 0, 96,
-     {"tl_sgemm_cp64", "tl_sgemm_cp64_nt", "tl_sgemm_cp64_tn", "tl_sgemm_cp64_tt"}},
+     {"tl_sgemm_cp64", "tl_sgemm_cp64_nt", "tl_sgemm_cp64_tn", "tl_sgemm_cp64_tt",
+      "tl_sgemm_cp64_bias", "tl_sgemm_cp64_bias_nt", "tl_sgemm_cp64_bias_tn",
+      "tl_sgemm_cp64_bias_tt"}},
     {1, 128, 8, kWaveSingles, 0,
-     {"tl_sgemm_cp128", "tl_sgemm_cp128_nt", "tl_sgemm_cp128_tn", "tl_sgemm_cp128_tt"}},
+     {"tl_sgemm_cp128", "tl_sgemm_cp128_nt", "tl_sgemm_cp128_tn", "tl_sgemm_cp128_tt",
+      "tl_sgemm_cp128_bias", "tl_sgemm_cp128_bias_nt", "tl_sgemm_cp128_bias_tn",
+      "tl_sgemm_cp128_bias_tt"}},
 };
 
 struct context {
@@ -381,10 +385,10 @@ struct context {
   // The f32 SGEMM fast path, one kernel per tile (sgemm_tiles) and operand
   // layout, cached separately from the kop table since it has no kop of its
   // own.
-  CUfunction sgemm_fn[8] = {};
-  CUfunction sgemm_(bool ta, bool tb, const sgemm_tile& t) {
-    int layout = (ta ? 2 : 0) | (tb ? 1 : 0);
-    return cached_(sgemm_fn[t.id * 4 | layout], t.names[layout]);
+  CUfunction sgemm_fn[16] = {};
+  CUfunction sgemm_(bool ta, bool tb, bool bias, const sgemm_tile& t) {
+    int layout = (bias ? 4 : 0) | (ta ? 2 : 0) | (tb ? 1 : 0);
+    return cached_(sgemm_fn[t.id * 8 | layout], t.names[layout]);
   }
 
   // M7 decode GEMV (f32 and bf16-weight variants), cached like sgemm_.
@@ -581,6 +585,10 @@ struct context {
   // The graph's fused layer norm.
   CUfunction layer_norm_fn = nullptr;
   CUfunction layer_norm_() { return cached_(layer_norm_fn, "tl_layer_norm"); }
+
+  // A fused gemm bias laid under split partials (gemm_launch_).
+  CUfunction fill_rows_fn = nullptr;
+  CUfunction fill_rows_() { return cached_(fill_rows_fn, "tl_fill_rows"); }
 
   // M9 prefill: bulk cache fill + causal prefill attention.
   CUfunction kv_fill_fn = nullptr, kv_fill_bf16_fn = nullptr;
@@ -2040,24 +2048,28 @@ inline sgemm_splitk sgemm_splitk_(long base_blocks, unsigned k, const sgemm_tile
   return by_chunk(whole_slabs((k + (unsigned)want - 1) / (unsigned)want));
 }
 
-// C[bi](m,n) = (A[bi] @ B[bi]) * scale + offset for bi < batch, the batch
-// elements sa/sb floats apart (0 broadcasts) and C's packed at m·n. lda/ldb
-// row strides; trans reads a transposed view in place. One launch: the batch
-// rides on gridDim.z next to split-K. batch == 1 is the plain GEMM and keeps
-// the one-output-per-thread fallback (tl_sgemm) for the layouts the fast path
-// declines; batch > 1 has no fallback here and returns false, so the caller
-// loops per slice.
-inline bool gemm_batched(void* a, int64_t ao, int64_t lda, bool ta, int64_t sa,
+// C[bi](m,n) = (A[bi] @ B[bi]) * scale + offset (+ bias[j]) for bi < batch,
+// the batch elements sa/sb floats apart (0 broadcasts) and C's packed at m·n.
+// lda/ldb row strides; trans reads a transposed view in place; `bias`, when
+// given, is n contiguous floats at biaso added in the kernel's store. One
+// launch: the batch rides on gridDim.z next to split-K. batch == 1 is the
+// plain GEMM and keeps the one-output-per-thread fallback (tl_sgemm) for the
+// layouts the fast path declines; batch > 1 has no fallback here and returns
+// false, so the caller loops per slice.
+inline bool gemm_launch_(void* a, int64_t ao, int64_t lda, bool ta, int64_t sa,
                          void* b, int64_t bo, int64_t ldb, bool tb, int64_t sb,
                          void* out, int64_t oo, int64_t m, int64_t n, int64_t k,
-                         int64_t batch, float scale, float offset) {
+                         int64_t batch, float scale, float offset, void* bias,
+                         int64_t biaso) {
   auto& c = context::get();
   if (!c.ready || batch < 1) return false;
   c.device_read_(a);
   c.device_read_(b);
+  if (bias) c.device_read_(bias);
   c.device_write_(out);
   float* pa = context::off_(a, ao);
   float* pb = context::off_(b, bo);
+  float* pbias = bias ? context::off_(bias, biaso) : nullptr;
   float* po = context::off_(out, oo);
   unsigned um = (unsigned)m, un = (unsigned)n, uk = (unsigned)k;
 
@@ -2081,24 +2093,34 @@ inline bool gemm_batched(void* a, int64_t ao, int64_t lda, bool ta, int64_t sa,
     // Tile choice (sgemm_tile_), then split-K fills what the grid leaves.
     const sgemm_tile& t = sgemm_tile_(m, n, k, batch);
     unsigned gx = (un + t.bm - 1) / t.bm, gy = (um + t.bm - 1) / t.bm;
-    if (CUfunction f = c.sgemm_(ta, tb, t)) {
-      auto [S, ksplit] = sgemm_splitk_((long)gx * gy * batch, uk, t);
-      // gridDim.z carries batch × S; the driver caps it at 65535.
-      if ((int64_t)S * batch <= 65535) {
-        if (S > 1) {
-          // atomicAdd needs a zeroed C. Async on the stream where the driver
-          // has it (ordered before the launch, no host sync, capturable — as
-          // gemm_bf16_nt's is); the plain memset otherwise.
-          CUdeviceptr pc = reinterpret_cast<CUdeviceptr>(po);
-          size_t bytes = (size_t)batch * m * n * 4;
-          if (c.d.MemsetD8Async) c.d.MemsetD8Async(pc, 0, bytes, c.stream);
-          else c.d.MemsetD8(pc, 0, bytes);
-        }
-        unsigned usa = (unsigned)sa, usb = (unsigned)sb, usc = (unsigned)(m * n),
-                 uz = (unsigned)(S * batch);
-        return c.launch_(f, {gx, gy, uz}, {256}, 0, pa, pb, po, um, un, uk, scale,
-                         offset, ksplit, usa, usb, usc);
+    auto [S, ksplit] = sgemm_splitk_((long)gx * gy * batch, uk, t);
+    // A fused bias goes into the store unsplit, and under the partials split:
+    // their atomicAdds land on the bias rows in place of a zeroed C, so the
+    // split kernel is the plain one.
+    const bool store_bias = pbias && S == 1;
+    CUfunction f = c.sgemm_(ta, tb, store_bias, t);
+    // tl_fill_rows puts the rows on gridDim.y, which the driver caps at 65535
+    // like z below.
+    CUfunction fill = pbias && S > 1 && m <= 65535 ? c.fill_rows_() : nullptr;
+    // gridDim.z carries batch × S; the driver caps it at 65535.
+    if (f && (int64_t)S * batch <= 65535 && (!pbias || S == 1 || fill)) {
+      if (fill) {
+        if (!c.launch_(fill, {(un + 255) / 256, um}, {256}, 0, po, pbias, um, un))
+          return false;
+      } else if (S > 1) {
+        // atomicAdd needs a zeroed C. Async on the stream where the driver
+        // has it (ordered before the launch, no host sync, capturable — as
+        // gemm_bf16_nt's is); the plain memset otherwise.
+        CUdeviceptr pc = reinterpret_cast<CUdeviceptr>(po);
+        size_t bytes = (size_t)batch * m * n * 4;
+        if (c.d.MemsetD8Async) c.d.MemsetD8Async(pc, 0, bytes, c.stream);
+        else c.d.MemsetD8(pc, 0, bytes);
       }
+      unsigned usa = (unsigned)sa, usb = (unsigned)sb, usc = (unsigned)(m * n),
+               uz = (unsigned)(S * batch);
+      return c.launch_(f, {gx, gy, uz}, {256}, 0, pa, pb, po,
+                       store_bias ? pbias : nullptr, um, un, uk, scale, offset,
+                       ksplit, usa, usb, usc);
     }
   }
   if (batch != 1) return false;
@@ -2110,16 +2132,34 @@ inline bool gemm_batched(void* a, int64_t ao, int64_t lda, bool ta, int64_t sa,
   if (gx == 0) gx = 1;
   if (gy == 0) gy = 1;
   // kop::sgemm32 is routed to tl_sgemm by kernel_name_.
-  return c.launch_(c.fn_(kop::sgemm32), {gx, gy}, {bx, by}, 0, pa, pb, po, um,
-                   un, uk, ula, ulb, uta, utb, scale, offset);
+  return c.launch_(c.fn_(kop::sgemm32), {gx, gy}, {bx, by}, 0, pa, pb, po,
+                   pbias, um, un, uk, ula, ulb, uta, utb, scale, offset);
+}
+
+inline bool gemm_batched(void* a, int64_t ao, int64_t lda, bool ta, int64_t sa,
+                         void* b, int64_t bo, int64_t ldb, bool tb, int64_t sb,
+                         void* out, int64_t oo, int64_t m, int64_t n, int64_t k,
+                         int64_t batch, float scale, float offset) {
+  return gemm_launch_(a, ao, lda, ta, sa, b, bo, ldb, tb, sb, out, oo, m, n, k,
+                      batch, scale, offset, nullptr, 0);
 }
 
 // C(m,n) = (A @ B) * scale + offset: the batch == 1 case of gemm_batched.
 inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
                  int64_t ldb, bool tb, void* out, int64_t oo, int64_t m,
                  int64_t n, int64_t k, float scale, float offset) {
-  return gemm_batched(a, ao, lda, ta, 0, b, bo, ldb, tb, 0, out, oo, m, n, k, 1,
-                      scale, offset);
+  return gemm_launch_(a, ao, lda, ta, 0, b, bo, ldb, tb, 0, out, oo, m, n, k, 1,
+                      scale, offset, nullptr, 0);
+}
+
+// C(m,n) = (A @ B) * scale + offset + bias[j]: addmm's shape, the row bias
+// added in the gemm's own store rather than by a second pass over C.
+inline bool gemm_bias(void* a, int64_t ao, int64_t lda, bool ta, void* b,
+                      int64_t bo, int64_t ldb, bool tb, void* bias,
+                      int64_t biaso, void* out, int64_t oo, int64_t m,
+                      int64_t n, int64_t k, float scale, float offset) {
+  return gemm_launch_(a, ao, lda, ta, 0, b, bo, ldb, tb, 0, out, oo, m, n, k, 1,
+                      scale, offset, bias, biaso);
 }
 
 // Row op over the last axis: softmax writes rows×cols; row_sum/row_max write
@@ -2195,6 +2235,11 @@ inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
 inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
                          int64_t, int64_t, bool, int64_t, void*, int64_t,
                          int64_t, int64_t, int64_t, int64_t, float, float) {
+  return false;
+}
+inline bool gemm_bias(void*, int64_t, int64_t, bool, void*, int64_t, int64_t,
+                      bool, void*, int64_t, void*, int64_t, int64_t, int64_t,
+                      int64_t, float, float) {
   return false;
 }
 inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,

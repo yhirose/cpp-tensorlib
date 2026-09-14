@@ -1117,6 +1117,13 @@ inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
 // and returning false is the whole implementation either way — it sends the
 // evaluator down the widen-to-F32 CPU fallback. Keeps the gpu:: facade
 // symmetric with CUDA, so the one platform #ifdef stays the namespace alias.
+// A gemm with its row bias added in the store: CUDA-first; the evaluator adds
+// the bias with the broadcast kernel after gemm here.
+inline bool gemm_bias(void*, int64_t, int64_t, bool, void*, int64_t, int64_t,
+                      bool, void*, int64_t, void*, int64_t, int64_t, int64_t,
+                      int64_t, float, float) {
+  return false;
+}
 inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,

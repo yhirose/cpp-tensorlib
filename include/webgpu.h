@@ -1366,6 +1366,13 @@ inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
 // on purpose: both branches would define them identically, and returning false
 // is the whole implementation either way — it routes the op to CPU, which is
 // why each porting phase lands in a working state.
+// A gemm with its row bias added in the store: CUDA-first; the evaluator adds
+// the bias with the broadcast kernel after gemm here.
+inline bool gemm_bias(void*, int64_t, int64_t, bool, void*, int64_t, int64_t,
+                      bool, void*, int64_t, void*, int64_t, int64_t, int64_t,
+                      int64_t, float, float) {
+  return false;
+}
 inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,

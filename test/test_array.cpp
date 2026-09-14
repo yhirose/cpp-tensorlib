@@ -760,6 +760,32 @@ TEST_CASE("auto mode derives its matmul threshold on the first eval") {
   CHECK(tl::cpu::min_work_per_thread_() > 0);
 }
 
+TEST_CASE("dot + row bias fuses into the gemm and matches the unfused sum") {
+  // graph::fuse_dot_bias_ makes the bias a third input of the dot; the CUDA
+  // gemm adds it in its store (tail and split-K shapes below, both tiles), and
+  // every other path after the epilogue. Checked against the GPU/ref oracles
+  // and against the unfused sum (an evaluated dot plus the bias).
+  struct { int64_t m, k, n; } shapes[] = {
+      {3, 4, 5}, {129, 64, 130}, {256, 512, 512}, {512, 1024, 512}, {200, 1024, 136},
+  };
+  int seed = 1300;
+  for (auto s : shapes) {
+    auto A = random_array({s.m, s.k}, seed++);
+    auto B = random_array({s.k, s.n}, seed++), Bt = random_array({s.n, s.k}, seed++);
+    auto bias = random_array({s.n}, seed++), bias_row = random_array({1, s.n}, seed++);
+    const float rtol = 1e-4f, atol = std::max(1e-5f, 2e-7f * (float)s.k);
+    CHECK(matches_gpu_oracle([&] { return A.dot(B) + bias; }, rtol, atol));
+    CHECK(matches_gpu_oracle([&] { return bias_row + A.dot(Bt.transpose()); }, rtol, atol));
+    CHECK(matches_gpu_oracle([&] { return A.dot(B) * 0.5f + 1.0f + bias; }, rtol, atol));
+    CHECK(matches_gpu_oracle([&] { return (A.dot(B) + bias) * 2.0f - 1.0f; }, rtol, atol));
+    CHECK(tl::allclose((A.dot(B) + bias).eval(), A.dot(B).eval() + bias, rtol, atol));
+    // a shared dot: the fused copy leaves the plain product to its other reader
+    auto y = A.dot(B);
+    auto z = y + bias_row;
+    CHECK(tl::allclose(z.eval() - bias_row, y.eval(), rtol, atol));
+  }
+}
+
 TEST_CASE("affine fusion composes scalar chains") {
   auto a = array::from({1, 2, 3, 4}, {2, 2});
 
