@@ -369,6 +369,35 @@ fn softmax(@builtin(workgroup_id) wg : vec3<u32>,
   }
 }
 
+// Layer norm over the last axis with the affine epilogue: (x - mu) /
+// sqrt(var + eps) * g + b. A = x, B = g, D = b (p._pad3 its element offset),
+// p.arg = eps. Two tree sums (x, then the squared deviations), each scaled by
+// 1/N after the tree as row_reduce's mean is.
+@compute @workgroup_size(256, 1, 1)
+fn layer_norm(@builtin(workgroup_id) wg : vec3<u32>,
+              @builtin(local_invocation_index) lid : u32) {
+  let row = wg.x;
+  let src = p.a_off + row * p.N;
+  let dst = p.c_off + row * p.N;
+  let inv_n = 1.0 / f32(p.N);
+
+  var sum = 0.0;
+  for (var c : u32 = lid; c < p.N; c = c + T) { sum = sum + A[src + c]; }
+  let mu = tree_reduce(OP_ROW_SUM, lid, sum) * inv_n;
+
+  var ss = 0.0;
+  for (var c : u32 = lid; c < p.N; c = c + T) {
+    let v = A[src + c] - mu;
+    ss = ss + v * v;
+  }
+  let inv = 1.0 / sqrt(tree_reduce(OP_ROW_SUM, lid, ss) * inv_n + p.arg);
+
+  for (var c : u32 = lid; c < p.N; c = c + T) {
+    let y = (A[src + c] - mu) * inv * B[p.b_off + c] + D[p._pad3 + c];
+    C[dst + c] = y * p.scale + p.offset;
+  }
+}
+
 // One value per row, with the affine epilogue.
 @compute @workgroup_size(256, 1, 1)
 fn row_reduce(@builtin(workgroup_id) wg : vec3<u32>,

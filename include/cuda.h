@@ -576,6 +576,10 @@ struct context {
   CUfunction add_rmsnorm_fn = nullptr;
   CUfunction add_rmsnorm_() { return cached_(add_rmsnorm_fn, "tl_add_rmsnorm"); }
 
+  // The graph's fused layer norm.
+  CUfunction layer_norm_fn = nullptr;
+  CUfunction layer_norm_() { return cached_(layer_norm_fn, "tl_layer_norm"); }
+
   // M9 prefill: bulk cache fill + causal prefill attention.
   CUfunction kv_fill_fn = nullptr, kv_fill_bf16_fn = nullptr;
   CUfunction kv_fill_(bool bf16 = false) {
@@ -2093,6 +2097,29 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
                    pin, po, ur, uc, scale, offset);
 }
 
+// Layer norm over the last axis: out = (x - mu) · 1/sqrt(var + eps) · g + b per
+// row, affine epilogue; g and b are contiguous d-vectors. One block per row,
+// 256 threads, like row_op.
+inline bool layer_norm(void* x, int64_t xo, void* g, int64_t go, void* b,
+                       int64_t bo, void* out, int64_t oo, int64_t rows,
+                       int64_t cols, float eps, float scale, float offset) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(x);
+  c.device_read_(g);
+  c.device_read_(b);
+  c.device_write_(out);
+  float* px = context::off_(x, xo);
+  float* pg = context::off_(g, go);
+  float* pb = context::off_(b, bo);
+  float* po = context::off_(out, oo);
+  unsigned ur = (unsigned)rows, uc = (unsigned)cols;
+  unsigned block = 256;
+  return c.launch_(c.layer_norm_(), {ur ? ur : 1}, {block},
+                   block * sizeof(float), px, pg, pb, po, ur, uc, eps, scale,
+                   offset);
+}
+
 #else  // stubs (Apple, or a build without TENSORLIB_CUDA)
 
 // Only the gpu:: facade surface is stubbed — what array.h/storage.h dispatch
@@ -2131,6 +2158,10 @@ inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
 }
 inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
                    float) {
+  return false;
+}
+inline bool layer_norm(void*, int64_t, void*, int64_t, void*, int64_t, void*,
+                       int64_t, int64_t, int64_t, float, float, float) {
   return false;
 }
 inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,

@@ -177,6 +177,8 @@ struct node {
     attn_pre,  // fused causal prefill attention: row t is softmax(arg0 ·
                // q_t·K[..t]ᵀ)·V[..t]
     rope,      // rotary position embedding (arg0=base, axis=position offset)
+    layer_norm_,  // fused last-axis layer norm: inputs {x, gamma, beta},
+                  // arg0=eps
     sum_ax, mean_ax, max_ax, argmax_ax, sum_to_,
     pad_,   // zero-pad axis `axis` by `arg0` (=before) elements; `shape` is
             // the padded target (`after` is derivable: shape[axis] - before
@@ -464,6 +466,11 @@ class array {
   // [H,D] (decode, T=1) or [H,T,D] (prefill); `pos` is the position of t=0.
   static array rope(const array& x, int64_t pos, float base = 10000.0f);
   static array rmsnorm(const array& x, const array& weight, float eps = 1e-5f);
+  // Layer norm over the last axis, fused: (x - mean) / sqrt(var + eps) · gamma
+  // + beta, with gamma/beta holding the last dim's d weights ([d] or [1, d]).
+  // One node and one output where the composition takes nine.
+  static array layer_norm(const array& x, const array& gamma, const array& beta,
+                          float eps = 1e-5f);
   static array silu(const array& x);
   static array swiglu(const array& gate, const array& up);
 
@@ -1370,6 +1377,56 @@ inline array softmax(const array& a, int max_threads = 1) {
   return out;
 }
 
+// Layer norm over the last axis: (x - mu) · 1/sqrt(var + eps) · gamma + beta,
+// mu and var the row's mean and biased variance; gamma/beta are d-vectors
+// (their last axis holds all d). The arithmetic is the composition's —
+// mean(-1, keepdims), sub, square, mean, + eps, 1/sqrt, mul, mul, add — with
+// each sum folding the lanes ref::mean folds and 1/d scaling it after, so the
+// fused op and the composition agree on this backend. Rows are independent,
+// so `max_threads` spreads them as in softmax (default 1 is the oracle).
+inline array layer_norm(const array& x, const array& gamma, const array& beta,
+                        float eps, int max_threads = 1) {
+  auto out = array::empty(x.shape());
+  int64_t d = x.shape().back();
+  int64_t rows = x.size() / (d ? d : 1);
+  int64_t xs = x.strides().back();
+  int64_t gs = gamma.strides().back(), bs = beta.strides().back();
+  shape_t outer(x.shape().begin(), x.shape().end() - 1);
+  std::vector<int64_t> outer_strides(x.strides().begin(), x.strides().end() - 1);
+  std::vector<int64_t> row_off(rows);
+  detail::for_each_index(outer, {outer_strides},
+                         [&](int64_t i, const std::vector<int64_t>& off) {
+                           row_off[i] = off[0];
+                         });
+  const auto* pi = x.raw();
+  const auto* pg = gamma.raw();
+  const auto* pb = beta.raw();
+  auto* po = out.data();
+  const float inv_d = 1.0f / static_cast<float>(d);
+  auto add = [](float& a, float v) { a += v; };
+  auto rows_fn = [&](int64_t r0, int64_t r1) {
+    for (int64_t r = r0; r < r1; r++) {
+      const float* src = pi + row_off[r];
+      float* dst = po + r * d;
+      float mu = detail::fold_lanes(src, xs, d, 0.0f, add) * inv_d;
+      // dst holds the squared deviations for the second sum, then the output.
+      for (int64_t c = 0; c < d; c++) {
+        float v = src[c * xs] - mu;
+        dst[c] = v * v;
+      }
+      float var = detail::fold_lanes(dst, 1, d, 0.0f, add) * inv_d;
+      float inv = 1.0f / std::sqrt(var + eps);
+      for (int64_t c = 0; c < d; c++)
+        dst[c] = (src[c * xs] - mu) * inv * pg[c * gs] + pb[c * bs];
+    }
+  };
+  if (max_threads > 1)
+    cpu::thread_pool::instance().parallel_for(rows, rows_fn, max_threads);
+  else
+    rows_fn(0, rows);
+  return out;
+}
+
 inline array dot(const array& a_in, const array& b_in) {
   array a = a_in, b = b_in;
   bool vec_m = a.rank() == 1, vec_n = b.rank() == 1;
@@ -2248,6 +2305,26 @@ struct graph {
     return from_node(std::move(n));
   }
 
+  static array layer_norm(const array& x, const array& gamma,
+                          const array& beta, float eps) {
+    const auto& s = x.shape();
+    int64_t d = s.empty() ? 0 : s.back();
+    auto holds_d = [d](const array& w) {
+      return w.rank() >= 1 && w.shape().back() == d && w.size() == d;
+    };
+    if (d <= 0 || !holds_d(gamma) || !holds_d(beta))
+      throw std::invalid_argument(
+          "tl::layer_norm: expect rank>=1 x and gamma, beta holding its last "
+          "dim — got x " + shape_str(s) + ", gamma " + shape_str(gamma.shape()) +
+          ", beta " + shape_str(beta.shape()));
+    auto n = std::make_shared<node>();
+    n->op = op_t::layer_norm_;
+    n->shape = s;
+    n->arg0 = eps;
+    n->inputs = {as_node(x), as_node(gamma), as_node(beta)};
+    return from_node(std::move(n));
+  }
+
   // Materialized view of an evaluated node, for kernel consumption.
   static array wrap(const node& n) {
     array a;
@@ -2928,6 +3005,27 @@ struct graph {
     if (!out.storage_.native) return std::nullopt;
     if (!gpu::rope(x.storage_.native, out.storage_.native, rows, T, D, n.axis,
                    n.arg0))
+      return std::nullopt;
+    return out;
+  }
+
+  // Layer norm on the GPU: x, gamma and beta contiguous (gamma/beta d-vectors,
+  // graph::layer_norm checked). The kernels apply the epilogue in the store.
+  static std::optional<array> gpu_layer_norm_(const node& n, const array& x,
+                                              const array& g, const array& b) {
+    if (!gpu_mode_(x.size(), kernel_class::reduction)) return std::nullopt;
+    if (!x.contiguous() || !g.contiguous() || !b.contiguous())
+      return std::nullopt;
+    if (!x.storage_.native || !g.storage_.native || !b.storage_.native)
+      return std::nullopt;
+    auto out = array::empty(x.shape());
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    int64_t d = x.shape().back();
+    if (!gpu::layer_norm(x.storage_.native, x.offset_ * 4, g.storage_.native,
+                         g.offset_ * 4, b.storage_.native, b.offset_ * 4,
+                         out.storage_.native, out.offset_ * 4, x.size() / d, d,
+                         n.arg0, n.scale, n.offset))
       return std::nullopt;
     return out;
   }
@@ -3757,6 +3855,18 @@ struct graph {
         }
         break;
       }
+      case op_t::layer_norm_: {
+        auto x = in(0), g = in(1), b = in(2);
+        if (auto gp = gpu_layer_norm_(n, x, g, b)) {
+          r = std::move(*gp);
+          epi_done = true;
+        } else {
+          // Four streaming passes per element: sum, square, sum, store.
+          r = ref::layer_norm(x, g, b, n.arg0,
+                              own_threads_(x.size() * 4 * kStreamMacs));
+        }
+        break;
+      }
       case op_t::sum_ax:
       case op_t::max_ax: {
         // GPU row reductions cover the last-axis case (softmax/argmax
@@ -4174,6 +4284,11 @@ inline array array::rmsnorm(const array& x, const array& weight, float eps) {
   array ms = (x * x).mean(static_cast<int>(x.rank()) - 1, /*keepdims=*/true);
   array inv = 1.0f / (ms + eps).sqrt();  // [.,1] broadcasts over the last dim
   return (x * inv) * weight;
+}
+
+inline array array::layer_norm(const array& x, const array& gamma,
+                               const array& beta, float eps) {
+  return detail::graph::layer_norm(x, gamma, beta, eps);
 }
 
 inline array array::silu(const array& x) { return x * x.sigmoid(); }

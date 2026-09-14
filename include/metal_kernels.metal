@@ -833,6 +833,54 @@ kernel void softmax_(device const float* in [[buffer(0)]],
   for (uint c = lid; c < p.cols; c += T) dst[c] = exp(src[c] - row_max) * inv;
 }
 
+// Layer norm over the last axis with the affine epilogue: (x - mu) ·
+// 1/sqrt(var + eps) · g + b. Two tree sums (x, then the squared deviations),
+// each scaled by 1/cols after the tree as row_sum_'s mean is.
+struct layer_norm_params {
+  uint rows, cols;
+  float eps, scale, offset;
+};
+
+kernel void layer_norm_(device const float* x [[buffer(0)]],
+                        device const float* g [[buffer(1)]],
+                        device const float* b [[buffer(2)]],
+                        device float* out     [[buffer(3)]],
+                        constant layer_norm_params& p [[buffer(4)]],
+                        uint row [[threadgroup_position_in_grid]],
+                        uint lid [[thread_index_in_threadgroup]]) {
+  constexpr uint T = 256;
+  threadgroup float scratch[T];
+  device const float* src = x + row * p.cols;
+  device float* dst = out + row * p.cols;
+  float inv_n = 1.0f / float(p.cols);
+
+  float sum = 0.0f;
+  for (uint c = lid; c < p.cols; c += T) sum += src[c];
+  scratch[lid] = sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = T / 2; s > 0; s >>= 1) {
+    if (lid < s) scratch[lid] += scratch[lid + s];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  float mu = scratch[0] * inv_n;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float ss = 0.0f;
+  for (uint c = lid; c < p.cols; c += T) {
+    float v = src[c] - mu;
+    ss += v * v;
+  }
+  scratch[lid] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = T / 2; s > 0; s >>= 1) {
+    if (lid < s) scratch[lid] += scratch[lid + s];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  float inv = 1.0f / sqrt(scratch[0] * inv_n + p.eps);
+  for (uint c = lid; c < p.cols; c += T)
+    dst[c] = ((src[c] - mu) * inv * g[c] + b[c]) * p.scale + p.offset;
+}
+
 #define ROW_REDUCE(name, init, combine, finish)                              \
   kernel void name(device const float* in [[buffer(0)]],                     \
                    device float* out       [[buffer(1)]],                    \

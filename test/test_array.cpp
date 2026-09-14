@@ -983,6 +983,51 @@ TEST_CASE("rope GPU dispatch matches the CPU oracle") {
   for (int64_t i = 0; i < x.size(); i++) CHECK(pr[i] == px[i]);
 }
 
+TEST_CASE("layer_norm matches its composition, across the pool and on the GPU") {
+  // The nine-op composition the fused node replaces.
+  auto composed = [](const array& x, const array& g, const array& b) {
+    int last = static_cast<int>(x.rank()) - 1;
+    auto mu = x.mean(last, true);
+    auto diff = x - mu;
+    auto var = (diff * diff).mean(last, true);
+    return diff * (1.0f / (var + 1e-5f).sqrt()) * g + b;
+  };
+  auto x1 = random_array({5}, 1101);
+  auto g5 = random_array({5}, 1102), b5 = random_array({5}, 1103);
+  auto x2 = random_array({7, 33}, 1104);
+  auto g33 = random_array({33}, 1105), b33 = random_array({1, 33}, 1106);
+  auto x3 = random_array({4, 6, 40}, 1107);
+  auto g40 = random_array({1, 40}, 1108), b40 = random_array({40}, 1109);
+  auto xt = random_array({40, 6}, 1110).transpose();  // [6, 40], strided rows
+  auto xw = random_array({3, 700}, 1111);             // a row wider than 256
+  auto g700 = random_array({700}, 1112), b700 = random_array({700}, 1113);
+
+  auto matches_composed = [&](const array& x, const array& g, const array& b) {
+    return tl::allclose(array::layer_norm(x, g, b).eval(),
+                        composed(x, g, b).eval(), 1e-4f, 1e-5f);
+  };
+  CHECK(matches_composed(x1, g5, b5));
+  CHECK(matches_composed(x2, g33, b33));
+  CHECK(matches_composed(x3, g40, b40));
+  CHECK(matches_composed(xt, g40, b40));
+  CHECK(matches_composed(xw, g700, b700));
+
+  auto x4 = random_array({64, 512}, 1114);
+  auto g512 = random_array({512}, 1115), b512 = random_array({512}, 1116);
+  CHECK(cpu_matches_ref([&] { return array::layer_norm(x4, g512, b512); }));
+
+  CHECK(matches_gpu_oracle([&] { return array::layer_norm(x2, g33, b33); }));
+  CHECK(matches_gpu_oracle([&] { return array::layer_norm(x3, g40, b40); }));
+  CHECK(matches_gpu_oracle([&] { return array::layer_norm(xw, g700, b700); }));
+  CHECK(matches_gpu_oracle([&] { return array::layer_norm(x4, g512, b512); }));
+  // fused epilogue composes with the kernel's store.
+  CHECK(matches_gpu_oracle(
+      [&] { return array::layer_norm(x2, g33, b33) * 2.0f - 1.0f; }));
+
+  CHECK_THROWS(array::layer_norm(x2, random_array({32}, 1117), b33));
+  CHECK_THROWS(array::layer_norm(x2, g33, random_array({2, 33}, 1118)));
+}
+
 TEST_CASE("concat GPU dispatch matches the CPU oracle") {
   auto a = array::from({1, 2, 3, 4}, {2, 2});
   auto b = array::from({5, 6, 7, 8}, {2, 2});

@@ -549,6 +549,49 @@ __global__ void tl_softmax(const float* in, float* out, unsigned rows,
   for (unsigned c = t; c < cols; c += T) dst[c] = expf(src[c] - row_max) * inv;
 }
 
+// ---- layer norm over the last axis (rows×cols out), affine epilogue ----
+// out = (x - mu) * 1/sqrt(var + eps) * g + b; mu/var the row's mean and biased
+// variance. Two shared sums (x, then the squared deviations), each scaled by
+// 1/cols after the tree the way tl_row_sum's mean is, so the fused op reads the
+// numbers the mean(-1, keepdims) composition does on this backend.
+__global__ void tl_layer_norm(const float* x, const float* g, const float* b,
+                              float* out, unsigned rows, unsigned cols,
+                              float eps, float scale, float offset) {
+  unsigned row = blockIdx.x;
+  if (row >= rows) return;
+  const float* src = x + (size_t)row * cols;
+  float* dst = out + (size_t)row * cols;
+  extern __shared__ float sdata[];
+  unsigned t = threadIdx.x, T = blockDim.x;
+  float inv_n = 1.0f / (float)cols;
+
+  float sum = 0.0f;
+  for (unsigned c = t; c < cols; c += T) sum += src[c];
+  sdata[t] = sum;
+  __syncthreads();
+  for (unsigned s = T >> 1; s > 0; s >>= 1) {
+    if (t < s) sdata[t] += sdata[t + s];
+    __syncthreads();
+  }
+  float mu = sdata[0] * inv_n;
+  __syncthreads();
+
+  float ss = 0.0f;
+  for (unsigned c = t; c < cols; c += T) {
+    float v = src[c] - mu;
+    ss += v * v;
+  }
+  sdata[t] = ss;
+  __syncthreads();
+  for (unsigned s = T >> 1; s > 0; s >>= 1) {
+    if (t < s) sdata[t] += sdata[t + s];
+    __syncthreads();
+  }
+  float inv = 1.0f / sqrtf(sdata[0] * inv_n + eps);
+  for (unsigned c = t; c < cols; c += T)
+    dst[c] = ((src[c] - mu) * inv * g[c] + b[c]) * scale + offset;
+}
+
 // ---- SGEMM: C(m,n) = (A @ B) * scale + offset ----
 // lda/ldb are row strides; trans flags let a transposed (col-major) view be
 // read in place — same layout contract as metal::gemm / accel::gemm:

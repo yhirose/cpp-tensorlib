@@ -51,7 +51,8 @@ enum class kop {
   tanh_, sin_, cos_,             // unary_ext_op maps onto these
   clamp_, sum_to_,               // dedicated ops, mirroring cuda.h's own
   concat_part_, rope_,           // ditto -- Tensor.concat / RoPE's own dispatch
-  pow_s_, gt_s_, lt_s_, ge_s_, le_s_, eq_s_, ne_s_  // scalar_op maps onto these
+  pow_s_, gt_s_, lt_s_, ge_s_, le_s_, eq_s_, ne_s_,  // scalar_op maps onto these
+  layer_norm_                                        // the fused layer norm
 };
 
 // Comparisons (gt/lt/ge/le/eq/ne) are deliberately NOT kop values: kop is
@@ -172,6 +173,7 @@ struct context {
       case kop::le_s_: return "le_s_";
       case kop::eq_s_: return "eq_s_";
       case kop::ne_s_: return "ne_s_";
+      case kop::layer_norm_: return "layer_norm_";
     }
     return "";
   }
@@ -375,6 +377,11 @@ struct reduce_params {
   float scale, offset;
 };
 
+struct layer_norm_params {
+  uint32_t rows, cols;
+  float eps, scale, offset;
+};
+
 inline void set_buf_(objc::id enc, void* buf, int64_t off, unsigned long idx) {
   objc::send(enc, "setBuffer:offset:atIndex:", buf,
              static_cast<unsigned long>(off), idx);
@@ -475,6 +482,30 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
                            static_cast<uint32_t>(cols), scale, offset};
   objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
              static_cast<unsigned long>(sizeof(p)), 2ul);
+  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(rows), 1, 1},
+                          {256, 1, 1});
+  return true;
+}
+
+// Layer norm over the last axis: out = (x - mu) · 1/sqrt(var + eps) · g + b per
+// row, affine epilogue; g and b are contiguous d-vectors. One threadgroup per
+// row, like row_op.
+inline bool layer_norm(void* x, int64_t xo, void* g, int64_t go, void* b,
+                       int64_t bo, void* out, int64_t oo, int64_t rows,
+                       int64_t cols, float eps, float scale, float offset) {
+  auto& c = context::get();
+  if (!c.device) return false;
+  auto pso = c.pso_(kop::layer_norm_);
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  detail_::set_buf_(c.enc, x, xo, 0ul);
+  detail_::set_buf_(c.enc, g, go, 1ul);
+  detail_::set_buf_(c.enc, b, bo, 2ul);
+  detail_::set_buf_(c.enc, out, oo, 3ul);
+  detail_::layer_norm_params p{static_cast<uint32_t>(rows),
+                               static_cast<uint32_t>(cols), eps, scale, offset};
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), 4ul);
   detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(rows), 1, 1},
                           {256, 1, 1});
   return true;
@@ -1016,6 +1047,10 @@ inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
 }
 inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t,
                    float, float) {
+  return false;
+}
+inline bool layer_norm(void*, int64_t, void*, int64_t, void*, int64_t, void*,
+                       int64_t, int64_t, int64_t, float, float, float) {
   return false;
 }
 inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,

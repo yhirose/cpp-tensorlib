@@ -145,7 +145,7 @@ inline constexpr const char* kEntryPoints[] = {
     "softmax",      "row_reduce",  "pad",          "fold",
     "index_select", "index_add",  "scatter_axis", "ew_bcast_nd",
     "where_nd",     "cmp",        "clamp_",       "sum_to",
-    "concat_part",  "rope",        "ew_scalar"};
+    "concat_part",  "rope",        "ew_scalar",    "layer_norm"};
 
 // emscripten_webgpu_get_device() does not report "no device" — it hands
 // Module.preinitializedWebGPUDevice straight to importJsDevice, which reads
@@ -722,6 +722,34 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
   return c.encode_(entry, ma, mb, mo, p, rows, 1);
 }
 
+// Layer norm over the last axis: out = (x - mu) · 1/sqrt(var + eps) · g + b per
+// row, affine epilogue; g and b are contiguous d-vectors. One workgroup per
+// row, like row_op. A = x, B = g, D = b (p.pad3 its element offset), p.arg =
+// eps. b's mirror is resolved before operands_ stages anything, so a decline
+// leaves no half-staged operands behind.
+inline bool layer_norm(void* x, int64_t xo, void* g, int64_t go, void* b,
+                       int64_t bo, void* out, int64_t oo, int64_t rows,
+                       int64_t cols, float eps, float scale, float offset) {
+  auto& c = context::get();
+  if (!c.ready || rows <= 0 || cols <= 0) return false;
+  params p = {};
+  if (!elem_off_(xo, &p.a_off) || !elem_off_(go, &p.b_off) ||
+      !elem_off_(bo, &p.pad3) || !elem_off_(oo, &p.c_off)) {
+    return false;
+  }
+  context::mirror* mb = c.mirror_(b);
+  if (!mb) return false;
+  context::mirror *mx, *mg, *mo;
+  if (!operands_(c, x, g, out, &mx, &mg, &mo)) return false;
+  c.device_read_(b);
+  p.M = static_cast<uint32_t>(rows);
+  p.N = static_cast<uint32_t>(cols);
+  p.arg = eps;
+  p.scale = scale;
+  p.offset = offset;
+  return c.encode_("layer_norm", mx, mg, mo, p, rows, 1, mb);
+}
+
 // A ring, not one reused buffer: queue.WriteBuffer runs ahead of whatever is
 // still sitting in the unsubmitted encoder (see device_read_'s comment
 // above), so two pad/fold calls batched into the same unflushed pass would
@@ -1269,6 +1297,10 @@ inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
 }
 inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
                    float) {
+  return false;
+}
+inline bool layer_norm(void*, int64_t, void*, int64_t, void*, int64_t, void*,
+                       int64_t, int64_t, int64_t, float, float, float) {
   return false;
 }
 inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
