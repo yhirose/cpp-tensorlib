@@ -189,21 +189,28 @@ inline const char* kernel_name_(kop op) {
   }
 }
 
+// A launch places one block per SM up to this many blocks, two past it.
+constexpr long kWaveSingles = 80;
+
 // The f32 gemm's tiles (kernels/tensorlib_cuda.cu): a bm² block tile with a
-// bk-deep K slab (K must be a multiple) and the kernel per operand layout (NN,
-// NT, TN, TT). `single_fill` lets the wave plan (sgemm_wave_chunk_) cut
-// shallower layers to fill the SMs one block each when a wave's worth will not
-// come. `id` is the kernel cache slot (context::sgemm_).
+// bk-deep K slab (K must be a multiple), the kernel per operand layout (NN,
+// NT, TN, TT), and how it takes the wave plan (sgemm_wave_chunk_): from how
+// many blocks the plan beats the fill heuristics, and how shallow (along K) it
+// may cut layers to fill the SMs one block each (0: it does not). The 64²
+// takes the plan always; the 128² once it fills the SMs one block each (80
+// measured a win over the heuristics, 256×2048×512 +8%; 64 a loss to the 64²
+// tile, 256×512×2048 -9%). `id` is the kernel cache slot (context::sgemm_).
 struct sgemm_tile {
   int id;
   unsigned bm, bk;
-  bool single_fill;
+  long wave_min_blocks;
+  unsigned single_min_k;
   const char* names[4];
 };
 constexpr sgemm_tile sgemm_tiles[] = {
-    {0, 64, 16, true,
+    {0, 64, 16, 0, 96,
      {"tl_sgemm_cp64", "tl_sgemm_cp64_nt", "tl_sgemm_cp64_tn", "tl_sgemm_cp64_tt"}},
-    {1, 128, 8, false,
+    {1, 128, 8, kWaveSingles, 0,
      {"tl_sgemm_cp128", "tl_sgemm_cp128_nt", "tl_sgemm_cp128_tn", "tl_sgemm_cp128_tt"}},
 };
 
@@ -702,8 +709,8 @@ inline bool big_tile_(int64_t m, int64_t n, int64_t k, int64_t batch = 1) {
 // So split K into `full` equal layers that fit the wave, each at least
 // kWaveMinK deep (a block's fixed cost is some twenty 128² slabs), and when
 // slots stay spare, into full layers plus a shorter tail layer that cycles
-// `rounds` times through the spare slots while the full layers run. A
-// single_fill tile then cuts shallower layers, down to kSingleMinK, to fill the
+// `rounds` times through the spare slots while the full layers run. A tile
+// with a single_min_k then cuts shallower layers, down to that, to fill the
 // SMs one block each when the wave plan leaves fewer. Returns the chunk, k when
 // unsplit. bench_cuda_gemm (RTX 3090, own GF/s, one shape per process, the fill
 // heuristics → this): 512×1024×4096 16.2k → 18.1k, 512×4096×1024 15.8k →
@@ -711,8 +718,7 @@ inline bool big_tile_(int64_t m, int64_t n, int64_t k, int64_t batch = 1) {
 // with the pipelined 64² over the register-staged one, 256×768×768 7.0k →
 // 8.7k, 256×256×768 4.3k → 5.7k, 256×1024×256:nt 5.1k → 6.5k, single fill
 // 256×768×256:nt 5.1k → 5.6k and 256×512×256:nt 3.9k → 4.5k.
-constexpr long kWaveSingles = 80;
-constexpr unsigned kWaveMinK = 192, kSingleMinK = 96;
+constexpr unsigned kWaveMinK = 192;
 inline unsigned sgemm_wave_chunk_(long tiles, unsigned k, const sgemm_tile& t) {
   if (tiles >= kFillBlocks) return k;
   const long slabs = k / t.bk, min_slabs = kWaveMinK / t.bk;
@@ -724,21 +730,24 @@ inline unsigned sgemm_wave_chunk_(long tiles, unsigned k, const sgemm_tile& t) {
     if (slabs >= min_slabs * parts) chunk_slabs = (slabs * rounds + parts - 1) / parts;
   }
   const long layers = (slabs + chunk_slabs - 1) / chunk_slabs;
-  if (t.single_fill && tiles * layers < kWaveSingles) {
-    const long singles = std::min(kWaveSingles / tiles, slabs / (kSingleMinK / t.bk));
+  if (t.single_min_k && tiles * layers < kWaveSingles) {
+    const long singles = std::min(kWaveSingles / tiles, slabs / (t.single_min_k / t.bk));
     if (singles > layers) chunk_slabs = (slabs + singles - 1) / singles;
   }
-  const unsigned chunk = (unsigned)chunk_slabs * t.bk;
-  return chunk < k ? chunk : k;
+  return (unsigned)chunk_slabs * t.bk;
+}
+// A TL_* census knob as a number, -1 when unset; callers keep it in a static.
+inline long knob_(const char* name) {
+  const char* e = std::getenv(name);
+  return e ? std::atol(e) : -1L;
 }
 inline long sgemm_wave_blocks_(long tiles, unsigned k, const sgemm_tile& t) {
   const unsigned chunk = sgemm_wave_chunk_(tiles, k, t);
   return tiles * (long)((k + chunk - 1) / chunk);
 }
 
-// Which f32 tile: the 128² whenever its wave plan fills the SMs one block each
-// (80 blocks measured a win over the heuristics, 256×2048×512 +8%; 64 a loss
-// to the 64² tile, 256×512×2048 -9%), or its grid has a wave's worth of
+// Which f32 tile: the 128² whenever its wave plan reaches its wave_min_blocks,
+// or its grid has a wave's worth of
 // blocks, or the K is long enough for its pipeline to matter, or M is at
 // least 512 (four 128-rows against any N); the 64² for the short-K
 // few-hundred-row projections whose grid it quadruples — and always when K
@@ -750,15 +759,13 @@ inline long sgemm_wave_blocks_(long tiles, unsigned k, const sgemm_tile& t) {
 // census (when K allows its slab), read once like the other TL_* knobs.
 inline const sgemm_tile& sgemm_tile_(int64_t m, int64_t n, int64_t k,
                                      int64_t batch = 1) {
-  static const int forced = [] {
-    const char* e = std::getenv("TL_TILE");
-    return e ? std::atoi(e) : -1;
-  }();
-  constexpr int ntiles = sizeof(sgemm_tiles) / sizeof(sgemm_tiles[0]);
+  static const long forced = knob_("TL_TILE");
+  constexpr long ntiles = sizeof(sgemm_tiles) / sizeof(sgemm_tiles[0]);
   if (forced >= 0 && forced < ntiles && k % sgemm_tiles[forced].bk == 0)
     return sgemm_tiles[forced];
   const long tiles = blocks128_(m, n, batch);
-  bool big = sgemm_wave_blocks_(tiles, (unsigned)k, sgemm_tiles[1]) >= kWaveSingles ||
+  const sgemm_tile& big_tile = sgemm_tiles[1];
+  bool big = sgemm_wave_blocks_(tiles, (unsigned)k, big_tile) >= big_tile.wave_min_blocks ||
              tiles >= 64 || k >= 2048 || m >= 512 || k % 16 != 0;
   return sgemm_tiles[big ? 1 : 0];
 }
@@ -1999,8 +2006,8 @@ struct kv_cache {
 // global traffic is unchanged — the only cost is C written S× via atomicAdd
 // into a pre-zeroed buffer (the kernel folds scale/offset into the partials,
 // so a fused epilogue splits too). The wave plan (sgemm_wave_chunk_) sets S
-// for the 64² tile always, and for the 128² tile when it fills the SMs one
-// block each. The 128² grids it does not fill keep the fill heuristics: enough
+// once it puts the tile's wave_min_blocks on the grid (the 64² always). The
+// 128² grids it does not fill keep the fill heuristics: enough
 // splits to reach ~64 blocks with each at least 96 deep, then a long K keeps
 // splitting in slices of at least 1024 up to ~128 blocks (own GF/s:
 // 512×1024×4096 S=1 17.9k vs S=2 15.4k; 512×1024×1024 S=2 13.5k vs S=4
@@ -2017,27 +2024,20 @@ inline sgemm_splitk sgemm_splitk_(long base_blocks, unsigned k, const sgemm_tile
     if (chunk >= k) return {1, k};
     return {(k + chunk - 1) / chunk, chunk};
   };
-  auto knob = [](const char* name) {
-    const char* e = std::getenv(name);
-    return e ? std::atol(e) : -1L;
-  };
-  static const long forced_chunk = knob("TL_KSPLIT");
-  static const long forced = knob("TL_SPLITK");
-  if (forced_chunk > 0)
-    return by_chunk(((unsigned)forced_chunk + t.bk - 1) / t.bk * t.bk);
-  if (forced < 0 &&
-      (t.bm == 64 || sgemm_wave_blocks_(base_blocks, k, t) >= kWaveSingles))
-    return by_chunk(sgemm_wave_chunk_(base_blocks, k, t));
-  long want = forced;
-  if (want < 0) {
-    long by_fill = std::min((63 + base_blocks) / base_blocks,
-                            std::max<long>(1, k / 96));
-    long by_k = std::min<long>(k / 1024, (127 + base_blocks) / base_blocks);
-    want = std::max(by_fill, by_k);
+  static const long forced_chunk = knob_("TL_KSPLIT");
+  static const long forced = knob_("TL_SPLITK");
+  auto whole_slabs = [&t](unsigned chunk) { return (chunk + t.bk - 1) / t.bk * t.bk; };
+  if (forced_chunk > 0) return by_chunk(whole_slabs((unsigned)forced_chunk));
+  if (forced < 0) {
+    const unsigned wave = sgemm_wave_chunk_(base_blocks, k, t);
+    if (base_blocks * (long)((k + wave - 1) / wave) >= t.wave_min_blocks)
+      return by_chunk(wave);
   }
+  const long by_fill = std::min((63 + base_blocks) / base_blocks, std::max<long>(1, k / 96));
+  const long by_k = std::min<long>(k / 1024, (127 + base_blocks) / base_blocks);
+  const long want = forced >= 0 ? forced : std::max(by_fill, by_k);
   if (want <= 1) return {1, k};
-  const unsigned chunk = (k + (unsigned)want - 1) / (unsigned)want;
-  return by_chunk(std::max(t.bk, (chunk + t.bk - 1) / t.bk * t.bk));
+  return by_chunk(whole_slabs((k + (unsigned)want - 1) / (unsigned)want));
 }
 
 // C[bi](m,n) = (A[bi] @ B[bi]) * scale + offset for bi < batch, the batch

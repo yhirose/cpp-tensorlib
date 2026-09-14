@@ -549,6 +549,20 @@ __global__ void tl_softmax(const float* in, float* out, unsigned rows,
   for (unsigned c = t; c < cols; c += T) dst[c] = expf(src[c] - row_max) * inv;
 }
 
+// Tree-sum one value per thread through the block's shared `s`, handing every
+// thread the total; the trailing barrier lets a second sum reuse `s`.
+__device__ __forceinline__ float tl_tree_sum_(float* s, unsigned t, unsigned T, float v) {
+  s[t] = v;
+  __syncthreads();
+  for (unsigned h = T >> 1; h > 0; h >>= 1) {
+    if (t < h) s[t] += s[t + h];
+    __syncthreads();
+  }
+  const float total = s[0];
+  __syncthreads();
+  return total;
+}
+
 // ---- layer norm over the last axis (rows×cols out), affine epilogue ----
 // out = (x - mu) * 1/sqrt(var + eps) * g + b; mu/var the row's mean and biased
 // variance. Two shared sums (x, then the squared deviations), each scaled by
@@ -567,27 +581,13 @@ __global__ void tl_layer_norm(const float* x, const float* g, const float* b,
 
   float sum = 0.0f;
   for (unsigned c = t; c < cols; c += T) sum += src[c];
-  sdata[t] = sum;
-  __syncthreads();
-  for (unsigned s = T >> 1; s > 0; s >>= 1) {
-    if (t < s) sdata[t] += sdata[t + s];
-    __syncthreads();
-  }
-  float mu = sdata[0] * inv_n;
-  __syncthreads();
-
+  const float mu = tl_tree_sum_(sdata, t, T, sum) * inv_n;
   float ss = 0.0f;
   for (unsigned c = t; c < cols; c += T) {
     float v = src[c] - mu;
     ss += v * v;
   }
-  sdata[t] = ss;
-  __syncthreads();
-  for (unsigned s = T >> 1; s > 0; s >>= 1) {
-    if (t < s) sdata[t] += sdata[t + s];
-    __syncthreads();
-  }
-  float inv = 1.0f / sqrtf(sdata[0] * inv_n + eps);
+  const float inv = 1.0f / sqrtf(tl_tree_sum_(sdata, t, T, ss) * inv_n + eps);
   for (unsigned c = t; c < cols; c += T)
     dst[c] = ((src[c] - mu) * inv * g[c] + b[c]) * scale + offset;
 }
@@ -843,7 +843,7 @@ __device__ __forceinline__ void cp_async_wait_() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
-template <bool TA, bool TB, int BM, int STAGES>
+template <bool TA, bool TB, int BM>
 __device__ __forceinline__ void sgemm_cp_core(const float* __restrict__ A,
                                               const float* __restrict__ B,
                                               float* __restrict__ C, unsigned m,
@@ -853,7 +853,9 @@ __device__ __forceinline__ void sgemm_cp_core(const float* __restrict__ A,
                                               unsigned sc) {
   using G = sgemm_geom<BM>;
   constexpr int BK = G::BK;
-  static_assert(STAGES >= 3, "slab i+1 must have landed while slab i computes");
+  // Ring depth: at least 3, so slab i+1 has landed while slab i computes (a
+  // 3-deep ring measured at or below this one).
+  constexpr int STAGES = 4;
   // Ring stages hold an M/N-contiguous operand in compute layout [k][m|n]
   // and a K-contiguous one raw as [m|n][k]; the raw ones get a double-
   // buffered compute-layout tile of their own.
@@ -920,21 +922,21 @@ __device__ __forceinline__ void sgemm_cp_core(const float* __restrict__ A,
 
 // One __global__ per operand layout per tile (extern "C" for a stable symbol
 // the host looks up by name — cuda.h context::sgemm_).
-#define TL_SGEMM_KERNEL(NAME, CORE, TA, TB, ...)                                 \
+#define TL_SGEMM_KERNEL(NAME, TA, TB, BM)                                        \
   extern "C" __global__ void NAME(                                             \
       const float* __restrict__ A, const float* __restrict__ B,                \
       float* __restrict__ C, unsigned m, unsigned n, unsigned k, float scale,   \
       float offset, unsigned ksplit, unsigned sa, unsigned sb, unsigned sc) {   \
-    CORE<TA, TB, __VA_ARGS__>(A, B, C, m, n, k, scale, offset, ksplit, sa, sb, \
+    sgemm_cp_core<TA, TB, BM>(A, B, C, m, n, k, scale, offset, ksplit, sa, sb, \
                               sc);                                             \
   }
-#define TL_SGEMM_LAYOUTS(NAME, CORE, ...)                   \
-  TL_SGEMM_KERNEL(NAME, CORE, false, false, __VA_ARGS__)    \
-  TL_SGEMM_KERNEL(NAME##_nt, CORE, false, true, __VA_ARGS__) \
-  TL_SGEMM_KERNEL(NAME##_tn, CORE, true, false, __VA_ARGS__) \
-  TL_SGEMM_KERNEL(NAME##_tt, CORE, true, true, __VA_ARGS__)
-TL_SGEMM_LAYOUTS(tl_sgemm_cp64, sgemm_cp_core, 64, 4)
-TL_SGEMM_LAYOUTS(tl_sgemm_cp128, sgemm_cp_core, 128, 4)
+#define TL_SGEMM_LAYOUTS(NAME, BM)           \
+  TL_SGEMM_KERNEL(NAME, false, false, BM)    \
+  TL_SGEMM_KERNEL(NAME##_nt, false, true, BM) \
+  TL_SGEMM_KERNEL(NAME##_tn, true, false, BM) \
+  TL_SGEMM_KERNEL(NAME##_tt, true, true, BM)
+TL_SGEMM_LAYOUTS(tl_sgemm_cp64, 64)
+TL_SGEMM_LAYOUTS(tl_sgemm_cp128, 128)
 #undef TL_SGEMM_LAYOUTS
 #undef TL_SGEMM_KERNEL
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
@@ -977,8 +979,8 @@ extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 // (float adds land in arrival order), so it is opt-in per launch, not the
 // default.
 //
-// The K slab is prefetched into registers while the current one computes
-// (tl_sgemm_rb's trick): gateup 547 -> 461 us.
+// The K slab is prefetched into registers while the current one computes:
+// gateup 547 -> 461 us.
 }  // close extern "C": the __device__ core template below can't have C linkage;
    // each __global__ wrapper re-declares its own for a stable symbol.
 template <int BM, bool SPLITK>

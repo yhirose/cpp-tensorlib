@@ -1336,44 +1336,50 @@ array reduce_axis(const array& a, int axis, bool keepdims, float init, F f,
 
 namespace ref {
 
-// Softmax over the last axis. Rows are independent, so `max_threads` spreads
-// them across the thread pool (the own-CPU dispatch passes its work cap; the
-// default runs one thread, the oracle). Off the GPU this had been one thread
-// of scalar exps whatever the size — the whole remaining gap of a hand-written
-// attention once its gemms were even, and what causal_attention's backward
-// pays to rebuild its probabilities.
-inline array softmax(const array& a, int max_threads = 1) {
-  auto out = array::empty(a.shape());
+// fn(r, off) for each row r of `a`'s last axis, `off` its start walked through
+// the outer dims. Rows are independent, so `max_threads` spreads them across
+// the thread pool (the own-CPU dispatch passes its work cap; the default runs
+// one thread, the oracle, without touching the pool).
+template <typename F>
+inline void for_last_axis_rows_(const array& a, int max_threads, F&& fn) {
   int64_t cols = a.shape().back();
   int64_t rows = a.size() / (cols ? cols : 1);
-  int64_t col_stride = a.strides().back();
-  // Walk row starts through the outer dims (all but the last).
   shape_t outer(a.shape().begin(), a.shape().end() - 1);
-  std::vector<int64_t> outer_strides(a.strides().begin(),
-                                     a.strides().end() - 1);
+  std::vector<int64_t> outer_strides(a.strides().begin(), a.strides().end() - 1);
   std::vector<int64_t> row_off(rows);
   detail::for_each_index(outer, {outer_strides},
                          [&](int64_t i, const std::vector<int64_t>& off) {
                            row_off[i] = off[0];
                          });
-  const auto* pi = a.raw();
-  auto* po = out.data();
   auto rows_fn = [&](int64_t r0, int64_t r1) {
-    for (int64_t r = r0; r < r1; r++) {
-      const float* src = pi + row_off[r];
-      float* dst = po + r * cols;
-      float m = detail::fold_lanes(src, col_stride, cols, src[0],
-                                   [](float& a, float v) { a = std::max(a, v); });
-      for (int64_t c = 0; c < cols; c++) dst[c] = std::exp(src[c * col_stride] - m);
-      float denom = detail::fold_lanes(dst, 1, cols, 0.0f,
-                                       [](float& a, float v) { a += v; });
-      for (int64_t c = 0; c < cols; c++) dst[c] /= denom;
-    }
+    for (int64_t r = r0; r < r1; r++) fn(r, row_off[r]);
   };
   if (max_threads > 1)
     cpu::thread_pool::instance().parallel_for(rows, rows_fn, max_threads);
   else
     rows_fn(0, rows);
+}
+
+// Softmax over the last axis, rows across the pool (for_last_axis_rows_). Off
+// the GPU this had been one thread of scalar exps whatever the size — the
+// whole remaining gap of a hand-written attention once its gemms were even,
+// and what causal_attention's backward pays to rebuild its probabilities.
+inline array softmax(const array& a, int max_threads = 1) {
+  auto out = array::empty(a.shape());
+  int64_t cols = a.shape().back();
+  int64_t col_stride = a.strides().back();
+  const auto* pi = a.raw();
+  auto* po = out.data();
+  for_last_axis_rows_(a, max_threads, [&](int64_t r, int64_t off) {
+    const float* src = pi + off;
+    float* dst = po + r * cols;
+    float m = detail::fold_lanes(src, col_stride, cols, src[0],
+                                 [](float& a, float v) { a = std::max(a, v); });
+    for (int64_t c = 0; c < cols; c++) dst[c] = std::exp(src[c * col_stride] - m);
+    float denom = detail::fold_lanes(dst, 1, cols, 0.0f,
+                                     [](float& a, float v) { a += v; });
+    for (int64_t c = 0; c < cols; c++) dst[c] /= denom;
+  });
   return out;
 }
 
@@ -1382,48 +1388,34 @@ inline array softmax(const array& a, int max_threads = 1) {
 // (their last axis holds all d). The arithmetic is the composition's —
 // mean(-1, keepdims), sub, square, mean, + eps, 1/sqrt, mul, mul, add — with
 // each sum folding the lanes ref::mean folds and 1/d scaling it after, so the
-// fused op and the composition agree on this backend. Rows are independent,
-// so `max_threads` spreads them as in softmax (default 1 is the oracle).
+// fused op and the composition agree on this backend. Rows across the pool
+// (for_last_axis_rows_).
 inline array layer_norm(const array& x, const array& gamma, const array& beta,
                         float eps, int max_threads = 1) {
   auto out = array::empty(x.shape());
   int64_t d = x.shape().back();
-  int64_t rows = x.size() / (d ? d : 1);
   int64_t xs = x.strides().back();
   int64_t gs = gamma.strides().back(), bs = beta.strides().back();
-  shape_t outer(x.shape().begin(), x.shape().end() - 1);
-  std::vector<int64_t> outer_strides(x.strides().begin(), x.strides().end() - 1);
-  std::vector<int64_t> row_off(rows);
-  detail::for_each_index(outer, {outer_strides},
-                         [&](int64_t i, const std::vector<int64_t>& off) {
-                           row_off[i] = off[0];
-                         });
   const auto* pi = x.raw();
   const auto* pg = gamma.raw();
   const auto* pb = beta.raw();
   auto* po = out.data();
   const float inv_d = 1.0f / static_cast<float>(d);
   auto add = [](float& a, float v) { a += v; };
-  auto rows_fn = [&](int64_t r0, int64_t r1) {
-    for (int64_t r = r0; r < r1; r++) {
-      const float* src = pi + row_off[r];
-      float* dst = po + r * d;
-      float mu = detail::fold_lanes(src, xs, d, 0.0f, add) * inv_d;
-      // dst holds the squared deviations for the second sum, then the output.
-      for (int64_t c = 0; c < d; c++) {
-        float v = src[c * xs] - mu;
-        dst[c] = v * v;
-      }
-      float var = detail::fold_lanes(dst, 1, d, 0.0f, add) * inv_d;
-      float inv = 1.0f / std::sqrt(var + eps);
-      for (int64_t c = 0; c < d; c++)
-        dst[c] = (src[c * xs] - mu) * inv * pg[c * gs] + pb[c * bs];
+  for_last_axis_rows_(x, max_threads, [&](int64_t r, int64_t off) {
+    const float* src = pi + off;
+    float* dst = po + r * d;
+    float mu = detail::fold_lanes(src, xs, d, 0.0f, add) * inv_d;
+    // dst holds the squared deviations for the second sum, then the output.
+    for (int64_t c = 0; c < d; c++) {
+      float v = src[c * xs] - mu;
+      dst[c] = v * v;
     }
-  };
-  if (max_threads > 1)
-    cpu::thread_pool::instance().parallel_for(rows, rows_fn, max_threads);
-  else
-    rows_fn(0, rows);
+    float var = detail::fold_lanes(dst, 1, d, 0.0f, add) * inv_d;
+    float inv = 1.0f / std::sqrt(var + eps);
+    for (int64_t c = 0; c < d; c++)
+      dst[c] = (src[c * xs] - mu) * inv * pg[c * gs] + pb[c * bs];
+  });
   return out;
 }
 
