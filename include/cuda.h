@@ -741,7 +741,8 @@ inline unsigned sgemm_wave_chunk_(long tiles, unsigned k, const sgemm_tile& t) {
   }
   const long layers = (slabs + chunk_slabs - 1) / chunk_slabs;
   if (t.single_min_k && tiles * layers < kWaveSingles) {
-    const long singles = std::min(kWaveSingles / tiles, slabs / (t.single_min_k / t.bk));
+    const long singles =
+        std::min<long>(kWaveSingles / tiles, slabs / long(t.single_min_k / t.bk));
     if (singles > layers) chunk_slabs = (slabs + singles - 1) / singles;
   }
   return (unsigned)chunk_slabs * t.bk;
