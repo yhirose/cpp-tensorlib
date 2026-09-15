@@ -144,6 +144,25 @@ __global__ void tl_where_nd(const float* cond, const float* a,
   out[i] = cond[c_off] != 0.0f ? a[a_off] : b[b_off];
 }
 
+// ---- N-D strided copy (clone() of a permuted/transposed view, which the flat
+// one-input kernels cannot read): same flat-index decode as tl_where_nd, one
+// operand. meta packs [out_shape(rank), a_strides(rank)].
+__global__ void tl_copy_nd(const float* a, float* out, const long long* meta,
+                           int rank, unsigned n) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const long long* out_shape = meta;
+  const long long* a_strides = meta + rank;
+  long long rem = i;
+  long long a_off = 0;
+  for (int d = rank - 1; d >= 0; --d) {
+    long long dim = out_shape[d];
+    a_off += (rem % dim) * a_strides[d];
+    rem /= dim;
+  }
+  out[i] = a[a_off];
+}
+
 // ---- sum_to: sum `a` down to a smaller broadcast-target shape (array.h's
 // sum_to, the dual of broadcast_to that every arithmetic op's backward uses
 // to un-broadcast a gradient). Gather, not scatter: one thread per OUTPUT

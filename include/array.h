@@ -325,6 +325,13 @@ inline void (*run_hook)(const std::vector<node_ptr>&) = nullptr;
 // No-sync variant (graph::run_noflush) for view construction: kernels stay
 // in flight; a later host read barriers. Null falls back to run_hook.
 inline void (*run_noflush_hook)(const std::vector<node_ptr>&) = nullptr;
+// Drains the device stream (gpu::flush); the end of a defer_flush scope.
+inline void (*flush_hook)() = nullptr;
+
+// Open defer_flush scopes on this thread. While positive, a blocking
+// materialize leaves its kernels in flight like realize(); host reads still
+// barrier on their own, so only the sync points move.
+inline thread_local int defer_flush_depth = 0;
 
 // Monotonic stamp for graph::run's visited marking (O(1), allocation-free;
 // nodes are single-threaded like the rest of evaluation).
@@ -685,8 +692,10 @@ inline bool array::contiguous() const {
 
 namespace detail {
 
-// The one choke point making mixed CPU/GPU graphs safe: every CPU-side
-// buffer access flushes pending GPU work first.
+// Every CPU-side buffer access passes here first. On unified memory (Metal) a
+// pending command buffer may still be writing the very bytes the CPU is about
+// to touch, so it flushes; the CUDA device-mirror waits per buffer instead, in
+// host_sync_ below, and only when that buffer's live copy is on the device.
 inline void barrier_() {
 #ifdef TL_RUNTIME_HOOKS
   if (cpu_barrier_hook) cpu_barrier_hook();
@@ -698,8 +707,9 @@ inline void barrier_() {
 // Pull a storage's device copy back to host before a CPU access (D2H if the
 // device holds the live version), and on a write mark the device copy stale so
 // the next GPU op re-uploads. No-op on unified backends (Metal) and for heap
-// storages (native==null). Pairs with barrier_(): flush first (kernels done),
-// then reconcile this specific buffer.
+// storages (native==null). Pairs with barrier_(): that one waits where the
+// device can write host-visible bytes (Metal); this one waits for this
+// specific buffer, when its live copy is on the device (CUDA).
 inline void host_sync_(void* native, bool for_write) {
 #ifdef TL_RUNTIME_HOOKS
   if (host_sync_hook) host_sync_hook(native, for_write);
@@ -865,7 +875,19 @@ inline array array::unfold(int axis, int64_t win, int64_t step) const {
   return make_view_(*this, std::move(shape), std::move(strides), offset_);
 }
 
+namespace detail {
+// clone()'s device arm, defined once graph is complete.
+inline std::optional<array> device_clone_(const array& a);
+}  // namespace detail
+
 inline array array::clone() const {
+  // On a device buffer the host arm below reads the data back and writes it
+  // out again (CUDA: D2H, then H2D at the next device use); copy on the device
+  // instead and leave the kernel in flight, like any other realized result.
+  realize_();
+  if (storage_.native && storage_.dt == tl::dtype::f32) {
+    if (auto out = detail::device_clone_(*this)) return std::move(*out);
+  }
   ensure_();
   if (storage_.dt != tl::dtype::f32) {
     // bf16 arrays are contiguous weight leaves (to_bf16 output); byte-copy.
@@ -2599,6 +2621,27 @@ struct graph {
     return out;
   }
 
+  // clone()'s device arm: one gather per output element, so a strided view (a
+  // permute, a transpose) copies like a contiguous buffer, and bit-exact
+  // (unlike an identity affine, which turns -0.0 into +0.0).
+  static std::optional<array> gpu_copy_nd_(const array& a) {
+    if (!gpu_mode_(a.size(), kernel_class::elementwise) || !a.storage_.native) {
+      return std::nullopt;
+    }
+    int rank = static_cast<int>(a.rank());
+    if (rank <= 0) return std::nullopt;
+    auto out = array::empty(a.shape());
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    std::vector<int64_t> shape_v(a.shape().begin(), a.shape().end());
+    if (!gpu::copy_nd(a.storage_.native, a.offset_ * 4, a.strides_.data(),
+                      out.storage_.native, out.offset_ * 4, shape_v.data(),
+                      rank, out.size())) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
   // Add the fused dot offset to a materialized GEMM result (accel/cpu take
   // the scale as alpha; offset is a cheap post-pass). No-op when offset==0.
   static void apply_dot_offset_(array& out, float offset) {
@@ -4113,6 +4156,7 @@ struct graph {
 
 inline void array::materialize_(bool do_flush) const {
   if (!node_) return;
+  if (detail::defer_flush_depth > 0) do_flush = false;
   if (!node_->evaluated) {
 #ifdef TL_RUNTIME_HOOKS
     if (!detail::run_hook) {
@@ -4435,7 +4479,44 @@ inline void install_runtime_hooks() {
   detail::gpu_pending_hook = &gpu::pending;
   detail::run_hook = &detail::graph::run;
   detail::run_noflush_hook = &detail::graph::run_noflush;
+  detail::flush_hook = &gpu::flush;
 }
+
+// Waits for the device to finish what is in flight — results realized
+// without a sync (clone, realize) included — unless a defer_flush scope is
+// open, whose end waits instead.
+inline void synchronize() {
+  if (detail::defer_flush_depth > 0) return;
+#ifdef TL_RUNTIME_HOOKS
+  if (detail::flush_hook) detail::flush_hook();
+#else
+  gpu::flush();
+#endif
+}
+
+// Leaves every evaluation inside the scope in flight on the device and drains
+// the stream once when the outermost scope ends: a caller that evaluates op by
+// op (an autograd walk) pays one sync instead of one per evaluation.
+class defer_flush {
+ public:
+  defer_flush() { ++detail::defer_flush_depth; }
+  ~defer_flush() {
+    if (--detail::defer_flush_depth == 0) synchronize();
+  }
+  defer_flush(const defer_flush&) = delete;
+  defer_flush& operator=(const defer_flush&) = delete;
+};
+
+namespace detail {
+// clone()'s device arm: a bit-exact gather on the device, contiguous or
+// strided, launched straight on evaluated data — no graph, so a view's
+// reshape may clone mid-eval without a nested run. nullopt when the device
+// declines (no kernel on this backend, small in auto mode); clone() then
+// copies on the host as before.
+inline std::optional<array> device_clone_(const array& a) {
+  return graph::gpu_copy_nd_(a);
+}
+}  // namespace detail
 
 inline bool array_equal(const array& a, const array& b) {
   return allclose(a, b, 0.0f, 0.0f);

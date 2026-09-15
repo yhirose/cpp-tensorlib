@@ -6,7 +6,7 @@
 // drop-in. The contract, i.e. everything array.h/storage.h may call:
 //   lifecycle  available / pending / flush / cpu_barrier
 //   memory     alloc / release / sync_to_host
-//   kernels    binary / binary_bcast / binary_bcast_nd / where_nd / unary /
+//   kernels    binary / binary_bcast / binary_bcast_nd / where_nd / copy_nd / unary /
 //              gemm / gemm_batched / gemm_bias / row_op / pad / fold /
 //              index_select / index_add / scatter_to_axis / sum_to / compare /
 //              unary_ext / clamp / scalar_binary / concat_part / rope /

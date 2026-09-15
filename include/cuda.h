@@ -448,6 +448,10 @@ struct context {
     }
   }
   CUfunction where_nd_() { return cached_(where_nd_fn, "tl_where_nd"); }
+  // clone()'s strided arm (same meta layout as the bcast_nd family, one
+  // operand), so its own slot next to where_nd's.
+  CUfunction copy_nd_fn = nullptr;
+  CUfunction copy_nd_() { return cached_(copy_nd_fn, "tl_copy_nd"); }
 
   // array.h's sum_to (un-broadcast a gradient) -- gather-based, its own
   // meta-buffer layout (not the bcast_nd family's), so its own slot.
@@ -908,16 +912,19 @@ inline void release(void* buf, int64_t, float*) {
   c.mirrors.erase(it);
 }
 
-// Reconcile a buffer for a CPU access: flush pending kernels, then D2H if the
-// device holds the live copy. for_write invalidates the device copy (the host
-// is about to mutate it). No-op for heap storages / unknown pointers.
+// Reconcile a buffer for a CPU access: when the device holds the live copy,
+// wait for the kernels in flight (one may still be writing it) and D2H.
+// for_write invalidates the device copy (the host is about to mutate it). A
+// host-live buffer needs no wait: kernels only ever write device copies, and
+// an upload queued from it staged the pageable host bytes when it was queued.
+// No-op for heap storages / unknown pointers.
 inline void sync_to_host(void* native, bool for_write) {
   auto& c = context::get();
   if (!c.ready || !native) return;
   context::mirror* m = c.mirror_(native);
   if (!m) return;
-  if (c.pending) flush();
   if (m->where == context::DEVICE) {
+    if (c.pending) flush();
     c.d.MemcpyDtoH(m->host, m->dev, m->bytes);
     m->where = context::BOTH;
   }
@@ -1094,6 +1101,25 @@ inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
   float* po = context::off_(out_native, oo);
   unsigned un = static_cast<unsigned>(n);
   return c.launch1d_(c.where_nd_(), un, pc, pa, pb, po, pmeta, rank, un);
+}
+
+// N-D strided copy: clone()'s device arm for a view the flat one-input
+// kernels cannot read (a permute, a transpose). Same flat-index decode and
+// meta upload as where_nd above, one operand.
+inline bool copy_nd(void* a_native, int64_t ao, const int64_t* a_strides,
+                    void* out_native, int64_t oo, const int64_t* out_shape,
+                    int rank, int64_t n) {
+  if (rank <= 0 || rank > kPadFoldMaxRank) return false;
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(a_native);
+  c.device_write_(out_native);
+  const long long* pmeta = upload_bcast_meta_(c, out_shape, rank, {a_strides});
+  if (!pmeta) return false;
+  float* pa = context::off_(a_native, ao);
+  float* po = context::off_(out_native, oo);
+  unsigned un = static_cast<unsigned>(n);
+  return c.launch1d_(c.copy_nd_(), un, pa, po, pmeta, rank, un);
 }
 
 // Gather-based GPU dispatch for array.h's sum_to (un-broadcast a gradient).
@@ -2270,6 +2296,10 @@ inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
                      int64_t, const int64_t*, int, int64_t) {
   return false;
 }
+inline bool copy_nd(void*, int64_t, const int64_t*, void*, int64_t,
+                    const int64_t*, int, int64_t) {
+  return false;
+}
 inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
                    const int64_t*, int, int64_t, int64_t, void*, int64_t) {
   return false;
@@ -2294,9 +2324,11 @@ inline void sync_to_host(void*, bool) {}
 #endif
 
 // CPU-read barrier: sync the GPU before any host read of a managed buffer.
-inline void cpu_barrier() {
-  if (pending()) flush();
-}
+// Nothing to wait for before a CPU access in general: kernels write only
+// device copies, so sync_to_host waits per buffer, when that buffer's live copy
+// is on the device. Flushing here made every host read of a host-live buffer
+// (a rank-0 scalar operand, a freshly filled constant) drain the whole stream.
+inline void cpu_barrier() {}
 
 }  // namespace cuda
 

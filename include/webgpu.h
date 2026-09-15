@@ -1333,6 +1333,10 @@ inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
                      int64_t, const int64_t*, int, int64_t) {
   return false;
 }
+inline bool copy_nd(void*, int64_t, const int64_t*, void*, int64_t,
+                    const int64_t*, int, int64_t) {
+  return false;
+}
 inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
                    const int64_t*, int, int64_t, int64_t, void*, int64_t) {
   return false;

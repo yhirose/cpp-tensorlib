@@ -22,3 +22,8 @@ gemm_batched
 # for the transformer's projections and FFN; Metal/WebGPU add the bias with
 # their broadcast kernel after gemm meanwhile.
 gemm_bias
+
+# N-D strided copy: clone()'s device arm for a permuted/transposed view.
+# CUDA-first, where the host copy is a D2H and an H2D round trip; Metal's
+# unified memory makes its host copy a flush and a memcpy meanwhile.
+copy_nd
