@@ -1374,7 +1374,17 @@ TEST_CASE("the fused pullback's dq and logsumexp match explicit softmax math") {
 
   auto out = tl::array::attn_prefill(q, K, V, scale);
   auto got = tl::array::attn_prefill_bwd_dq(q, K, V, dO, out, scale);
+  // The pullback's kernels are CUDA's, so a CUDA build must take them — while
+  // a device of another kind declines and its caller composes the unfused
+  // form, which is what the gradient tests above already cover.
+#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
   REQUIRE(got.has_value());
+#endif
+  if (!got) {
+    MESSAGE("no fused attention pullback on this backend — skipping");
+    tl::device_ = prev;
+    return;
+  }
   const array& dq = got->first;
   const array& stats = got->second;
   CHECK(dq.shape() == tl::shape_t{H, T, D});
@@ -1437,9 +1447,17 @@ TEST_CASE("the fused pullback's dK and dV match explicit softmax math") {
 
   auto out = tl::array::attn_prefill(q, K, V, scale);
   auto dqs = tl::array::attn_prefill_bwd_dq(q, K, V, dO, out, scale);
-  REQUIRE(dqs.has_value());
-  auto got = tl::array::attn_prefill_bwd_dkv(q, K, V, dO, dqs->second, scale);
-  REQUIRE(got.has_value());
+  auto got = dqs ? tl::array::attn_prefill_bwd_dkv(q, K, V, dO, dqs->second,
+                                                   scale)
+                 : std::nullopt;
+#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
+  REQUIRE(got.has_value());  // as above: the kernels are CUDA's
+#endif
+  if (!got) {
+    MESSAGE("no fused attention pullback on this backend — skipping");
+    tl::device_ = prev;
+    return;
+  }
   const array& dK = got->first;
   const array& dV = got->second;
   CHECK(dK.shape() == tl::shape_t{H, T, D});
