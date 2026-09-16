@@ -229,6 +229,9 @@ TEST_CASE("an elementwise scalar on a widened view stays narrow") {
   auto src = random_array({1, 64}, 21);
   auto widened = src.broadcast_to({32, 64});
   auto materialized = widened.clone();
+  // 2.0f / x builds recip's node, so it needs a source away from zero
+  auto pos_src = random_array({1, 64}, 22).exp().eval();
+  auto pos = pos_src.broadcast_to({32, 64});
 
   auto widened_result = [](const array& x) {
     for (auto s : x.strides()) {
@@ -237,23 +240,32 @@ TEST_CASE("an elementwise scalar on a widened view stays narrow") {
     return false;
   };
 
-  // The ratchet: the scalar pushes down to the narrow source, so the result is
-  // a stride-0 view and no [32, 64] buffer is ever allocated or walked. Values
-  // cannot see this — scaling after widening gives the same numbers for 32x the
-  // memory — so without this check the push-down can be undone silently.
+  // The ratchet: the op pushes down to the narrow source, so the result is a
+  // stride-0 view and no [32, 64] buffer is ever allocated or walked. Values
+  // cannot see this — running the op after widening gives the same numbers for
+  // 32x the memory — so without this check the push-down can be undone silently.
   auto scaled = (widened * 2.0f + 1.0f).eval();
   CHECK(scaled.shape() == tl::shape_t{32, 64});
   CHECK(widened_result(scaled));
-  CHECK(widened_result(tl::pow(widened, 2.0f).eval()));  // scalar_binary's family
+  CHECK(widened_result(tl::pow(widened, 2.0f).eval()));   // scalar_binary
   CHECK(widened_result((widened > 0.0f).eval()));
+  CHECK(widened_result(widened.exp().eval()));            // unary
+  CHECK(widened_result(widened.clamp(-0.5f, 0.5f).eval()));
+  CHECK(widened_result((2.0f / pos).eval()));  // recip's node, then the affine
 
-  // and the numbers are the ones the widened operand would have given
-  CHECK(allclose(scaled, (materialized * 2.0f + 1.0f).eval()));
-  CHECK(allclose(tl::pow(widened, 2.0f).eval(),
-                 tl::pow(materialized, 2.0f).eval()));
-  CHECK(allclose((widened > 0.0f).eval(), (materialized > 0.0f).eval()));
+  // softmax is the exception: its normalizer sums along the axis, so the
+  // repeats belong in the sum and it has to see the widened operand.
+  auto sm = widened.softmax().eval();
+  CHECK(!widened_result(sm));
+  CHECK(allclose(sm, materialized.softmax().eval()));
+
+  // and the accelerated paths agree with the reference oracle
   CHECK(matches_oracle([&] { return src.broadcast_to({32, 64}) * 2.0f + 1.0f; }));
   CHECK(matches_oracle([&] { return tl::pow(src.broadcast_to({32, 64}), 2.0f); }));
+  CHECK(matches_oracle([&] { return src.broadcast_to({32, 64}) > 0.0f; }));
+  CHECK(matches_oracle([&] { return src.broadcast_to({32, 64}).exp(); }));
+  CHECK(matches_oracle([&] { return src.broadcast_to({32, 64}).clamp(-0.5f, 0.5f); }));
+  CHECK(matches_oracle([&] { return 2.0f / pos_src.broadcast_to({32, 64}); }));
 }
 
 TEST_CASE("axis reductions off the last axis match the oracle") {

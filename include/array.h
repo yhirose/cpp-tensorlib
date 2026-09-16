@@ -2168,6 +2168,11 @@ struct graph {
   }
 
   static array unary(op_t op, const array& a) {
+    if (commutes_with_widening_(op)) {  // see narrow_widened_
+      if (auto narrow = narrow_widened_(a)) {
+        return unary(op, *narrow).broadcast_to(a.shape());
+      }
+    }
     if (num_elements(a.shape()) <= kEagerTiny && eager_operand_(a) &&
         eager_cpu_ok_()) {
       switch (op) {  // direct switch, see graph::binary
@@ -2199,12 +2204,35 @@ struct graph {
   // Null when `a` carries no widened axis, i.e. there is nothing to push past.
   static std::optional<array> narrow_widened_(const array& a) {
     if (!a.materialized()) return std::nullopt;  // strides are the view's
-    std::optional<array> narrow;
+    shape_t narrow = a.shape();
     for (size_t i = 0; i < a.rank(); i++) {
-      if (a.strides()[i] != 0 || a.shape()[i] == 1) continue;
-      narrow = (narrow ? *narrow : a).slice(static_cast<int>(i), 0, 1);
+      if (a.strides()[i] == 0) narrow[i] = 1;
     }
-    return narrow;
+    if (narrow == a.shape()) return std::nullopt;  // nothing was widened
+    return make_view_(a, std::move(narrow), a.strides_, a.offset_);
+  }
+
+  // The ops unary() may push past a widening: each output element reads the
+  // input element at its own index. softmax is absent because its normalizer
+  // sums along an axis, where the repeats belong; affine because graph::affine
+  // sets the scale on the node unary() hands back, so it pushes down itself
+  // before building it. An op left out costs the wide buffer, never a wrong
+  // value -- the safe direction for a list a new op can be forgotten from.
+  static bool commutes_with_widening_(op_t op) {
+    switch (op) {
+      case op_t::recip:
+      case op_t::exp_:
+      case op_t::log_:
+      case op_t::sqrt_:
+      case op_t::sigmoid:
+      case op_t::relu:
+      case op_t::tanh_:
+      case op_t::sin_:
+      case op_t::cos_:
+        return true;
+      default:
+        return false;
+    }
   }
 
   // y = a * s + o. If `a` is an unevaluated op node, compose into a copy of
@@ -2314,6 +2342,9 @@ struct graph {
   // (arg0=lo, arg1=hi), so it can't go through the generic unary() builder
   // above (which has no params to carry them).
   static array clamp(const array& a, float lo, float hi) {
+    if (auto narrow = narrow_widened_(a)) {  // see narrow_widened_
+      return clamp(*narrow, lo, hi).broadcast_to(a.shape());
+    }
     auto n = std::make_shared<node>();
     n->op = op_t::clamp_;
     n->shape = a.shape();
