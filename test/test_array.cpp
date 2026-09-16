@@ -2099,8 +2099,12 @@ TEST_CASE("logsumexp: GPU dispatch matches the ref oracle") {
 }
 
 TEST_CASE("xent_bwd: the fused pullback matches (softmax - onehot) * g") {
+  // A CUDA build with no driver (the CI's fallback job) has the kernel
+  // compiled in but no device to run it on, so the REQUIRE below has to sit
+  // behind this, not just behind the build's own #if.
+  if (!tl::gpu_available()) return;
   auto prev = tl::device_;
-  tl::device_ = tl::device_type::gpu;
+  tl::use_gpu();
   const int64_t N = 8, C = 32;
   auto logits = random_array({N, C}, 46);
   auto targets = array::from({0, 5, 31, 12, 7, 7, 1, 30}, {N});
