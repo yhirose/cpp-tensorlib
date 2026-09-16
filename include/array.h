@@ -3471,6 +3471,24 @@ struct graph {
     return out;
   }
 
+  // An axis reduction that is not over the last axis has no row kernel (those
+  // read the last axis contiguously), but it is exactly a sum_to of the
+  // keepdims shape -- so the blocked reduction above covers it, and a
+  // `x.sum(0)` stops being the one reduction that runs on the host. nullopt
+  // when the device declines; the caller then takes the CPU oracle.
+  static std::optional<array> gpu_reduce_axis_(const array& a, int axis,
+                                               bool keepdims,
+                                               const shape_t& out_shape) {
+    int rank = static_cast<int>(a.rank());
+    if (axis < 0 || axis >= rank) return std::nullopt;
+    shape_t kd = a.shape();
+    kd[static_cast<size_t>(axis)] = 1;
+    auto g = gpu_sum_to_(a, kd);
+    if (!g) return std::nullopt;
+    if (keepdims) return g;
+    return g->reshape(out_shape);
+  }
+
   // GPU dispatch for the 6 comparison ops (gt/lt/ge/le/eq/ne) -- same shape
   // only (no broadcast form; ReLU/LeakyReLU/Clip's backward gate and the
   // concrete Tensor.gt/... callers never need one). Kept off the shared
@@ -4005,8 +4023,9 @@ struct graph {
       case op_t::sum_ax:
       case op_t::max_ax: {
         // GPU row reductions cover the last-axis case (softmax/argmax
-        // support shape); other axes fall to the CPU oracle. The epilogue
-        // applies in the kernel, so mark it done.
+        // support shape) and fold the epilogue in, so mark it done. Any other
+        // axis goes through sum_to's blocked kernel, which does not fold it;
+        // max has no sum_to dual and still takes the CPU oracle.
         auto a = in(0);
         gpu::kop k =
             n.op == op_t::sum_ax ? gpu::kop::row_sum : gpu::kop::row_max;
@@ -4014,6 +4033,11 @@ struct graph {
           if (auto g = gpu_row(k, a, n.shape, n.scale, n.offset)) {
             r = std::move(*g);
             epi_done = true;
+            break;
+          }
+        } else if (n.op == op_t::sum_ax) {
+          if (auto g = gpu_reduce_axis_(a, n.axis, n.keepdims, n.shape)) {
+            r = std::move(*g);
             break;
           }
         }
@@ -4025,7 +4049,9 @@ struct graph {
       case op_t::mean_ax: {
         // Last-axis mean lowers to the row_sum kernel with 1/cols folded into
         // the epilogue scale — no dedicated kernel, and no CPU fallback that
-        // would drain the GPU pipeline mid-graph (layer-norm's op mix).
+        // would drain the GPU pipeline mid-graph (layer-norm's op mix). Any
+        // other axis sums through the blocked kernel and takes 1/dim in the
+        // affine that follows, which is the epilogue.
         auto a = in(0);
         if (n.axis == static_cast<int>(a.rank()) - 1 &&
             a.shape().back() > 0) {
@@ -4033,6 +4059,15 @@ struct graph {
           if (auto g = gpu_row(gpu::kop::row_sum, a, n.shape, n.scale * inv,
                                n.offset)) {
             r = std::move(*g);
+            epi_done = true;
+            break;
+          }
+        } else if (n.axis < static_cast<int>(a.rank()) &&
+                   a.shape()[static_cast<size_t>(n.axis)] > 0) {
+          float inv =
+              1.0f / static_cast<float>(a.shape()[static_cast<size_t>(n.axis)]);
+          if (auto g = gpu_reduce_axis_(a, n.axis, n.keepdims, n.shape)) {
+            r = affine_(*g, n.scale * inv, n.offset);
             epi_done = true;
             break;
           }

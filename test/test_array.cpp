@@ -225,6 +225,33 @@ TEST_CASE("broadcast_to feeds ops and clones like a materialized copy") {
   CHECK(matches_oracle([&] { return src.broadcast_to({32, 64}) * other; }));
 }
 
+TEST_CASE("axis reductions off the last axis match the oracle") {
+  auto deep = random_array({96, 40}, 11);   // 96 rows: the blocked kernel
+  auto shallow = random_array({7, 40}, 12);  // 7 rows: the flat one
+  auto r3 = random_array({12, 5, 9}, 13);
+
+  CHECK(matches_oracle([&] { return deep.sum(0); }));
+  CHECK(matches_oracle([&] { return deep.sum(0, true); }));
+  CHECK(matches_oracle([&] { return deep.mean(0); }));
+  CHECK(matches_oracle([&] { return deep.mean(0, true); }));
+  CHECK(matches_oracle([&] { return shallow.sum(0); }));
+  CHECK(matches_oracle([&] { return shallow.mean(0); }));
+  CHECK(matches_oracle([&] { return r3.sum(0); }));
+  CHECK(matches_oracle([&] { return r3.sum(1); }));
+  CHECK(matches_oracle([&] { return r3.mean(1, true); }));
+
+  // A fused affine on the reduction: sum_ax leaves the epilogue to the shared
+  // pass while mean_ax folds 1/dim into one of its own, so both spellings have
+  // to come out the same as the oracle's.
+  CHECK(matches_oracle([&] { return deep.sum(0) * 2.0f + 1.0f; }));
+  CHECK(matches_oracle([&] { return deep.mean(0) * 3.0f - 0.5f; }));
+
+  // The last axis keeps its row kernel, and max still has no dual to take.
+  CHECK(matches_oracle([&] { return deep.sum(1); }));
+  CHECK(matches_oracle([&] { return deep.max(0); }));
+  CHECK(matches_oracle([&] { return deep.mean(1); }));
+}
+
 TEST_CASE("dot") {
   auto a = array::from({1, 2, 3, 4, 5, 6}, {2, 3});
   auto b = array::from({7, 8, 9, 10, 11, 12}, {3, 2});
