@@ -180,6 +180,51 @@ TEST_CASE("views over a lazy source defer without a batch boundary") {
   CHECK(tl::detail::visit_counter == before + 1);  // exactly one batch
 }
 
+TEST_CASE("broadcast_to widens with stride 0 and stays a view") {
+  auto a = array::from({1, 2, 3}, {1, 3});
+
+  auto b = a.broadcast_to({4, 3});
+  CHECK(b.shape() == tl::shape_t{4, 3});
+  CHECK(!b.contiguous());
+  CHECK(b.at({0, 0}) == 1.0f);
+  CHECK(b.at({3, 2}) == 3.0f);
+  // a view: the widened axis reads the source's single row
+  a.data()[1] = 20.0f;
+  CHECK(b.at({2, 1}) == 20.0f);
+
+  // rank expansion: missing leading axes widen too
+  auto row = array::from({5, 6}, {2});
+  auto r3 = row.broadcast_to({2, 2, 2});
+  CHECK(r3.shape() == tl::shape_t{2, 2, 2});
+  CHECK(r3.at({1, 1, 0}) == 5.0f);
+
+  // same shape is a no-op, and an incompatible one throws
+  CHECK(a.broadcast_to({1, 3}).shape() == tl::shape_t{1, 3});
+  CHECK_THROWS_AS(a.broadcast_to({4, 4}), std::invalid_argument);
+
+  // sum_to is its dual: widen then reduce returns the scaled source
+  auto back = a.broadcast_to({4, 3}).sum_to({1, 3});
+  CHECK(back.at({0, 0}) == 4.0f);
+  CHECK(back.at({0, 1}) == 80.0f);
+}
+
+TEST_CASE("broadcast_to feeds ops and clones like a materialized copy") {
+  auto src = random_array({1, 64}, 7);
+  auto other = random_array({32, 64}, 8);
+
+  // an op against the view matches the same op against a real copy
+  auto widened = src.broadcast_to({32, 64});
+  auto materialized = widened.clone();
+  CHECK(materialized.contiguous());
+  CHECK(allclose(widened, materialized));
+  CHECK(allclose((widened + other).eval(), (materialized + other).eval()));
+  CHECK(allclose((widened * other).eval(), (materialized * other).eval()));
+
+  // and through the ref oracle, so the accelerated paths are checked too
+  CHECK(matches_oracle([&] { return src.broadcast_to({32, 64}) + other; }));
+  CHECK(matches_oracle([&] { return src.broadcast_to({32, 64}) * other; }));
+}
+
 TEST_CASE("dot") {
   auto a = array::from({1, 2, 3, 4, 5, 6}, {2, 3});
   auto b = array::from({7, 8, 9, 10, 11, 12}, {3, 2});

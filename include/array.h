@@ -491,6 +491,11 @@ class array {
   // over leading dims and size-1 dims. `shape` must broadcast to shape().
   array sum_to(shape_t shape) const;
 
+  // Widen to `shape` (sum_to's dual, and the VJP of a reduction): the added
+  // and size-1 axes get stride 0, so this is a view, not a copy. shape() must
+  // broadcast to `shape`.
+  array broadcast_to(shape_t shape) const;
+
   // In-place accumulate (eager): this += b, broadcasting b. Mutates the
   // underlying storage — visible through every view sharing it, and through
   // unevaluated graphs holding it as a constant. Intended for gradient
@@ -871,6 +876,27 @@ inline array array::unfold(int axis, int64_t win, int64_t step) const {
                       std::move(strides), offset_,
                       {static_cast<int>(ax)}, step);
   }
+  realize_();
+  return make_view_(*this, std::move(shape), std::move(strides), offset_);
+}
+
+inline array array::broadcast_to(shape_t shape) const {
+  if (shape == shape_) return *this;
+  if (shape.size() < shape_.size()) {
+    throw std::invalid_argument("tl::broadcast_to: target rank is lower");
+  }
+  size_t lead = shape.size() - shape_.size();
+  for (size_t i = 0; i < shape_.size(); i++) {
+    if (shape_[i] != 1 && shape_[i] != shape[lead + i]) {
+      throw std::invalid_argument("tl::broadcast_to: shape does not broadcast");
+    }
+  }
+  auto strides = detail::broadcast_strides(shape_, strides_, shape);
+  // The widened axes step 0, which every consumer that takes per-operand
+  // strides handles (the broadcast kernels, the CPU walker, clone's gather).
+  // A lazy source materializes first: view nodes carry a vkind and there is
+  // none for widening, and the callers (a reduction's VJP) hold an evaluated
+  // gradient anyway.
   realize_();
   return make_view_(*this, std::move(shape), std::move(strides), offset_);
 }
@@ -2539,9 +2565,9 @@ struct graph {
     // Rank-2 broadcast (bias / row vector / column vector / scalar): one
     // stride-parameterized kernel keeps the op on the GPU — a CPU fallback
     // here drains the whole pending pipeline (commit + wait) mid-graph.
-    if (!a.contiguous() || !b.contiguous()) {
-      return std::nullopt;
-    }
+    // The kernels below read each operand through its own strides, so a
+    // strided operand (a transposed view, or the stride-0 one broadcast_to
+    // returns) belongs on this path too rather than on the CPU oracle.
     auto bk = to_bcast_kop_(n.op);
     if (!bk) return std::nullopt;
     // Any other rank (a Transformer's [N,S,D] LayerNorm broadcasting a
