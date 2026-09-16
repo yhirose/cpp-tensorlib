@@ -832,6 +832,25 @@ TEST_CASE("auto mode derives its matmul threshold on the first eval") {
   CHECK(tl::cpu::min_work_per_thread_() > 0);
 }
 
+TEST_CASE("the auto census keeps out of the caller's defer_flush scope") {
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+  const int64_t saved = tl::detail::graph::auto_matmul_;
+  tl::detail::graph::auto_matmul_ = -1;  // census again, in a scope this time
+  tl::use_auto();
+  {
+    // What an autograd walk opens. The census must not borrow it: under the
+    // scope its GPU timings would skip their sync and its kernels would stay
+    // in flight, and a pipeline in flight sends every op below to the GPU
+    // however small.
+    tl::defer_flush defer;
+    random_array({8, 8}, 700).dot(random_array({8, 8}, 701)).eval();
+    CHECK(!tl::gpu::pending());
+  }
+  tl::detail::graph::auto_matmul_ = saved;
+  tl::device_ = prev;
+}
+
 TEST_CASE("dot + row bias fuses into the gemm and matches the unfused sum") {
   // graph::fuse_dot_bias_ makes the bias a third input of the dot; the CUDA
   // gemm adds it in its store (tail and split-K shapes below, both tiles), and

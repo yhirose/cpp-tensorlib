@@ -2498,6 +2498,16 @@ struct graph {
         return;
       }
     }
+    // The census measures what the auto rule compares: GPU total, kernel plus
+    // sync. A caller evaluating inside a defer_flush scope (an autograd walk
+    // opens one) would lend it to the census, and that scope suppresses every
+    // flush below it — the GPU timings would drop their sync and win at the
+    // smallest size, and the stream would still be in flight when the caller's
+    // own graph resumed, where gpu_mode_'s "never break a running pipeline"
+    // rule sends every op to the GPU however small. Suspend the scope for the
+    // measurement and drain what it queued.
+    const int saved_depth = defer_flush_depth;
+    defer_flush_depth = 0;
     using clk = std::chrono::steady_clock;
     auto median_us = [](auto&& f) {
       f();
@@ -2528,6 +2538,8 @@ struct graph {
         break;
       }
     }
+    gpu::flush();
+    defer_flush_depth = saved_depth;
     device_ = saved;
     auto_matmul_ = chosen;
     if (trace)
