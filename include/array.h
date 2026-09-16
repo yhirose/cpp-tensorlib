@@ -180,6 +180,8 @@ struct node {
     layer_norm_,  // fused last-axis layer norm: inputs {x, gamma, beta},
                   // arg0=eps
     sum_ax, mean_ax, max_ax, argmax_ax, sum_to_,
+    lse_ax,  // log(sum(exp)) along `axis` — softmax's denominator, reduced
+             // to one value per row without the probabilities in between.
     pad_,   // zero-pad axis `axis` by `arg0` (=before) elements; `shape` is
             // the padded target (`after` is derivable: shape[axis] - before
             // - input.shape()[axis]). A real write, not a view — see pad_.
@@ -193,6 +195,10 @@ struct node {
     scatter_axis_,  // one-hot scatter into a new trailing axis. inputs=
                     // {indices, values}, same shape; `shape` is theirs
                     // with that axis (size = shape.back()) appended.
+    gather_axis_,   // scatter_axis_'s dual: the one element each position
+                    // labels, back out of the trailing axis. inputs=
+                    // {src, indices}; `shape` is indices' (one axis fewer
+                    // than src's).
     concat_,  // N-ary: inputs are the parts, joined along `axis`. `shape`
               // is the output (every dim but `axis` matches the parts;
               // `axis` is their sum) — same "target shape as op parameter"
@@ -489,6 +495,15 @@ class array {
       const array& q, const array& K, const array& V, const array& dout,
       const array& stats, float scale);
 
+  // Softmax cross-entropy's pullback, given the forward's row logsumexp:
+  // out[i,j] = g[i] · (exp(logits[i,j] - lse[i]) - [j == targets[i]]) in one
+  // pass. logits and the result are [N, C]; lse, targets and g are [N].
+  // Eager for the same reason the attention pullback is, and nullopt when no
+  // kernel takes it — the caller then composes (softmax - onehot) · g, which
+  // walks that matrix four more times.
+  static std::optional<array> xent_bwd(const array& logits, const array& lse,
+                                       const array& targets, const array& g);
+
   // Transformer building blocks (M9 model surface). RoPE is a fused op (needs
   // cos/sin); RMSNorm/SiLU/SwiGLU are pure compositions of existing ops (so they
   // ride the tuned kernels and are autograd-ready when VJPs land). RoPE input is
@@ -508,6 +523,11 @@ class array {
   array mean(int axis, bool keepdims = false) const;
   array max(int axis, bool keepdims = false) const;
   array argmax(int axis, bool keepdims = false) const;
+
+  // log(sum(exp(x))) along `axis`, numerically stable — softmax's own
+  // denominator, without the probabilities in between. On the last axis one
+  // fused pass reads the row once; any other axis composes.
+  array logsumexp(int axis, bool keepdims = false) const;
 
   // Reduce broadcast dims back to `shape` (the VJP of broadcasting): sums
   // over leading dims and size-1 dims. `shape` must broadcast to shape().
@@ -626,10 +646,18 @@ array index_add(const array& indices, const array& values,
 // argmax's own host-loop backward: `max(axis)`/`argmax(axis)` pick one
 // element out of a window; this scatters a gradient back into that same
 // window shape -- e.g. a pooling layer's own hand-derived backward. No
-// native VJP yet: that would need this op's own dual (gather one element
-// per position back out of the window axis), which no caller needs today.
+// native VJP yet, though the dual it would need is now gather_from_axis
+// just below.
 array scatter_to_axis(const array& indices, const array& values,
                       int64_t size);
+
+// scatter_to_axis's dual: out[...] = src[..., indices[...]] -- the one
+// element each position labels, back out of the trailing axis. `src` is
+// shaped like some scatter_to_axis output (indices' shape plus that axis)
+// and the result is indices' shape. Cross-entropy names a row's target
+// logit with this instead of multiplying by a one-hot matrix; a pooling
+// backward would use it as max(axis)'s own gather. indices get no gradient.
+array gather_from_axis(const array& src, const array& indices);
 
 array sum_to(const array& a, shape_t shape);
 
@@ -1453,6 +1481,34 @@ inline array softmax(const array& a, int max_threads = 1) {
   return out;
 }
 
+// log(sum(exp)) over the last axis, one value per row. One pass: the row
+// carries a running max and the sum of exp below it, rescaling the sum
+// whenever a larger element arrives — the same fold the CUDA kernel's threads
+// do, so the two backends agree. `out_shape` is the reduced shape (keepdims
+// or not); either way there is one output per row.
+inline array logsumexp(const array& a, const shape_t& out_shape,
+                       int max_threads = 1) {
+  auto out = array::empty(out_shape);
+  int64_t cols = a.shape().back();
+  int64_t col_stride = a.strides().back();
+  const auto* pi = a.raw();
+  auto* po = out.data();
+  for_last_axis_rows_(a, max_threads, [&](int64_t r, int64_t off) {
+    const float* src = pi + off;
+    float m = -3.402823466e+38f, s = 0.0f;
+    for (int64_t c = 0; c < cols; c++) {
+      float v = src[c * col_stride];
+      if (v > m) {
+        s *= std::exp(m - v);  // s is 0 on the first step, so -FLT_MAX is safe
+        m = v;
+      }
+      s += std::exp(v - m);
+    }
+    po[r] = m + std::log(s);
+  });
+  return out;
+}
+
 // Layer norm over the last axis: (x - mu) · 1/sqrt(var + eps) · gamma + beta,
 // mu and var the row's mean and biased variance; gamma/beta are d-vectors
 // (their last axis holds all d). The arithmetic is the composition's —
@@ -1804,6 +1860,39 @@ inline array scatter_to_axis(const array& indices, const array& values,
     po[out_off + k] = pv[v_off];
     for (size_t d = r; d-- > 0;) {
       if (++idx[d] < v_shape[d]) break;
+      idx[d] = 0;
+    }
+  }
+  return out;
+}
+
+// scatter_to_axis's dual: out[pos] = src[pos, indices[pos]], one element per
+// position out of the trailing axis. A manual walk like index_select's --
+// the label makes that axis's offset data-dependent, which no fixed reindex
+// could express.
+inline array gather_from_axis(const array& src, const array& indices,
+                              const shape_t& out_shape) {
+  auto out = array::empty(out_shape);
+  auto* po = out.data();
+  const auto* ps = src.raw();
+  const auto* pidx = indices.raw();
+  size_t r = indices.rank();
+  const auto& idx_strides = indices.strides();
+  const auto& src_strides = src.strides();
+  const auto& out_strides = out.strides();
+  std::vector<int64_t> idx(r, 0);
+  int64_t n = out.size();
+  for (int64_t i = 0; i < n; i++) {
+    int64_t idx_off = 0, src_off = 0, out_off = 0;
+    for (size_t d = 0; d < r; d++) {
+      idx_off += idx[d] * idx_strides[d];
+      src_off += idx[d] * src_strides[d];
+      out_off += idx[d] * out_strides[d];
+    }
+    int64_t k = static_cast<int64_t>(std::llround(pidx[idx_off]));
+    po[out_off] = ps[src_off + k * src_strides[r]];
+    for (size_t d = r; d-- > 0;) {
+      if (++idx[d] < out_shape[d]) break;
       idx[d] = 0;
     }
   }
@@ -2182,6 +2271,22 @@ struct graph {
     n->shape = indices.shape();
     n->shape.push_back(size);
     n->inputs = {as_node(indices), as_node(values)};
+    return from_node(std::move(n));
+  }
+
+  static array gather_from_axis(const array& src, const array& indices) {
+    if (src.rank() != indices.rank() + 1 ||
+        !std::equal(indices.shape().begin(), indices.shape().end(),
+                    src.shape().begin())) {
+      throw std::invalid_argument(
+          "tl::gather_from_axis: src must be indices' shape plus a trailing "
+          "axis -- got src " + shape_str(src.shape()) + ", indices " +
+          shape_str(indices.shape()));
+    }
+    auto n = std::make_shared<node>();
+    n->op = op_t::gather_axis_;
+    n->shape = indices.shape();
+    n->inputs = {as_node(src), as_node(indices)};
     return from_node(std::move(n));
   }
 
@@ -3077,6 +3182,50 @@ struct graph {
     return out;
   }
 
+  // Cross-entropy's pullback from the forward's row logsumexp (see
+  // array::xent_bwd). Eager and GPU-only, the same bargain the attention
+  // halves below make: one pass here, or the caller's composition.
+  static std::optional<array> xent_bwd(const array& x, const array& lse,
+                                       const array& tgt, const array& g) {
+    const auto& s = x.shape();
+    if (s.size() != 2) {
+      throw std::invalid_argument("tl::xent_bwd: expect rank-2 logits — got " +
+                                  shape_str(s));
+    }
+    int64_t rows = s[0], cols = s[1];
+    shape_t per_row{rows};
+    if (lse.shape() != per_row || tgt.shape() != per_row ||
+        g.shape() != per_row) {
+      throw std::invalid_argument(
+          "tl::xent_bwd: expect lse, targets and g all [" +
+          std::to_string(rows) + "] — got lse " + shape_str(lse.shape()) +
+          ", targets " + shape_str(tgt.shape()) + ", g " +
+          shape_str(g.shape()));
+    }
+    if (!gpu_mode_(rows * cols, kernel_class::elementwise)) return std::nullopt;
+    x.realize();
+    lse.realize();
+    tgt.realize();
+    g.realize();
+    if (!x.contiguous() || !lse.contiguous() || !tgt.contiguous() ||
+        !g.contiguous()) {
+      return std::nullopt;
+    }
+    if (!x.storage_.native || !lse.storage_.native || !tgt.storage_.native ||
+        !g.storage_.native) {
+      return std::nullopt;
+    }
+    auto out = array::empty(s);
+    if (!out.storage_.native) return std::nullopt;
+    if (!gpu::xent_bwd(x.storage_.native, x.offset_ * 4, lse.storage_.native,
+                       lse.offset_ * 4, tgt.storage_.native, tgt.offset_ * 4,
+                       g.storage_.native, g.offset_ * 4, out.storage_.native,
+                       out.offset_ * 4, rows, cols)) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
   // The query half of the fused pullback (see array::attn_prefill_bwd_dq).
   // Eager and GPU-only: the kernel writes dq and L, or this declines and the
   // caller composes the unfused form. The shape rules are the forward's, plus
@@ -3552,6 +3701,52 @@ struct graph {
                               values.storage_.native, values.offset_ * 4,
                               out.storage_.native, out.offset_ * 4,
                               values.size(), out_shape.back())) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
+  // scatter_to_axis's dual — the GPU-dispatch twin of ref::gather_from_axis.
+  // A pure gather: nothing to pre-zero, no atomics.
+  static std::optional<array> gpu_gather_from_axis_(const array& src,
+                                                    const array& indices,
+                                                    const shape_t& out_shape) {
+    if (!gpu_mode_(num_elements(out_shape), kernel_class::elementwise) ||
+        !src.contiguous() || !indices.contiguous()) {
+      return std::nullopt;
+    }
+    if (!src.storage_.native || !indices.storage_.native) return std::nullopt;
+    auto out = array::empty(out_shape);
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    if (!gpu::gather_from_axis(src.storage_.native, src.offset_ * 4,
+                               indices.storage_.native, indices.offset_ * 4,
+                               out.storage_.native, out.offset_ * 4, out.size(),
+                               src.shape().back())) {
+      return std::nullopt;
+    }
+    return out;
+  }
+
+  // Row logsumexp over the last axis: gpu_row's shape rules, but its own
+  // entry point rather than a kop — the enum is dispatched unconditionally
+  // (see metal.h's comment), and this kernel is CUDA's alone for now.
+  static std::optional<array> gpu_row_logsumexp_(const array& a,
+                                                 const shape_t& out_shape,
+                                                 float scale, float offset) {
+    if (!gpu_mode_(a.size(), kernel_class::reduction) || !a.contiguous() ||
+        a.rank() == 0) {
+      return std::nullopt;
+    }
+    if (!a.storage_.native) return std::nullopt;
+    int64_t cols = a.shape().back();
+    int64_t rows = cols ? a.size() / cols : 0;
+    auto out = array::empty(out_shape);
+    if (out.size() == 0) return out;
+    if (!out.storage_.native) return std::nullopt;
+    if (!gpu::row_logsumexp(a.storage_.native, a.offset_ * 4,
+                            out.storage_.native, out.offset_ * 4, rows, cols,
+                            scale, offset)) {
       return std::nullopt;
     }
     return out;
@@ -4134,6 +4329,18 @@ struct graph {
         }
         break;
       }
+      case op_t::lse_ax: {
+        // Only ever built for the last axis (array::logsumexp composes any
+        // other), so this is the fused row kernel or the one-pass CPU fold.
+        auto a = in(0);
+        if (auto g = gpu_row_logsumexp_(a, n.shape, n.scale, n.offset)) {
+          r = std::move(*g);
+          epi_done = true;
+          break;
+        }
+        r = ref::logsumexp(a, n.shape, own_threads_(a.size() * kStreamMacs));
+        break;
+      }
       case op_t::sum_ax:
       case op_t::max_ax: {
         // GPU row reductions cover the last-axis case (softmax/argmax
@@ -4254,6 +4461,17 @@ struct graph {
           r = std::move(*g);
         } else {
           r = ref::index_add(indices, values, n.shape);
+        }
+        break;
+      }
+      case op_t::gather_axis_: {
+        auto src = in(0);
+        auto indices = in(1);
+        check_labels_(indices, src.shape().back(), "gather_from_axis");
+        if (auto g = gpu_gather_from_axis_(src, indices, n.shape)) {
+          r = std::move(*g);
+        } else {
+          r = ref::gather_from_axis(src, indices, n.shape);
         }
         break;
       }
@@ -4472,6 +4690,9 @@ inline array scatter_to_axis(const array& indices, const array& values,
                              int64_t size) {
   return detail::graph::scatter_to_axis(indices, values, size);
 }
+inline array gather_from_axis(const array& src, const array& indices) {
+  return detail::graph::gather_from_axis(src, indices);
+}
 
 inline array array::sum_to(shape_t shape) const {
   return detail::graph::sum_to(*this, std::move(shape));
@@ -4572,6 +4793,13 @@ inline std::optional<std::pair<array, array>> array::attn_prefill_bwd_dkv(
   return detail::graph::attn_prefill_bwd_dkv(q, K, V, dout, stats, scale);
 }
 
+inline std::optional<array> array::xent_bwd(const array& logits,
+                                            const array& lse,
+                                            const array& targets,
+                                            const array& g) {
+  return detail::graph::xent_bwd(logits, lse, targets, g);
+}
+
 inline array array::rope(const array& x, int64_t pos, float base) {
   return detail::graph::rope(x, pos, base);
 }
@@ -4606,6 +4834,19 @@ inline array array::mean(int axis, bool keepdims) const {
 inline array array::max(int axis, bool keepdims) const {
   return detail::graph::reduce(detail::node::op_t::max_ax, *this, axis,
                                keepdims);
+}
+inline array array::logsumexp(int axis, bool keepdims) const {
+  int ax = axis;
+  auto out_shape = detail::reduce_shape(shape_, ax, keepdims);  // normalizes ax
+  if (ax == static_cast<int>(rank()) - 1) {
+    return detail::graph::reduce(detail::node::op_t::lse_ax, *this, ax,
+                                 keepdims);
+  }
+  // No fused kernel off the last axis; the stable composition is exact and
+  // every op in it already has one.
+  auto m = max(ax, /*keepdims=*/true);
+  auto r = (*this - m).exp().sum(ax, /*keepdims=*/true).log() + m;
+  return keepdims ? r : r.reshape(out_shape);
 }
 inline array array::argmax(int axis, bool keepdims) const {
   return detail::graph::reduce(detail::node::op_t::argmax_ax, *this, axis,

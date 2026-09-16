@@ -582,6 +582,21 @@ extern "C" __global__ void tl_scatter_axis(const float* __restrict__ idx,
   out[(size_t)i * size + k] = values[i];
 }
 
+// ---- gather_from_axis: scatter_to_axis's dual. Takes the one element each
+// position labels out of the trailing axis: out[i] = src[i*size + idx[i]].
+// One thread per output, no conflicts -- the read-side twin of the write
+// above, so cross-entropy can name a row's target logit without building the
+// one-hot [rows, size] matrix the scatter would.
+extern "C" __global__ void tl_gather_axis(const float* __restrict__ src,
+                                          const float* __restrict__ idx,
+                                          float* __restrict__ out,
+                                          unsigned size, unsigned n) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  long long k = (long long)(idx[i] + 0.5f);
+  out[i] = src[(size_t)i * size + k];
+}
+
 // ---- softmax over the last axis (rows×cols out); scale/offset ignored ----
 // Numerically stable (subtract row max). Two shared reductions (max, sum).
 __global__ void tl_softmax(const float* in, float* out, unsigned rows,
@@ -616,6 +631,65 @@ __global__ void tl_softmax(const float* in, float* out, unsigned rows,
   }
   float inv = 1.0f / sdata[0];
   for (unsigned c = t; c < cols; c += T) dst[c] = expf(src[c] - row_max) * inv;
+}
+
+// ---- row logsumexp over the last axis (one value per row); affine epilogue.
+// One block per row, ONE pass: each thread carries a running (max, sum-of-
+// exp-below-that-max) pair for its own columns and the tree merges pairs, so
+// the row is read once where tl_softmax above reads it three times and writes
+// a whole row back. Cross-entropy's forward is this plus a gather.
+__global__ void tl_row_logsumexp(const float* in, float* out, unsigned rows,
+                                 unsigned cols, float scale, float offset) {
+  unsigned row = blockIdx.x;
+  if (row >= rows) return;
+  const float* src = in + (size_t)row * cols;
+  extern __shared__ float sdata[];
+  unsigned t = threadIdx.x, T = blockDim.x;
+  float* sm = sdata;      // each thread's running max
+  float* ss = sdata + T;  // and its sum of exp(x - that max)
+
+  float m = -3.402823466e+38f, s = 0.0f;
+  for (unsigned c = t; c < cols; c += T) {
+    float v = src[c];
+    if (v > m) {
+      s *= expf(m - v);  // s is 0 on the first step, so -FLT_MAX is safe here
+      m = v;
+    }
+    s += expf(v - m);
+  }
+  sm[t] = m;
+  ss[t] = s;
+  __syncthreads();
+  for (unsigned h = T >> 1; h > 0; h >>= 1) {
+    if (t < h) {
+      float m1 = sm[t], s1 = ss[t], m2 = sm[t + h], s2 = ss[t + h];
+      float mm = fmaxf(m1, m2);
+      ss[t] = s1 * expf(m1 - mm) + s2 * expf(m2 - mm);
+      sm[t] = mm;
+    }
+    __syncthreads();
+  }
+  if (t == 0) out[row] = (sm[0] + logf(ss[0])) * scale + offset;
+}
+
+// ---- softmax cross-entropy's pullback, from the forward's row logsumexp:
+// dx[i,j] = g[i] · (exp(x[i,j] - lse[i]) - [j == target[i]]). One read and one
+// write of [rows, cols], where composing it re-derives the probabilities, then
+// builds a one-hot, subtracts and scales -- four more passes over the same
+// matrix. The forward keeps lse (one float per row) instead of those probs.
+extern "C" __global__ void tl_xent_bwd(const float* __restrict__ x,
+                                       const float* __restrict__ lse,
+                                       const float* __restrict__ tgt,
+                                       const float* __restrict__ g,
+                                       float* __restrict__ out, unsigned cols,
+                                       unsigned n) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  unsigned row = i / cols, col = i % cols;
+  float p = expf(x[i] - lse[row]);
+  long long k = (long long)(tgt[row] + 0.5f);
+  if ((long long)col == k) p -= 1.0f;
+  out[i] = p * g[row];
 }
 
 // Tree-sum one value per thread through the block's shared `s`, handing every

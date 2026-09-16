@@ -429,6 +429,19 @@ struct context {
     return cached_(scatter_axis_fn, "tl_scatter_axis");
   }
 
+  // Cross-entropy's three: the trailing-axis gather (scatter_axis_'s dual),
+  // the one-pass row logsumexp its forward reduces with, and the pullback
+  // that rebuilds the softmax from that logsumexp.
+  CUfunction gather_axis_fn = nullptr, row_logsumexp_fn = nullptr,
+             xent_bwd_fn = nullptr;
+  CUfunction gather_axis_() {
+    return cached_(gather_axis_fn, "tl_gather_axis");
+  }
+  CUfunction row_logsumexp_() {
+    return cached_(row_logsumexp_fn, "tl_row_logsumexp");
+  }
+  CUfunction xent_bwd_() { return cached_(xent_bwd_fn, "tl_xent_bwd"); }
+
   // N-D broadcast binary (any rank) and N-D broadcast ternary select
   // (Tensor.where's GPU dispatch) -- new capabilities, one kernel per op
   // like the rank-2 kop/fn_() vocabulary above, but not part of that
@@ -1383,6 +1396,67 @@ inline bool scatter_to_axis(void* idx_native, int64_t idxo,
   unsigned un = static_cast<unsigned>(n);
   unsigned usize = static_cast<unsigned>(size);
   return c.launch1d_(c.scatter_axis_(), un, pidx, pv, po, usize, un);
+}
+
+// scatter_to_axis's dual: out[i] = src[i * size + indices[i]], taking the one
+// element each position labels out of the trailing axis. One thread per
+// output, so — like index_select — no conflicts and nothing to pre-zero.
+inline bool gather_from_axis(void* src_native, int64_t so, void* idx_native,
+                             int64_t idxo, void* out_native, int64_t oo,
+                             int64_t n, int64_t size) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(src_native);
+  c.device_read_(idx_native);
+  c.device_write_(out_native);
+  float* ps = context::off_(src_native, so);
+  float* pidx = context::off_(idx_native, idxo);
+  float* po = context::off_(out_native, oo);
+  unsigned un = static_cast<unsigned>(n);
+  unsigned usize = static_cast<unsigned>(size);
+  return c.launch1d_(c.gather_axis_(), un, ps, pidx, po, usize, un);
+}
+
+// Row logsumexp over the last axis: log(sum exp) per row, affine epilogue.
+// One block per row like row_op, but each thread carries a running (max, sum)
+// pair through the tree, so it takes two shared floats per thread instead of
+// one — and reads the row once where a max pass plus a sum pass reads it twice.
+inline bool row_logsumexp(void* in, int64_t io, void* out, int64_t oo,
+                          int64_t rows, int64_t cols, float scale,
+                          float offset) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(in);
+  c.device_write_(out);
+  float* pin = context::off_(in, io);
+  float* po = context::off_(out, oo);
+  unsigned ur = (unsigned)rows, uc = (unsigned)cols;
+  unsigned block = 256;
+  return c.launch_(c.row_logsumexp_(), {ur ? ur : 1}, {block},
+                   2 * block * sizeof(float), pin, po, ur, uc, scale, offset);
+}
+
+// Softmax cross-entropy's pullback, from the forward's row logsumexp:
+// out[i,j] = g[i] · (exp(x[i,j] - lse[i]) - [j == targets[i]]). x and out are
+// [rows, cols]; lse, targets and g are one value per row.
+inline bool xent_bwd(void* x, int64_t xo, void* lse, int64_t lo, void* tgt,
+                     int64_t to, void* g, int64_t go, void* out, int64_t oo,
+                     int64_t rows, int64_t cols) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_read_(x);
+  c.device_read_(lse);
+  c.device_read_(tgt);
+  c.device_read_(g);
+  c.device_write_(out);
+  float* px = context::off_(x, xo);
+  float* pl = context::off_(lse, lo);
+  float* pt = context::off_(tgt, to);
+  float* pg = context::off_(g, go);
+  float* po = context::off_(out, oo);
+  unsigned un = static_cast<unsigned>(rows * cols);
+  unsigned uc = static_cast<unsigned>(cols);
+  return c.launch1d_(c.xent_bwd_(), un, px, pl, pt, pg, po, uc, un);
 }
 
 // M7 decode GEMV: y(n) = a(1,k) @ B(k,n), F32 accumulate. B is either f32 or
@@ -2374,6 +2448,18 @@ inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
 }
 inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
                             int64_t, int64_t) {
+  return false;
+}
+inline bool gather_from_axis(void*, int64_t, void*, int64_t, void*, int64_t,
+                             int64_t, int64_t) {
+  return false;
+}
+inline bool row_logsumexp(void*, int64_t, void*, int64_t, int64_t, int64_t,
+                          float, float) {
+  return false;
+}
+inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
+                     int64_t, void*, int64_t, int64_t, int64_t) {
   return false;
 }
 inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,

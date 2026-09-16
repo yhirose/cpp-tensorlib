@@ -8,9 +8,9 @@
 //   memory     alloc / release / sync_to_host
 //   kernels    binary / binary_bcast / binary_bcast_nd / where_nd / copy_nd / unary /
 //              gemm / gemm_batched / gemm_bias / row_op / pad / fold /
-//              index_select / index_add / scatter_to_axis / sum_to / compare /
-//              unary_ext / clamp / scalar_binary / concat_part / rope /
-//              layer_norm
+//              index_select / index_add / scatter_to_axis / gather_from_axis /
+//              sum_to / compare / unary_ext / clamp / scalar_binary /
+//              concat_part / rope / layer_norm / row_logsumexp / xent_bwd
 //   LLM path   gemv_f32 / gemv_bf16 / gemv_q4 / attn_decode / attn_prefill /
 //              attn_prefill_dq / attn_prefill_dkv
 // A backend with no kernel for one of these returns false and the evaluator

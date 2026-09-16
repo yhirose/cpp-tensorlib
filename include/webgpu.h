@@ -979,6 +979,22 @@ inline bool scatter_to_axis(void* idx_native, int64_t idxo,
   return c.encode_("scatter_axis", ma, mb, mo, p, (out_n + 255) / 256, 1);
 }
 
+// Cross-entropy's three: the trailing-axis gather, the one-pass row logsumexp
+// and the pullback that reads it. CUDA-first (allowlisted); array.h composes
+// the same values here.
+inline bool gather_from_axis(void*, int64_t, void*, int64_t, void*, int64_t,
+                             int64_t, int64_t) {
+  return false;
+}
+inline bool row_logsumexp(void*, int64_t, void*, int64_t, int64_t, int64_t,
+                          float, float) {
+  return false;
+}
+inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
+                     int64_t, void*, int64_t, int64_t, int64_t) {
+  return false;
+}
+
 // N-D broadcast binary: generalizes binary_bcast() above to any rank (a
 // Transformer's [N,S,D] LayerNorm broadcasting a [N,S,1] mean, rank 3).
 // a_strides/b_strides are the broadcast strides (0 on a broadcast axis)
@@ -1328,6 +1344,18 @@ inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
 }
 inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
                             int64_t, int64_t) {
+  return false;
+}
+inline bool gather_from_axis(void*, int64_t, void*, int64_t, void*, int64_t,
+                             int64_t, int64_t) {
+  return false;
+}
+inline bool row_logsumexp(void*, int64_t, void*, int64_t, int64_t, int64_t,
+                          float, float) {
+  return false;
+}
+inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
+                     int64_t, void*, int64_t, int64_t, int64_t) {
   return false;
 }
 inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,

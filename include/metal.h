@@ -671,6 +671,22 @@ inline bool scatter_to_axis(void* idx_native, int64_t idxo,
                                     sizeof(p), p.n);
 }
 
+// Cross-entropy's three: the trailing-axis gather, the one-pass row logsumexp
+// and the pullback that reads it. CUDA-first (allowlisted); array.h composes
+// the same values here.
+inline bool gather_from_axis(void*, int64_t, void*, int64_t, void*, int64_t,
+                             int64_t, int64_t) {
+  return false;
+}
+inline bool row_logsumexp(void*, int64_t, void*, int64_t, int64_t, int64_t,
+                          float, float) {
+  return false;
+}
+inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
+                     int64_t, void*, int64_t, int64_t, int64_t) {
+  return false;
+}
+
 namespace detail_ {
 struct bcast_nd_params {
   uint32_t out_shape[kPadFoldMaxRank];
@@ -1078,6 +1094,18 @@ inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
 }
 inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
                             int64_t, int64_t) {
+  return false;
+}
+inline bool gather_from_axis(void*, int64_t, void*, int64_t, void*, int64_t,
+                             int64_t, int64_t) {
+  return false;
+}
+inline bool row_logsumexp(void*, int64_t, void*, int64_t, int64_t, int64_t,
+                          float, float) {
+  return false;
+}
+inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
+                     int64_t, void*, int64_t, int64_t, int64_t) {
   return false;
 }
 inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,

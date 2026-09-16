@@ -138,6 +138,15 @@ if(TENSORLIB_CUDA)
   target_link_libraries(tensorlib_bench_attn_bwd PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_bench_attn_bwd)
 
+  # Cross-entropy's three kernels against the softmax the composed form
+  # materializes, at head shapes. Direct cuda:: API, same reasoning as the
+  # attention pullback bench above.
+  add_executable(tensorlib_bench_xent bench/cuda/speed/bench_xent.cpp)
+  target_include_directories(tensorlib_bench_xent BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(tensorlib_bench_xent PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_bench_xent)
+
   # M9 end-to-end: multi-layer llama decode loop wired to the persistent
   # kv_cache (GQA) via the array<->native bridge, verified vs a CPU reference at
   # every step. Uses the array API + tl::cuda::kv_cache, so CUDA-build only.

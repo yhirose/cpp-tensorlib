@@ -2011,6 +2011,124 @@ TEST_CASE("index ops: a label outside the target throws at eval") {
       tl::scatter_to_axis(array::from({0, 1, 3}, {3}), vals, 4).eval());
 }
 
+TEST_CASE("gather_from_axis: scatter_to_axis's dual, one element per position") {
+  auto src = array::from({0, 0, 5, 0,   // row 0: the labelled slot holds 5
+                          7, 0, 0, 0,   // row 1: 7
+                          0, 9, 0, 0},  // row 2: 9
+                         {3, 4});
+  auto idx = array::from({2, 0, 1}, {3});
+  auto out = tl::gather_from_axis(src, idx);
+  CHECK(out.shape() == tl::shape_t{3});
+  CHECK(out.at({0}) == doctest::Approx(5));
+  CHECK(out.at({1}) == doctest::Approx(7));
+  CHECK(out.at({2}) == doctest::Approx(9));
+}
+
+TEST_CASE("gather_from_axis: undoes scatter_to_axis (2-D window axis)") {
+  auto idx = array::from({0, 3, 2, 1}, {2, 2});
+  auto values = array::from({1, 2, 3, 4}, {2, 2});
+  auto out = tl::gather_from_axis(tl::scatter_to_axis(idx, values, 4), idx);
+  CHECK(out.shape() == tl::shape_t{2, 2});
+  for (int64_t i = 0; i < 2; i++) {
+    for (int64_t j = 0; j < 2; j++) {
+      CHECK(out.at({i, j}) == doctest::Approx(values.at({i, j})));
+    }
+  }
+}
+
+TEST_CASE("gather_from_axis: GPU dispatch matches the ref oracle") {
+  CHECK(matches_gpu_oracle([&] {
+    auto src = random_array({4, 16}, 41);
+    return tl::gather_from_axis(src, array::from({15, 0, 7, 3}, {4}));
+  }));
+  CHECK(matches_gpu_oracle([&] {
+    auto src = random_array({2, 3, 8}, 42);
+    return tl::gather_from_axis(src, array::from({0, 7, 3, 3, 1, 6}, {2, 3}));
+  }));
+}
+
+TEST_CASE("gather_from_axis: bad shapes and labels throw") {
+  auto src = random_array({3, 4}, 43);
+  // indices must be src's shape minus the trailing axis
+  CHECK_THROWS(tl::gather_from_axis(src, array::from({0, 1}, {2})));
+  CHECK_THROWS(tl::gather_from_axis(src, array::from({0, 1, 2}, {3}).reshape(
+                                             {3, 1})));
+  // and label the trailing axis, checked at eval like the scatter's own
+  CHECK_THROWS(tl::gather_from_axis(src, array::from({0, 4, 1}, {3})).eval());
+  CHECK_NOTHROW(tl::gather_from_axis(src, array::from({0, 3, 1}, {3})).eval());
+}
+
+TEST_CASE("logsumexp: softmax's denominator, one value per row") {
+  auto a = array::from({1, 2, 3, -1, 0, 1}, {2, 3});
+  auto out = a.logsumexp(1);
+  CHECK(out.shape() == tl::shape_t{2});
+  CHECK(out.at({0}) == doctest::Approx(std::log(std::exp(1.0f) +
+                                                std::exp(2.0f) +
+                                                std::exp(3.0f))));
+  CHECK(out.at({1}) == doctest::Approx(std::log(std::exp(-1.0f) +
+                                                std::exp(0.0f) +
+                                                std::exp(1.0f))));
+}
+
+TEST_CASE("logsumexp: stable where a naive sum of exps overflows") {
+  auto a = array::from({100, 101, 102}, {1, 3});
+  auto out = a.logsumexp(1);
+  CHECK(out.at({0}) == doctest::Approx(102.0f + std::log(std::exp(-2.0f) +
+                                                         std::exp(-1.0f) +
+                                                         1.0f)));
+}
+
+TEST_CASE("logsumexp: keepdims, and an axis with no fused kernel of its own") {
+  auto a = random_array({4, 5}, 44);
+  CHECK(a.logsumexp(1, true).shape() == tl::shape_t{4, 1});
+  // Off the last axis array::logsumexp composes; transposing puts the same
+  // numbers on the fused path, so the two must agree.
+  auto ax0 = a.logsumexp(0);
+  auto by_hand = a.transpose().logsumexp(1);
+  CHECK(ax0.shape() == tl::shape_t{5});
+  for (int64_t j = 0; j < 5; j++) {
+    CHECK(ax0.at({j}) == doctest::Approx(by_hand.at({j})));
+  }
+}
+
+TEST_CASE("logsumexp: GPU dispatch matches the ref oracle") {
+  CHECK(matches_gpu_oracle([&] {
+    auto a = random_array({8, 512}, 45);
+    return a.logsumexp(1);
+  }));
+}
+
+TEST_CASE("xent_bwd: the fused pullback matches (softmax - onehot) * g") {
+  auto prev = tl::device_;
+  tl::device_ = tl::device_type::gpu;
+  const int64_t N = 8, C = 32;
+  auto logits = random_array({N, C}, 46);
+  auto targets = array::from({0, 5, 31, 12, 7, 7, 1, 30}, {N});
+  auto g = random_array({N}, 47);
+  auto got = tl::array::xent_bwd(logits, logits.logsumexp(1), targets, g);
+  // The kernel is CUDA's, so a CUDA build must take it; another device
+  // declines and its caller composes the form checked against right here.
+#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
+  REQUIRE(got.has_value());
+#endif
+  if (!got) {
+    MESSAGE("no fused cross-entropy pullback on this backend — skipping");
+    tl::device_ = prev;
+    return;
+  }
+  CHECK(got->shape() == tl::shape_t{N, C});
+  auto onehot = tl::scatter_to_axis(targets, tl::array::ones({N}), C);
+  auto want = (logits.softmax() - onehot) * g.reshape({N, 1});
+  tl::eval(*got, want);
+  for (int64_t i = 0; i < N; i++) {
+    for (int64_t j = 0; j < C; j++) {
+      CHECK(got->at({i, j}) ==
+            doctest::Approx(want.at({i, j})).epsilon(1e-4));
+    }
+  }
+  tl::device_ = prev;
+}
+
 TEST_CASE("scatter_to_axis: mismatched indices/values shape throws") {
   auto idx = array::from({0, 1}, {2});
   auto values = random_array({3}, 36);

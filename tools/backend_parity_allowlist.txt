@@ -33,3 +33,11 @@ gemm_bias
 # CUDA-first, where the host copy is a D2H and an H2D round trip; Metal's
 # unified memory makes its host copy a flush and a memcpy meanwhile.
 copy_nd
+
+# Cross-entropy without a [rows, classes] intermediate: the trailing-axis
+# gather (scatter_to_axis's dual), the one-pass row logsumexp the forward
+# reduces with, and the pullback that rebuilds the softmax from it. CUDA-first;
+# elsewhere the same values compose out of softmax/scatter/log meanwhile.
+gather_from_axis
+row_logsumexp
+xent_bwd
