@@ -129,6 +129,15 @@ if(TENSORLIB_CUDA)
   target_link_libraries(tensorlib_bench_attn PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_bench_attn)
 
+  # The causal prefill pullback's two kernels against their forward, at
+  # training shapes. Direct cuda:: API, so it measures a kernel change without
+  # a consumer's build in the way.
+  add_executable(tensorlib_bench_attn_bwd bench/cuda/speed/bench_attn_bwd.cpp)
+  target_include_directories(tensorlib_bench_attn_bwd BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(tensorlib_bench_attn_bwd PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_bench_attn_bwd)
+
   # M9 end-to-end: multi-layer llama decode loop wired to the persistent
   # kv_cache (GQA) via the array<->native bridge, verified vs a CPU reference at
   # every step. Uses the array API + tl::cuda::kv_cache, so CUDA-build only.

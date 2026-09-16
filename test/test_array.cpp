@@ -1360,6 +1360,142 @@ TEST_CASE("fused prefill attention matches an explicit causal softmax(qKt)V") {
   CHECK_THROWS(tl::array::attn_prefill(q, K, V.reshape({H, D, T}), scale));
 }
 
+TEST_CASE("the fused pullback's dq and logsumexp match explicit softmax math") {
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+  tl::use_gpu();
+
+  // T sits off the 32-query tile, so the last block carries rows past the end
+  // and the first tile it walks is a partial one.
+  const int64_t H = 3, T = 70, D = 64;
+  auto q = random_array({H, T, D}, 900), K = random_array({H, T, D}, 901),
+       V = random_array({H, T, D}, 902), dO = random_array({H, T, D}, 903);
+  const float scale = 1.0f / std::sqrt((float)D);
+
+  auto out = tl::array::attn_prefill(q, K, V, scale);
+  auto got = tl::array::attn_prefill_bwd_dq(q, K, V, dO, out, scale);
+  REQUIRE(got.has_value());
+  const array& dq = got->first;
+  const array& stats = got->second;
+  CHECK(dq.shape() == tl::shape_t{H, T, D});
+  CHECK(stats.shape() == tl::shape_t{2, H, T});
+
+  // Row t of head h, spelled out: the causal softmax of its scores, then
+  // dq_t = scale · Σ_j P_tj (dP_tj − Δ_t) k_j with dP_tj = dO_t·v_j and
+  // Δ_t = Σ_j P_tj dP_tj. L_t is that softmax's m + log l.
+  std::vector<float> p(T), dp(T);
+  for (int64_t h = 0; h < H; h++) {
+    for (int64_t t = 0; t < T; t++) {
+      float mx = -1e30f;
+      for (int64_t j = 0; j <= t; j++) {
+        float s = 0;
+        for (int64_t d = 0; d < D; d++) s += q.at({h, t, d}) * K.at({h, j, d});
+        p[j] = s * scale;
+        mx = std::max(mx, p[j]);
+      }
+      float sum = 0;
+      for (int64_t j = 0; j <= t; j++) {
+        p[j] = std::exp(p[j] - mx);
+        sum += p[j];
+      }
+      float delta = 0;
+      for (int64_t j = 0; j <= t; j++) {
+        p[j] /= sum;
+        float g = 0;
+        for (int64_t d = 0; d < D; d++) g += dO.at({h, t, d}) * V.at({h, j, d});
+        dp[j] = g;
+        delta += p[j] * g;
+      }
+      CHECK(stats.at({0, h, t}) ==
+            doctest::Approx(mx + std::log(sum)).epsilon(1e-4));
+      CHECK(stats.at({1, h, t}) == doctest::Approx(delta).epsilon(1e-3));
+      for (int64_t d : {0, 31, 63}) {
+        float e = 0;
+        for (int64_t j = 0; j <= t; j++)
+          e += p[j] * (dp[j] - delta) * K.at({h, j, d});
+        CHECK(dq.at({h, t, d}) == doctest::Approx(e * scale).epsilon(1e-3));
+      }
+    }
+  }
+
+  // Same shape rule as the forward, extended to the two gradients.
+  CHECK_THROWS(tl::array::attn_prefill_bwd_dq(q, K, V, dO.reshape({H, D, T}),
+                                              out, scale));
+
+  tl::device_ = prev;
+}
+
+TEST_CASE("the fused pullback's dK and dV match explicit softmax math") {
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+  tl::use_gpu();
+
+  const int64_t H = 3, T = 70, D = 64;
+  auto q = random_array({H, T, D}, 900), K = random_array({H, T, D}, 901),
+       V = random_array({H, T, D}, 902), dO = random_array({H, T, D}, 903);
+  const float scale = 1.0f / std::sqrt((float)D);
+
+  auto out = tl::array::attn_prefill(q, K, V, scale);
+  auto dqs = tl::array::attn_prefill_bwd_dq(q, K, V, dO, out, scale);
+  REQUIRE(dqs.has_value());
+  auto got = tl::array::attn_prefill_bwd_dkv(q, K, V, dO, dqs->second, scale);
+  REQUIRE(got.has_value());
+  const array& dK = got->first;
+  const array& dV = got->second;
+  CHECK(dK.shape() == tl::shape_t{H, T, D});
+  CHECK(dV.shape() == tl::shape_t{H, T, D});
+
+  // Key j collects from every query that can see it:
+  //   dv_j = Σ_{i≥j} P_ij dO_i,  dk_j = scale · Σ_{i≥j} P_ij (dP_ij − Δ_i) q_i.
+  // Building the head's whole causal P keeps the expectation readable.
+  std::vector<float> P((size_t)T * T, 0.f), dP((size_t)T * T, 0.f), delta(T);
+  for (int64_t h = 0; h < H; h++) {
+    for (int64_t i = 0; i < T; i++) {
+      float* pr = P.data() + i * T;
+      float* dr = dP.data() + i * T;
+      float mx = -1e30f;
+      for (int64_t j = 0; j <= i; j++) {
+        float s = 0;
+        for (int64_t d = 0; d < D; d++) s += q.at({h, i, d}) * K.at({h, j, d});
+        pr[j] = s * scale;
+        mx = std::max(mx, pr[j]);
+      }
+      float sum = 0;
+      for (int64_t j = 0; j <= i; j++) {
+        pr[j] = std::exp(pr[j] - mx);
+        sum += pr[j];
+      }
+      delta[i] = 0;
+      for (int64_t j = 0; j <= i; j++) {
+        pr[j] /= sum;
+        float gd = 0;
+        for (int64_t d = 0; d < D; d++) gd += dO.at({h, i, d}) * V.at({h, j, d});
+        dr[j] = gd;
+        delta[i] += pr[j] * gd;
+      }
+    }
+    // The first key (every query sees it), one off the 32-key tile, and the
+    // last (one query sees it).
+    for (int64_t j : {0, 37, 69}) {
+      for (int64_t d : {0, 31, 63}) {
+        float ev = 0, ek = 0;
+        for (int64_t i = j; i < T; i++) {
+          const float p = P[(size_t)i * T + j];
+          ev += p * dO.at({h, i, d});
+          ek += p * (dP[(size_t)i * T + j] - delta[i]) * q.at({h, i, d});
+        }
+        CHECK(dV.at({h, j, d}) == doctest::Approx(ev).epsilon(1e-3));
+        CHECK(dK.at({h, j, d}) == doctest::Approx(ek * scale).epsilon(1e-3));
+      }
+    }
+  }
+
+  // stats is [2,H,T], not the forward's output.
+  CHECK_THROWS(tl::array::attn_prefill_bwd_dkv(q, K, V, dO, out, scale));
+
+  tl::device_ = prev;
+}
+
 TEST_CASE("q4 weight storage: decode dot + widen fallback vs dequant oracle") {
   // W [K,N], K a multiple of 256; a [1,K]. int4 quant error on random data is
   // large (a small weight in a big-maxabs group rounds coarsely), so the right

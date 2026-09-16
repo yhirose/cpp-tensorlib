@@ -1927,6 +1927,319 @@ extern "C" __global__ void tl_attn_prefill_tiled_bf16_64(const float* q,
                                                 group, scale, pos0);
 }
 
+// The query half of attn_prefill's pullback, and the row statistics the key/
+// value half needs. Same streaming shape as the forward — one block per (head,
+// query tile), K/V walked in tiles through shared memory — over a training
+// shape: q, K, V, dO, O, dq all [H,T,D] contiguous, no cache, no GQA.
+//
+// Writing Δ_i = dO_i·O_i, row i's gradient is
+//   dq_i = scale · Σ_j P_ij (dP_ij − Δ_i) k_j,   dP_ij = dO_i·v_j,
+// with P_ij = exp(s_ij − m_i)/l_i the same softmax the forward built. Δ_i needs
+// no P of its own: O_i = Σ_j P_ij v_j makes Σ_j P_ij dP_ij exactly dO_i·O_i. A
+// per-row constant is what lets the whole sum run under one online softmax —
+// accumulate against the running max, rescale the accumulator when the max
+// grows, divide by l once at the end — so the [T,T] scores are never anywhere
+// but in registers, and one pass over the keys is enough.
+//
+// Both of this pass's by-products are written to `stats` [2,H,T] — plane 0 the
+// row logsumexp L_i = m_i + log l_i, plane 1 the Δ_i above — because the dK/dV
+// kernel needs exactly those two and can compute neither cheaply: it sums over
+// i, where no rescaling can stand in for a normalizer, and it never holds an
+// output row next to its gradient. Handing them over is free here.
+//
+// A tile carries half the queries the forward's does (BQ = ROWS·QPT with QPT
+// halved): dO's rows take a second Qs-sized block of shared memory, and the
+// forward's tile would put the total past the 48 KB static limit.
+template <int AD, int QPT>
+__device__ void attn_bwd_dq_core(const float* __restrict__ q,
+                                 const float* __restrict__ K,
+                                 const float* __restrict__ V,
+                                 const float* __restrict__ dO,
+                                 const float* __restrict__ O,
+                                 float* __restrict__ dq,
+                                 float* __restrict__ stats, unsigned T,
+                                 float scale) {
+  constexpr int NT = 128, LANES = 8, ROWS = NT / LANES;
+  constexpr int BQ = ROWS * QPT;            // queries per block
+  constexpr int TK = (AD == 64) ? 32 : 16;  // keys per tile
+  constexpr int DG = AD / LANES;            // accumulator dims per lane
+  constexpr int SPT = TK / LANES;           // scores per lane per tile
+  // Same +1 row padding as the forward, and for the same reason: every one of
+  // these is read down a column by lanes that differ only in the row index.
+  // Vs is padded here too — the dP dot reads it the way the score loop reads
+  // Ks, not the way the forward's context loop does.
+  __shared__ float Qs[BQ][AD + 1];
+  __shared__ float Gs[BQ][AD + 1];  // dO's rows
+  __shared__ float Ks[TK][AD + 1];
+  __shared__ float Vs[TK][AD + 1];
+  __shared__ float Cs[BQ][TK + 1];  // exp(s − m)·(dP − Δ), the dq coefficient
+  __shared__ float Ds[BQ];          // Δ per row
+
+  const unsigned h = blockIdx.x;
+  const unsigned qbase = (gridDim.y - 1u - blockIdx.y) * BQ;  // reversed order
+  const unsigned tid = threadIdx.x;
+  const unsigned qr0 = tid >> 3, dg = tid & 7u;
+  const float* qh = q + (size_t)h * T * AD;
+  const float* Kh = K + (size_t)h * T * AD;
+  const float* Vh = V + (size_t)h * T * AD;
+  const float* Gh = dO + (size_t)h * T * AD;
+  const float* Oh = O + (size_t)h * T * AD;
+
+  for (unsigned i = tid; i < BQ * AD; i += NT) {
+    const unsigned r = i / AD, c = i % AD;
+    const bool live = qbase + r < T;
+    Qs[r][c] = live ? qh[(size_t)(qbase + r) * AD + c] : 0.f;
+    Gs[r][c] = live ? Gh[(size_t)(qbase + r) * AD + c] : 0.f;
+  }
+  __syncthreads();
+  for (unsigned r = tid; r < BQ; r += NT) {
+    float d = 0.f;
+    if (qbase + r < T) {
+      const float* op = Oh + (size_t)(qbase + r) * AD;
+      for (int c = 0; c < AD; c++) d += Gs[r][c] * op[c];
+    }
+    Ds[r] = d;
+  }
+  const unsigned last = qbase + BQ - 1 < T ? qbase + BQ - 1 : T - 1;
+
+  float acc[QPT][DG] = {};
+  float m[QPT], l[QPT];
+#pragma unroll
+  for (int u = 0; u < QPT; u++) { m[u] = -1e30f; l[u] = 0.0f; }
+
+  for (unsigned kt = 0; kt <= last; kt += TK) {
+    __syncthreads();  // previous tile's Ks/Vs are done being read
+    for (unsigned i = tid; i < TK * AD / 4; i += NT) {
+      const unsigned r = i / (AD / 4), c4 = (i % (AD / 4)) * 4;
+      const unsigned kk = kt + r;
+      float kb[4] = {0, 0, 0, 0}, vb[4] = {0, 0, 0, 0};
+      if (kk <= last) {
+        kv_ld4(Kh + (size_t)kk * AD + c4, kb);
+        kv_ld4(Vh + (size_t)kk * AD + c4, vb);
+      }
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        Ks[r][c4 + e] = kb[e];
+        Vs[r][c4 + e] = vb[e];
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int u = 0; u < QPT; u++) {
+      const unsigned row = qr0 + u * ROWS;
+      const unsigned pabs = qbase + row;
+      // A dot per key, each re-reading this query's row: the dK/dV half is
+      // written the other way round (the operand it holds fixed read once,
+      // used against every query) because there it spills otherwise, but here
+      // the same rewrite only costs — 62 registers instead of 196, and 9%
+      // slower for having less to overlap.
+      float sc[SPT], dp[SPT], mt = -1e30f;
+#pragma unroll
+      for (int t2 = 0; t2 < SPT; t2++) {
+        const unsigned kk = kt + dg * SPT + t2;
+        float dot = 0.0f, dpd = 0.0f;
+#pragma unroll
+        for (int d = 0; d < AD; d++) {
+          dot += Qs[row][d] * Ks[dg * SPT + t2][d];
+          dpd += Gs[row][d] * Vs[dg * SPT + t2][d];
+        }
+        sc[t2] = (kk <= pabs) ? dot * scale : -1e30f;  // causal mask
+        dp[t2] = dpd;
+        mt = fmaxf(mt, sc[t2]);
+      }
+#pragma unroll
+      for (int off = 4; off > 0; off >>= 1)
+        mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, off));
+      const float m_new = fmaxf(m[u], mt);
+      const float corr = __expf(m[u] - m_new);
+      const float delta = Ds[row];
+      float ls = 0.0f;
+#pragma unroll
+      for (int t2 = 0; t2 < SPT; t2++) {
+        const float p = __expf(sc[t2] - m_new);
+        Cs[row][dg * SPT + t2] = p * (dp[t2] - delta);
+        ls += p;
+      }
+#pragma unroll
+      for (int off = 4; off > 0; off >>= 1)
+        ls += __shfl_xor_sync(0xffffffffu, ls, off);
+      l[u] = l[u] * corr + ls;
+      m[u] = m_new;
+#pragma unroll
+      for (int d = 0; d < DG; d++) acc[u][d] *= corr;
+    }
+    __syncthreads();  // Cs complete
+#pragma unroll
+    for (int kk = 0; kk < TK; kk++) {
+#pragma unroll
+      for (int u = 0; u < QPT; u++) {
+        const float c = Cs[qr0 + u * ROWS][kk];
+#pragma unroll
+        for (int d = 0; d < DG; d++)
+          acc[u][d] += c * Ks[kk][d * LANES + dg];
+      }
+    }
+  }
+
+#pragma unroll
+  for (int u = 0; u < QPT; u++) {
+    const unsigned qi = qbase + qr0 + u * ROWS;
+    if (qi >= T) continue;
+    const float f = scale / l[u];
+#pragma unroll
+    for (int d = 0; d < DG; d++)
+      dq[((size_t)h * T + qi) * AD + d * LANES + dg] = acc[u][d] * f;
+    if (dg == 0) {
+      const size_t row = (size_t)h * T + qi;
+      stats[row] = m[u] + __logf(l[u]);
+      stats[(size_t)gridDim.x * T + row] = Ds[qr0 + u * ROWS];
+    }
+  }
+}
+extern "C" __global__ void tl_attn_bwd_dq_f32(const float* q, const float* K,
+    const float* V, const float* dO, const float* O, float* dq, float* stats,
+    unsigned T, float scale) {
+  attn_bwd_dq_core<128, 1>(q, K, V, dO, O, dq, stats, T, scale);
+}
+extern "C" __global__ void tl_attn_bwd_dq_f32_64(const float* q, const float* K,
+    const float* V, const float* dO, const float* O, float* dq, float* stats,
+    unsigned T, float scale) {
+  attn_bwd_dq_core<64, 2>(q, K, V, dO, O, dq, stats, T, scale);
+}
+
+// The key/value half, the same streaming shape with the roles swapped: one
+// block per (head, key tile), walking the query tiles that can see those keys.
+//   dv_j = Σ_{i≥j} P_ij dO_i,   dk_j = scale · Σ_{i≥j} P_ij (dP_ij − Δ_i) q_i.
+// Summing over queries is what makes this half different: their normalizers
+// differ, so no running rescale can stand in for one, and P_ij = exp(s_ij − L_i)
+// is read off the stats the dq kernel already wrote. Block 0 holds the earliest
+// keys, which the most queries see — the heaviest blocks are the first
+// launched, so the natural order is the balanced one here (the forward, whose
+// last queries are its heaviest, reverses for the same reason).
+template <int AD, int KPT>
+__device__ void attn_bwd_dkv_core(const float* __restrict__ q,
+                                  const float* __restrict__ K,
+                                  const float* __restrict__ V,
+                                  const float* __restrict__ dO,
+                                  const float* __restrict__ stats,
+                                  float* __restrict__ dK,
+                                  float* __restrict__ dV, unsigned T,
+                                  float scale) {
+  constexpr int NT = 128, LANES = 8, ROWS = NT / LANES;
+  constexpr int BK = ROWS * KPT;            // keys per block
+  constexpr int TQ = (AD == 64) ? 32 : 16;  // queries per tile
+  constexpr int DG = AD / LANES;            // accumulator dims per lane
+  constexpr int SPT = TQ / LANES;           // scores per lane per tile
+  __shared__ float Ks[BK][AD + 1];
+  __shared__ float Vs[BK][AD + 1];
+  __shared__ float Qs[TQ][AD + 1];
+  __shared__ float Gs[TQ][AD + 1];
+  __shared__ float Ps[BK][TQ + 1];  // the softmax probability
+  __shared__ float Cs[BK][TQ + 1];  // P·(dP − Δ), the dk coefficient
+  __shared__ float Ls[TQ], Ds[TQ];
+
+  const unsigned h = blockIdx.x;
+  const unsigned kbase = blockIdx.y * BK;
+  const unsigned tid = threadIdx.x;
+  const unsigned kr0 = tid >> 3, dg = tid & 7u;
+  const float* qh = q + (size_t)h * T * AD;
+  const float* Kh = K + (size_t)h * T * AD;
+  const float* Vh = V + (size_t)h * T * AD;
+  const float* Gh = dO + (size_t)h * T * AD;
+  const float* Lh = stats + (size_t)h * T;
+  const float* Dh = stats + (size_t)gridDim.x * T + (size_t)h * T;
+
+  for (unsigned i = tid; i < BK * AD; i += NT) {
+    const unsigned r = i / AD, c = i % AD;
+    const bool live = kbase + r < T;
+    Ks[r][c] = live ? Kh[(size_t)(kbase + r) * AD + c] : 0.f;
+    Vs[r][c] = live ? Vh[(size_t)(kbase + r) * AD + c] : 0.f;
+  }
+
+  float dk[KPT][DG] = {}, dv[KPT][DG] = {};
+
+  // Queries before this tile's first key see none of it.
+  for (unsigned qt = (kbase / TQ) * TQ; qt < T; qt += TQ) {
+    __syncthreads();  // previous tile's Qs/Gs are done being read
+    for (unsigned i = tid; i < TQ * AD; i += NT) {
+      const unsigned r = i / AD, c = i % AD;
+      const bool live = qt + r < T;
+      Qs[r][c] = live ? qh[(size_t)(qt + r) * AD + c] : 0.f;
+      Gs[r][c] = live ? Gh[(size_t)(qt + r) * AD + c] : 0.f;
+    }
+    for (unsigned r = tid; r < TQ; r += NT) {
+      const bool live = qt + r < T;
+      Ls[r] = live ? Lh[qt + r] : 0.f;
+      Ds[r] = live ? Dh[qt + r] : 0.f;
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int u = 0; u < KPT; u++) {
+      const unsigned row = kr0 + u * ROWS;
+      const unsigned kabs = kbase + row;
+      // The key's own dimension is read once and used against every query this
+      // lane carries. Written the other way round — a dot per query, each
+      // re-reading Ks and Vs — the 64-deep loop unrolls into so many loads in
+      // flight that ptxas spills, and the kernel runs 4x slower.
+      float sc[SPT] = {}, dpd[SPT] = {};
+#pragma unroll 8
+      for (int d = 0; d < AD; d++) {
+        const float kd = Ks[row][d], vd = Vs[row][d];
+#pragma unroll
+        for (int t2 = 0; t2 < SPT; t2++) {
+          sc[t2] += Qs[dg * SPT + t2][d] * kd;
+          dpd[t2] += Gs[dg * SPT + t2][d] * vd;
+        }
+      }
+#pragma unroll
+      for (int t2 = 0; t2 < SPT; t2++) {
+        const unsigned ql = dg * SPT + t2, qi = qt + ql;
+        // Off the causal half, or past the last query: contributes nothing.
+        const float p =
+            (qi < T && kabs <= qi) ? __expf(sc[t2] * scale - Ls[ql]) : 0.f;
+        Ps[row][ql] = p;
+        Cs[row][ql] = p * (dpd[t2] - Ds[ql]);
+      }
+    }
+    __syncthreads();  // Ps/Cs complete
+#pragma unroll
+    for (int qq = 0; qq < TQ; qq++) {
+#pragma unroll
+      for (int u = 0; u < KPT; u++) {
+        const float p = Ps[kr0 + u * ROWS][qq], c = Cs[kr0 + u * ROWS][qq];
+#pragma unroll
+        for (int d = 0; d < DG; d++) {
+          dv[u][d] += p * Gs[qq][d * LANES + dg];
+          dk[u][d] += c * Qs[qq][d * LANES + dg];
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int u = 0; u < KPT; u++) {
+    const unsigned kj = kbase + kr0 + u * ROWS;
+    if (kj >= T) continue;
+#pragma unroll
+    for (int d = 0; d < DG; d++) {
+      dK[((size_t)h * T + kj) * AD + d * LANES + dg] = dk[u][d] * scale;
+      dV[((size_t)h * T + kj) * AD + d * LANES + dg] = dv[u][d];
+    }
+  }
+}
+extern "C" __global__ void tl_attn_bwd_dkv_f32(const float* q, const float* K,
+    const float* V, const float* dO, const float* stats, float* dK, float* dV,
+    unsigned T, float scale) {
+  attn_bwd_dkv_core<128, 1>(q, K, V, dO, stats, dK, dV, T, scale);
+}
+extern "C" __global__ void tl_attn_bwd_dkv_f32_64(const float* q, const float* K,
+    const float* V, const float* dO, const float* stats, float* dK, float* dV,
+    unsigned T, float scale) {
+  attn_bwd_dkv_core<64, 2>(q, K, V, dO, stats, dK, dV, T, scale);
+}
+
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 
 // RoPE (rotary position embedding), half-split (GPT-NeoX / HF-llama) convention.

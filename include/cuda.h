@@ -617,6 +617,18 @@ struct context {
                            : cached_(attn_prefill_tiled_fn, "tl_attn_prefill_tiled_f32"));
   }
 
+  // The two halves of that kernel's pullback. Training only, so f32 only.
+  CUfunction attn_bwd_dq_fn = nullptr, attn_bwd_dq_64_fn = nullptr;
+  CUfunction attn_bwd_dq_(int64_t D) {
+    return D == 64 ? cached_(attn_bwd_dq_64_fn, "tl_attn_bwd_dq_f32_64")
+                   : cached_(attn_bwd_dq_fn, "tl_attn_bwd_dq_f32");
+  }
+  CUfunction attn_bwd_dkv_fn = nullptr, attn_bwd_dkv_64_fn = nullptr;
+  CUfunction attn_bwd_dkv_(int64_t D) {
+    return D == 64 ? cached_(attn_bwd_dkv_64_fn, "tl_attn_bwd_dkv_f32_64")
+                   : cached_(attn_bwd_dkv_fn, "tl_attn_bwd_dkv_f32");
+  }
+
   // Grow-once device scratch, shared by every reusable buffer below: on the
   // first call past its current size, free (syncs; fine, this only happens
   // while growing) and reallocate. `buf`/`bytes` are the caller's own
@@ -1610,6 +1622,15 @@ inline unsigned attn_split_count(unsigned n_heads, int64_t ctx) {
 inline constexpr unsigned attn_tile_threads = 128;
 inline constexpr unsigned attn_tile_queries(int64_t D) { return D == 64 ? 64 : 32; }
 
+// The same ABI for the two backward kernels — rows of the sequence a block
+// owns, queries in the dq half and keys in the dK/dV half. Half the forward's
+// tile: both halves hold a second [tile, D] block of shared memory (the output
+// gradient's rows, or the probabilities), and the forward's tile would put them
+// past the 48 KB of static shared memory.
+inline constexpr unsigned attn_bwd_tile(int64_t D) {
+  return attn_tile_queries(D) / 2;
+}
+
 // Keys per split for the split-KV kernels: ceil(ctx / attn_split_count), rounded
 // up to a multiple of 4 warps. The device-side attn_dpos_chunk in
 // tensorlib_cuda.cu is the twin of attn_split_count + this rounding and MUST
@@ -1858,6 +1879,60 @@ inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads
                    {static_cast<unsigned>(n_q_heads), (uT + tile - 1) / tile},
                    {attn_tile_threads}, 0, pq, pk, pv, po, uT, kv_stride, group,
                    scale, up0);
+}
+
+// The query half of causal prefill attention's pullback: q, K, V, dO, O and dq
+// all [H,T,D] contiguous — a training shape, so no KV cache, no GQA and no
+// chunked positions — and `stats` [2,H,T] the row logsumexp and dO·O the dK/dV
+// half reads. D∈{64,128}. One block per (head, query tile).
+inline bool attn_prefill_dq(void* q, void* K, void* V, void* dO, void* O,
+                            void* dq, void* stats, int64_t H, int64_t T,
+                            int64_t D, float scale) {
+  auto& c = context::get();
+  if (!c.ready || (D != 128 && D != 64)) return false;
+  if (H <= 0 || T <= 0 || T > 65535) return false;
+  c.device_read_(q);
+  c.device_read_(K);
+  c.device_read_(V);
+  c.device_read_(dO);
+  c.device_read_(O);
+  c.device_write_(dq);
+  c.device_write_(stats);
+  unsigned uT = static_cast<unsigned>(T);
+  const unsigned tile = attn_bwd_tile(D);
+  return c.launch_(c.attn_bwd_dq_(D),
+                   {static_cast<unsigned>(H), (uT + tile - 1) / tile},
+                   {attn_tile_threads}, 0, context::off_(q, 0),
+                   context::off_(K, 0), context::off_(V, 0),
+                   context::off_(dO, 0), context::off_(O, 0),
+                   context::off_(dq, 0), context::off_(stats, 0), uT, scale);
+}
+
+// The key/value half, reading the stats the call above wrote: q, K, V, dO, dK
+// and dV all [H,T,D] contiguous, `stats` [2,H,T]. One block per (head, key
+// tile), and the head count reaches the kernel as gridDim.x — it is what the
+// stats' plane stride is made of.
+inline bool attn_prefill_dkv(void* q, void* K, void* V, void* dO, void* stats,
+                             void* dK, void* dV, int64_t H, int64_t T,
+                             int64_t D, float scale) {
+  auto& c = context::get();
+  if (!c.ready || (D != 128 && D != 64)) return false;
+  if (H <= 0 || T <= 0 || T > 65535) return false;
+  c.device_read_(q);
+  c.device_read_(K);
+  c.device_read_(V);
+  c.device_read_(dO);
+  c.device_read_(stats);
+  c.device_write_(dK);
+  c.device_write_(dV);
+  unsigned uT = static_cast<unsigned>(T);
+  const unsigned tile = attn_bwd_tile(D);
+  return c.launch_(c.attn_bwd_dkv_(D),
+                   {static_cast<unsigned>(H), (uT + tile - 1) / tile},
+                   {attn_tile_threads}, 0, context::off_(q, 0),
+                   context::off_(K, 0), context::off_(V, 0),
+                   context::off_(dO, 0), context::off_(stats, 0),
+                   context::off_(dK, 0), context::off_(dV, 0), uT, scale);
 }
 
 // RoPE: rotate a contiguous [rows, D] buffer (rows = H*T). Row r's position is

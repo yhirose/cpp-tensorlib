@@ -467,6 +467,28 @@ class array {
   static array attn_prefill(const array& q, const array& K, const array& V,
                             float scale);
 
+  // The two halves of attn_prefill's pullback. The scores stay in registers in
+  // both — the [T,T] matrix the composed pullback materializes is never
+  // anywhere — and the price of that is the row statistics `stats` [2,H,T],
+  // the softmax's logsumexp and dO·O per row: the dq half computes both on its
+  // way past, and the dK/dV half, which sums over queries rather than keys,
+  // can derive neither and reads them instead.
+  //
+  // Eager, not graph nodes: they run inside a backward pass, and a node per
+  // gradient would rebuild the scores once each. nullopt when no GPU kernel
+  // takes the shape (head width off {64,128}, an operand not device-resident,
+  // CPU mode) — the caller then composes the unfused pullback.
+  //
+  // dq takes q, K, V, the gradient `dout` of the forward's output and that
+  // output `out` (all [H,T,D]) and returns {dq, stats}; dkv takes those stats
+  // in place of `out` and returns {dK, dV}.
+  static std::optional<std::pair<array, array>> attn_prefill_bwd_dq(
+      const array& q, const array& K, const array& V, const array& dout,
+      const array& out, float scale);
+  static std::optional<std::pair<array, array>> attn_prefill_bwd_dkv(
+      const array& q, const array& K, const array& V, const array& dout,
+      const array& stats, float scale);
+
   // Transformer building blocks (M9 model surface). RoPE is a fused op (needs
   // cos/sin); RMSNorm/SiLU/SwiGLU are pure compositions of existing ops (so they
   // ride the tuned kernels and are autograd-ready when VJPs land). RoPE input is
@@ -3038,6 +3060,81 @@ struct graph {
     return out;
   }
 
+  // The query half of the fused pullback (see array::attn_prefill_bwd_dq).
+  // Eager and GPU-only: the kernel writes dq and L, or this declines and the
+  // caller composes the unfused form. The shape rules are the forward's, plus
+  // dout and out on the same [H,T,D].
+  static std::optional<std::pair<array, array>> attn_prefill_bwd_dq(
+      const array& q, const array& K, const array& V, const array& dout,
+      const array& out, float scale) {
+    const auto& s = q.shape();
+    if (s.size() != 3 || K.shape() != s || V.shape() != s ||
+        dout.shape() != s || out.shape() != s) {
+      throw std::invalid_argument(
+          "tl::attn_prefill_bwd_dq: expect q, K, V, dout, out all [H,T,D] — "
+          "got q " + shape_str(s) + ", K " + shape_str(K.shape()) + ", V " +
+          shape_str(V.shape()) + ", dout " + shape_str(dout.shape()) +
+          ", out " + shape_str(out.shape()));
+    }
+    int64_t H = s[0], T = s[1], D = s[2];
+    if (!gpu_mode_(H * T * T * D, kernel_class::matmul)) return std::nullopt;
+    q.realize();
+    K.realize();
+    V.realize();
+    dout.realize();
+    out.realize();
+    if (!attn_operands_ready_(q, K, V) ||
+        !attn_operands_ready_(dout, out, out)) {
+      return std::nullopt;
+    }
+    array dq = array::empty(s), stats = array::empty({2, H, T});
+    if (!dq.storage_.native || !stats.storage_.native) return std::nullopt;
+    if (!gpu::attn_prefill_dq(q.storage_.native, K.storage_.native,
+                              V.storage_.native, dout.storage_.native,
+                              out.storage_.native, dq.storage_.native,
+                              stats.storage_.native, H, T, D, scale)) {
+      return std::nullopt;
+    }
+    return std::make_pair(dq, stats);
+  }
+
+  // The key/value half (see array::attn_prefill_bwd_dkv). Same rules, with the
+  // dq half's stats standing in for the forward's output.
+  static std::optional<std::pair<array, array>> attn_prefill_bwd_dkv(
+      const array& q, const array& K, const array& V, const array& dout,
+      const array& stats, float scale) {
+    const auto& s = q.shape();
+    if (s.size() != 3 || K.shape() != s || V.shape() != s ||
+        dout.shape() != s ||
+        stats.shape() != shape_t{2, s[0], s[1]}) {
+      throw std::invalid_argument(
+          "tl::attn_prefill_bwd_dkv: expect q, K, V, dout all [H,T,D] and "
+          "stats [2,H,T] — got q " + shape_str(s) + ", K " +
+          shape_str(K.shape()) + ", V " + shape_str(V.shape()) + ", dout " +
+          shape_str(dout.shape()) + ", stats " + shape_str(stats.shape()));
+    }
+    int64_t H = s[0], T = s[1], D = s[2];
+    if (!gpu_mode_(H * T * T * D, kernel_class::matmul)) return std::nullopt;
+    q.realize();
+    K.realize();
+    V.realize();
+    dout.realize();
+    stats.realize();
+    if (!attn_operands_ready_(q, K, V) ||
+        !attn_operands_ready_(dout, stats, stats)) {
+      return std::nullopt;
+    }
+    array dK = array::empty(s), dV = array::empty(s);
+    if (!dK.storage_.native || !dV.storage_.native) return std::nullopt;
+    if (!gpu::attn_prefill_dkv(q.storage_.native, K.storage_.native,
+                               V.storage_.native, dout.storage_.native,
+                               stats.storage_.native, dK.storage_.native,
+                               dV.storage_.native, H, T, D, scale)) {
+      return std::nullopt;
+    }
+    return std::make_pair(dK, dV);
+  }
+
   // Causal prefill attention on the own CPU backend, tiled over (head × a
   // block of BQ query rows) and run across the thread pool. A tile [t0,t1)
   // attends keys [0,t1) only — causality halves the work — as S = scale ·
@@ -4444,6 +4541,18 @@ inline array array::attn_decode(const array& q, const array& K, const array& V,
 inline array array::attn_prefill(const array& q, const array& K,
                                  const array& V, float scale) {
   return detail::graph::attn_prefill(q, K, V, scale);
+}
+
+inline std::optional<std::pair<array, array>> array::attn_prefill_bwd_dq(
+    const array& q, const array& K, const array& V, const array& dout,
+    const array& out, float scale) {
+  return detail::graph::attn_prefill_bwd_dq(q, K, V, dout, out, scale);
+}
+
+inline std::optional<std::pair<array, array>> array::attn_prefill_bwd_dkv(
+    const array& q, const array& K, const array& V, const array& dout,
+    const array& stats, float scale) {
+  return detail::graph::attn_prefill_bwd_dkv(q, K, V, dout, stats, scale);
 }
 
 inline array array::rope(const array& x, int64_t pos, float base) {
