@@ -2498,16 +2498,25 @@ struct graph {
         return;
       }
     }
-    // The census measures what the auto rule compares: GPU total, kernel plus
-    // sync. A caller evaluating inside a defer_flush scope (an autograd walk
-    // opens one) would lend it to the census, and that scope suppresses every
-    // flush below it — the GPU timings would drop their sync and win at the
-    // smallest size, and the stream would still be in flight when the caller's
-    // own graph resumed, where gpu_mode_'s "never break a running pipeline"
-    // rule sends every op to the GPU however small. Suspend the scope for the
-    // measurement and drain what it queued.
-    const int saved_depth = defer_flush_depth;
-    defer_flush_depth = 0;
+    // The measurement runs outside the caller's evaluation state and leaves
+    // none of its own behind — both halves, or the census lies twice over. A
+    // caller evaluating inside a defer_flush scope (an autograd walk opens one)
+    // lends it to the census unless it is suspended, and that scope suppresses
+    // every flush below it: the GPU timings would drop the sync the auto rule
+    // compares against the CPU, and win at the smallest size in the sweep. What
+    // the census then left in flight is what gpu_mode_ reads as a pipeline not
+    // to break, which sends every op of the caller's own graph to the GPU
+    // however small.
+    struct CensusScope {
+      const device_type device = device_;
+      const int depth = defer_flush_depth;
+      CensusScope() { defer_flush_depth = 0; }
+      ~CensusScope() {
+        gpu::flush();
+        defer_flush_depth = depth;
+        device_ = device;
+      }
+    } census_scope;
     using clk = std::chrono::steady_clock;
     auto median_us = [](auto&& f) {
       f();
@@ -2521,7 +2530,6 @@ struct graph {
       std::sort(std::begin(ts), std::end(ts));
       return ts[2];
     };
-    const device_type saved = device_;
     const bool trace = std::getenv("TL_AUTO_TRACE") != nullptr;
     int64_t chosen = auto_threshold_(kernel_class::matmul);
     for (int64_t m : {96, 128, 192, 256}) {
@@ -2538,9 +2546,6 @@ struct graph {
         break;
       }
     }
-    gpu::flush();
-    defer_flush_depth = saved_depth;
-    device_ = saved;
     auto_matmul_ = chosen;
     if (trace)
       std::fprintf(stderr, "tl: auto matmul threshold %lld\n", (long long)chosen);

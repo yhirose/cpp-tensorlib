@@ -839,10 +839,8 @@ TEST_CASE("the auto census keeps out of the caller's defer_flush scope") {
   tl::detail::graph::auto_matmul_ = -1;  // census again, in a scope this time
   tl::use_auto();
   {
-    // What an autograd walk opens. The census must not borrow it: under the
-    // scope its GPU timings would skip their sync and its kernels would stay
-    // in flight, and a pipeline in flight sends every op below to the GPU
-    // however small.
+    // What an autograd walk opens; the census must not borrow it (the
+    // CensusScope in calibrate_auto_ says what goes wrong when it does).
     tl::defer_flush defer;
     random_array({8, 8}, 700).dot(random_array({8, 8}, 701)).eval();
     CHECK(!tl::gpu::pending());
