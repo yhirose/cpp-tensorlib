@@ -457,6 +457,11 @@ struct context {
   // meta-buffer layout (not the bcast_nd family's), so its own slot.
   CUfunction sum_to_fn = nullptr;
   CUfunction sum_to_() { return cached_(sum_to_fn, "tl_sum_to"); }
+  // The same reduction with a block per output, for a deep reduced range.
+  CUfunction sum_to_blocked_fn = nullptr;
+  CUfunction sum_to_blocked_() {
+    return cached_(sum_to_blocked_fn, "tl_sum_to_blocked");
+  }
 
   // Comparisons (gt/lt/ge/le/eq/ne): ReLU/LeakyReLU/Clip's backward gate
   // and Tensor.gt/lt/... generally. Own vocabulary, not the kop table
@@ -1147,6 +1152,16 @@ inline bool sum_to(void* a_native, int64_t ao, const int64_t* a_shape,
   float* po = context::off_(out_native, oo);
   unsigned un = static_cast<unsigned>(out_n);
   unsigned ured = static_cast<unsigned>(reduced_n);
+  // A deep reduction (a bias gradient sums its column over every row) earns a
+  // block per output, whose threads split that range; a shallow one keeps the
+  // flat kernel, where one thread per output already has the parallelism.
+  if (ured >= 64) {
+    if (CUfunction fb = c.sum_to_blocked_()) {
+      unsigned block = 256;
+      return c.launch_(fb, {un ? un : 1}, {block}, block * sizeof(float), pa, po,
+                       pmeta, rank, un, ured);
+    }
+  }
   return c.launch1d_(f, un, pa, po, pmeta, rank, un, ured);
 }
 

@@ -208,6 +208,56 @@ __global__ void tl_sum_to(const float* a, float* out, const long long* meta,
   out[t] = sum;
 }
 
+// ---- sum_to, one block per output element ------------------------------
+// The flat kernel above gives each output a single thread that walks the whole
+// reduced range, so a [N, C] -> [C] bias gradient does N adds in sequence per
+// column and the reduced axis carries no parallelism at all. Here the block's
+// threads stride over that range and finish in shared memory, the same shape
+// as the row reductions below. Same meta layout, so the host picks between the
+// two on depth alone.
+__global__ void tl_sum_to_blocked(const float* a, float* out,
+                                  const long long* meta, int rank,
+                                  unsigned out_n, unsigned reduced_n) {
+  unsigned t = blockIdx.x;
+  if (t >= out_n) return;
+  const long long* a_shape = meta;
+  const long long* a_strides = meta + rank;
+  const long long* acc = meta + 2 * rank;
+  long long base = 0;
+  int red_axis[8];
+  int red_count = 0;
+  for (int d = 0; d < rank; d++) {
+    if (acc[d] != 0) {
+      long long idx = (t / acc[d]) % a_shape[d];
+      base += idx * a_strides[d];
+    } else {
+      red_axis[red_count++] = d;
+    }
+  }
+  extern __shared__ float sdata[];
+  unsigned tid = threadIdx.x, T = blockDim.x;
+  float sum = 0.0f;
+  for (unsigned r = tid; r < reduced_n; r += T) {
+    unsigned rem = r;
+    long long off = base;
+    for (int k = red_count - 1; k >= 0; --k) {
+      int d = red_axis[k];
+      unsigned dim = static_cast<unsigned>(a_shape[d]);
+      unsigned coord = rem % dim;
+      rem /= dim;
+      off += static_cast<long long>(coord) * a_strides[d];
+    }
+    sum += a[off];
+  }
+  sdata[tid] = sum;
+  __syncthreads();
+  for (unsigned s = T >> 1; s > 0; s >>= 1) {
+    if (tid < s) sdata[tid] += sdata[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) out[t] = sdata[0];
+}
+
 // ---- unary: out = f(a) * scale + offset (affine = identity f) ----
 #define TL_EW_UNARY(NAME, EXPR)                                             \
   __global__ void NAME(const float* a, float* out, unsigned n, float scale, \
