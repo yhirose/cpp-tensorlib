@@ -2190,6 +2190,23 @@ struct graph {
     return from_node(std::move(n));
   }
 
+  // broadcast_to's result is a materialized stride-0 view carrying no node, so
+  // epilogue fusion cannot take it and the node built for an elementwise op on
+  // it would be shaped like the WIDE result — eval allocates that whole buffer
+  // and walks it to write data that only repeats ([4096, 8192]: 134MB, 17ms).
+  // Widening is a pure gather, so it commutes with anything elementwise: narrow
+  // the widened axes back to 1, run the op there, and widen the result again.
+  // Null when `a` carries no widened axis, i.e. there is nothing to push past.
+  static std::optional<array> narrow_widened_(const array& a) {
+    if (!a.materialized()) return std::nullopt;  // strides are the view's
+    std::optional<array> narrow;
+    for (size_t i = 0; i < a.rank(); i++) {
+      if (a.strides()[i] != 0 || a.shape()[i] == 1) continue;
+      narrow = (narrow ? *narrow : a).slice(static_cast<int>(i), 0, 1);
+    }
+    return narrow;
+  }
+
   // y = a * s + o. If `a` is an unevaluated op node, compose into a copy of
   // it (epilogue fusion): (base*S+O)*s+o = base*(S*s) + (O*s+o). The copy
   // shares the original's inputs; the original is left untouched for any
@@ -2202,6 +2219,9 @@ struct graph {
       c->scale = a.node_->scale * s;
       c->offset = a.node_->offset * s + o;
       return from_node(std::move(c));
+    }
+    if (auto narrow = narrow_widened_(a)) {
+      return affine(*narrow, s, o).broadcast_to(a.shape());
     }
     if (num_elements(a.shape()) <= kEagerTiny && eager_operand_(a) &&
         eager_cpu_ok_()) {
@@ -2306,6 +2326,9 @@ struct graph {
   // x OP s with the scalar in the node (arg0), not a rank-0 input; an
   // epilogue fuses onto it like any unary's.
   static array scalar_binary(op_t op, const array& a, float s) {
+    if (auto narrow = narrow_widened_(a)) {  // see narrow_widened_
+      return scalar_binary(op, *narrow, s).broadcast_to(a.shape());
+    }
     if (num_elements(a.shape()) <= kEagerTiny && eager_operand_(a) &&
         eager_cpu_ok_()) {
       switch (op) {  // direct switch, see graph::binary

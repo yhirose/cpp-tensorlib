@@ -225,6 +225,37 @@ TEST_CASE("broadcast_to feeds ops and clones like a materialized copy") {
   CHECK(matches_oracle([&] { return src.broadcast_to({32, 64}) * other; }));
 }
 
+TEST_CASE("an elementwise scalar on a widened view stays narrow") {
+  auto src = random_array({1, 64}, 21);
+  auto widened = src.broadcast_to({32, 64});
+  auto materialized = widened.clone();
+
+  auto widened_result = [](const array& x) {
+    for (auto s : x.strides()) {
+      if (s == 0) return true;
+    }
+    return false;
+  };
+
+  // The ratchet: the scalar pushes down to the narrow source, so the result is
+  // a stride-0 view and no [32, 64] buffer is ever allocated or walked. Values
+  // cannot see this — scaling after widening gives the same numbers for 32x the
+  // memory — so without this check the push-down can be undone silently.
+  auto scaled = (widened * 2.0f + 1.0f).eval();
+  CHECK(scaled.shape() == tl::shape_t{32, 64});
+  CHECK(widened_result(scaled));
+  CHECK(widened_result(tl::pow(widened, 2.0f).eval()));  // scalar_binary's family
+  CHECK(widened_result((widened > 0.0f).eval()));
+
+  // and the numbers are the ones the widened operand would have given
+  CHECK(allclose(scaled, (materialized * 2.0f + 1.0f).eval()));
+  CHECK(allclose(tl::pow(widened, 2.0f).eval(),
+                 tl::pow(materialized, 2.0f).eval()));
+  CHECK(allclose((widened > 0.0f).eval(), (materialized > 0.0f).eval()));
+  CHECK(matches_oracle([&] { return src.broadcast_to({32, 64}) * 2.0f + 1.0f; }));
+  CHECK(matches_oracle([&] { return tl::pow(src.broadcast_to({32, 64}), 2.0f); }));
+}
+
 TEST_CASE("axis reductions off the last axis match the oracle") {
   auto deep = random_array({96, 40}, 11);   // 96 rows: the blocked kernel
   auto shallow = random_array({7, 40}, 12);  // 7 rows: the flat one
