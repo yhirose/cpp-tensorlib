@@ -1078,6 +1078,13 @@ inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
   return c.encode_("where_nd", mcond, ma, mo, p, (n + 255) / 256, 1, mb, mm);
 }
 
+// clone()'s device arm, CUDA-first: no WebGPU kernel yet, so a clone of a
+// device buffer takes array.h's host copy.
+inline bool copy_nd(void*, int64_t, const int64_t*, void*, int64_t,
+                    const int64_t*, int, int64_t) {
+  return false;
+}
+
 // sum_to (un-broadcast a gradient): gather, mirrors cuda.h's tl_sum_to and
 // metal.h's own sum_to -- one invocation per OUTPUT element sums every `a`
 // element that broadcasts onto it, so no atomics (unlike index_add). Only

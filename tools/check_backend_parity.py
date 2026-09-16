@@ -17,11 +17,16 @@ unnamed parameters, always `return false;`. So "is this backend's first
 definition's body anything other than exactly `return false;`" is a
 reliable REAL/STUB signal without needing a real C++ parser.
 
+That convention is also checked, not just assumed: an op defined ONLY
+between the header's platform `#else` and its `#endif` is missing from the
+platform that actually compiles the backend, and only that platform's build
+says so. See misplaced_ops() below.
+
 Usage: tools/check_backend_parity.py
 Exit status: 0 if every op is REAL or STUB the same way on all three
 backends (a uniform stub is fine -- that just means nobody has ported it
-yet); 1 if any op's status differs across backends, printing what's
-missing where.
+yet); 1 if any op's status differs across backends, or if any definition
+sits only in a disabled-platform block, printing what is missing where.
 """
 import re
 import sys
@@ -107,6 +112,44 @@ def status(text, name):
     return "stub" if re.sub(r"\s+", " ", body).strip() == "return false;" else "REAL"
 
 
+def platform_block(text):
+    """(else, endif) offsets of the header's top-level platform #if block."""
+    depth = 0
+    else_pos = None
+    for m in re.finditer(r"^#(if\w*|else|elif|endif)", text, re.MULTILINE):
+        kind = m.group(1)
+        if kind.startswith("if"):
+            depth += 1
+        elif kind == "endif":
+            if depth == 1 and else_pos is not None:
+                return else_pos, m.start()
+            depth -= 1
+        elif kind == "else" and depth == 1 and else_pos is None:
+            else_pos = m.start()
+    return None, None
+
+
+def misplaced_ops(text, ops):
+    """Ops defined only between the platform #else and #endif.
+
+    The real platform then has no such function at all, so its build breaks
+    on the first caller -- and nothing else does, which is why this is worth
+    a check rather than a convention. Ops both branches would define the
+    same way live after the #endif (gemm_bias, the LLM decode ops); those
+    are outside the block and fine.
+    """
+    else_pos, endif_pos = platform_block(text)
+    if else_pos is None:
+        return []
+    out = []
+    for op in ops:
+        spots = [m.start() for m in re.finditer(
+            rf"^inline bool {re.escape(op)}\s*\(", text, re.MULTILINE)]
+        if spots and all(else_pos < s < endif_pos for s in spots):
+            out.append(op)
+    return out
+
+
 ALLOWLIST_PATH = ROOT / "tools/backend_parity_allowlist.txt"
 
 
@@ -155,13 +198,22 @@ def main():
         for op in stale:
             print(f"  {op}")
 
+    misplaced = [(b, op) for b, src in sources.items()
+                 for op in misplaced_ops(src, ops)]
+    if misplaced:
+        print(f"\nFAIL: {len(misplaced)} definition(s) sit only inside a "
+              f"disabled-platform #else block, so the platform that compiles "
+              f"that backend has no such function:")
+        for b, op in misplaced:
+            print(f"  {b}: {op} -- add it to the real block too "
+                  f"(a `return false;` stub is fine)")
+
     if unallowed:
         print(f"\nFAIL: {len(unallowed)} unallowlisted mismatch(es). Either "
               f"port the missing backend(s), or add the op to "
               f"{ALLOWLIST_PATH.name} with a reason if the gap is "
               f"deliberate.")
-        return 1
-    return 0
+    return 1 if (unallowed or misplaced) else 0
 
 
 if __name__ == "__main__":

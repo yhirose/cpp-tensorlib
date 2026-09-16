@@ -775,6 +775,13 @@ inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
   detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
   return true;
 }
+
+// clone()'s device arm, CUDA-first: no Metal kernel yet, so a clone takes
+// array.h's host copy (a flush and a memcpy on unified memory).
+inline bool copy_nd(void*, int64_t, const int64_t*, void*, int64_t,
+                    const int64_t*, int, int64_t) {
+  return false;
+}
 namespace detail_ {
 inline kop to_cmp_(cmp_op op) {
   switch (op) {
