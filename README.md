@@ -167,6 +167,18 @@ WebGPU actually implement it rather than falling back to the CPU oracle, and
 fails (in CI too) if an asymmetry isn't recorded in
 `tools/backend_parity_allowlist.txt` as deliberate.
 
+### Profiling
+
+`tl::profile` (`profile.h`) says where evaluation goes: a `profile::scope`
+labels a block, the evaluator opens one per op under it, and every kernel
+launch, transfer and blocking wait a backend performs lands under the
+innermost open scope. `profile::start()` / `stop()` bracket a session,
+`rows()` returns it, `report(stderr)` prints it as a table; `TL_PROFILE=1`
+does all three for a whole process. CUDA stamps each launch with events, so
+its rows carry a device time; Metal knows the GPU time per command buffer
+(`summarize().batch_device_us`); WebGPU counts launches. A row's
+`device_timed` says how many of its launches the device time covers.
+
 ### Storage dtypes
 
 Compute and results are **always f32**. `bf16` and `q4` are weight-container

@@ -16,6 +16,7 @@
 // Device dispatch slots in at detail::graph::eval_one (M3+).
 
 #include <cpu.h>
+#include <profile.h>
 #include <shape.h>
 #include <storage.h>
 #include <types.h>
@@ -972,6 +973,9 @@ inline array array::clone() const {
   // out again (CUDA: D2H, then H2D at the next device use); copy on the device
   // instead and leave the kernel in flight, like any other realized result.
   realize_();
+  // Eager, so no evaluator scope names the copy; opened after the source's
+  // own evaluation so that lands under its own ops, not here.
+  profile::scope ps("clone");
   if (storage_.native && storage_.dt == tl::dtype::f32) {
     if (auto out = detail::device_clone_(*this)) return std::move(*out);
   }
@@ -4027,6 +4031,8 @@ struct graph {
     run_(roots, false);
   }
   static void run_(const std::vector<node_ptr>& roots, bool do_flush) {
+    static const bool profile_env = (profile::detail::env_autostart(), true);
+    (void)profile_env;
     // First auto-mode eval on a host with a GPU: derive the matmul crossover
     // first. Its census evals each nest a run_, and `roots` may be
     // materialize_'s own thread-local scratch, which those evals reuse — so
@@ -4224,8 +4230,69 @@ struct graph {
     return true;
   }
 
+  // The op's name as tl::profile labels the evaluator's scope for it.
+  static const char* op_name_(node::op_t op) {
+    using op_t = node::op_t;
+    switch (op) {
+      case op_t::constant: return "constant";
+      case op_t::add: return "add";
+      case op_t::sub: return "sub";
+      case op_t::mul: return "mul";
+      case op_t::div: return "div";
+      case op_t::pow_: return "pow";
+      case op_t::gt: return "gt";
+      case op_t::lt: return "lt";
+      case op_t::ge: return "ge";
+      case op_t::le: return "le";
+      case op_t::eq: return "eq";
+      case op_t::ne: return "ne";
+      case op_t::pow_s: return "pow_s";
+      case op_t::gt_s: return "gt_s";
+      case op_t::lt_s: return "lt_s";
+      case op_t::ge_s: return "ge_s";
+      case op_t::le_s: return "le_s";
+      case op_t::eq_s: return "eq_s";
+      case op_t::ne_s: return "ne_s";
+      case op_t::affine: return "affine";
+      case op_t::recip: return "recip";
+      case op_t::exp_: return "exp";
+      case op_t::log_: return "log";
+      case op_t::sqrt_: return "sqrt";
+      case op_t::sigmoid: return "sigmoid";
+      case op_t::relu: return "relu";
+      case op_t::tanh_: return "tanh";
+      case op_t::sin_: return "sin";
+      case op_t::cos_: return "cos";
+      case op_t::clamp_: return "clamp";
+      case op_t::softmax: return "softmax";
+      case op_t::where_: return "where";
+      case op_t::dot: return "dot";
+      case op_t::attn_dec: return "attn_decode";
+      case op_t::attn_pre: return "attn_prefill";
+      case op_t::rope: return "rope";
+      case op_t::layer_norm_: return "layer_norm";
+      case op_t::sum_ax: return "sum";
+      case op_t::mean_ax: return "mean";
+      case op_t::max_ax: return "max";
+      case op_t::argmax_ax: return "argmax";
+      case op_t::sum_to_: return "sum_to";
+      case op_t::lse_ax: return "logsumexp";
+      case op_t::pad_: return "pad";
+      case op_t::fold_: return "fold";
+      case op_t::index_select_: return "index_select";
+      case op_t::index_add_: return "index_add";
+      case op_t::scatter_axis_: return "scatter_axis";
+      case op_t::gather_axis_: return "gather_axis";
+      case op_t::concat_: return "concat";
+      case op_t::view_: return "view";
+    }
+    return "?";
+  }
+
   static void eval_one(node& n) {
-    if (n.op != node::op_t::constant && try_fast_ew_(n)) return;
+    if (n.op == node::op_t::constant) return;
+    profile::scope ps(op_name_(n.op));
+    if (try_fast_ew_(n)) return;
     if (n.op == node::op_t::dot && try_fast_dot_(n)) return;
     // Input funnel. bf16 inputs widen to an F32 copy here — the universal
     // fallback that keeps every backend kernel F32-only; the sole native bf16

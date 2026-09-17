@@ -38,6 +38,7 @@
 #include <cstdint>
 
 #include "metal.h"  // reuse tl::metal::kop (platform-independent op enum)
+#include "profile.h"
 #include "types.h"
 
 namespace tl {
@@ -428,6 +429,7 @@ struct context {
 
     pending = true;
     dispatch_counts[entry]++;
+    profile::detail::launch(entry);  // counted; WebGPU stamps no time
     return true;
   }
 
@@ -464,9 +466,11 @@ inline void flush() {
   wgpu::CommandBuffer cmds = c.enc.Finish();
   c.enc = nullptr;
   c.queue.Submit(1, &cmds);
+  const auto t0 = profile::detail::clock::now();
   c.wait(c.queue.OnSubmittedWorkDone(
       wgpu::CallbackMode::WaitAnyOnly,
       [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {}));
+  profile::detail::wait(profile::detail::us_since(t0));
 }
 
 inline void context::flush_() { flush(); }

@@ -22,6 +22,7 @@
 #ifdef __APPLE__
 
 #include <objc.h>
+#include <profile.h>
 
 #include <cstdlib>
 #include <stdexcept>
@@ -93,6 +94,10 @@ struct context {
   // objc round trip (tiny-tensor workloads allocate per op).
   std::unordered_map<int64_t, std::vector<std::pair<void*, float*>>> free_bufs;
   std::unordered_map<int, objc::id> psos;
+  // The kernel pso_ last handed out, which is the one the next dispatch
+  // binds: what tl::profile names the launch (an op looks its pipeline up
+  // and dispatches it in the same breath).
+  const char* bound = nullptr;
 
   static context& get() {
     static auto* c = new context();  // leaked: outlives all storage deleters
@@ -180,6 +185,7 @@ struct context {
   }
 
   objc::id pso_(kop op) {
+    bound = kernel_name_(op);
     auto it = psos.find(static_cast<int>(op));
     if (it != psos.end()) return it->second;
     if (!library) {
@@ -227,7 +233,15 @@ inline void flush() {
   if (!c.pending) return;
   objc::send(c.enc, "endEncoding");
   objc::send(c.cb, "commit");
+  const auto t0 = profile::detail::clock::now();
   objc::send(c.cb, "waitUntilCompleted");
+  profile::detail::wait(profile::detail::us_since(t0));
+  if (profile::active()) {
+    // The GPU time is known per command buffer, not per dispatch.
+    const double s = objc::send<double>(c.cb, "GPUStartTime");
+    const double e = objc::send<double>(c.cb, "GPUEndTime");
+    if (e > s) profile::detail::batch_device((e - s) * 1e6);
+  }
   objc_autoreleasePoolPop(c.pool);
   c.cb = c.enc = nullptr;
   c.pool = nullptr;
@@ -260,6 +274,18 @@ inline void release(void* buf, int64_t bytes, float* contents) {
 
 namespace detail_ {
 
+// Every dispatch goes through here: the one place a launch is counted.
+inline void dispatch_grid_(objc::id enc, mtl_size grid, mtl_size tg) {
+  using fn = void (*)(objc::id, objc::sel_t, mtl_size, mtl_size);
+  reinterpret_cast<fn>(objc_msgSend)(
+      enc, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"),
+      grid, tg);
+  if (profile::active()) {
+    const char* name = context::get().bound;
+    profile::detail::launch(name ? name : "?");
+  }
+}
+
 struct ew_params {
   float scale;
   float offset;
@@ -271,10 +297,7 @@ inline void dispatch_(objc::id enc, objc::id pso, const ew_params& p,
   objc::send(enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
              static_cast<unsigned long>(sizeof(p)), params_index);
   unsigned long groups = (p.n + 255ul) / 256ul;
-  using dispatch_fn = void (*)(objc::id, objc::sel_t, mtl_size, mtl_size);
-  reinterpret_cast<dispatch_fn>(objc_msgSend)(
-      enc, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"),
-      mtl_size{groups, 1, 1}, mtl_size{256, 1, 1});
+  dispatch_grid_(enc, {groups, 1, 1}, {256, 1, 1});
   (void)pso;
 }
 
@@ -356,12 +379,10 @@ inline bool binary_bcast(kop op, void* a, int64_t ao, int64_t ars, int64_t acs,
       static_cast<uint32_t>(bcs)};
   objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
              static_cast<unsigned long>(sizeof(p)), 3ul);
-  using fn = void (*)(objc::id, objc::sel_t, mtl_size, mtl_size);
-  reinterpret_cast<fn>(objc_msgSend)(
-      c.enc, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"),
-      mtl_size{(static_cast<unsigned long>(n) + 31ul) / 32ul,
-               (static_cast<unsigned long>(m) + 7ul) / 8ul, 1},
-      mtl_size{32, 8, 1});
+  detail_::dispatch_grid_(c.enc,
+                          {(static_cast<unsigned long>(n) + 31ul) / 32ul,
+                           (static_cast<unsigned long>(m) + 7ul) / 8ul, 1},
+                          {32, 8, 1});
   return true;
 }
 
@@ -386,13 +407,6 @@ struct layer_norm_params {
 inline void set_buf_(objc::id enc, void* buf, int64_t off, unsigned long idx) {
   objc::send(enc, "setBuffer:offset:atIndex:", buf,
              static_cast<unsigned long>(off), idx);
-}
-
-inline void dispatch_grid_(objc::id enc, mtl_size grid, mtl_size tg) {
-  using fn = void (*)(objc::id, objc::sel_t, mtl_size, mtl_size);
-  reinterpret_cast<fn>(objc_msgSend)(
-      enc, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"),
-      grid, tg);
 }
 
 }  // namespace detail_

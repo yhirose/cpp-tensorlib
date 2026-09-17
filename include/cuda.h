@@ -28,6 +28,7 @@
 #include <cstdint>
 
 #include "metal.h"  // reuse tl::metal::kop (platform-independent op enum)
+#include "profile.h"  // tl::profile (per-launch attribution and timing)
 #include "shape.h"  // tl::contiguous_strides_into (pad/fold meta upload)
 #include "types.h"  // tl::dtype (KV cache storage width)
 
@@ -96,12 +97,14 @@ struct CUfunc_st;
 struct CUstream_st;
 struct CUgraph_st;
 struct CUgraphExec_st;
+struct CUevent_st;
 using CUcontext = CUctx_st*;
 using CUmodule = CUmod_st*;
 using CUfunction = CUfunc_st*;
 using CUstream = CUstream_st*;
 using CUgraph = CUgraph_st*;
 using CUgraphExec = CUgraphExec_st*;
+using CUevent = CUevent_st*;
 
 struct driver {
   CUresult (*Init)(unsigned) = nullptr;
@@ -137,6 +140,12 @@ struct driver {
   CUresult (*GraphLaunch)(CUgraphExec, CUstream) = nullptr;
   CUresult (*GraphExecDestroy)(CUgraphExec) = nullptr;
   CUresult (*GraphDestroy)(CUgraph) = nullptr;
+  // Events, for tl::profile's per-launch timing. Optional like the graph
+  // set: timing_ok() gates them, and a driver without them still launches.
+  CUresult (*EventCreate)(CUevent*, unsigned) = nullptr;
+  CUresult (*EventRecord)(CUevent, CUstream) = nullptr;
+  CUresult (*EventSynchronize)(CUevent) = nullptr;
+  CUresult (*EventElapsedTime)(float*, CUevent, CUevent) = nullptr;
 
   bool ok() const {
     return Init && DeviceGet && DevicePrimaryCtxRetain && CtxSetCurrent &&
@@ -148,6 +157,9 @@ struct driver {
     return MemcpyHtoDAsync && StreamCreate && StreamBeginCapture &&
            StreamEndCapture && GraphInstantiate && GraphLaunch &&
            GraphExecDestroy && GraphDestroy && StreamSynchronize;
+  }
+  bool timing_ok() const {
+    return EventCreate && EventRecord && EventSynchronize && EventElapsedTime;
   }
 };
 
@@ -230,6 +242,17 @@ struct context {
   bool no_splitk = false;
   std::unordered_map<int, CUfunction> fns;
 
+  // tl::profile: the name each loaded function was looked up by (a launch
+  // only has the handle), and the launches bracketed by events whose
+  // elapsed time has not been read back yet. Events are recycled.
+  std::unordered_map<CUfunction, std::string> kernel_names;
+  struct timed_launch {
+    profile::row* row;
+    CUevent begin, end;
+  };
+  std::vector<timed_launch> timed;
+  std::vector<CUevent> spare_events;
+
   // Host/device mirror per allocation, keyed by the device pointer (== the
   // `native` handle stored in storage). Views sharing a storage share the key,
   // so one dirty state serves every view. loc tracks where the live copy is.
@@ -260,10 +283,22 @@ struct context {
   void device_read_(void* native) {
     mirror* m = mirror_(native);
     if (m && m->where == HOST) {
-      if (d.MemcpyHtoDAsync) d.MemcpyHtoDAsync(m->dev, m->host, m->bytes, stream);
-      else d.MemcpyHtoD(m->dev, m->host, m->bytes);
+      upload_(*m);
       m->where = BOTH;
     }
+  }
+  // The H2D behind device_read_ / device_rmw_: async on the stream when the
+  // driver has it. Profiled as a transfer either way (the blocking form with
+  // its wait).
+  void upload_(const mirror& m) {
+    if (d.MemcpyHtoDAsync) {
+      d.MemcpyHtoDAsync(m.dev, m.host, m.bytes, stream);
+      profile::detail::transfer("h2d", m.bytes, 0.0);
+      return;
+    }
+    const auto t0 = profile::detail::clock::now();
+    d.MemcpyHtoD(m.dev, m.host, m.bytes);
+    profile::detail::transfer("h2d", m.bytes, profile::detail::us_since(t0));
   }
   // A kernel is about to WRITE every element of this buffer: it becomes the
   // live copy, and whatever the host held is dead. A kernel that reads it
@@ -278,10 +313,7 @@ struct context {
   void device_rmw_(void* native) {
     mirror* m = mirror_(native);
     if (!m) return;
-    if (m->where == HOST) {
-      if (d.MemcpyHtoDAsync) d.MemcpyHtoDAsync(m->dev, m->host, m->bytes, stream);
-      else d.MemcpyHtoD(m->dev, m->host, m->bytes);
-    }
+    if (m->where == HOST) upload_(*m);
     m->where = DEVICE;
   }
 
@@ -360,6 +392,11 @@ struct context {
     d.GraphLaunch = (CUresult(*)(CUgraphExec, CUstream))S("cuGraphLaunch");
     d.GraphExecDestroy = (CUresult(*)(CUgraphExec))S("cuGraphExecDestroy");
     d.GraphDestroy = (CUresult(*)(CUgraph))S("cuGraphDestroy");
+    d.EventCreate = (CUresult(*)(CUevent*, unsigned))S("cuEventCreate");
+    d.EventRecord = (CUresult(*)(CUevent, CUstream))S("cuEventRecord");
+    d.EventSynchronize = (CUresult(*)(CUevent))S("cuEventSynchronize");
+    d.EventElapsedTime =
+        (CUresult(*)(float*, CUevent, CUevent))S("cuEventElapsedTime");
     if (!d.ok()) return;
 
     if (d.Init(0) != 0) return;
@@ -371,14 +408,27 @@ struct context {
     d.CtxSetCurrent(ctx);
     if (d.ModuleLoadData(&mod, ptx_source_()) != 0) return;
     ready = true;
+    profile::detail::drain_hook = [] { context::get().resolve_timed_(); };
+  }
+
+  // Every function handle comes out of one of the three lookups below, so
+  // this is the one place a name is known; launch_ reads it back.
+  CUfunction load_(const char* name) {
+    CUfunction f = nullptr;
+    d.ModuleGetFunction(&f, mod, name);
+    if (f) kernel_names.emplace(f, name);
+    return f;
+  }
+  const char* name_(CUfunction f) const {
+    auto it = kernel_names.find(f);
+    return it == kernel_names.end() ? "?" : it->second.c_str();
   }
 
   CUfunction fn_(kop op) {
     int key = static_cast<int>(op);
     auto it = fns.find(key);
     if (it != fns.end()) return it->second;
-    CUfunction f = nullptr;
-    d.ModuleGetFunction(&f, mod, kernel_name_(op));
+    CUfunction f = load_(kernel_name_(op));
     fns[key] = f;
     return f;
   }
@@ -387,8 +437,33 @@ struct context {
   // line applied to its slot. The variant getters (D x bf16 etc.) just pick
   // which (slot, name) pair to hand it.
   CUfunction cached_(CUfunction& slot, const char* name) {
-    if (!slot) d.ModuleGetFunction(&slot, mod, name);
+    if (!slot) slot = load_(name);
     return slot;
+  }
+
+  // ---- tl::profile: a launch bracketed by two events on the stream, read
+  // back (never mid-pipeline) once the device is known idle ----
+  CUevent event_() {
+    if (!spare_events.empty()) {
+      CUevent e = spare_events.back();
+      spare_events.pop_back();
+      return e;
+    }
+    CUevent e = nullptr;
+    d.EventCreate(&e, 0 /*CU_EVENT_DEFAULT: timing on*/);
+    return e;
+  }
+  void resolve_timed_() {
+    for (const timed_launch& t : timed) {
+      float ms = 0.0f;
+      d.EventSynchronize(t.end);
+      if (d.EventElapsedTime(&ms, t.begin, t.end) == 0) {
+        profile::detail::device_time(t.row, ms * 1000.0);
+      }
+      spare_events.push_back(t.begin);
+      spare_events.push_back(t.end);
+    }
+    timed.clear();
   }
 
   // The f32 SGEMM fast path, one kernel per tile (sgemm_tiles) and operand
@@ -403,7 +478,7 @@ struct context {
       char name[64];
       std::snprintf(name, sizeof(name), "%s%s%s", t.base, bias ? "_bias" : "",
                     suffix[layout & 3]);
-      d.ModuleGetFunction(&slot, mod, name);
+      slot = load_(name);
     }
     return slot;
   }
@@ -733,8 +808,25 @@ struct context {
     if (!f) return false;
     void* argv[] = {&args...};
     pending = true;
-    return d.LaunchKernel(f, grid.x, grid.y, grid.z, block.x, block.y, block.z,
-                          smem, stream, argv, nullptr) == 0;
+    // Profiling: the launch under the open scope, and — outside a graph
+    // capture, where an event record would become a graph node — an event on
+    // each side of it for the elapsed time.
+    profile::row* pr =
+        profile::active() ? profile::detail::launch(name_(f)) : nullptr;
+    CUevent begin = nullptr;
+    if (pr && d.timing_ok() && !stream) {  // null = the default stream
+      begin = event_();
+      d.EventRecord(begin, stream);
+    }
+    const bool ok =
+        d.LaunchKernel(f, grid.x, grid.y, grid.z, block.x, block.y, block.z,
+                       smem, stream, argv, nullptr) == 0;
+    if (begin) {
+      CUevent end = event_();
+      d.EventRecord(end, stream);
+      timed.push_back({pr, begin, end});
+    }
+    return ok;
   }
 
   // The 1-D elementwise shape: 256-thread blocks covering n elements.
@@ -842,8 +934,11 @@ inline bool pending() { return context::get().pending; }
 inline void flush() {
   auto& c = context::get();
   if (!c.pending) return;
+  const auto t0 = profile::detail::clock::now();
   c.d.CtxSynchronize();
   c.pending = false;
+  profile::detail::wait(profile::detail::us_since(t0));
+  if (!c.timed.empty()) c.resolve_timed_();  // the device is idle: free reads
 }
 
 // ---- CUDA-graph capture (M9 C1-2): record a fixed launch sequence once and
@@ -974,7 +1069,9 @@ inline void sync_to_host(void* native, bool for_write) {
   if (!m) return;
   if (m->where == context::DEVICE) {
     if (c.pending) flush();
+    const auto t0 = profile::detail::clock::now();
     c.d.MemcpyDtoH(m->host, m->dev, m->bytes);
+    profile::detail::transfer("d2h", m->bytes, profile::detail::us_since(t0));
     m->where = context::BOTH;
   }
   if (for_write) m->where = context::HOST;

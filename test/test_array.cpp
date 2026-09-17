@@ -2429,3 +2429,82 @@ TEST_CASE("add_ invalidates the device copy the GPU will read next") {
 
   tl::device_ = prev;
 }
+
+// tl::profile: the evaluator opens a scope per op under the caller's own, and
+// what a backend launches lands under the innermost one. Only the backend
+// actually driving the device stamps a per-launch time, so that part is asked
+// of CUDA alone; every backend counts.
+TEST_CASE("profile: scopes nest into paths and launches land under them") {
+  using tl::profile::row;
+  auto a = random_array({96, 96}, 1500), b = random_array({96, 96}, 1501);
+  a.eval();
+  b.eval();
+
+  tl::profile::start();
+  {
+    tl::profile::scope phase("phase");
+    tl::profile::scope mm("mm");
+    a.dot(b).eval();
+  }
+  tl::profile::stop();
+  auto rows = tl::profile::rows();
+
+  auto find = [&](std::string_view path, std::string_view kernel) {
+    const row* hit = nullptr;
+    for (const row& r : rows) {
+      if (r.path == path && r.kernel == kernel) hit = &r;
+    }
+    return hit;
+  };
+  const row* phase = find("phase", "");
+  REQUIRE(phase);
+  CHECK(phase->count == 1);
+  CHECK(phase->host_us > 0);
+  const row* dot = find("phase/mm/dot", "");
+  REQUIRE(dot);
+  CHECK(dot->count == 1);
+  CHECK(phase->host_us >= dot->host_us);
+
+  const bool on_device =
+      tl::gpu_available() && tl::device_ == tl::device_type::gpu;
+  std::vector<const row*> launches;
+  for (const row& r : rows) {
+    if (r.path == "phase/mm/dot" && !r.kernel.empty() && r.kernel != "wait" &&
+        r.kernel != "h2d" && r.kernel != "d2h") {
+      launches.push_back(&r);
+    }
+  }
+  if (on_device) {
+    // the matmul dispatched at least one kernel, and the batch's flush was
+    // waited for under the scope that evaluated it
+    CHECK(!launches.empty());
+    const row* wait = find("phase/mm", "wait");
+    REQUIRE(wait);
+    CHECK(wait->count >= 1);
+#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
+    for (const row* r : launches) {
+      CHECK(r->device_timed == r->count);
+      CHECK(r->device_us > 0);
+    }
+#endif
+#ifdef __APPLE__
+    CHECK(tl::profile::summarize().batches >= 1);
+#endif
+  } else {
+    CHECK(launches.empty());  // the CPU path launches nothing
+  }
+  CHECK(tl::profile::summarize().scopes >= 3);
+
+  // Stopped: the next evaluation leaves no trace.
+  {
+    tl::profile::scope after("after");
+    a.dot(b).eval();
+  }
+  rows = tl::profile::rows();
+  CHECK(!find("after", ""));
+
+  // A new session starts from nothing.
+  tl::profile::start();
+  tl::profile::stop();
+  CHECK(tl::profile::rows().empty());
+}
