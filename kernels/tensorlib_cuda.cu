@@ -756,6 +756,108 @@ __global__ void tl_layer_norm(const float* x, const float* g, const float* b,
     dst[c] = ((src[c] - mu) * inv * g[c] + b[c]) * scale + offset;
 }
 
+// ---- layer norm's pullback over the last axis, in three launches ----
+// With x̂ = (x − μ)·s, s = 1/sqrt(var + eps) and ĝ = dy ⊙ γ, the closed form is
+//   dx = s · (ĝ − mean(ĝ) − x̂ · mean(ĝ ⊙ x̂)),  dγ = Σ_rows dy ⊙ x̂,  dβ = Σ_rows dy.
+// The forward kept no x̂, so the dx kernel recomputes μ and s per row exactly
+// as tl_layer_norm does (the same two tree sums, the same 1/cols scaling) and
+// leaves them in `stats` [2, rows] for the column sums, which read x, dy and
+// the row's (μ, s) once more instead of a second row reduction per column.
+// One block per row, 256 threads, like tl_layer_norm.
+__global__ void tl_layer_norm_bwd_dx(const float* x, const float* g,
+                                     const float* dy, float* dx, float* stats,
+                                     unsigned rows, unsigned cols, float eps) {
+  unsigned row = blockIdx.x;
+  if (row >= rows) return;
+  const float* src = x + (size_t)row * cols;
+  const float* gy = dy + (size_t)row * cols;
+  float* dst = dx + (size_t)row * cols;
+  extern __shared__ float sdata[];
+  unsigned t = threadIdx.x, T = blockDim.x;
+  float inv_n = 1.0f / (float)cols;
+
+  float sum = 0.0f;
+  for (unsigned c = t; c < cols; c += T) sum += src[c];
+  const float mu = tl_tree_sum_(sdata, t, T, sum) * inv_n;
+  float ss = 0.0f;
+  for (unsigned c = t; c < cols; c += T) {
+    float v = src[c] - mu;
+    ss += v * v;
+  }
+  const float inv = 1.0f / sqrtf(tl_tree_sum_(sdata, t, T, ss) * inv_n + eps);
+  float sg = 0.0f, sgx = 0.0f;
+  for (unsigned c = t; c < cols; c += T) {
+    float gh = gy[c] * g[c];
+    sg += gh;
+    sgx += gh * (src[c] - mu) * inv;
+  }
+  const float mean_g = tl_tree_sum_(sdata, t, T, sg) * inv_n;
+  const float mean_gx = tl_tree_sum_(sdata, t, T, sgx) * inv_n;
+  for (unsigned c = t; c < cols; c += T) {
+    float xhat = (src[c] - mu) * inv;
+    dst[c] = inv * (gy[c] * g[c] - mean_g - xhat * mean_gx);
+  }
+  if (t == 0) {
+    stats[row] = mu;
+    stats[rows + row] = inv;
+  }
+}
+
+// The column sums' first half: a block per (32-column strip, chunk of rows),
+// its 32×8 threads striding the chunk's rows so a warp reads 32 consecutive
+// columns of one row, folded over the 8 lanes in shared memory into
+// `partials` [2, chunks, cols] (dγ's plane first). A fixed lane order keeps
+// the sums deterministic, which float atomics would not.
+__global__ void tl_layer_norm_bwd_gb(const float* x, const float* dy,
+                                     const float* stats, float* partials,
+                                     unsigned rows, unsigned cols,
+                                     unsigned rows_per_chunk) {
+  __shared__ float sg[8][32], sgx[8][32];
+  unsigned tx = threadIdx.x, ty = threadIdx.y;
+  unsigned c = blockIdx.x * 32 + tx;
+  unsigned chunk = blockIdx.y;
+  unsigned r0 = chunk * rows_per_chunk;
+  unsigned r1 = r0 + rows_per_chunk;
+  if (r1 > rows) r1 = rows;
+  float ag = 0.0f, agx = 0.0f;
+  if (c < cols) {
+    for (unsigned r = r0 + ty; r < r1; r += 8) {
+      float gy = dy[(size_t)r * cols + c];
+      float xhat = (x[(size_t)r * cols + c] - stats[r]) * stats[rows + r];
+      ag += gy;
+      agx += gy * xhat;
+    }
+  }
+  sg[ty][tx] = ag;
+  sgx[ty][tx] = agx;
+  __syncthreads();
+  if (ty == 0 && c < cols) {
+    float tg = 0.0f, tgx = 0.0f;
+    for (unsigned l = 0; l < 8; l++) {
+      tg += sg[l][tx];
+      tgx += sgx[l][tx];
+    }
+    size_t at = (size_t)chunk * cols + c;
+    partials[at] = tgx;
+    partials[(size_t)gridDim.y * cols + at] = tg;
+  }
+}
+
+// The second half: a thread per column folds its chunks into dγ and dβ.
+__global__ void tl_layer_norm_bwd_gb_fold(const float* partials, float* dg,
+                                          float* db, unsigned chunks,
+                                          unsigned cols) {
+  unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= cols) return;
+  float tg = 0.0f, tb = 0.0f;
+  for (unsigned k = 0; k < chunks; k++) {
+    tg += partials[(size_t)k * cols + c];
+    tb += partials[((size_t)chunks + k) * cols + c];
+  }
+  dg[c] = tg;
+  db[c] = tb;
+}
+
 // ---- C(i, j) = bias[j]: the row bias laid under a split gemm's partials ----
 // One element per thread, a block per 256 columns of a row (grid y = rows): a
 // thread per row streaming its row ran 512×4096 in 1 ms on two blocks.

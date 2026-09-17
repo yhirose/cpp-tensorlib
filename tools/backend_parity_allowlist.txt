@@ -42,6 +42,11 @@ gather_from_axis
 row_logsumexp
 xent_bwd
 
+# Layer norm's pullback in three launches (dx with the row stats, the column
+# partials, their fold). CUDA-first; elsewhere the backward composes the
+# same gradients out of the unfused ops meanwhile.
+layer_norm_bwd
+
 # Adam's per-parameter update in one launch. CUDA-first; elsewhere array.h's
 # own host loop runs after the data comes home -- a flush and a memcpy on
 # Metal's unified memory, a D2H and H2D round trip on WebGPU -- meanwhile.

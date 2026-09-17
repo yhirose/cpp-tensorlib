@@ -997,6 +997,13 @@ inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
                      int64_t, void*, int64_t, int64_t, int64_t) {
   return false;
 }
+// Layer norm's pullback. CUDA-first (allowlisted); the caller composes the
+// unfused form when this declines.
+inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
+                           void*, int64_t, void*, int64_t, void*, int64_t,
+                           void*, void*, int64_t, int64_t, int64_t, float) {
+  return false;
+}
 
 // Adam's fused per-parameter update. CUDA-first (allowlisted); array.h takes
 // its host loop when this declines, a D2H and H2D round trip here.
@@ -1366,6 +1373,13 @@ inline bool row_logsumexp(void*, int64_t, void*, int64_t, int64_t, int64_t,
 }
 inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
                      int64_t, void*, int64_t, int64_t, int64_t) {
+  return false;
+}
+// Layer norm's pullback. CUDA-first (allowlisted); the caller composes the
+// unfused form when this declines.
+inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
+                           void*, int64_t, void*, int64_t, void*, int64_t,
+                           void*, void*, int64_t, int64_t, int64_t, float) {
   return false;
 }
 inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,

@@ -10,7 +10,8 @@
 //              gemm / gemm_batched / gemm_bias / row_op / pad / fold /
 //              index_select / index_add / scatter_to_axis / gather_from_axis /
 //              sum_to / compare / unary_ext / clamp / scalar_binary /
-//              concat_part / rope / layer_norm / row_logsumexp / xent_bwd
+//              concat_part / rope / layer_norm / layer_norm_bwd /
+//              row_logsumexp / xent_bwd / adam_step
 //   LLM path   gemv_f32 / gemv_bf16 / gemv_q4 / attn_decode / attn_prefill /
 //              attn_prefill_dq / attn_prefill_dkv
 // A backend with no kernel for one of these returns false and the evaluator

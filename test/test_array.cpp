@@ -1285,6 +1285,66 @@ TEST_CASE("layer_norm matches its composition, across the pool and on the GPU") 
   CHECK_THROWS(array::layer_norm(x2, g33, random_array({2, 33}, 1118)));
 }
 
+TEST_CASE("layer_norm_bwd matches the composed pullback on the GPU") {
+  if (!tl::gpu_available()) return;
+  // The closed form the fused kernels replace, spelled with the unfused ops
+  // on the CPU: dx = s·(ĝ − mean ĝ − x̂·mean(ĝ⊙x̂)), dγ = Σ dy⊙x̂, dβ = Σ dy.
+  auto composed = [](const array& x, const array& g, const array& dy) {
+    int last = static_cast<int>(x.rank()) - 1;
+    int64_t d = x.shape().back(), rows = x.size() / d;
+    auto mu = x.mean(last, true);
+    auto diff = x - mu;
+    auto var = (diff * diff).mean(last, true);
+    auto s = 1.0f / (var + 1e-5f).sqrt();
+    auto xhat = diff * s;
+    auto gh = dy * g;
+    auto dx = s * (gh - gh.mean(last, true) - xhat * (gh * xhat).mean(last, true));
+    auto dg = (dy * xhat).reshape({rows, d}).sum(0);
+    auto db = dy.reshape({rows, d}).sum(0);
+    return std::array<array, 3>{dx.eval(), dg.eval(), db.eval()};
+  };
+  auto prev = tl::device_;
+  bool fused_seen = false;
+  auto check = [&](const array& x, const array& g, const array& dy) {
+    tl::use_gpu();
+    auto got = tl::array::layer_norm_bwd(x, g, dy);
+    tl::use_cpu();
+    if (!got) return;
+    fused_seen = true;
+    auto want = composed(x, g, dy);
+    for (int i = 0; i < 3; i++) {
+      CHECK(got->at(i).shape() == want[i].shape());
+      CHECK(tl::allclose(got->at(i).eval(), want[i], 1e-4f, 1e-5f));
+    }
+  };
+  // A short input (one row chunk, a partial column strip), a rank-3 one with
+  // gamma as [1, d], a row wider than the 256-thread block, and a tall one
+  // whose 200 rows split into chunks with a partial last (64·3 + 8).
+  check(random_array({7, 33}, 1201), random_array({33}, 1202),
+        random_array({7, 33}, 1203));
+  check(random_array({4, 6, 40}, 1204), random_array({1, 40}, 1205),
+        random_array({4, 6, 40}, 1206));
+  check(random_array({3, 700}, 1207), random_array({700}, 1208),
+        random_array({3, 700}, 1209));
+  check(random_array({200, 300}, 1210), random_array({300}, 1211),
+        random_array({200, 300}, 1212));
+  // The kernels are CUDA's, so a CUDA build must take them — another device
+  // declines and its caller composes the form above (covered by the gradient
+  // tests of the consumers).
+#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
+  CHECK(fused_seen);
+#else
+  if (!fused_seen) MESSAGE("no fused layer norm pullback on this backend");
+#endif
+  tl::use_gpu();
+  auto x = random_array({7, 33}, 1213), dy = random_array({7, 33}, 1214);
+  CHECK_THROWS(tl::array::layer_norm_bwd(x, random_array({32}, 1215), dy));
+  CHECK_THROWS(tl::array::layer_norm_bwd(x, random_array({2, 33}, 1216), dy));
+  CHECK_THROWS(tl::array::layer_norm_bwd(x, random_array({33}, 1217),
+                                         random_array({33, 7}, 1218)));
+  tl::device_ = prev;
+}
+
 TEST_CASE("concat GPU dispatch matches the CPU oracle") {
   auto a = array::from({1, 2, 3, 4}, {2, 2});
   auto b = array::from({5, 6, 7, 8}, {2, 2});

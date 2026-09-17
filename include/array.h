@@ -26,6 +26,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -527,6 +528,14 @@ class array {
   // One node and one output where the composition takes nine.
   static array layer_norm(const array& x, const array& gamma, const array& beta,
                           float eps = 1e-5f);
+  // Its pullback, fused: given the forward's x and gamma and the gradient
+  // `dout` of its output, {dx, dgamma, dbeta} — dgamma and dbeta as [d].
+  // Eager and GPU-only, like the attention halves below: nullopt when no
+  // kernel takes it (CPU mode, an operand not device-resident or not
+  // contiguous), and the caller composes the unfused form.
+  static std::optional<std::array<array, 3>> layer_norm_bwd(
+      const array& x, const array& gamma, const array& dout,
+      float eps = 1e-5f);
   static array silu(const array& x);
   static array swiglu(const array& gate, const array& up);
 
@@ -3295,6 +3304,57 @@ struct graph {
     return out;
   }
 
+  // Layer norm's fused pullback (see array::layer_norm_bwd). Eager and
+  // GPU-only, the same bargain as xent_bwd: three launches here, or the
+  // caller's composition. The shape rules are graph::layer_norm's, with dout
+  // on x's shape; the row stats and column partials the kernels hand each
+  // other are scratch this frame owns.
+  static std::optional<std::array<array, 3>> layer_norm_bwd(
+      const array& x, const array& gamma, const array& dout, float eps) {
+    profile::scope ps("layer_norm_bwd");  // eager: no evaluator scope names it
+    const auto& s = x.shape();
+    int64_t d = s.empty() ? 0 : s.back();
+    if (d <= 0 || gamma.size() != d || gamma.shape().back() != d ||
+        dout.shape() != s) {
+      throw std::invalid_argument(
+          "tl::layer_norm_bwd: expect rank>=1 x, gamma holding its last axis "
+          "and dout on x's shape — got x " + shape_str(s) + ", gamma " +
+          shape_str(gamma.shape()) + ", dout " + shape_str(dout.shape()));
+    }
+    int64_t rows = x.size() / d;
+    if (!gpu_mode_(x.size(), kernel_class::reduction)) return std::nullopt;
+    x.realize();
+    gamma.realize();
+    dout.realize();
+    if (!x.contiguous() || !gamma.contiguous() || !dout.contiguous()) {
+      return std::nullopt;
+    }
+    if (!x.storage_.native || !gamma.storage_.native ||
+        !dout.storage_.native) {
+      return std::nullopt;
+    }
+    // The column sums split the rows into up to 64 chunks of at least 64 —
+    // enough blocks to fill the device on a tall input, one chunk on a short.
+    int64_t chunks = std::min<int64_t>(64, (rows + 63) / 64);
+    array dx = array::empty(s), dg = array::empty({d}), db = array::empty({d});
+    array stats = array::empty({2, rows}), partials = array::empty({2, chunks, d});
+    if (!dx.storage_.native || !dg.storage_.native || !db.storage_.native ||
+        !stats.storage_.native || !partials.storage_.native) {
+      return std::nullopt;
+    }
+    if (!gpu::layer_norm_bwd(x.storage_.native, x.offset_ * 4,
+                             gamma.storage_.native, gamma.offset_ * 4,
+                             dout.storage_.native, dout.offset_ * 4,
+                             dx.storage_.native, dx.offset_ * 4,
+                             dg.storage_.native, dg.offset_ * 4,
+                             db.storage_.native, db.offset_ * 4,
+                             stats.storage_.native, partials.storage_.native,
+                             rows, d, chunks, eps)) {
+      return std::nullopt;
+    }
+    return std::array<array, 3>{dx, dg, db};
+  }
+
   // Adam's fused update (see array::adam_step). Eager, and in place on p, m
   // and v: an optimizer's state is materialized by nature, so there is no graph
   // to build and nothing to fuse into. The device kernel where there is one,
@@ -5016,6 +5076,11 @@ inline array array::rmsnorm(const array& x, const array& weight, float eps) {
 inline array array::layer_norm(const array& x, const array& gamma,
                                const array& beta, float eps) {
   return detail::graph::layer_norm(x, gamma, beta, eps);
+}
+
+inline std::optional<std::array<array, 3>> array::layer_norm_bwd(
+    const array& x, const array& gamma, const array& dout, float eps) {
+  return detail::graph::layer_norm_bwd(x, gamma, dout, eps);
 }
 
 inline array array::silu(const array& x) { return x * x.sigmoid(); }
