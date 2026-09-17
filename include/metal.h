@@ -687,6 +687,13 @@ inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
   return false;
 }
 
+// Adam's fused per-parameter update. CUDA-first (allowlisted); array.h runs the
+// host loop for CPU-resident parameters and otherwise composes.
+inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,
+                      int64_t, int64_t, float, float, float, float, float) {
+  return false;
+}
+
 namespace detail_ {
 struct bcast_nd_params {
   uint32_t out_shape[kPadFoldMaxRank];
@@ -1184,6 +1191,10 @@ inline bool attn_prefill_dkv(void*, void*, void*, void*, void*, void*, void*,
   return false;
 }
 inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
+  return false;
+}
+inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,
+                      int64_t, int64_t, float, float, float, float, float) {
   return false;
 }
 

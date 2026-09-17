@@ -504,6 +504,16 @@ class array {
   static std::optional<array> xent_bwd(const array& logits, const array& lse,
                                        const array& targets, const array& g);
 
+  // Adam's per-parameter update, in place: m and v advance on g, then p moves
+  // by the bias-corrected ratio. p, m, v and g share one shape; `bc1`/`bc2` are
+  // the caller's 1 - beta^t. Written as ops it is a dozen passes over the four
+  // and a buffer for every intermediate — the shape of an optimizer step's
+  // cost, not of its arithmetic. False when neither the device kernel nor the
+  // host loop takes it (a non-CUDA device buffer), so the caller composes.
+  static bool adam_step(array& p, array& m, array& v, const array& g, float lr,
+                        float beta1, float beta2, float eps, float bc1,
+                        float bc2);
+
   // Transformer building blocks (M9 model surface). RoPE is a fused op (needs
   // cos/sin); RMSNorm/SiLU/SwiGLU are pure compositions of existing ops (so they
   // ride the tuned kernels and are autograd-ready when VJPs land). RoPE input is
@@ -3280,6 +3290,68 @@ struct graph {
     return out;
   }
 
+  // Adam's fused update (see array::adam_step). Eager, and in place on p, m
+  // and v: an optimizer's state is materialized by nature, so there is no graph
+  // to build and nothing to fuse into. The device arm needs all four resident;
+  // CPU-resident parameters take the host loop right here, and a device buffer
+  // with no kernel for it declines rather than dragging the data home.
+  static bool adam_step(array& p, array& m, array& v, const array& g, float lr,
+                        float beta1, float beta2, float eps, float bc1,
+                        float bc2) {
+    const auto& s = p.shape();
+    if (m.shape() != s || v.shape() != s || g.shape() != s) {
+      throw std::invalid_argument(
+          "tl::adam_step: expect p, m, v and g to share one shape — got p " +
+          shape_str(s) + ", m " + shape_str(m.shape()) + ", v " +
+          shape_str(v.shape()) + ", g " + shape_str(g.shape()));
+    }
+    if (bc1 == 0.0f || bc2 == 0.0f) {
+      throw std::invalid_argument(
+          "tl::adam_step: bias correction of 0 (beta^t == 1)");
+    }
+    int64_t n = num_elements(s);
+    if (n == 0) return true;
+    p.realize();
+    m.realize();
+    v.realize();
+    g.realize();
+    if (!p.contiguous() || !m.contiguous() || !v.contiguous() ||
+        !g.contiguous()) {
+      return false;
+    }
+    // The composition's own spelling: m · (lr/bc1) over sqrt(v · 1/bc2) + eps.
+    const float lr_over_bc1 = lr / bc1, inv_bc2 = 1.0f / bc2;
+    if (gpu_mode_(n, kernel_class::elementwise)) {
+      // On the device: the kernel, or decline so the caller composes there. A
+      // host loop here would drag the parameters home and push them back every
+      // step, which is the cost this op exists to remove.
+      if (!p.storage_.native || !m.storage_.native || !v.storage_.native ||
+          !g.storage_.native) {
+        return false;
+      }
+      return gpu::adam_step(p.storage_.native, p.offset_ * 4, m.storage_.native,
+                            m.offset_ * 4, v.storage_.native, v.offset_ * 4,
+                            g.storage_.native, g.offset_ * 4, n, beta1, beta2,
+                            eps, lr_over_bc1, inv_bc2);
+    }
+    // CPU mode: data() brings any device copy home first, the same as every
+    // other host path. A CUDA build hands every buffer a mirror key, so
+    // "has a native handle" is not "lives on the device" — only the mode is.
+    float* pp = p.data();
+    float* pm = m.data();
+    float* pv = v.data();
+    const float* pg = g.raw();
+    for (int64_t i = 0; i < n; i++) {
+      float gi = pg[i];
+      float mi = beta1 * pm[i] + (1.0f - beta1) * gi;
+      float vi = beta2 * pv[i] + (1.0f - beta2) * gi * gi;
+      pm[i] = mi;
+      pv[i] = vi;
+      pp[i] -= (mi * lr_over_bc1) / (std::sqrt(vi * inv_bc2) + eps);
+    }
+    return true;
+  }
+
   // The query half of the fused pullback (see array::attn_prefill_bwd_dq).
   // Eager and GPU-only: the kernel writes dq and L, or this declines and the
   // caller composes the unfused form. The shape rules are the forward's, plus
@@ -4839,6 +4911,12 @@ inline std::optional<std::pair<array, array>> array::attn_prefill_bwd_dq(
     const array& q, const array& K, const array& V, const array& dout,
     const array& out, float scale) {
   return detail::graph::attn_prefill_bwd_dq(q, K, V, dout, out, scale);
+}
+
+inline bool array::adam_step(array& p, array& m, array& v, const array& g,
+                             float lr, float beta1, float beta2, float eps,
+                             float bc1, float bc2) {
+  return detail::graph::adam_step(p, m, v, g, lr, beta1, beta2, eps, bc1, bc2);
 }
 
 inline std::optional<std::pair<array, array>> array::attn_prefill_bwd_dkv(

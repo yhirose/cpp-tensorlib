@@ -892,6 +892,71 @@ TEST_CASE("the auto census keeps out of the caller's defer_flush scope") {
   tl::device_ = prev;
 }
 
+namespace {
+// The update every optimizer loop writes as ops today; adam_step has to land on
+// these same numbers, so the test states the composition once and compares.
+struct adam_ref {
+  array m, v, p;
+};
+adam_ref compose_adam(const array& p0, const array& m0, const array& v0,
+                      const array& g, float lr, float b1, float b2, float eps,
+                      float bc1, float bc2) {
+  auto m = (m0 * b1 + g * (1.0f - b1)).eval();
+  auto v = (v0 * b2 + g * g * (1.0f - b2)).eval();
+  auto p = (p0 - (m * (lr / bc1)) /
+                     (tl::pow(v * (1.0f / bc2), 0.5f) + eps)).eval();
+  return {m, v, p};
+}
+}  // namespace
+
+TEST_CASE("adam_step lands on the numbers the composition does") {
+  const float lr = 3e-4f, b1 = 0.9f, b2 = 0.95f, eps = 1e-8f;
+  const float bc1 = 1.0f - b1 * b1, bc2 = 1.0f - b2 * b2;  // the second step
+  auto p0 = random_array({4, 6}, 1400);
+  auto m0 = random_array({4, 6}, 1401);
+  auto v0 = tl::pow(random_array({4, 6}, 1402), 2.0f).eval();  // v is a square
+  auto g = random_array({4, 6}, 1403);
+  auto want = compose_adam(p0, m0, v0, g, lr, b1, b2, eps, bc1, bc2);
+
+  auto p = p0.clone(), m = m0.clone(), v = v0.clone();
+  CHECK(tl::array::adam_step(p, m, v, g, lr, b1, b2, eps, bc1, bc2));
+  CHECK(allclose(m, want.m));
+  CHECK(allclose(v, want.v));
+  CHECK(allclose(p, want.p));
+  CHECK(!allclose(p0, p));  // in place on the clones, not on the originals
+
+  // shape and bias-correction misuse are the caller's bug, not a decline
+  auto wrong = random_array({4, 5}, 1404);
+  CHECK_THROWS_AS(tl::array::adam_step(p, m, v, wrong, lr, b1, b2, eps, bc1, bc2),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(tl::array::adam_step(p, m, v, g, lr, b1, b2, eps, 0.0f, bc2),
+                  std::invalid_argument);
+}
+
+TEST_CASE("adam_step on a device buffer matches the same composition") {
+  if (!tl::gpu_available()) return;
+  const float lr = 1e-3f, b1 = 0.9f, b2 = 0.999f, eps = 1e-8f;
+  const float bc1 = 1.0f - b1 * b1 * b1, bc2 = 1.0f - b2 * b2 * b2;
+  auto prev = tl::device_;
+  tl::use_gpu();
+  auto p0 = random_array({129, 40}, 1410);  // a tail past the block size
+  auto m0 = random_array({129, 40}, 1411);
+  auto v0 = tl::pow(random_array({129, 40}, 1412), 2.0f).eval();
+  auto g = random_array({129, 40}, 1413);
+  auto want = compose_adam(p0, m0, v0, g, lr, b1, b2, eps, bc1, bc2);
+
+  auto p = p0.clone(), m = m0.clone(), v = v0.clone();
+  bool ran = tl::array::adam_step(p, m, v, g, lr, b1, b2, eps, bc1, bc2);
+  tl::device_ = prev;
+  if (!ran) {
+    MESSAGE("no adam_step kernel on this backend -- the caller composes");
+    return;
+  }
+  CHECK(allclose(m, want.m, 1e-4f, 1e-6f));
+  CHECK(allclose(v, want.v, 1e-4f, 1e-6f));
+  CHECK(allclose(p, want.p, 1e-4f, 1e-6f));
+}
+
 TEST_CASE("dot + row bias fuses into the gemm and matches the unfused sum") {
   // graph::fuse_dot_bias_ makes the bias a third input of the dot; the CUDA
   // gemm adds it in its store (tail and split-K shapes below, both tiles), and

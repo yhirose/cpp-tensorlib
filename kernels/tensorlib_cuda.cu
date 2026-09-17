@@ -692,6 +692,27 @@ extern "C" __global__ void tl_xent_bwd(const float* __restrict__ x,
   out[i] = p * g[row];
 }
 
+// Adam's per-parameter update, fused: m and v advance, then p moves by the
+// bias-corrected ratio. One read of g, one read-modify-write of m, v and p,
+// where the composed form walks all four a dozen times and allocates a buffer
+// for every intermediate. `lr_over_bc1` and `inv_bc2` fold the bias correction
+// the host already computed, so the kernel spells the composition's arithmetic.
+extern "C" __global__ void tl_adam_step(float* __restrict__ p,
+                                        float* __restrict__ m,
+                                        float* __restrict__ v,
+                                        const float* __restrict__ g, float b1,
+                                        float b2, float eps, float lr_over_bc1,
+                                        float inv_bc2, unsigned n) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float gi = g[i];
+  float mi = b1 * m[i] + (1.0f - b1) * gi;
+  float vi = b2 * v[i] + (1.0f - b2) * gi * gi;
+  m[i] = mi;
+  v[i] = vi;
+  p[i] -= (mi * lr_over_bc1) / (sqrtf(vi * inv_bc2) + eps);
+}
+
 // Tree-sum one value per thread through the block's shared `s`, handing every
 // thread the total; the trailing barrier lets a second sum reuse `s`.
 __device__ __forceinline__ float tl_tree_sum_(float* s, unsigned t, unsigned T, float v) {

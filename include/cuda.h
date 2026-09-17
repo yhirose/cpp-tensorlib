@@ -442,6 +442,10 @@ struct context {
   }
   CUfunction xent_bwd_() { return cached_(xent_bwd_fn, "tl_xent_bwd"); }
 
+  // Adam's fused per-parameter update (the optimizer's whole step, one launch).
+  CUfunction adam_step_fn = nullptr;
+  CUfunction adam_step_() { return cached_(adam_step_fn, "tl_adam_step"); }
+
   // N-D broadcast binary (any rank) and N-D broadcast ternary select
   // (Tensor.where's GPU dispatch) -- new capabilities, one kernel per op
   // like the rank-2 kop/fn_() vocabulary above, but not part of that
@@ -1459,6 +1463,26 @@ inline bool xent_bwd(void* x, int64_t xo, void* lse, int64_t lo, void* tgt,
   return c.launch1d_(c.xent_bwd_(), un, px, pl, pt, pg, po, uc, un);
 }
 
+// Adam's per-parameter update in place: m and v advance, p moves by the
+// bias-corrected ratio. p, m, v and g are one shape, contiguous; the host
+// folds the bias correction into lr_over_bc1 = lr/bc1 and inv_bc2 = 1/bc2.
+inline bool adam_step(void* p, int64_t po, void* m, int64_t mo, void* v,
+                      int64_t vo, void* g, int64_t go, int64_t n, float beta1,
+                      float beta2, float eps, float lr_over_bc1,
+                      float inv_bc2) {
+  auto& c = context::get();
+  if (!c.ready || n <= 0) return false;
+  c.device_read_(g);
+  c.device_write_(p);
+  c.device_write_(m);
+  c.device_write_(v);
+  unsigned un = static_cast<unsigned>(n);
+  return c.launch1d_(c.adam_step_(), un, context::off_(p, po),
+                     context::off_(m, mo), context::off_(v, vo),
+                     context::off_(g, go), beta1, beta2, eps, lr_over_bc1,
+                     inv_bc2, un);
+}
+
 // M7 decode GEMV: y(n) = a(1,k) @ B(k,n), F32 accumulate. B is either f32 or
 // bf16 weights (bf16 halves the dominant K×N weight traffic — the decode
 // bandwidth lever). Buffers are opaque device pointers; the kernel interprets
@@ -2460,6 +2484,10 @@ inline bool row_logsumexp(void*, int64_t, void*, int64_t, int64_t, int64_t,
 }
 inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
                      int64_t, void*, int64_t, int64_t, int64_t) {
+  return false;
+}
+inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,
+                      int64_t, int64_t, float, float, float, float, float) {
   return false;
 }
 inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,

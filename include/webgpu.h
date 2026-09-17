@@ -995,6 +995,13 @@ inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
   return false;
 }
 
+// Adam's fused per-parameter update. CUDA-first (allowlisted); array.h runs the
+// host loop for CPU-resident parameters and otherwise composes.
+inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,
+                      int64_t, int64_t, float, float, float, float, float) {
+  return false;
+}
+
 // N-D broadcast binary: generalizes binary_bcast() above to any rank (a
 // Transformer's [N,S,D] LayerNorm broadcasting a [N,S,1] mean, rank 3).
 // a_strides/b_strides are the broadcast strides (0 on a broadcast axis)
@@ -1356,6 +1363,10 @@ inline bool row_logsumexp(void*, int64_t, void*, int64_t, int64_t, int64_t,
 }
 inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
                      int64_t, void*, int64_t, int64_t, int64_t) {
+  return false;
+}
+inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,
+                      int64_t, int64_t, float, float, float, float, float) {
   return false;
 }
 inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,

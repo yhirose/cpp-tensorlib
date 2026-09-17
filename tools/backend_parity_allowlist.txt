@@ -41,3 +41,8 @@ copy_nd
 gather_from_axis
 row_logsumexp
 xent_bwd
+
+# Adam's per-parameter update in one launch. CUDA-first; CPU-resident
+# parameters take array.h's own host loop, and a Metal/WebGPU-resident one
+# composes the same arithmetic meanwhile.
+adam_step
