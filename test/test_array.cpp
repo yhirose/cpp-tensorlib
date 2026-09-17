@@ -226,28 +226,14 @@ TEST_CASE("broadcast_to feeds ops and clones like a materialized copy") {
 }
 
 TEST_CASE("clone of a strided view gathers the same elements on the device") {
-  // clone()'s device arm (gpu::copy_nd) is a gather over the view's strides;
-  // the host arm is a strided walk. A transpose, a rank-3 permutation and a
+  // clone()'s device arm (gpu::copy_nd) is a gather over the view's strides,
+  // the host arm a strided walk. A transpose, a rank-3 permutation and a
   // stride-0 widening cover the layouts a training step clones.
-  if (!tl::gpu_available()) return;
-  auto prev = tl::device_;
-  tl::use_cpu();
   auto base = random_array({3, 5, 7}, 1500);
   auto row = random_array({1, 6}, 1501);
-  auto want_t = base.transpose().clone();
-  auto want_p = base.transpose({1, 2, 0}).clone();
-  auto want_w = row.broadcast_to({4, 6}).clone();
-  tl::use_gpu();
-  auto got_t = base.transpose().clone();
-  auto got_p = base.transpose({1, 2, 0}).clone();
-  auto got_w = row.broadcast_to({4, 6}).clone();
-  tl::device_ = prev;
-  CHECK(got_t.contiguous());
-  CHECK(got_p.contiguous());
-  CHECK(got_w.contiguous());
-  CHECK(allclose(got_t, want_t));
-  CHECK(allclose(got_p, want_p));
-  CHECK(allclose(got_w, want_w));
+  CHECK(matches_gpu_oracle([&] { return base.transpose().clone(); }));
+  CHECK(matches_gpu_oracle([&] { return base.transpose({1, 2, 0}).clone(); }));
+  CHECK(matches_gpu_oracle([&] { return row.broadcast_to({4, 6}).clone(); }));
 }
 
 TEST_CASE("an elementwise scalar on a widened view stays narrow") {

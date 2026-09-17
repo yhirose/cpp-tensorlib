@@ -46,14 +46,13 @@ enum class kop {
   softmax, row_sum, row_max, pad, fold,
   index_select, index_add, scatter_axis,
   badd_nd, bsub_nd, bmul_nd, bdiv_nd, bpow_nd,  // N-D broadcast binary
-  where_nd,
+  where_nd, copy_nd,             // N-D select / clone()'s strided gather
   gt_, lt_, ge_, le_, eq_, ne_,  // comparisons -- cmp_op maps onto these
   tanh_, sin_, cos_,             // unary_ext_op maps onto these
   clamp_, sum_to_,               // dedicated ops, mirroring cuda.h's own
   concat_part_, rope_,           // ditto -- Tensor.concat / RoPE's own dispatch
   pow_s_, gt_s_, lt_s_, ge_s_, le_s_, eq_s_, ne_s_,  // scalar_op maps onto these
-  layer_norm_,                                       // the fused layer norm
-  copy_nd_                                           // clone()'s strided gather
+  layer_norm_                                        // the fused layer norm
 };
 
 // Comparisons (gt/lt/ge/le/eq/ne) are deliberately NOT kop values: kop is
@@ -154,7 +153,7 @@ struct context {
       case kop::bdiv_nd: return "bdiv_nd_";
       case kop::bpow_nd: return "bpow_nd_";
       case kop::where_nd: return "where_nd_";
-      case kop::copy_nd_: return "copy_nd_";
+      case kop::copy_nd: return "copy_nd_";
       case kop::gt_: return "gt_";
       case kop::lt_: return "lt_";
       case kop::ge_: return "ge_";
@@ -807,18 +806,15 @@ inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
   return true;
 }
 
-// clone()'s device arm for a strided view (a transpose, a permute, a stride-0
-// widening): a gather into a contiguous output, the counterpart of cuda.h's.
-// Until now a clone here took array.h's host copy -- a memcpy on unified
-// memory, but behind a flush that drains every kernel in flight, and a
-// training step clones on each gradient's first accumulation and each detach.
+// clone()'s device arm for a strided view: a gather into a contiguous output,
+// where_nd's decode with one operand -- mirrors cuda.h's own copy_nd. The
+// .metal banner says why a clone must not go through the host here.
 inline bool copy_nd(void* a_native, int64_t ao, const int64_t* a_strides,
                     void* out_native, int64_t oo, const int64_t* out_shape,
                     int rank, int64_t n) {
   auto& c = context::get();
   if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
-  if (n <= 0) return true;  // nothing to gather, and no zero-sized dispatch
-  auto pso = c.pso_(kop::copy_nd_);
+  auto pso = c.pso_(kop::copy_nd);
   c.ensure_encoder_();
   objc::send(c.enc, "setComputePipelineState:", pso);
   detail_::set_buf_(c.enc, a_native, ao, 0ul);
