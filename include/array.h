@@ -508,8 +508,9 @@ class array {
   // by the bias-corrected ratio. p, m, v and g share one shape; `bc1`/`bc2` are
   // the caller's 1 - beta^t. Written as ops it is a dozen passes over the four
   // and a buffer for every intermediate — the shape of an optimizer step's
-  // cost, not of its arithmetic. False when neither the device kernel nor the
-  // host loop takes it (a non-CUDA device buffer), so the caller composes.
+  // cost, not of its arithmetic. Total on a contiguous f32 set: the device
+  // kernel where there is one, the host loop otherwise. False only for a layout
+  // it cannot take, since a caller updating in place cannot compose its way out.
   static bool adam_step(array& p, array& m, array& v, const array& g, float lr,
                         float beta1, float beta2, float eps, float bc1,
                         float bc2);
@@ -3321,22 +3322,22 @@ struct graph {
     }
     // The composition's own spelling: m · (lr/bc1) over sqrt(v · 1/bc2) + eps.
     const float lr_over_bc1 = lr / bc1, inv_bc2 = 1.0f / bc2;
-    if (gpu_mode_(n, kernel_class::elementwise)) {
-      // On the device: the kernel, or decline so the caller composes there. A
-      // host loop here would drag the parameters home and push them back every
-      // step, which is the cost this op exists to remove.
-      if (!p.storage_.native || !m.storage_.native || !v.storage_.native ||
-          !g.storage_.native) {
-        return false;
+    if (gpu_mode_(n, kernel_class::elementwise) && p.storage_.native &&
+        m.storage_.native && v.storage_.native && g.storage_.native) {
+      if (gpu::adam_step(p.storage_.native, p.offset_ * 4, m.storage_.native,
+                         m.offset_ * 4, v.storage_.native, v.offset_ * 4,
+                         g.storage_.native, g.offset_ * 4, n, beta1, beta2,
+                         eps, lr_over_bc1, inv_bc2)) {
+        return true;
       }
-      return gpu::adam_step(p.storage_.native, p.offset_ * 4, m.storage_.native,
-                            m.offset_ * 4, v.storage_.native, v.offset_ * 4,
-                            g.storage_.native, g.offset_ * 4, n, beta1, beta2,
-                            eps, lr_over_bc1, inv_bc2);
+      // No kernel for it on this backend: the host loop below. The caller
+      // updates in place and cannot compose its way out, so this has to be
+      // total -- and Metal's unified memory makes the round trip a flush and a
+      // memcpy, the same bargain its other CPU fallbacks make.
     }
-    // CPU mode: data() brings any device copy home first, the same as every
-    // other host path. A CUDA build hands every buffer a mirror key, so
-    // "has a native handle" is not "lives on the device" — only the mode is.
+    // data() brings any device copy home first, the same as every other host
+    // path. A CUDA build hands every buffer a mirror key, so "has a native
+    // handle" is not "lives on the device" — only the mode is.
     float* pp = p.data();
     float* pm = m.data();
     float* pv = v.data();
