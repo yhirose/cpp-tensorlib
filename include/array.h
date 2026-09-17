@@ -3293,9 +3293,8 @@ struct graph {
 
   // Adam's fused update (see array::adam_step). Eager, and in place on p, m
   // and v: an optimizer's state is materialized by nature, so there is no graph
-  // to build and nothing to fuse into. The device arm needs all four resident;
-  // CPU-resident parameters take the host loop right here, and a device buffer
-  // with no kernel for it declines rather than dragging the data home.
+  // to build and nothing to fuse into. The device kernel where there is one,
+  // the host loop otherwise; false only for a non-contiguous layout.
   static bool adam_step(array& p, array& m, array& v, const array& g, float lr,
                         float beta1, float beta2, float eps, float bc1,
                         float bc2) {

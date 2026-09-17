@@ -948,10 +948,7 @@ TEST_CASE("adam_step on a device buffer matches the same composition") {
   auto p = p0.clone(), m = m0.clone(), v = v0.clone();
   bool ran = tl::array::adam_step(p, m, v, g, lr, b1, b2, eps, bc1, bc2);
   tl::device_ = prev;
-  if (!ran) {
-    MESSAGE("no adam_step kernel on this backend -- the caller composes");
-    return;
-  }
+  CHECK(ran);  // total: the kernel here, the host loop on a backend without one
   CHECK(allclose(m, want.m, 1e-4f, 1e-6f));
   CHECK(allclose(v, want.v, 1e-4f, 1e-6f));
   CHECK(allclose(p, want.p, 1e-4f, 1e-6f));

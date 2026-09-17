@@ -995,8 +995,8 @@ inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
   return false;
 }
 
-// Adam's fused per-parameter update. CUDA-first (allowlisted); array.h runs the
-// host loop for CPU-resident parameters and otherwise composes.
+// Adam's fused per-parameter update. CUDA-first (allowlisted); array.h takes
+// its host loop when this declines, a D2H and H2D round trip here.
 inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,
                       int64_t, int64_t, float, float, float, float, float) {
   return false;
