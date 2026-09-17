@@ -2449,18 +2449,17 @@ TEST_CASE("profile: scopes nest into paths and launches land under them") {
   tl::profile::stop();
   auto rows = tl::profile::rows();
 
-  auto find = [&](std::string_view path, std::string_view kernel) {
-    const row* hit = nullptr;
-    for (const row& r : rows) {
-      if (r.path == path && r.kernel == kernel) hit = &r;
-    }
-    return hit;
+  auto find = [&](std::string_view path, row::kind_t kind) -> const row* {
+    auto it = std::find_if(rows.begin(), rows.end(), [&](const row& r) {
+      return r.path == path && r.kind == kind;
+    });
+    return it == rows.end() ? nullptr : &*it;
   };
-  const row* phase = find("phase", "");
+  const row* phase = find("phase", row::kind_t::scope);
   REQUIRE(phase);
   CHECK(phase->count == 1);
   CHECK(phase->host_us > 0);
-  const row* dot = find("phase/mm/dot", "");
+  const row* dot = find("phase/mm/dot", row::kind_t::scope);
   REQUIRE(dot);
   CHECK(dot->count == 1);
   CHECK(phase->host_us >= dot->host_us);
@@ -2469,8 +2468,7 @@ TEST_CASE("profile: scopes nest into paths and launches land under them") {
       tl::gpu_available() && tl::device_ == tl::device_type::gpu;
   std::vector<const row*> launches;
   for (const row& r : rows) {
-    if (r.path == "phase/mm/dot" && !r.kernel.empty() && r.kernel != "wait" &&
-        r.kernel != "h2d" && r.kernel != "d2h") {
+    if (r.path == "phase/mm/dot" && r.kind == row::kind_t::launch) {
       launches.push_back(&r);
     }
   }
@@ -2478,7 +2476,7 @@ TEST_CASE("profile: scopes nest into paths and launches land under them") {
     // the matmul dispatched at least one kernel, and the batch's flush was
     // waited for under the scope that evaluated it
     CHECK(!launches.empty());
-    const row* wait = find("phase/mm", "wait");
+    const row* wait = find("phase/mm", row::kind_t::wait);
     REQUIRE(wait);
     CHECK(wait->count >= 1);
 #if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
@@ -2501,7 +2499,7 @@ TEST_CASE("profile: scopes nest into paths and launches land under them") {
     a.dot(b).eval();
   }
   rows = tl::profile::rows();
-  CHECK(!find("after", ""));
+  CHECK(!find("after", row::kind_t::scope));
 
   // A new session starts from nothing.
   tl::profile::start();

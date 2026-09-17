@@ -3302,6 +3302,7 @@ struct graph {
   static bool adam_step(array& p, array& m, array& v, const array& g, float lr,
                         float beta1, float beta2, float eps, float bc1,
                         float bc2) {
+    profile::scope ps("adam_step");  // eager: no evaluator scope names it
     const auto& s = p.shape();
     if (m.shape() != s || v.shape() != s || g.shape() != s) {
       throw std::invalid_argument(
@@ -3363,6 +3364,7 @@ struct graph {
   static std::optional<std::pair<array, array>> attn_prefill_bwd_dq(
       const array& q, const array& K, const array& V, const array& dout,
       const array& out, float scale) {
+    profile::scope ps("attn_prefill_bwd_dq");  // eager, like adam_step
     const auto& s = q.shape();
     if (s.size() != 3 || K.shape() != s || V.shape() != s ||
         dout.shape() != s || out.shape() != s) {
@@ -3399,6 +3401,7 @@ struct graph {
   static std::optional<std::pair<array, array>> attn_prefill_bwd_dkv(
       const array& q, const array& K, const array& V, const array& dout,
       const array& stats, float scale) {
+    profile::scope ps("attn_prefill_bwd_dkv");  // eager, like adam_step
     const auto& s = q.shape();
     if (s.size() != 3 || K.shape() != s || V.shape() != s ||
         dout.shape() != s ||
@@ -4031,8 +4034,7 @@ struct graph {
     run_(roots, false);
   }
   static void run_(const std::vector<node_ptr>& roots, bool do_flush) {
-    static const bool profile_env = (profile::detail::env_autostart(), true);
-    (void)profile_env;
+    profile::detail::env_autostart();
     // First auto-mode eval on a host with a GPU: derive the matmul crossover
     // first. Its census evals each nest a run_, and `roots` may be
     // materialize_'s own thread-local scratch, which those evals reuse — so

@@ -94,9 +94,8 @@ struct context {
   // objc round trip (tiny-tensor workloads allocate per op).
   std::unordered_map<int64_t, std::vector<std::pair<void*, float*>>> free_bufs;
   std::unordered_map<int, objc::id> psos;
-  // The kernel pso_ last handed out, which is the one the next dispatch
-  // binds: what tl::profile names the launch (an op looks its pipeline up
-  // and dispatches it in the same breath).
+  // The kernel the encoder currently has bound (set by bind_): what
+  // tl::profile names the next dispatch.
   const char* bound = nullptr;
 
   static context& get() {
@@ -184,8 +183,16 @@ struct context {
     return "";
   }
 
-  objc::id pso_(kop op) {
+  // Every op binds its pipeline through here: the pipeline for `op` on the
+  // pending encoder, opened if there is none.
+  void bind_(kop op) {
+    objc::id pso = pso_(op);
+    ensure_encoder_();
+    objc::send(enc, "setComputePipelineState:", pso);
     bound = kernel_name_(op);
+  }
+
+  objc::id pso_(kop op) {
     auto it = psos.find(static_cast<int>(op));
     if (it != psos.end()) return it->second;
     if (!library) {
@@ -233,9 +240,10 @@ inline void flush() {
   if (!c.pending) return;
   objc::send(c.enc, "endEncoding");
   objc::send(c.cb, "commit");
-  const auto t0 = profile::detail::clock::now();
-  objc::send(c.cb, "waitUntilCompleted");
-  profile::detail::wait(profile::detail::us_since(t0));
+  {
+    profile::detail::blocked waiting;
+    objc::send(c.cb, "waitUntilCompleted");
+  }
   if (profile::active()) {
     // The GPU time is known per command buffer, not per dispatch.
     const double s = objc::send<double>(c.cb, "GPUStartTime");
@@ -292,13 +300,12 @@ struct ew_params {
   uint32_t n;
 };
 
-inline void dispatch_(objc::id enc, objc::id pso, const ew_params& p,
+inline void dispatch_(objc::id enc, const ew_params& p,
                       unsigned long params_index) {
   objc::send(enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
              static_cast<unsigned long>(sizeof(p)), params_index);
   unsigned long groups = (p.n + 255ul) / 256ul;
   dispatch_grid_(enc, {groups, 1, 1}, {256, 1, 1});
-  (void)pso;
 }
 
 }  // namespace detail_
@@ -309,17 +316,14 @@ inline bool binary(kop op, void* a, int64_t ao, void* b, int64_t bo, void* out,
                    int64_t oo, int64_t n, float scale, float offset) {
   auto& c = context::get();
   if (!c.device) return false;
-  auto pso = c.pso_(op);
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(op);
   objc::send(c.enc, "setBuffer:offset:atIndex:", a,
              static_cast<unsigned long>(ao), 0ul);
   objc::send(c.enc, "setBuffer:offset:atIndex:", b,
              static_cast<unsigned long>(bo), 1ul);
   objc::send(c.enc, "setBuffer:offset:atIndex:", out,
              static_cast<unsigned long>(oo), 2ul);
-  detail_::dispatch_(c.enc, pso,
-                     {scale, offset, static_cast<uint32_t>(n)}, 3ul);
+  detail_::dispatch_(c.enc, {scale, offset, static_cast<uint32_t>(n)}, 3ul);
   return true;
 }
 
@@ -327,15 +331,12 @@ inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo,
                   int64_t n, float scale, float offset) {
   auto& c = context::get();
   if (!c.device) return false;
-  auto pso = c.pso_(op);
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(op);
   objc::send(c.enc, "setBuffer:offset:atIndex:", a,
              static_cast<unsigned long>(ao), 0ul);
   objc::send(c.enc, "setBuffer:offset:atIndex:", out,
              static_cast<unsigned long>(oo), 1ul);
-  detail_::dispatch_(c.enc, pso,
-                     {scale, offset, static_cast<uint32_t>(n)}, 2ul);
+  detail_::dispatch_(c.enc, {scale, offset, static_cast<uint32_t>(n)}, 2ul);
   return true;
 }
 
@@ -359,9 +360,7 @@ inline bool binary_bcast(kop op, void* a, int64_t ao, int64_t ars, int64_t acs,
                          float scale, float offset) {
   auto& c = context::get();
   if (!c.device) return false;
-  auto pso = c.pso_(op);
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(op);
   objc::send(c.enc, "setBuffer:offset:atIndex:", a,
              static_cast<unsigned long>(ao), 0ul);
   objc::send(c.enc, "setBuffer:offset:atIndex:", b,
@@ -456,9 +455,7 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b,
     gx = (static_cast<unsigned long>(n) + bn - 1) / bn;
     gy = (static_cast<unsigned long>(m) + bm - 1) / bm;
   }
-  auto pso = c.pso_(kk_);
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(kk_);
   detail_::set_buf_(c.enc, a, ao, 0ul);
   detail_::set_buf_(c.enc, b, bo, 1ul);
   detail_::set_buf_(c.enc, out, oo, 2ul);
@@ -488,9 +485,7 @@ inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
                    int64_t rows, int64_t cols, float scale, float offset) {
   auto& c = context::get();
   if (!c.device) return false;
-  auto pso = c.pso_(op);
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(op);
   detail_::set_buf_(c.enc, in, io, 0ul);
   detail_::set_buf_(c.enc, out, oo, 1ul);
   detail_::reduce_params p{static_cast<uint32_t>(rows),
@@ -510,9 +505,7 @@ inline bool layer_norm(void* x, int64_t xo, void* g, int64_t go, void* b,
                        int64_t cols, float eps, float scale, float offset) {
   auto& c = context::get();
   if (!c.device) return false;
-  auto pso = c.pso_(kop::layer_norm_);
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(kop::layer_norm_);
   detail_::set_buf_(c.enc, x, xo, 0ul);
   detail_::set_buf_(c.enc, g, go, 1ul);
   detail_::set_buf_(c.enc, b, bo, 2ul);
@@ -553,9 +546,7 @@ inline bool dispatch_pad_fold_(kop op, void* a_native, int64_t ao,
                                int64_t out_n) {
   auto& c = context::get();
   if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
-  auto pso = c.pso_(op);
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(op);
   set_buf_(c.enc, a_native, ao, 0ul);
   set_buf_(c.enc, out_native, oo, 1ul);
   pad_fold_params p{};
@@ -633,9 +624,7 @@ inline bool dispatch_gather3_(kop op, void* buf0, int64_t off0, void* buf1,
                               uint32_t n) {
   auto& c = context::get();
   if (!c.device) return false;
-  auto pso = c.pso_(op);
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(op);
   set_buf_(c.enc, buf0, off0, 0ul);
   set_buf_(c.enc, buf1, off1, 1ul);
   set_buf_(c.enc, out_native, oo, 2ul);
@@ -764,9 +753,7 @@ inline bool binary_bcast_nd(kop op, void* a_native, int64_t ao,
                             float scale, float offset) {
   auto& c = context::get();
   if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
-  auto pso = c.pso_(detail_::to_nd_(op));
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(detail_::to_nd_(op));
   detail_::set_buf_(c.enc, a_native, ao, 0ul);
   detail_::set_buf_(c.enc, b_native, bo, 1ul);
   detail_::set_buf_(c.enc, out_native, oo, 2ul);
@@ -797,9 +784,7 @@ inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
                      int rank, int64_t n) {
   auto& c = context::get();
   if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
-  auto pso = c.pso_(kop::where_nd);
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(kop::where_nd);
   detail_::set_buf_(c.enc, cond_native, co, 0ul);
   detail_::set_buf_(c.enc, a_native, ao, 1ul);
   detail_::set_buf_(c.enc, b_native, bo, 2ul);
@@ -828,9 +813,7 @@ inline bool copy_nd(void* a_native, int64_t ao, const int64_t* a_strides,
                     int rank, int64_t n) {
   auto& c = context::get();
   if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
-  auto pso = c.pso_(kop::copy_nd);
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(kop::copy_nd);
   detail_::set_buf_(c.enc, a_native, ao, 0ul);
   detail_::set_buf_(c.enc, out_native, oo, 1ul);
   detail_::copy_nd_params p{};
@@ -910,9 +893,7 @@ inline bool compare(cmp_op op, void* a, int64_t ao, void* b, int64_t bo,
                     void* out, int64_t oo, int64_t n, int64_t bstride) {
   auto& c = context::get();
   if (!c.device) return false;
-  auto pso = c.pso_(detail_::to_cmp_(op));
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(detail_::to_cmp_(op));
   detail_::set_buf_(c.enc, a, ao, 0ul);
   detail_::set_buf_(c.enc, b, bo, 1ul);
   detail_::set_buf_(c.enc, out, oo, 2ul);
@@ -937,9 +918,7 @@ inline bool clamp(void* a, int64_t ao, void* out, int64_t oo, int64_t n,
                   float lo, float hi) {
   auto& c = context::get();
   if (!c.device) return false;
-  auto pso = c.pso_(kop::clamp_);
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(kop::clamp_);
   detail_::set_buf_(c.enc, a, ao, 0ul);
   detail_::set_buf_(c.enc, out, oo, 1ul);
   detail_::clamp_params p{lo, hi, static_cast<uint32_t>(n)};
@@ -955,9 +934,7 @@ inline bool scalar_binary(scalar_op op, void* a, int64_t ao, void* out,
                           float offset) {
   auto& c = context::get();
   if (!c.device) return false;
-  auto pso = c.pso_(detail_::to_scalar_(op));
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(detail_::to_scalar_(op));
   detail_::set_buf_(c.enc, a, ao, 0ul);
   detail_::set_buf_(c.enc, out, oo, 1ul);
   detail_::scalar_params p{s, scale, offset, static_cast<uint32_t>(n)};
@@ -975,9 +952,7 @@ inline bool sum_to(void* a, int64_t ao, const int64_t* a_shape,
                    int64_t out_n, int64_t reduced_n, void* out, int64_t oo) {
   auto& c = context::get();
   if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
-  auto pso = c.pso_(kop::sum_to_);
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(kop::sum_to_);
   detail_::set_buf_(c.enc, a, ao, 0ul);
   detail_::set_buf_(c.enc, out, oo, 1ul);
   detail_::sum_to_params p{};
@@ -1026,9 +1001,7 @@ inline bool concat_part(void* a, int64_t ao, void* out, int64_t oo,
     out_strides[d] = acc;
     acc *= out_shape[d];
   }
-  auto pso = c.pso_(kop::concat_part_);
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(kop::concat_part_);
   detail_::set_buf_(c.enc, a, ao, 0ul);
   detail_::set_buf_(c.enc, out, oo, 1ul);
   detail_::concat_part_params p{};
@@ -1069,9 +1042,7 @@ inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
   if (!c.device || D <= 0 || (D & 1)) return false;
   int64_t half = D / 2;
   int64_t n = rows * half;
-  auto pso = c.pso_(kop::rope_);
-  c.ensure_encoder_();
-  objc::send(c.enc, "setComputePipelineState:", pso);
+  c.bind_(kop::rope_);
   detail_::set_buf_(c.enc, x, 0, 0ul);
   detail_::set_buf_(c.enc, out, 0, 1ul);
   detail_::rope_params p{};

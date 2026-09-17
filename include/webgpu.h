@@ -429,7 +429,7 @@ struct context {
 
     pending = true;
     dispatch_counts[entry]++;
-    profile::detail::launch(entry);  // counted; WebGPU stamps no time
+    if (profile::active()) profile::detail::launch(entry);  // counted, untimed
     return true;
   }
 
@@ -466,11 +466,10 @@ inline void flush() {
   wgpu::CommandBuffer cmds = c.enc.Finish();
   c.enc = nullptr;
   c.queue.Submit(1, &cmds);
-  const auto t0 = profile::detail::clock::now();
+  profile::detail::blocked waiting;
   c.wait(c.queue.OnSubmittedWorkDone(
       wgpu::CallbackMode::WaitAnyOnly,
       [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {}));
-  profile::detail::wait(profile::detail::us_since(t0));
 }
 
 inline void context::flush_() { flush(); }

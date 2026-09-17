@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -37,15 +38,16 @@ namespace tl {
 namespace profile {
 
 struct row {
+  enum class kind_t { scope, launch, transfer, wait };
+  kind_t kind = kind_t::scope;
   std::string path;    // "/"-joined scope labels
-  std::string kernel;  // empty for the scope's own row; "h2d"/"d2h"/"wait"
-                       // for a transfer or a blocking wait under it
+  std::string kernel;  // launch: the kernel's name; transfer: "h2d" / "d2h"
   uint64_t count = 0;         // scope entries, or launches / transfers / waits
-  double host_us = 0;         // scope rows: inclusive wall; transfer and wait
-                              // rows: the time the host was blocked
-  double device_us = 0;       // kernel rows: summed launch time, where timed
+  double host_us = 0;         // scope: inclusive wall; transfer and wait: how
+                              // long the host was blocked
+  double device_us = 0;       // launch: summed kernel time, where timed
   uint64_t device_timed = 0;  // launches device_us covers
-  uint64_t bytes = 0;         // transfer rows: bytes moved
+  uint64_t bytes = 0;         // transfer: bytes moved
 };
 
 // Totals over the rows, plus what only the batch knows.
@@ -67,9 +69,12 @@ inline double us_since(clock::time_point t) {
 struct state {
   bool active = false;
   std::string path;
-  std::vector<size_t> marks;              // path length before each push
-  std::vector<clock::time_point> starts;  // each open scope's entry time
-  std::unordered_map<std::string, row> rows;  // key: path + '\0' + kernel
+  struct frame {
+    size_t mark;  // path length before this scope's label
+    clock::time_point start;
+  };
+  std::vector<frame> open;
+  std::unordered_map<std::string, row> rows;  // key: path, kind, kernel
   uint64_t batches = 0;
   double batch_device_us = 0;
 };
@@ -79,17 +84,19 @@ inline state& st() {
   return *s;
 }
 
-// The row for (current path, kernel), made on first use. Pointers into the
-// map stay valid across rehash, which is what lets a backend hold one until
-// its device time comes back.
-inline row& row_(state& s, std::string_view kernel) {
+// The row for (current path, kind, kernel), made on first use. Pointers into
+// the map stay valid across rehash, which is what lets a backend hold one
+// until its device time comes back.
+inline row& row_(state& s, row::kind_t kind, std::string_view kernel) {
   thread_local std::string key;
   key.assign(s.path);
   key.push_back('\0');
+  key.push_back(static_cast<char>(kind));
   key.append(kernel);
   auto it = s.rows.find(key);
   if (it == s.rows.end()) {
     it = s.rows.emplace(key, row{}).first;
+    it->second.kind = kind;
     it->second.path = s.path;
     it->second.kernel = std::string(kernel);
   }
@@ -108,7 +115,7 @@ inline void (*drain_hook)() = nullptr;
 inline row* launch(std::string_view kernel) {
   auto& s = st();
   if (!s.active) return nullptr;
-  row& r = row_(s, kernel);
+  row& r = row_(s, row::kind_t::launch, kernel);
   r.count++;
   return &r;
 }
@@ -123,7 +130,7 @@ inline void device_time(row* r, double us) {
 inline void transfer(const char* kind, uint64_t bytes, double host_us) {
   auto& s = st();
   if (!s.active) return;
-  row& r = row_(s, kind);
+  row& r = row_(s, row::kind_t::transfer, kind);
   r.count++;
   r.bytes += bytes;
   r.host_us += host_us;
@@ -133,7 +140,7 @@ inline void transfer(const char* kind, uint64_t bytes, double host_us) {
 inline void wait(double us) {
   auto& s = st();
   if (!s.active) return;
-  row& r = row_(s, "wait");
+  row& r = row_(s, row::kind_t::wait, "");
   r.count++;
   r.host_us += us;
 }
@@ -146,6 +153,19 @@ inline void batch_device(double us) {
   s.batches++;
   s.batch_device_us += us;
 }
+
+// Times a blocking call for the backends: a wait, or a transfer of `bytes`
+// when `kind` names one.
+struct blocked {
+  const char* kind = nullptr;
+  uint64_t bytes = 0;
+  clock::time_point t0 = clock::now();
+  ~blocked() {
+    const double us = us_since(t0);
+    if (kind) transfer(kind, bytes, us);
+    else wait(us);
+  }
+};
 
 }  // namespace detail
 
@@ -162,89 +182,84 @@ inline void start() {
   s.active = true;
 }
 
-namespace detail {
 // End the session: what was launched is resolved and the rows stay readable.
-inline void stop_(state& s) {
+inline void stop() {
+  auto& s = detail::st();
   if (!s.active) return;
-  if (drain_hook) drain_hook();
+  if (detail::drain_hook) detail::drain_hook();
   s.active = false;
 }
-}  // namespace detail
-
-inline void stop() { detail::stop_(detail::st()); }
 
 class scope {
  public:
   explicit scope(std::string_view label) {
     auto& s = detail::st();
     if (!s.active) return;
-    s_ = &s;
-    s.marks.push_back(s.path.size());
+    open_ = true;
+    s.open.push_back({s.path.size(), detail::clock::now()});
     if (!s.path.empty()) s.path.push_back('/');
     s.path.append(label);
-    s.starts.push_back(detail::clock::now());
   }
   ~scope() {
-    if (!s_ || s_->marks.empty()) return;
-    auto& s = *s_;
-    const double us = detail::us_since(s.starts.back());
-    s.starts.pop_back();
+    if (!open_) return;
+    auto& s = detail::st();
+    const auto f = s.open.back();
+    s.open.pop_back();
     if (s.active) {
-      row& r = detail::row_(s, "");
+      row& r = detail::row_(s, row::kind_t::scope, "");
       r.count++;
-      r.host_us += us;
+      r.host_us += detail::us_since(f.start);
     }
-    s.path.resize(s.marks.back());
-    s.marks.pop_back();
+    s.path.resize(f.mark);
   }
   scope(const scope&) = delete;
   scope& operator=(const scope&) = delete;
 
  private:
-  detail::state* s_ = nullptr;
+  bool open_ = false;
 };
-
-namespace detail {
 
 // The session's rows, grouped by path — paths in descending order of their
 // scope's inclusive time, each scope row first, its kernels by device time —
 // so the table reads top-down from where the time went.
-inline std::vector<row> rows_(state& s) {
-  if (s.active && drain_hook) drain_hook();
+inline std::vector<row> rows() {
+  auto& s = detail::st();
+  if (s.active && detail::drain_hook) detail::drain_hook();
+  std::unordered_map<std::string_view, double> weight;
+  for (const auto& kv : s.rows) {
+    if (kv.second.kind == row::kind_t::scope) {
+      weight[kv.second.path] = kv.second.host_us;
+    }
+  }
   std::vector<row> out;
   out.reserve(s.rows.size());
   for (const auto& kv : s.rows) out.push_back(kv.second);
-  std::unordered_map<std::string, double> weight;
-  for (const auto& r : out) {
-    if (r.kernel.empty()) weight[r.path] = r.host_us;
-  }
-  std::sort(out.begin(), out.end(), [&](const row& a, const row& b) {
-    if (a.path != b.path) {
-      const double wa = weight.count(a.path) ? weight[a.path] : -1.0;
-      const double wb = weight.count(b.path) ? weight[b.path] : -1.0;
-      if (wa != wb) return wa > wb;
-      return a.path < b.path;
-    }
-    if (a.kernel.empty() != b.kernel.empty()) return a.kernel.empty();
-    if (a.device_us != b.device_us) return a.device_us > b.device_us;
-    if (a.host_us != b.host_us) return a.host_us > b.host_us;
-    return a.kernel < b.kernel;
-  });
+  auto key = [&](const row& r) {
+    auto w = weight.find(r.path);
+    return std::make_tuple(w == weight.end() ? 1.0 : -w->second,
+                           std::string_view(r.path),
+                           r.kind != row::kind_t::scope, -r.device_us,
+                           -r.host_us, std::string_view(r.kernel));
+  };
+  std::sort(out.begin(), out.end(),
+            [&](const row& a, const row& b) { return key(a) < key(b); });
   return out;
 }
 
-inline summary summarize_(state& s) {
+inline summary summarize() {
+  auto& s = detail::st();
   summary t;
   for (const auto& kv : s.rows) {
     const row& r = kv.second;
-    if (r.kernel.empty()) {
-      t.scopes += r.count;
-    } else if (r.kernel == "wait") {
-      t.wait_us += r.host_us;
-    } else if (r.kernel != "h2d" && r.kernel != "d2h") {
-      t.launches += r.count;
-      t.launches_timed += r.device_timed;
-      t.device_us += r.device_us;
+    switch (r.kind) {
+      case row::kind_t::scope: t.scopes += r.count; break;
+      case row::kind_t::launch:
+        t.launches += r.count;
+        t.launches_timed += r.device_timed;
+        t.device_us += r.device_us;
+        break;
+      case row::kind_t::wait: t.wait_us += r.host_us; break;
+      case row::kind_t::transfer: break;
     }
   }
   t.batches = s.batches;
@@ -252,10 +267,11 @@ inline summary summarize_(state& s) {
   return t;
 }
 
-// The text table: one line per row, indented one level for a kernel under
-// its scope. Times in ms; a device column left blank was not timed.
-inline void report_(state& s, FILE* out) {
-  const summary t = summarize_(s);
+// The text table: one line per row, indented one level for a launch, transfer
+// or wait under its scope. Times in ms; a device column left blank was not
+// timed.
+inline void report(FILE* out) {
+  const summary t = summarize();
   std::fprintf(out,
                "tl profile: %llu scope entries, %llu launches (%llu timed), "
                "device %.3f ms, waits %.3f ms",
@@ -269,56 +285,54 @@ inline void report_(state& s, FILE* out) {
   std::fprintf(out, "\n%10s %11s %11s  %s\n", "count", "host ms", "device ms",
                "path / kernel");
   const std::string* group = nullptr;  // the path whose rows are printing
-  for (const row& r : rows_(s)) {
+  for (const row& r : rows()) {
+    const char* label = r.path.empty() ? "(top)" : r.path.c_str();
     char host[24] = "", dev[24] = "";
-    if (r.kernel.empty() || r.host_us > 0) {
+    if (r.kind == row::kind_t::scope || r.host_us > 0) {
       std::snprintf(host, sizeof host, "%.3f", r.host_us / 1000.0);
     }
     if (r.device_timed) {
       std::snprintf(dev, sizeof dev, "%.3f", r.device_us / 1000.0);
     }
-    if (r.kernel.empty()) {
+    if (r.kind == row::kind_t::scope) {
       std::fprintf(out, "%10llu %11s %11s  %s\n", (unsigned long long)r.count,
-                   host, dev, r.path.empty() ? "(top)" : r.path.c_str());
-    } else if (!group || *group != r.path) {
-      // launches under a path that opened no scope of its own (eager work
-      // at the top level): name the path before its kernels
-      std::fprintf(out, "%10s %11s %11s  %s\n", "", "", "",
-                   r.path.empty() ? "(top)" : r.path.c_str());
-    }
-    group = &r.path;
-    if (r.kernel.empty()) {
+                   host, dev, label);
+      group = &r.path;
       continue;
-    } else if (r.bytes) {
-      std::fprintf(out, "%10llu %11s %11s    %s  %.1f MB\n",
-                   (unsigned long long)r.count, host, dev, r.kernel.c_str(),
-                   r.bytes / 1048576.0);
-    } else {
-      std::fprintf(out, "%10llu %11s %11s    %s\n",
-                   (unsigned long long)r.count, host, dev, r.kernel.c_str());
     }
+    if (!group || *group != r.path) {
+      // work under a path that opened no scope of its own (eager work at
+      // the top level): name the path before its rows
+      std::fprintf(out, "%10s %11s %11s  %s\n", "", "", "", label);
+      group = &r.path;
+    }
+    const char* name =
+        r.kind == row::kind_t::wait ? "wait" : r.kernel.c_str();
+    std::fprintf(out, "%10llu %11s %11s    %s", (unsigned long long)r.count,
+                 host, dev, name);
+    if (r.bytes) std::fprintf(out, "  %.1f MB", r.bytes / 1048576.0);
+    std::fputc('\n', out);
   }
 }
 
+namespace detail {
 // TL_PROFILE=1: profile the whole process from the first evaluation and
-// print the table to stderr at exit. Called once from the evaluator; the
-// handler names the state it started rather than the thread it runs on.
+// print the table to stderr at exit. Called by the evaluator; the first call
+// does the work (the exit handler reads the calling thread's state, which is
+// the evaluating one in every consumer).
 inline void env_autostart() {
+  static bool once = false;
+  if (once) return;
+  once = true;
   if (!std::getenv("TL_PROFILE")) return;
   start();
-  static state* main_state = &st();
   std::atexit([] {
-    if (!main_state->active) return;
-    stop_(*main_state);
-    report_(*main_state, stderr);
+    if (!active()) return;
+    stop();
+    report(stderr);
   });
 }
-
 }  // namespace detail
-
-inline std::vector<row> rows() { return detail::rows_(detail::st()); }
-inline summary summarize() { return detail::summarize_(detail::st()); }
-inline void report(FILE* out) { detail::report_(detail::st(), out); }
 
 }  // namespace profile
 }  // namespace tl

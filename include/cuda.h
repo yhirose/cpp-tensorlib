@@ -296,9 +296,8 @@ struct context {
       profile::detail::transfer("h2d", m.bytes, 0.0);
       return;
     }
-    const auto t0 = profile::detail::clock::now();
+    profile::detail::blocked timing{"h2d", m.bytes};
     d.MemcpyHtoD(m.dev, m.host, m.bytes);
-    profile::detail::transfer("h2d", m.bytes, profile::detail::us_since(t0));
   }
   // A kernel is about to WRITE every element of this buffer: it becomes the
   // live copy, and whatever the host held is dead. A kernel that reads it
@@ -419,9 +418,9 @@ struct context {
     if (f) kernel_names.emplace(f, name);
     return f;
   }
-  const char* name_(CUfunction f) const {
+  std::string_view name_(CUfunction f) const {
     auto it = kernel_names.find(f);
-    return it == kernel_names.end() ? "?" : it->second.c_str();
+    return it == kernel_names.end() ? std::string_view("?") : it->second;
   }
 
   CUfunction fn_(kop op) {
@@ -454,9 +453,12 @@ struct context {
     return e;
   }
   void resolve_timed_() {
+    if (timed.empty()) return;
+    // One stream completes in order: once the last end event is in, all
+    // are, and a flush that already synchronized returns from this at once.
+    d.EventSynchronize(timed.back().end);
     for (const timed_launch& t : timed) {
       float ms = 0.0f;
-      d.EventSynchronize(t.end);
       if (d.EventElapsedTime(&ms, t.begin, t.end) == 0) {
         profile::detail::device_time(t.row, ms * 1000.0);
       }
@@ -934,11 +936,12 @@ inline bool pending() { return context::get().pending; }
 inline void flush() {
   auto& c = context::get();
   if (!c.pending) return;
-  const auto t0 = profile::detail::clock::now();
-  c.d.CtxSynchronize();
+  {
+    profile::detail::blocked waiting;
+    c.d.CtxSynchronize();
+  }
   c.pending = false;
-  profile::detail::wait(profile::detail::us_since(t0));
-  if (!c.timed.empty()) c.resolve_timed_();  // the device is idle: free reads
+  c.resolve_timed_();  // the device is idle: free reads
 }
 
 // ---- CUDA-graph capture (M9 C1-2): record a fixed launch sequence once and
@@ -1069,9 +1072,10 @@ inline void sync_to_host(void* native, bool for_write) {
   if (!m) return;
   if (m->where == context::DEVICE) {
     if (c.pending) flush();
-    const auto t0 = profile::detail::clock::now();
-    c.d.MemcpyDtoH(m->host, m->dev, m->bytes);
-    profile::detail::transfer("d2h", m->bytes, profile::detail::us_since(t0));
+    {
+      profile::detail::blocked timing{"d2h", m->bytes};
+      c.d.MemcpyDtoH(m->host, m->dev, m->bytes);
+    }
     m->where = context::BOTH;
   }
   if (for_write) m->where = context::HOST;
