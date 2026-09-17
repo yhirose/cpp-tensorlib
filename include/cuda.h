@@ -1472,7 +1472,14 @@ inline bool adam_step(void* p, int64_t po, void* m, int64_t mo, void* v,
                       float inv_bc2) {
   auto& c = context::get();
   if (!c.ready || n <= 0) return false;
+  // p, m and v are read AND written: device_read_ brings a host-born copy up
+  // first (an optimizer's state starts as host zeros), device_write_ alone
+  // would only mark the device copy live and the kernel would read whatever
+  // the mirror held.
   c.device_read_(g);
+  c.device_read_(p);
+  c.device_read_(m);
+  c.device_read_(v);
   c.device_write_(p);
   c.device_write_(m);
   c.device_write_(v);

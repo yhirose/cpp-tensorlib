@@ -1115,6 +1115,10 @@ inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
                      int64_t, void*, int64_t, int64_t, int64_t) {
   return false;
 }
+inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,
+                      int64_t, int64_t, float, float, float, float, float) {
+  return false;
+}
 inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,
                             int64_t, const int64_t*, void*, int64_t,
                             const int64_t*, int, int64_t, float, float) {
@@ -1191,10 +1195,6 @@ inline bool attn_prefill_dkv(void*, void*, void*, void*, void*, void*, void*,
   return false;
 }
 inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
-  return false;
-}
-inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,
-                      int64_t, int64_t, float, float, float, float, float) {
   return false;
 }
 

@@ -957,6 +957,32 @@ TEST_CASE("adam_step on a device buffer matches the same composition") {
   CHECK(allclose(p, want.p, 1e-4f, 1e-6f));
 }
 
+TEST_CASE("adam_step's first device step reads host-born state rather than the mirror") {
+  // The optimizer's pattern: p, m and v are made on the host and first touched
+  // by the device inside the step itself. A kernel that marks them written
+  // without reading them up first works on a device-born clone and computes
+  // on the mirror's stale contents here. Non-zero m0/v0 on purpose: a fresh
+  // device allocation reads as zeros, which would let host zeros pass by luck.
+  if (!tl::gpu_available()) return;
+  const float lr = 3e-4f, b1 = 0.9f, b2 = 0.95f, eps = 1e-8f;
+  const float bc1 = 1.0f - b1, bc2 = 1.0f - b2;  // the first step
+  auto prev = tl::device_;
+  tl::use_cpu();
+  auto p0 = random_array({64, 32}, 1420);
+  auto m0 = random_array({64, 32}, 1422);
+  auto v0 = tl::pow(random_array({64, 32}, 1423), 2.0f).eval();
+  auto g = random_array({64, 32}, 1421);
+  auto want = compose_adam(p0, m0, v0, g, lr, b1, b2, eps, bc1, bc2);
+  auto p = p0.clone(), m = m0.clone(), v = v0.clone();  // host copies still
+  tl::use_gpu();
+  bool ran = tl::array::adam_step(p, m, v, g, lr, b1, b2, eps, bc1, bc2);
+  tl::device_ = prev;
+  CHECK(ran);
+  CHECK(allclose(m, want.m, 1e-4f, 1e-6f));
+  CHECK(allclose(v, want.v, 1e-4f, 1e-6f));
+  CHECK(allclose(p, want.p, 1e-4f, 1e-6f));
+}
+
 TEST_CASE("dot + row bias fuses into the gemm and matches the unfused sum") {
   // graph::fuse_dot_bias_ makes the bias a third input of the dot; the CUDA
   // gemm adds it in its store (tail and split-K shapes below, both tiles), and
