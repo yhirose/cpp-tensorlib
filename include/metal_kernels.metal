@@ -1167,6 +1167,36 @@ kernel void where_nd_(device const float* cond [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
+// copy_nd: clone()'s device arm for a strided view (a transpose, a permute, a
+// stride-0 widening) -- the Metal counterpart of tl_copy_nd. The same flat-
+// index decode as where_nd_ above with one input: a gather into a contiguous
+// output, so a permuted view clones on the device instead of through a flush.
+// ---------------------------------------------------------------------------
+
+struct copy_nd_params {
+  uint out_shape[kPadFoldMaxRank];
+  uint a_strides[kPadFoldMaxRank];
+  uint rank;
+  uint n;
+};
+
+kernel void copy_nd_(device const float* a [[buffer(0)]],
+                     device float* out [[buffer(1)]],
+                     constant copy_nd_params& p [[buffer(2)]],
+                     uint i [[thread_position_in_grid]]) {
+  if (i >= p.n) return;
+  uint rem = i;
+  uint a_off = 0;
+  for (int d = int(p.rank) - 1; d >= 0; d--) {
+    uint dim = p.out_shape[d];
+    uint coord = rem % dim;
+    rem /= dim;
+    a_off += coord * p.a_strides[d];
+  }
+  out[i] = a[a_off];
+}
+
+// ---------------------------------------------------------------------------
 // sum_to: sum `a` down to a smaller broadcast-target shape (the dual of
 // broadcast_to that every arithmetic op's backward uses to un-broadcast a
 // gradient) -- the Metal counterpart of tl_sum_to in kernels/tensorlib_cuda.cu.

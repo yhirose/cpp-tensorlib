@@ -52,7 +52,8 @@ enum class kop {
   clamp_, sum_to_,               // dedicated ops, mirroring cuda.h's own
   concat_part_, rope_,           // ditto -- Tensor.concat / RoPE's own dispatch
   pow_s_, gt_s_, lt_s_, ge_s_, le_s_, eq_s_, ne_s_,  // scalar_op maps onto these
-  layer_norm_                                        // the fused layer norm
+  layer_norm_,                                       // the fused layer norm
+  copy_nd_                                           // clone()'s strided gather
 };
 
 // Comparisons (gt/lt/ge/le/eq/ne) are deliberately NOT kop values: kop is
@@ -153,6 +154,7 @@ struct context {
       case kop::bdiv_nd: return "bdiv_nd_";
       case kop::bpow_nd: return "bpow_nd_";
       case kop::where_nd: return "where_nd_";
+      case kop::copy_nd_: return "copy_nd_";
       case kop::gt_: return "gt_";
       case kop::lt_: return "lt_";
       case kop::ge_: return "ge_";
@@ -712,6 +714,12 @@ struct where_nd_params {
   uint32_t rank;
   uint32_t n;
 };
+struct copy_nd_params {
+  uint32_t out_shape[kPadFoldMaxRank];
+  uint32_t a_strides[kPadFoldMaxRank];
+  uint32_t rank;
+  uint32_t n;
+};
 
 // binary_bcast_nd's incoming `op` is one of the rank-2 kop values (badd etc,
 // shared with binary_bcast() above -- array.h's gpu_binary_bcast_nd_ passes
@@ -799,11 +807,34 @@ inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
   return true;
 }
 
-// clone()'s device arm, CUDA-first: no Metal kernel yet, so a clone takes
-// array.h's host copy (a flush and a memcpy on unified memory).
-inline bool copy_nd(void*, int64_t, const int64_t*, void*, int64_t,
-                    const int64_t*, int, int64_t) {
-  return false;
+// clone()'s device arm for a strided view (a transpose, a permute, a stride-0
+// widening): a gather into a contiguous output, the counterpart of cuda.h's.
+// Until now a clone here took array.h's host copy -- a memcpy on unified
+// memory, but behind a flush that drains every kernel in flight, and a
+// training step clones on each gradient's first accumulation and each detach.
+inline bool copy_nd(void* a_native, int64_t ao, const int64_t* a_strides,
+                    void* out_native, int64_t oo, const int64_t* out_shape,
+                    int rank, int64_t n) {
+  auto& c = context::get();
+  if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
+  if (n <= 0) return true;  // nothing to gather, and no zero-sized dispatch
+  auto pso = c.pso_(kop::copy_nd_);
+  c.ensure_encoder_();
+  objc::send(c.enc, "setComputePipelineState:", pso);
+  detail_::set_buf_(c.enc, a_native, ao, 0ul);
+  detail_::set_buf_(c.enc, out_native, oo, 1ul);
+  detail_::copy_nd_params p{};
+  for (int d = 0; d < rank; d++) {
+    p.out_shape[d] = static_cast<uint32_t>(out_shape[d]);
+    p.a_strides[d] = static_cast<uint32_t>(a_strides[d]);
+  }
+  p.rank = static_cast<uint32_t>(rank);
+  p.n = static_cast<uint32_t>(n);
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), 2ul);
+  unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
+  detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
+  return true;
 }
 namespace detail_ {
 inline kop to_cmp_(cmp_op op) {

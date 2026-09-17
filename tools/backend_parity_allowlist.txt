@@ -30,8 +30,8 @@ gemm_batched
 gemm_bias
 
 # N-D strided copy: clone()'s device arm for a permuted/transposed view.
-# CUDA-first, where the host copy is a D2H and an H2D round trip; Metal's
-# unified memory makes its host copy a flush and a memcpy meanwhile.
+# CUDA and Metal gather on the device; WebGPU still takes the host copy, a
+# D2H and an H2D round trip, meanwhile.
 copy_nd
 
 # Cross-entropy without a [rows, classes] intermediate: the trailing-axis
