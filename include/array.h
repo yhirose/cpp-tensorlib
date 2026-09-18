@@ -975,6 +975,13 @@ inline array array::broadcast_to(shape_t shape) const {
 namespace detail {
 // clone()'s device arm, defined once graph is complete.
 inline std::optional<array> device_clone_(const array& a);
+
+// ...reached through a hook under TL_RUNTIME_HOOKS, for gpu_pending_hook's
+// reason (storage.h): clone() is a builder path, not an evaluation. A strided
+// view's reshape clones, so naming the device arm here would leave a Metal
+// reference in a translation unit that only builds graphs. Null means no
+// backend is installed, and clone() copies on the host as it always did.
+inline std::optional<array> (*device_clone_hook)(const array&) = nullptr;
 }  // namespace detail
 
 inline array array::clone() const {
@@ -986,7 +993,13 @@ inline array array::clone() const {
   // own evaluation so that lands under its own ops, not here.
   profile::scope ps("clone");
   if (storage_.native && storage_.dt == tl::dtype::f32) {
+#ifdef TL_RUNTIME_HOOKS
+    if (detail::device_clone_hook) {
+      if (auto out = detail::device_clone_hook(*this)) return std::move(*out);
+    }
+#else
     if (auto out = detail::device_clone_(*this)) return std::move(*out);
+#endif
   }
   ensure_();
   if (storage_.dt != tl::dtype::f32) {
@@ -5125,6 +5138,7 @@ inline void install_runtime_hooks() {
   detail::run_hook = &detail::graph::run;
   detail::run_noflush_hook = &detail::graph::run_noflush;
   detail::flush_hook = &gpu::flush;
+  detail::device_clone_hook = &detail::device_clone_;
 }
 
 // Waits for the device to finish what is in flight — results realized
