@@ -481,6 +481,56 @@ TEST_CASE("softmax: own CPU rows across the pool match the ref oracle") {
   CHECK(cpu_matches_ref([&] { return random_array({8, 256, 256}, 905).softmax(); }));
 }
 
+TEST_CASE("cpu::exp_shifted: within a few ulp of libm over softmax's domain") {
+  // Every 97th float bit pattern in [-88, 0] (~11M values), the exponents a
+  // max-shifted softmax produces.
+  const float lo = -88.0f;
+  uint32_t b_lo;
+  std::memcpy(&b_lo, &lo, 4);
+  std::vector<float> xs;
+  for (uint32_t b = b_lo; b > 0x80000000u; b -= std::min<uint32_t>(97, b - 0x80000000u)) {
+    float x;
+    std::memcpy(&x, &b, 4);
+    xs.push_back(x);
+  }
+  xs.push_back(0.0f);
+  std::vector<float> ys(xs.size());
+  tl::cpu::exp_shifted(ys.data(), xs.data(), 1, static_cast<int64_t>(xs.size()), 0.0f);
+  // Relative error against double-precision exp, over normal results.
+  double worst = 0;
+  for (size_t i = 0; i < xs.size(); i++) {
+    double want = std::exp(double(xs[i]));
+    if (want < 1.1754944e-38) continue;  // denormal results: flushed near there
+    worst = std::max(worst, std::abs(double(ys[i]) - want) / want);
+  }
+  MESSAGE("exp_shifted worst relative error: " << worst);
+  CHECK(worst < 1.1920929e-7);  // measured 7.7e-8 (~1.3 ulp) on AVX2
+  CHECK(ys.back() == 1.0f);
+
+  float special[] = {-INFINITY, -1000.0f, NAN, 0.0f};
+  float out[4];
+  tl::cpu::exp_shifted(out, special, 1, 4, 0.0f);
+  CHECK(out[0] == 0.0f);
+  CHECK(out[1] == 0.0f);
+  CHECK(std::isnan(out[2]));
+  CHECK(out[3] == 1.0f);
+}
+
+TEST_CASE("cpu::exp_shifted: a value does not depend on its place in the run") {
+  // Contiguous body, tail, and a strided run must round the same element the
+  // same way, or a row's softmax would depend on its length and layout.
+  std::vector<float> src(37);
+  for (size_t i = 0; i < src.size(); i++) src[i] = -0.37f * float(i) + 0.11f;
+  std::vector<float> whole(37), one(1), strided(18);
+  tl::cpu::exp_shifted(whole.data(), src.data(), 1, 37, 0.25f);
+  for (int64_t i = 0; i < 37; i++) {
+    tl::cpu::exp_shifted(one.data(), src.data() + i, 1, 1, 0.25f);
+    CHECK(one[0] == whole[i]);
+  }
+  tl::cpu::exp_shifted(strided.data(), src.data() + 1, 2, 18, 0.25f);
+  for (int64_t i = 0; i < 18; i++) CHECK(strided[i] == whole[1 + 2 * i]);
+}
+
 TEST_CASE("reductions") {
   auto a = array::from({1, 2, 3, 4, 5, 6}, {2, 3});
   CHECK(a.sum() == 21.0f);

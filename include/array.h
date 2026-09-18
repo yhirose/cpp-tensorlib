@@ -1500,7 +1500,9 @@ inline void for_last_axis_rows_(const array& a, int max_threads, F&& fn) {
 // the GPU this had been one thread of scalar exps whatever the size — the
 // whole remaining gap of a hand-written attention once its gemms were even,
 // and what causal_attention's backward pays to rebuild its probabilities.
-inline array softmax(const array& a, int max_threads = 1) {
+// `own_exp` takes the own-CPU backend's vector exp (cpu::exp_shifted); the
+// oracle keeps libm's.
+inline array softmax(const array& a, int max_threads = 1, bool own_exp = false) {
   auto out = array::empty(a.shape());
   int64_t cols = a.shape().back();
   int64_t col_stride = a.strides().back();
@@ -1511,7 +1513,11 @@ inline array softmax(const array& a, int max_threads = 1) {
     float* dst = po + r * cols;
     float m = detail::fold_lanes(src, col_stride, cols, src[0],
                                  [](float& a, float v) { a = std::max(a, v); });
-    for (int64_t c = 0; c < cols; c++) dst[c] = std::exp(src[c * col_stride] - m);
+    if (own_exp) {
+      cpu::exp_shifted(dst, src, col_stride, cols, m);
+    } else {
+      for (int64_t c = 0; c < cols; c++) dst[c] = std::exp(src[c * col_stride] - m);
+    }
     float denom = detail::fold_lanes(dst, 1, cols, 0.0f,
                                      [](float& a, float v) { a += v; });
     for (int64_t c = 0; c < cols; c++) dst[c] /= denom;
@@ -4466,7 +4472,7 @@ struct graph {
         } else {
           // An element costs about a hundred multiply-adds of time (the exp
           // plus the max and normalise passes).
-          r = ref::softmax(a, own_threads_(a.size() * 128));
+          r = ref::softmax(a, own_threads_(a.size() * 128), cpu::enabled_);
         }
         break;
       }

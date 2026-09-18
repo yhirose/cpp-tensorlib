@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -589,6 +590,70 @@ inline void sgemm_(const float* A, int64_t as0, int64_t as1, const float* B,
       }, max_threads);
     }
   }
+}
+
+namespace detail {
+#ifdef TL_CPU_X86
+// Cephes' expf, eight lanes: n = floor(x·log2e + 1/2), r = x − n·ln2 (ln2 in
+// two parts), a degree-5 polynomial in r, 2^n through the exponent bits.
+// Within 7.7e-8 relative (~1.3 ulp) over [-88, 0], the max-shifted exponents
+// softmax feeds it; results below FLT_MIN flush to 0.
+// "avx2" without "fma" on purpose: nothing may fuse into an FMA, so the
+// rounding is the same wherever this runs.
+TL_TARGET("avx2") inline __m256 exp8_(__m256 x) {
+  // min/max with x second: a NaN comes through (the other operand is kept).
+  x = _mm256_min_ps(_mm256_set1_ps(88.3762626647949f), x);
+  x = _mm256_max_ps(_mm256_set1_ps(-88.3762626647949f), x);
+  __m256 fx = _mm256_floor_ps(_mm256_add_ps(
+      _mm256_mul_ps(x, _mm256_set1_ps(1.44269504088896341f)),
+      _mm256_set1_ps(0.5f)));
+  x = _mm256_sub_ps(x, _mm256_mul_ps(fx, _mm256_set1_ps(0.693359375f)));
+  x = _mm256_sub_ps(x, _mm256_mul_ps(fx, _mm256_set1_ps(-2.12194440e-4f)));
+  __m256 z = _mm256_mul_ps(x, x);
+  __m256 y = _mm256_set1_ps(1.9875691500e-4f);
+  y = _mm256_add_ps(_mm256_mul_ps(y, x), _mm256_set1_ps(1.3981999507e-3f));
+  y = _mm256_add_ps(_mm256_mul_ps(y, x), _mm256_set1_ps(8.3334519073e-3f));
+  y = _mm256_add_ps(_mm256_mul_ps(y, x), _mm256_set1_ps(4.1665795894e-2f));
+  y = _mm256_add_ps(_mm256_mul_ps(y, x), _mm256_set1_ps(1.6666665459e-1f));
+  y = _mm256_add_ps(_mm256_mul_ps(y, x), _mm256_set1_ps(5.0000001201e-1f));
+  y = _mm256_add_ps(_mm256_add_ps(_mm256_mul_ps(y, z), x), _mm256_set1_ps(1.0f));
+  __m256i n = _mm256_add_epi32(_mm256_cvttps_epi32(fx), _mm256_set1_epi32(127));
+  return _mm256_mul_ps(y, _mm256_castsi256_ps(_mm256_slli_epi32(n, 23)));
+}
+
+TL_TARGET("avx2") inline void exp_shifted_avx2_(float* dst, const float* src,
+                                                int64_t stride, int64_t n,
+                                                float shift) {
+  const __m256 s = _mm256_set1_ps(shift);
+  int64_t i = 0;
+  if (stride == 1) {
+    for (; i + 8 <= n; i += 8)
+      _mm256_storeu_ps(dst + i, exp8_(_mm256_sub_ps(_mm256_loadu_ps(src + i), s)));
+  }
+  // The tail, or a strided run, through a lane buffer and the same kernel:
+  // an element's value does not depend on where in the row it sits.
+  for (; i < n; i += 8) {
+    const int64_t k = std::min<int64_t>(8, n - i);
+    float buf[8] = {};
+    for (int64_t j = 0; j < k; j++) buf[j] = src[(i + j) * stride];
+    _mm256_storeu_ps(buf, exp8_(_mm256_sub_ps(_mm256_loadu_ps(buf), s)));
+    std::memcpy(dst + i, buf, static_cast<size_t>(k) * sizeof(float));
+  }
+}
+#endif  // TL_CPU_X86
+}  // namespace detail
+
+// dst[i] = exp(src[i·stride] − shift) over a run of n: softmax's exp pass.
+// libm's expf is a scalar call per element (no -ffast-math, so nothing
+// vectorizes it), ~80% of a CPU softmax; AVX2 hosts take exp8_ instead.
+// Elsewhere this is std::exp, as before.
+inline void exp_shifted(float* dst, const float* src, int64_t stride,
+                        int64_t n, float shift) {
+#ifdef TL_CPU_X86
+  static const bool avx2 = detail::cpu_has_avx2_fma();
+  if (avx2) return detail::exp_shifted_avx2_(dst, src, stride, n, shift);
+#endif
+  for (int64_t i = 0; i < n; i++) dst[i] = std::exp(src[i * stride] - shift);
 }
 
 }  // namespace cpu
