@@ -2192,11 +2192,6 @@ struct graph {
   }
 
   static array unary(op_t op, const array& a) {
-    if (commutes_with_widening_(op)) {  // see narrow_widened_
-      if (auto narrow = narrow_widened_(a)) {
-        return unary(op, *narrow).broadcast_to(a.shape());
-      }
-    }
     if (num_elements(a.shape()) <= kEagerTiny && eager_operand_(a) &&
         eager_cpu_ok_()) {
       switch (op) {  // direct switch, see graph::binary
@@ -2219,46 +2214,6 @@ struct graph {
     return from_node(std::move(n));
   }
 
-  // broadcast_to's result is a materialized stride-0 view carrying no node, so
-  // epilogue fusion cannot take it and the node built for an elementwise op on
-  // it would be shaped like the WIDE result — eval allocates that whole buffer
-  // and walks it to write data that only repeats ([4096, 8192]: 134MB, 17ms).
-  // Widening is a pure gather, so it commutes with anything elementwise: narrow
-  // the widened axes back to 1, run the op there, and widen the result again.
-  // Null when `a` carries no widened axis, i.e. there is nothing to push past.
-  static std::optional<array> narrow_widened_(const array& a) {
-    if (!a.materialized()) return std::nullopt;  // strides are the view's
-    shape_t narrow = a.shape();
-    for (size_t i = 0; i < a.rank(); i++) {
-      if (a.strides()[i] == 0) narrow[i] = 1;
-    }
-    if (narrow == a.shape()) return std::nullopt;  // nothing was widened
-    return make_view_(a, std::move(narrow), a.strides_, a.offset_);
-  }
-
-  // The ops unary() may push past a widening: each output element reads the
-  // input element at its own index. softmax is absent because its normalizer
-  // sums along an axis, where the repeats belong; affine because graph::affine
-  // sets the scale on the node unary() hands back, so it pushes down itself
-  // before building it. An op left out costs the wide buffer, never a wrong
-  // value -- the safe direction for a list a new op can be forgotten from.
-  static bool commutes_with_widening_(op_t op) {
-    switch (op) {
-      case op_t::recip:
-      case op_t::exp_:
-      case op_t::log_:
-      case op_t::sqrt_:
-      case op_t::sigmoid:
-      case op_t::relu:
-      case op_t::tanh_:
-      case op_t::sin_:
-      case op_t::cos_:
-        return true;
-      default:
-        return false;
-    }
-  }
-
   // y = a * s + o. If `a` is an unevaluated op node, compose into a copy of
   // it (epilogue fusion): (base*S+O)*s+o = base*(S*s) + (O*s+o). The copy
   // shares the original's inputs; the original is left untouched for any
@@ -2271,9 +2226,6 @@ struct graph {
       c->scale = a.node_->scale * s;
       c->offset = a.node_->offset * s + o;
       return from_node(std::move(c));
-    }
-    if (auto narrow = narrow_widened_(a)) {
-      return affine(*narrow, s, o).broadcast_to(a.shape());
     }
     if (num_elements(a.shape()) <= kEagerTiny && eager_operand_(a) &&
         eager_cpu_ok_()) {
@@ -2366,9 +2318,6 @@ struct graph {
   // (arg0=lo, arg1=hi), so it can't go through the generic unary() builder
   // above (which has no params to carry them).
   static array clamp(const array& a, float lo, float hi) {
-    if (auto narrow = narrow_widened_(a)) {  // see narrow_widened_
-      return clamp(*narrow, lo, hi).broadcast_to(a.shape());
-    }
     auto n = std::make_shared<node>();
     n->op = op_t::clamp_;
     n->shape = a.shape();
@@ -2381,9 +2330,6 @@ struct graph {
   // x OP s with the scalar in the node (arg0), not a rank-0 input; an
   // epilogue fuses onto it like any unary's.
   static array scalar_binary(op_t op, const array& a, float s) {
-    if (auto narrow = narrow_widened_(a)) {  // see narrow_widened_
-      return scalar_binary(op, *narrow, s).broadcast_to(a.shape());
-    }
     if (num_elements(a.shape()) <= kEagerTiny && eager_operand_(a) &&
         eager_cpu_ok_()) {
       switch (op) {  // direct switch, see graph::binary
