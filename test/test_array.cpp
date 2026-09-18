@@ -2568,9 +2568,9 @@ TEST_CASE("profile: scopes nest into paths and launches land under them") {
   CHECK(tl::profile::rows().empty());
 }
 
-// An eager op names itself only when it runs: one that declines (CPU mode,
-// or a strided operand on a device) leaves no row for its caller to misread.
-TEST_CASE("profile: an eager op that declines leaves no row") {
+// An eager op names itself only past its operand checks: one that declines
+// there (CPU mode, or a strided operand on a device) leaves no row.
+TEST_CASE("profile: an eager op that declines on its operands leaves no row") {
   auto x = random_array({8, 32}, 1510), g = random_array({32}, 1511),
        dy = random_array({8, 32}, 1512);
   auto strided = random_array({32, 8}, 1513).transpose();

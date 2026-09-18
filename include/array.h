@@ -3263,8 +3263,10 @@ struct graph {
   }
 
   // The eager ops below open their profile scope once their operands are
-  // realized and the device has taken them: a pending graph evaluates under
-  // its own ops, and a call that declines leaves no row behind (clone() too).
+  // realized and pass the checks, as clone() does: a pending graph evaluates
+  // under its own ops, and a call that declines on its operands leaves no row.
+  // A backend without the kernel declines inside the scope, so a row with no
+  // launches under it means the caller composed the unfused form.
 
   // Cross-entropy's pullback from the forward's row logsumexp (see
   // array::xent_bwd). Eager and GPU-only, the same bargain the attention
