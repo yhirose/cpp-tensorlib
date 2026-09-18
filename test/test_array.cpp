@@ -1304,13 +1304,16 @@ TEST_CASE("layer_norm_bwd matches the composed pullback on the GPU") {
     return std::array<array, 3>{dx.eval(), dg.eval(), db.eval()};
   };
   auto prev = tl::device_;
-  bool fused_seen = false;
   auto check = [&](const array& x, const array& g, const array& dy) {
     tl::use_gpu();
     auto got = tl::array::layer_norm_bwd(x, g, dy);
     tl::use_cpu();
+    // The kernels are CUDA's; another device declines and its caller
+    // composes the form above.
+#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
+    REQUIRE(got.has_value());
+#endif
     if (!got) return;
-    fused_seen = true;
     auto want = composed(x, g, dy);
     for (int i = 0; i < 3; i++) {
       CHECK(got->at(i).shape() == want[i].shape());
@@ -1318,8 +1321,9 @@ TEST_CASE("layer_norm_bwd matches the composed pullback on the GPU") {
     }
   };
   // A short input (one row chunk, a partial column strip), a rank-3 one with
-  // gamma as [1, d], a row wider than the 256-thread block, and a tall one
-  // whose 200 rows split into chunks with a partial last (64·3 + 8).
+  // gamma as [1, d], a row wider than the 256-thread block, 200 rows in 64-row
+  // chunks with a partial last (64·3 + 8), and 4200 rows where the chunks
+  // grow past 64 rows to stay at 64 of them (66 each, the last 42).
   check(random_array({7, 33}, 1201), random_array({33}, 1202),
         random_array({7, 33}, 1203));
   check(random_array({4, 6, 40}, 1204), random_array({1, 40}, 1205),
@@ -1328,20 +1332,17 @@ TEST_CASE("layer_norm_bwd matches the composed pullback on the GPU") {
         random_array({3, 700}, 1209));
   check(random_array({200, 300}, 1210), random_array({300}, 1211),
         random_array({200, 300}, 1212));
-  // The kernels are CUDA's, so a CUDA build must take them — another device
-  // declines and its caller composes the form above (covered by the gradient
-  // tests of the consumers).
-#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
-  CHECK(fused_seen);
-#else
-  if (!fused_seen) MESSAGE("no fused layer norm pullback on this backend");
-#endif
+  check(random_array({4200, 40}, 1219), random_array({40}, 1220),
+        random_array({4200, 40}, 1221));
   tl::use_gpu();
   auto x = random_array({7, 33}, 1213), dy = random_array({7, 33}, 1214);
   CHECK_THROWS(tl::array::layer_norm_bwd(x, random_array({32}, 1215), dy));
   CHECK_THROWS(tl::array::layer_norm_bwd(x, random_array({2, 33}, 1216), dy));
   CHECK_THROWS(tl::array::layer_norm_bwd(x, random_array({33}, 1217),
                                          random_array({33, 7}, 1218)));
+  CHECK_THROWS(tl::array::layer_norm_bwd(random_array({1}, 1222),
+                                         array::full({}, 1.0f),
+                                         random_array({1}, 1223)));
   tl::device_ = prev;
 }
 
@@ -2565,4 +2566,25 @@ TEST_CASE("profile: scopes nest into paths and launches land under them") {
   tl::profile::start();
   tl::profile::stop();
   CHECK(tl::profile::rows().empty());
+}
+
+// An eager op names itself only when it runs: one that declines (CPU mode,
+// or a strided operand on a device) leaves no row for its caller to misread.
+TEST_CASE("profile: an eager op that declines leaves no row") {
+  auto x = random_array({8, 32}, 1510), g = random_array({32}, 1511),
+       dy = random_array({8, 32}, 1512);
+  auto strided = random_array({32, 8}, 1513).transpose();
+  auto prev = tl::device_;
+  tl::use_cpu();
+  tl::profile::start();
+  CHECK(!tl::array::layer_norm_bwd(x, g, dy));
+  if (tl::gpu_available()) {
+    tl::use_gpu();
+    CHECK(!tl::array::layer_norm_bwd(strided, g, dy));
+  }
+  tl::profile::stop();
+  tl::device_ = prev;
+  for (const auto& r : tl::profile::rows()) {
+    CHECK(r.path.find("layer_norm_bwd") == std::string::npos);
+  }
 }

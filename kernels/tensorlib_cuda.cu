@@ -727,11 +727,45 @@ __device__ __forceinline__ float tl_tree_sum_(float* s, unsigned t, unsigned T, 
   return total;
 }
 
+// tl_tree_sum_ for two values at once, in the same order; `s` holds 2·T.
+__device__ __forceinline__ float2 tl_tree_sum2_(float* s, unsigned t, unsigned T,
+                                                float a, float b) {
+  s[t] = a;
+  s[T + t] = b;
+  __syncthreads();
+  for (unsigned h = T >> 1; h > 0; h >>= 1) {
+    if (t < h) {
+      s[t] += s[t + h];
+      s[T + t] += s[T + t + h];
+    }
+    __syncthreads();
+  }
+  const float2 total = make_float2(s[0], s[T]);
+  __syncthreads();
+  return total;
+}
+
+// A row's mean and 1/sqrt(biased variance + eps) for layer norm and its
+// pullback: two shared sums (x, then the squared deviations), each scaled by
+// 1/cols after the tree the way tl_row_sum's mean is, so both read the numbers
+// the mean(-1, keepdims) composition does on this backend.
+__device__ __forceinline__ float2 tl_row_stats_(float* s, unsigned t, unsigned T,
+                                                const float* src, unsigned cols,
+                                                float eps) {
+  float inv_n = 1.0f / (float)cols;
+  float sum = 0.0f;
+  for (unsigned c = t; c < cols; c += T) sum += src[c];
+  const float mu = tl_tree_sum_(s, t, T, sum) * inv_n;
+  float ss = 0.0f;
+  for (unsigned c = t; c < cols; c += T) {
+    float v = src[c] - mu;
+    ss += v * v;
+  }
+  return make_float2(mu, 1.0f / sqrtf(tl_tree_sum_(s, t, T, ss) * inv_n + eps));
+}
+
 // ---- layer norm over the last axis (rows×cols out), affine epilogue ----
-// out = (x - mu) * 1/sqrt(var + eps) * g + b; mu/var the row's mean and biased
-// variance. Two shared sums (x, then the squared deviations), each scaled by
-// 1/cols after the tree the way tl_row_sum's mean is, so the fused op reads the
-// numbers the mean(-1, keepdims) composition does on this backend.
+// out = (x - mu) * 1/sqrt(var + eps) * g + b per row.
 __global__ void tl_layer_norm(const float* x, const float* g, const float* b,
                               float* out, unsigned rows, unsigned cols,
                               float eps, float scale, float offset) {
@@ -741,29 +775,17 @@ __global__ void tl_layer_norm(const float* x, const float* g, const float* b,
   float* dst = out + (size_t)row * cols;
   extern __shared__ float sdata[];
   unsigned t = threadIdx.x, T = blockDim.x;
-  float inv_n = 1.0f / (float)cols;
-
-  float sum = 0.0f;
-  for (unsigned c = t; c < cols; c += T) sum += src[c];
-  const float mu = tl_tree_sum_(sdata, t, T, sum) * inv_n;
-  float ss = 0.0f;
-  for (unsigned c = t; c < cols; c += T) {
-    float v = src[c] - mu;
-    ss += v * v;
-  }
-  const float inv = 1.0f / sqrtf(tl_tree_sum_(sdata, t, T, ss) * inv_n + eps);
+  const float2 st = tl_row_stats_(sdata, t, T, src, cols, eps);
+  const float mu = st.x, inv = st.y;
   for (unsigned c = t; c < cols; c += T)
     dst[c] = ((src[c] - mu) * inv * g[c] + b[c]) * scale + offset;
 }
 
 // ---- layer norm's pullback over the last axis, in three launches ----
-// With x̂ = (x − μ)·s, s = 1/sqrt(var + eps) and ĝ = dy ⊙ γ, the closed form is
-//   dx = s · (ĝ − mean(ĝ) − x̂ · mean(ĝ ⊙ x̂)),  dγ = Σ_rows dy ⊙ x̂,  dβ = Σ_rows dy.
-// The forward kept no x̂, so the dx kernel recomputes μ and s per row exactly
-// as tl_layer_norm does (the same two tree sums, the same 1/cols scaling) and
-// leaves them in `stats` [2, rows] for the column sums, which read x, dy and
-// the row's (μ, s) once more instead of a second row reduction per column.
-// One block per row, 256 threads, like tl_layer_norm.
+// With x̂ = (x − μ)·s and ĝ = dy ⊙ γ:  dx = s · (ĝ − mean(ĝ) − x̂ · mean(ĝ ⊙ x̂)),
+// dγ = Σ_rows dy ⊙ x̂, dβ = Σ_rows dy. The dx kernel recomputes (μ, s) like the
+// forward and leaves them in `stats` [2, rows] for the column sums. One block
+// per row; shared memory holds 2·blockDim floats.
 __global__ void tl_layer_norm_bwd_dx(const float* x, const float* g,
                                      const float* dy, float* dx, float* stats,
                                      unsigned rows, unsigned cols, float eps) {
@@ -775,24 +797,16 @@ __global__ void tl_layer_norm_bwd_dx(const float* x, const float* g,
   extern __shared__ float sdata[];
   unsigned t = threadIdx.x, T = blockDim.x;
   float inv_n = 1.0f / (float)cols;
-
-  float sum = 0.0f;
-  for (unsigned c = t; c < cols; c += T) sum += src[c];
-  const float mu = tl_tree_sum_(sdata, t, T, sum) * inv_n;
-  float ss = 0.0f;
-  for (unsigned c = t; c < cols; c += T) {
-    float v = src[c] - mu;
-    ss += v * v;
-  }
-  const float inv = 1.0f / sqrtf(tl_tree_sum_(sdata, t, T, ss) * inv_n + eps);
+  const float2 st = tl_row_stats_(sdata, t, T, src, cols, eps);
+  const float mu = st.x, inv = st.y;
   float sg = 0.0f, sgx = 0.0f;
   for (unsigned c = t; c < cols; c += T) {
     float gh = gy[c] * g[c];
     sg += gh;
     sgx += gh * (src[c] - mu) * inv;
   }
-  const float mean_g = tl_tree_sum_(sdata, t, T, sg) * inv_n;
-  const float mean_gx = tl_tree_sum_(sdata, t, T, sgx) * inv_n;
+  const float2 sums = tl_tree_sum2_(sdata, t, T, sg, sgx);
+  const float mean_g = sums.x * inv_n, mean_gx = sums.y * inv_n;
   for (unsigned c = t; c < cols; c += T) {
     float xhat = (src[c] - mu) * inv;
     dst[c] = inv * (gy[c] * g[c] - mean_g - xhat * mean_gx);
@@ -803,11 +817,9 @@ __global__ void tl_layer_norm_bwd_dx(const float* x, const float* g,
   }
 }
 
-// The column sums' first half: a block per (32-column strip, chunk of rows),
-// its 32×8 threads striding the chunk's rows so a warp reads 32 consecutive
-// columns of one row, folded over the 8 lanes in shared memory into
-// `partials` [2, chunks, cols] (dγ's plane first). A fixed lane order keeps
-// the sums deterministic, which float atomics would not.
+// The column sums: a block per (32-column strip, chunk of rows), a warp reading
+// 32 consecutive columns of one row, into `partials` [2, chunks, cols] (dγ's
+// plane first). Fixed lane and chunk order, so deterministic unlike atomics.
 __global__ void tl_layer_norm_bwd_gb(const float* x, const float* dy,
                                      const float* stats, float* partials,
                                      unsigned rows, unsigned cols,

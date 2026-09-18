@@ -2534,16 +2534,14 @@ inline bool layer_norm(void* x, int64_t xo, void* g, int64_t go, void* b,
 }
 
 // Layer norm's pullback: dx [rows, cols], dg and db [cols] from x and dy
-// [rows, cols] and the d-vector g. Three launches — a row kernel for dx that
-// also leaves each row's (mean, rstd) in `stats` [2, rows], a column-strip
-// kernel summing `chunks` row ranges into `partials` [2, chunks, cols], and
-// the fold of those into dg/db. All contiguous; the two scratch buffers are
-// the caller's, sized by `chunks`.
+// [rows, cols] and the d-vector g, all contiguous; dx/dg/db, `stats` [2, rows]
+// and `partials` [2, chunks, cols] are fresh buffers of the caller's, the rows
+// taken `per_chunk` at a time. A row kernel, a column-strip kernel, a fold.
 inline bool layer_norm_bwd(void* x, int64_t xo, void* g, int64_t go, void* dy,
-                           int64_t dyo, void* dx, int64_t dxo, void* dg,
-                           int64_t dgo, void* db, int64_t dbo, void* stats,
-                           void* partials, int64_t rows, int64_t cols,
-                           int64_t chunks, float eps) {
+                           int64_t dyo, void* dx, void* dg, void* db,
+                           void* stats, void* partials, int64_t rows,
+                           int64_t cols, int64_t per_chunk, int64_t chunks,
+                           float eps) {
   auto& c = context::get();
   if (!c.ready || rows <= 0 || cols <= 0 || chunks <= 0) return false;
   c.device_read_(x);
@@ -2557,20 +2555,20 @@ inline bool layer_norm_bwd(void* x, int64_t xo, void* g, int64_t go, void* dy,
   float* px = context::off_(x, xo);
   float* pg = context::off_(g, go);
   float* pdy = context::off_(dy, dyo);
-  float* pdx = context::off_(dx, dxo);
-  float* pdg = context::off_(dg, dgo);
-  float* pdb = context::off_(db, dbo);
+  float* pdx = context::off_(dx, 0);
+  float* pdg = context::off_(dg, 0);
+  float* pdb = context::off_(db, 0);
   float* ps = context::off_(stats, 0);
   float* pp = context::off_(partials, 0);
   unsigned ur = (unsigned)rows, uc = (unsigned)cols, uk = (unsigned)chunks;
-  unsigned per_chunk = (ur + uk - 1) / uk;
+  unsigned up = (unsigned)per_chunk;
   unsigned block = 256;
-  if (!c.launch_(c.layer_norm_bwd_dx_(), {ur}, {block}, block * sizeof(float),
-                 px, pg, pdy, pdx, ps, ur, uc, eps)) {
+  if (!c.launch_(c.layer_norm_bwd_dx_(), {ur}, {block},
+                 2 * block * sizeof(float), px, pg, pdy, pdx, ps, ur, uc, eps)) {
     return false;
   }
   if (!c.launch_(c.layer_norm_bwd_gb_(), {(uc + 31) / 32, uk}, {32, 8}, 0,
-                 px, pdy, ps, pp, ur, uc, per_chunk)) {
+                 px, pdy, ps, pp, ur, uc, up)) {
     return false;
   }
   return c.launch1d_(c.layer_norm_bwd_gb_fold_(), uc, pp, pdg, pdb, uk, uc);
@@ -2626,8 +2624,8 @@ inline bool layer_norm(void*, int64_t, void*, int64_t, void*, int64_t, void*,
   return false;
 }
 inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
-                           void*, int64_t, void*, int64_t, void*, int64_t,
-                           void*, void*, int64_t, int64_t, int64_t, float) {
+                           void*, void*, void*, void*, void*, int64_t, int64_t,
+                           int64_t, int64_t, float) {
   return false;
 }
 inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,

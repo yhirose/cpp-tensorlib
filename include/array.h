@@ -2584,14 +2584,16 @@ struct graph {
     return from_node(std::move(n));
   }
 
+  // A layer norm weight: the last axis's d values, as [d] or [1, d].
+  static bool holds_last_(const array& w, int64_t d) {
+    return w.rank() >= 1 && w.shape().back() == d && w.size() == d;
+  }
+
   static array layer_norm(const array& x, const array& gamma,
                           const array& beta, float eps) {
     const auto& s = x.shape();
     int64_t d = s.empty() ? 0 : s.back();
-    auto holds_d = [d](const array& w) {
-      return w.rank() >= 1 && w.shape().back() == d && w.size() == d;
-    };
-    if (d <= 0 || !holds_d(gamma) || !holds_d(beta))
+    if (d <= 0 || !holds_last_(gamma, d) || !holds_last_(beta, d))
       throw std::invalid_argument(
           "tl::layer_norm: expect rank>=1 x and gamma, beta holding its last "
           "dim — got x " + shape_str(s) + ", gamma " + shape_str(gamma.shape()) +
@@ -3260,6 +3262,10 @@ struct graph {
     return out;
   }
 
+  // The eager ops below open their profile scope once their operands are
+  // realized and the device has taken them: a pending graph evaluates under
+  // its own ops, and a call that declines leaves no row behind (clone() too).
+
   // Cross-entropy's pullback from the forward's row logsumexp (see
   // array::xent_bwd). Eager and GPU-only, the same bargain the attention
   // halves below make: one pass here, or the caller's composition.
@@ -3293,6 +3299,7 @@ struct graph {
         !g.storage_.native) {
       return std::nullopt;
     }
+    profile::scope ps("xent_bwd");
     auto out = array::empty(s);
     if (!out.storage_.native) return std::nullopt;
     if (!gpu::xent_bwd(x.storage_.native, x.offset_ * 4, lse.storage_.native,
@@ -3304,18 +3311,13 @@ struct graph {
     return out;
   }
 
-  // Layer norm's fused pullback (see array::layer_norm_bwd). Eager and
-  // GPU-only, the same bargain as xent_bwd: three launches here, or the
-  // caller's composition. The shape rules are graph::layer_norm's, with dout
-  // on x's shape; the row stats and column partials the kernels hand each
-  // other are scratch this frame owns.
+  // Layer norm's fused pullback (see array::layer_norm_bwd): graph::layer_norm's
+  // shape rules, with dout on x's shape.
   static std::optional<std::array<array, 3>> layer_norm_bwd(
       const array& x, const array& gamma, const array& dout, float eps) {
-    profile::scope ps("layer_norm_bwd");  // eager: no evaluator scope names it
     const auto& s = x.shape();
     int64_t d = s.empty() ? 0 : s.back();
-    if (d <= 0 || gamma.size() != d || gamma.shape().back() != d ||
-        dout.shape() != s) {
+    if (d <= 0 || !holds_last_(gamma, d) || dout.shape() != s) {
       throw std::invalid_argument(
           "tl::layer_norm_bwd: expect rank>=1 x, gamma holding its last axis "
           "and dout on x's shape — got x " + shape_str(s) + ", gamma " +
@@ -3333,9 +3335,11 @@ struct graph {
         !dout.storage_.native) {
       return std::nullopt;
     }
-    // The column sums split the rows into up to 64 chunks of at least 64 —
-    // enough blocks to fill the device on a tall input, one chunk on a short.
-    int64_t chunks = std::min<int64_t>(64, (rows + 63) / 64);
+    profile::scope ps("layer_norm_bwd");
+    // The column sums take the rows in chunks of at least 64, at most 64
+    // chunks: enough blocks to fill the device on a tall input, one on a short.
+    int64_t per_chunk = std::max<int64_t>(64, (rows + 63) / 64);
+    int64_t chunks = (rows + per_chunk - 1) / per_chunk;
     array dx = array::empty(s), dg = array::empty({d}), db = array::empty({d});
     array stats = array::empty({2, rows}), partials = array::empty({2, chunks, d});
     if (!dx.storage_.native || !dg.storage_.native || !db.storage_.native ||
@@ -3345,11 +3349,10 @@ struct graph {
     if (!gpu::layer_norm_bwd(x.storage_.native, x.offset_ * 4,
                              gamma.storage_.native, gamma.offset_ * 4,
                              dout.storage_.native, dout.offset_ * 4,
-                             dx.storage_.native, dx.offset_ * 4,
-                             dg.storage_.native, dg.offset_ * 4,
-                             db.storage_.native, db.offset_ * 4,
-                             stats.storage_.native, partials.storage_.native,
-                             rows, d, chunks, eps)) {
+                             dx.storage_.native, dg.storage_.native,
+                             db.storage_.native, stats.storage_.native,
+                             partials.storage_.native, rows, d, per_chunk,
+                             chunks, eps)) {
       return std::nullopt;
     }
     return std::array<array, 3>{dx, dg, db};
@@ -3362,7 +3365,6 @@ struct graph {
   static bool adam_step(array& p, array& m, array& v, const array& g, float lr,
                         float beta1, float beta2, float eps, float bc1,
                         float bc2) {
-    profile::scope ps("adam_step");  // eager: no evaluator scope names it
     const auto& s = p.shape();
     if (m.shape() != s || v.shape() != s || g.shape() != s) {
       throw std::invalid_argument(
@@ -3384,6 +3386,7 @@ struct graph {
         !g.contiguous()) {
       return false;
     }
+    profile::scope ps("adam_step");  // the device kernel or the host loop
     // The composition's own spelling: m · (lr/bc1) over sqrt(v · 1/bc2) + eps.
     const float lr_over_bc1 = lr / bc1, inv_bc2 = 1.0f / bc2;
     if (gpu_mode_(n, kernel_class::elementwise) && p.storage_.native &&
@@ -3424,7 +3427,6 @@ struct graph {
   static std::optional<std::pair<array, array>> attn_prefill_bwd_dq(
       const array& q, const array& K, const array& V, const array& dout,
       const array& out, float scale) {
-    profile::scope ps("attn_prefill_bwd_dq");  // eager, like adam_step
     const auto& s = q.shape();
     if (s.size() != 3 || K.shape() != s || V.shape() != s ||
         dout.shape() != s || out.shape() != s) {
@@ -3445,6 +3447,7 @@ struct graph {
         !attn_operands_ready_(dout, out, out)) {
       return std::nullopt;
     }
+    profile::scope ps("attn_prefill_bwd_dq");
     array dq = array::empty(s), stats = array::empty({2, H, T});
     if (!dq.storage_.native || !stats.storage_.native) return std::nullopt;
     if (!gpu::attn_prefill_dq(q.storage_.native, K.storage_.native,
@@ -3461,7 +3464,6 @@ struct graph {
   static std::optional<std::pair<array, array>> attn_prefill_bwd_dkv(
       const array& q, const array& K, const array& V, const array& dout,
       const array& stats, float scale) {
-    profile::scope ps("attn_prefill_bwd_dkv");  // eager, like adam_step
     const auto& s = q.shape();
     if (s.size() != 3 || K.shape() != s || V.shape() != s ||
         dout.shape() != s ||
@@ -3483,6 +3485,7 @@ struct graph {
         !attn_operands_ready_(dout, stats, stats)) {
       return std::nullopt;
     }
+    profile::scope ps("attn_prefill_bwd_dkv");
     array dK = array::empty(s), dV = array::empty(s);
     if (!dK.storage_.native || !dV.storage_.native) return std::nullopt;
     if (!gpu::attn_prefill_dkv(q.storage_.native, K.storage_.native,

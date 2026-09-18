@@ -1000,8 +1000,8 @@ inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
 // Layer norm's pullback. CUDA-first (allowlisted); the caller composes the
 // unfused form when this declines.
 inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
-                           void*, int64_t, void*, int64_t, void*, int64_t,
-                           void*, void*, int64_t, int64_t, int64_t, float) {
+                           void*, void*, void*, void*, void*, int64_t, int64_t,
+                           int64_t, int64_t, float) {
   return false;
 }
 
@@ -1378,8 +1378,8 @@ inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
 // Layer norm's pullback. CUDA-first (allowlisted); the caller composes the
 // unfused form when this declines.
 inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
-                           void*, int64_t, void*, int64_t, void*, int64_t,
-                           void*, void*, int64_t, int64_t, int64_t, float) {
+                           void*, void*, void*, void*, void*, int64_t, int64_t,
+                           int64_t, int64_t, float) {
   return false;
 }
 inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,
