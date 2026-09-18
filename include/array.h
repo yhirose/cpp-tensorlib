@@ -1513,13 +1513,13 @@ inline array softmax(const array& a, int max_threads = 1, bool own_exp = false) 
     float* dst = po + r * cols;
     float m = detail::fold_lanes(src, col_stride, cols, src[0],
                                  [](float& a, float v) { a = std::max(a, v); });
+    float denom;
     if (own_exp) {
-      cpu::exp_shifted(dst, src, col_stride, cols, m);
+      denom = cpu::exp_shifted(dst, src, col_stride, cols, m);
     } else {
       for (int64_t c = 0; c < cols; c++) dst[c] = std::exp(src[c * col_stride] - m);
+      denom = detail::fold_lanes(dst, 1, cols, 0.0f, [](float& a, float v) { a += v; });
     }
-    float denom = detail::fold_lanes(dst, 1, cols, 0.0f,
-                                     [](float& a, float v) { a += v; });
     for (int64_t c = 0; c < cols; c++) dst[c] /= denom;
   });
   return out;
@@ -3536,8 +3536,8 @@ struct graph {
             for (int64_t r = 0; r < rows; r++) {
               const int64_t t = t0 + r;
               float* row = s.data() + r * t1;
-              float mx = -std::numeric_limits<float>::infinity();
-              for (int64_t j = 0; j <= t; j++) mx = std::max(mx, row[j]);
+              float mx = detail::fold_lanes(row, 1, t + 1, row[0],
+                                            [](float& a, float v) { a = std::max(a, v); });
               float inv = 1.0f / cpu::exp_shifted(row, row, 1, t + 1, mx);
               for (int64_t j = 0; j <= t; j++) row[j] *= inv;
               for (int64_t j = t + 1; j < t1; j++) row[j] = 0.0f;

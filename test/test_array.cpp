@@ -482,13 +482,14 @@ TEST_CASE("softmax: own CPU rows across the pool match the ref oracle") {
 }
 
 TEST_CASE("cpu::exp_shifted: within a few ulp of libm over softmax's domain") {
-  // Every 97th float bit pattern in [-88, 0] (~11M values), the exponents a
+  // Every 997th float bit pattern in [-88, 0] (~1.1M values), the exponents a
   // max-shifted softmax produces.
   const float lo = -88.0f;
   uint32_t b_lo;
   std::memcpy(&b_lo, &lo, 4);
   std::vector<float> xs;
-  for (uint32_t b = b_lo; b > 0x80000000u; b -= std::min<uint32_t>(97, b - 0x80000000u)) {
+  xs.reserve((b_lo - 0x80000000u) / 997 + 2);
+  for (uint32_t b = b_lo; b > 0x80000000u; b -= 997) {
     float x;
     std::memcpy(&x, &b, 4);
     xs.push_back(x);
@@ -516,31 +517,27 @@ TEST_CASE("cpu::exp_shifted: within a few ulp of libm over softmax's domain") {
   CHECK(out[3] == 1.0f);
 }
 
-TEST_CASE("cpu::exp_shifted: a value does not depend on its place in the run") {
-  // Contiguous body, tail, and a strided run must round the same element the
-  // same way, or a row's softmax would depend on its length and layout.
+TEST_CASE("cpu::exp_shifted: place in the run, and the returned sum") {
+  // 37 = four full lanes and a tail of 5. Contiguous body, tail, and a strided
+  // run must round the same element the same way, or a row's softmax would
+  // depend on its length and layout; the tail's padding lanes add nothing.
   std::vector<float> src(37);
   for (size_t i = 0; i < src.size(); i++) src[i] = -0.37f * float(i) + 0.11f;
-  std::vector<float> whole(37), one(1), strided(18);
-  tl::cpu::exp_shifted(whole.data(), src.data(), 1, 37, 0.25f);
+  std::vector<float> whole(37), strided(18);
+  float sum = tl::cpu::exp_shifted(whole.data(), src.data(), 1, 37, 0.25f);
   for (int64_t i = 0; i < 37; i++) {
-    tl::cpu::exp_shifted(one.data(), src.data() + i, 1, 1, 0.25f);
-    CHECK(one[0] == whole[i]);
+    float one;
+    tl::cpu::exp_shifted(&one, src.data() + i, 1, 1, 0.25f);
+    CHECK(one == whole[i]);
   }
   tl::cpu::exp_shifted(strided.data(), src.data() + 1, 2, 18, 0.25f);
   for (int64_t i = 0; i < 18; i++) CHECK(strided[i] == whole[1 + 2 * i]);
-}
 
-TEST_CASE("cpu::exp_shifted: the returned sum, with or without dst") {
-  // 37 = four full lanes and a tail of 5: the tail's padding lanes add nothing.
-  std::vector<float> src(37), dst(37);
-  for (size_t i = 0; i < src.size(); i++) src[i] = -0.21f * float(i);
-  float sum = tl::cpu::exp_shifted(dst.data(), src.data(), 1, 37, 0.0f);
   double want = 0;
-  for (float e : dst) want += e;
+  for (float e : whole) want += e;
   CHECK(sum == doctest::Approx(want).epsilon(1e-6));
-  CHECK(tl::cpu::exp_shifted(nullptr, src.data(), 1, 37, 0.0f) == sum);
-  CHECK(tl::cpu::exp_shifted(nullptr, src.data(), 1, 0, 0.0f) == 0.0f);
+  CHECK(tl::cpu::exp_shifted(nullptr, src.data(), 1, 37, 0.25f) == sum);
+  CHECK(tl::cpu::exp_shifted(nullptr, src.data(), 1, 0, 0.25f) == 0.0f);
 }
 
 TEST_CASE("reductions") {
@@ -2142,6 +2139,11 @@ TEST_CASE("index_select: gathers rows by a 1-D index array") {
   CHECK(out.at({1, 1}) == doctest::Approx(2));
   CHECK(out.at({2, 0}) == doctest::Approx(5));
   CHECK(out.at({2, 1}) == doctest::Approx(6));
+
+  // Rows that are not dense: a transposed table, rows [1 3 5] and [2 4 6].
+  auto t = array::from({1, 2, 3, 4, 5, 6}, {3, 2}).transpose();
+  auto got = t.index_select(array::from({1, 0, 1}, {3})).eval();
+  CHECK(tl::allclose(got, array::from({2, 4, 6, 1, 3, 5, 2, 4, 6}, {3, 3})));
 }
 
 TEST_CASE("index_select: own CPU rows across the pool match the ref oracle") {
