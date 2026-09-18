@@ -531,6 +531,18 @@ TEST_CASE("cpu::exp_shifted: a value does not depend on its place in the run") {
   for (int64_t i = 0; i < 18; i++) CHECK(strided[i] == whole[1 + 2 * i]);
 }
 
+TEST_CASE("cpu::exp_shifted: the returned sum, with or without dst") {
+  // 37 = four full lanes and a tail of 5: the tail's padding lanes add nothing.
+  std::vector<float> src(37), dst(37);
+  for (size_t i = 0; i < src.size(); i++) src[i] = -0.21f * float(i);
+  float sum = tl::cpu::exp_shifted(dst.data(), src.data(), 1, 37, 0.0f);
+  double want = 0;
+  for (float e : dst) want += e;
+  CHECK(sum == doctest::Approx(want).epsilon(1e-6));
+  CHECK(tl::cpu::exp_shifted(nullptr, src.data(), 1, 37, 0.0f) == sum);
+  CHECK(tl::cpu::exp_shifted(nullptr, src.data(), 1, 0, 0.0f) == 0.0f);
+}
+
 TEST_CASE("reductions") {
   auto a = array::from({1, 2, 3, 4, 5, 6}, {2, 3});
   CHECK(a.sum() == 21.0f);
@@ -2335,6 +2347,19 @@ TEST_CASE("logsumexp: keepdims, and an axis with no fused kernel of its own") {
   for (int64_t j = 0; j < 5; j++) {
     CHECK(ax0.at({j}) == doctest::Approx(by_hand.at({j})));
   }
+}
+
+TEST_CASE("logsumexp: own CPU rows match the ref oracle") {
+  CHECK(cpu_matches_ref([&] { return random_array({4, 5}, 46).logsumexp(1); }));
+  CHECK(cpu_matches_ref([&] { return random_array({7, 33}, 47).logsumexp(1); }));
+  CHECK(cpu_matches_ref([&] { return random_array({40, 6}, 48).transpose().logsumexp(1); }));
+  CHECK(cpu_matches_ref([&] { return random_array({64, 4099}, 49).logsumexp(1); }));
+  // A masked row, and a row with nothing unmasked: the second has no finite
+  // max, so the own-CPU path hands it to the fold, which answers -inf.
+  const float inf = std::numeric_limits<float>::infinity();
+  auto out = array::from({0, -inf, 1, -inf, -inf, -inf}, {2, 3}).logsumexp(1).eval();
+  CHECK(out.at({0}) == doctest::Approx(std::log(1.0f + std::exp(1.0f))));
+  CHECK(out.at({1}) == -inf);
 }
 
 TEST_CASE("logsumexp: GPU dispatch matches the ref oracle") {

@@ -1529,9 +1529,11 @@ inline array softmax(const array& a, int max_threads = 1, bool own_exp = false) 
 // carries a running max and the sum of exp below it, rescaling the sum
 // whenever a larger element arrives — the same fold the CUDA kernel's threads
 // do, so the two backends agree. `out_shape` is the reduced shape (keepdims
-// or not); either way there is one output per row.
+// or not); either way there is one output per row. `own_exp` (the own-CPU
+// backend) takes two passes instead, the row's max and then the vector exp's
+// sum (cpu::exp_shifted); a row whose max is not finite keeps the fold.
 inline array logsumexp(const array& a, const shape_t& out_shape,
-                       int max_threads = 1) {
+                       int max_threads = 1, bool own_exp = false) {
   auto out = array::empty(out_shape);
   int64_t cols = a.shape().back();
   int64_t col_stride = a.strides().back();
@@ -1539,6 +1541,14 @@ inline array logsumexp(const array& a, const shape_t& out_shape,
   auto* po = out.data();
   for_last_axis_rows_(a, max_threads, [&](int64_t r, int64_t off) {
     const float* src = pi + off;
+    if (own_exp && cols > 0) {
+      float m = detail::fold_lanes(src, col_stride, cols, src[0],
+                                   [](float& a, float v) { a = std::max(a, v); });
+      if (std::isfinite(m)) {
+        po[r] = m + std::log(cpu::exp_shifted(nullptr, src, col_stride, cols, m));
+        return;
+      }
+    }
     float m = -3.402823466e+38f, s = 0.0f;
     for (int64_t c = 0; c < cols; c++) {
       float v = src[c * col_stride];
@@ -3528,12 +3538,7 @@ struct graph {
               float* row = s.data() + r * t1;
               float mx = -std::numeric_limits<float>::infinity();
               for (int64_t j = 0; j <= t; j++) mx = std::max(mx, row[j]);
-              float sum = 0;
-              for (int64_t j = 0; j <= t; j++) {
-                row[j] = std::exp(row[j] - mx);
-                sum += row[j];
-              }
-              float inv = 1.0f / sum;
+              float inv = 1.0f / cpu::exp_shifted(row, row, 1, t + 1, mx);
               for (int64_t j = 0; j <= t; j++) row[j] *= inv;
               for (int64_t j = t + 1; j < t1; j++) row[j] = 0.0f;
             }
@@ -4580,7 +4585,8 @@ struct graph {
           epi_done = true;
           break;
         }
-        r = ref::logsumexp(a, n.shape, own_threads_(a.size() * kStreamMacs));
+        r = ref::logsumexp(a, n.shape, own_threads_(a.size() * kStreamMacs),
+                           cpu::enabled_);
         break;
       }
       case op_t::sum_ax:

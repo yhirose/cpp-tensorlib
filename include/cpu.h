@@ -621,39 +621,57 @@ TL_TARGET("avx2") inline __m256 exp8_(__m256 x) {
   return _mm256_mul_ps(y, _mm256_castsi256_ps(_mm256_slli_epi32(n, 23)));
 }
 
-TL_TARGET("avx2") inline void exp_shifted_avx2_(float* dst, const float* src,
-                                                int64_t stride, int64_t n,
-                                                float shift) {
+TL_TARGET("avx2") inline float exp_shifted_avx2_(float* dst, const float* src,
+                                                 int64_t stride, int64_t n,
+                                                 float shift) {
   const __m256 s = _mm256_set1_ps(shift);
+  __m256 acc = _mm256_setzero_ps();
   int64_t i = 0;
   if (stride == 1) {
-    for (; i + 8 <= n; i += 8)
-      _mm256_storeu_ps(dst + i, exp8_(_mm256_sub_ps(_mm256_loadu_ps(src + i), s)));
+    for (; i + 8 <= n; i += 8) {
+      __m256 e = exp8_(_mm256_sub_ps(_mm256_loadu_ps(src + i), s));
+      if (dst) _mm256_storeu_ps(dst + i, e);
+      acc = _mm256_add_ps(acc, e);
+    }
   }
   // The tail, or a strided run, through a lane buffer and the same kernel:
-  // an element's value does not depend on where in the row it sits.
+  // an element's value does not depend on where in the row it sits. Lanes
+  // past the run are zeroed after the exp, so they add nothing.
   for (; i < n; i += 8) {
     const int64_t k = std::min<int64_t>(8, n - i);
-    float buf[8] = {};
+    alignas(32) float buf[8] = {};
     for (int64_t j = 0; j < k; j++) buf[j] = src[(i + j) * stride];
-    _mm256_storeu_ps(buf, exp8_(_mm256_sub_ps(_mm256_loadu_ps(buf), s)));
-    std::memcpy(dst + i, buf, static_cast<size_t>(k) * sizeof(float));
+    _mm256_store_ps(buf, exp8_(_mm256_sub_ps(_mm256_load_ps(buf), s)));
+    for (int64_t j = k; j < 8; j++) buf[j] = 0.0f;
+    if (dst) std::memcpy(dst + i, buf, static_cast<size_t>(k) * sizeof(float));
+    acc = _mm256_add_ps(acc, _mm256_load_ps(buf));
   }
+  alignas(32) float lanes[8];
+  _mm256_store_ps(lanes, acc);
+  return ((lanes[0] + lanes[1]) + (lanes[2] + lanes[3])) +
+         ((lanes[4] + lanes[5]) + (lanes[6] + lanes[7]));
 }
 #endif  // TL_CPU_X86
 }  // namespace detail
 
-// dst[i] = exp(src[i·stride] − shift) over a run of n: softmax's exp pass.
-// libm's expf is a scalar call per element (no -ffast-math, so nothing
-// vectorizes it), ~80% of a CPU softmax; AVX2 hosts take exp8_ instead.
-// Elsewhere this is std::exp, as before.
-inline void exp_shifted(float* dst, const float* src, int64_t stride,
-                        int64_t n, float shift) {
+// dst[i] = exp(src[i·stride] − shift) over a run of n, returning their sum;
+// dst may be null when only the sum is wanted (logsumexp). The exp pass of
+// softmax, logsumexp and the attention tile: libm's expf is a scalar call per
+// element (no -ffast-math, so nothing vectorizes it), ~80% of a CPU softmax,
+// so AVX2 hosts take exp8_ instead. Elsewhere this is std::exp, as before.
+inline float exp_shifted(float* dst, const float* src, int64_t stride,
+                         int64_t n, float shift) {
 #ifdef TL_CPU_X86
   static const bool avx2 = detail::cpu_has_avx2_fma();
   if (avx2) return detail::exp_shifted_avx2_(dst, src, stride, n, shift);
 #endif
-  for (int64_t i = 0; i < n; i++) dst[i] = std::exp(src[i * stride] - shift);
+  float sum = 0.0f;
+  for (int64_t i = 0; i < n; i++) {
+    float e = std::exp(src[i * stride] - shift);
+    if (dst) dst[i] = e;
+    sum += e;
+  }
+  return sum;
 }
 
 }  // namespace cpu
