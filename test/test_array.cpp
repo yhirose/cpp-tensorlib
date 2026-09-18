@@ -2082,6 +2082,27 @@ TEST_CASE("index_select: gathers rows by a 1-D index array") {
   CHECK(out.at({2, 1}) == doctest::Approx(6));
 }
 
+TEST_CASE("index_select: own CPU rows across the pool match the ref oracle") {
+  auto idx = [](int64_t n, int64_t limit) {
+    std::vector<float> v(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; i++) v[i] = float((i * 7919) % limit);
+    return array::from(std::move(v), {n});
+  };
+  CHECK(cpu_matches_ref([&] {
+    return random_array({512, 256}, 911).index_select(idx(1024, 512));
+  }));
+  CHECK(cpu_matches_ref([&] {
+    return random_array({64, 6, 40}, 912).index_select(idx(300, 64));
+  }));
+  // Rows that are not contiguous: a transposed table.
+  CHECK(cpu_matches_ref([&] {
+    return random_array({96, 128}, 913).transpose().index_select(idx(400, 128));
+  }));
+  CHECK(cpu_matches_ref([&] {
+    return random_array({50}, 914).index_select(idx(70, 50));
+  }));
+}
+
 TEST_CASE("index_select: GPU dispatch matches the ref oracle") {
   CHECK(matches_gpu_oracle([&] {
     auto table = random_array({64, 16}, 21);

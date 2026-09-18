@@ -1808,33 +1808,49 @@ inline array concat(const std::vector<array>& parts, size_t axis,
 }
 
 // Row gather along axis 0: out[i] = a[indices[i]] (indices float-valued,
-// rounded, matching argmax's own convention). A full odometer over
-// `out`'s own shape (same rank as `a`) rather than `for_each_index` --
-// `indices[idx[0]]` makes the row 0 stride data-dependent, which no fixed
-// reindex could express (the same reason fold above needs a manual walk).
+// rounded, matching argmax's own convention). Each output row is one source
+// row, so the label is read once per row and the row copied whole: a memcpy
+// when `a`'s rows are dense, else through offsets walked once for all rows.
+// Rows across the pool (`max_threads`, as for_last_axis_rows_). This had been
+// an odometer over every element, 19x torch's embedding lookup.
 inline array index_select(const array& a, const array& indices,
-                          const shape_t& out_shape) {
+                          const shape_t& out_shape, int max_threads = 1) {
   auto out = array::empty(out_shape);
+  int64_t rows = out_shape[0];
+  int64_t row_len = rows ? out.size() / rows : 0;
+  if (row_len == 0) return out;
   auto* po = out.data();
   const auto* pi = a.raw();
   const auto* pidx = indices.raw();
-  size_t r = a.rank();
-  const auto& a_strides = a.strides();
-  const auto& out_strides = out.strides();
-  std::vector<int64_t> idx(r, 0);
-  int64_t n = out.size();
-  for (int64_t i = 0; i < n; i++) {
-    int64_t row = static_cast<int64_t>(std::llround(pidx[idx[0]]));
-    int64_t src_off = row * a_strides[0];
-    int64_t dst_off = 0;
-    for (size_t d = 0; d < r; d++) dst_off += idx[d] * out_strides[d];
-    for (size_t d = 1; d < r; d++) src_off += idx[d] * a_strides[d];
-    po[dst_off] = pi[src_off];
-    for (size_t d = r; d-- > 0;) {
-      if (++idx[d] < out_shape[d]) break;
-      idx[d] = 0;
-    }
+  int64_t idx_stride = indices.strides()[0];
+  int64_t a_row_stride = a.strides()[0];
+  shape_t row_shape(a.shape().begin() + 1, a.shape().end());
+  std::vector<int64_t> row_strides(a.strides().begin() + 1, a.strides().end());
+  bool dense = row_strides == detail::contiguous_strides(row_shape);
+  std::vector<int64_t> offs;
+  if (!dense) {
+    offs.resize(static_cast<size_t>(row_len));
+    detail::for_each_index(row_shape, {row_strides},
+                           [&](int64_t j, const std::vector<int64_t>& off) {
+                             offs[j] = off[0];
+                           });
   }
+  auto rows_fn = [&](int64_t r0, int64_t r1) {
+    for (int64_t r = r0; r < r1; r++) {
+      int64_t row = static_cast<int64_t>(std::llround(pidx[r * idx_stride]));
+      const float* src = pi + row * a_row_stride;
+      float* dst = po + r * row_len;
+      if (dense) {
+        std::memcpy(dst, src, static_cast<size_t>(row_len) * sizeof(float));
+      } else {
+        for (int64_t j = 0; j < row_len; j++) dst[j] = src[offs[j]];
+      }
+    }
+  };
+  if (max_threads > 1)
+    cpu::thread_pool::instance().parallel_for(rows, rows_fn, max_threads);
+  else
+    rows_fn(0, rows);
   return out;
 }
 
@@ -4669,7 +4685,8 @@ struct graph {
         if (auto g = gpu_index_select_(a, indices, n.shape)) {
           r = std::move(*g);
         } else {
-          r = ref::index_select(a, indices, n.shape);
+          r = ref::index_select(a, indices, n.shape,
+                                own_threads_(num_elements(n.shape) * kStreamMacs));
         }
         break;
       }
