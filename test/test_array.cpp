@@ -238,14 +238,11 @@ TEST_CASE("clone of a strided view gathers the same elements on the device") {
 
 TEST_CASE("an elementwise op on a widened view matches the oracle") {
   auto src = random_array({1, 64}, 21);
-  auto widened = src.broadcast_to({32, 64});
-  auto materialized = widened.clone();
   // 2.0f / x builds recip's node, so it needs a source away from zero
   auto pos_src = random_array({1, 64}, 22).exp().eval();
 
   // softmax's normalizer sums along the axis, so the repeats belong in the sum
-  CHECK(allclose(widened.softmax().eval(), materialized.softmax().eval()));
-
+  CHECK(matches_oracle([&] { return src.broadcast_to({32, 64}).softmax(); }));
   CHECK(matches_oracle([&] { return src.broadcast_to({32, 64}) * 2.0f + 1.0f; }));
   CHECK(matches_oracle([&] { return tl::pow(src.broadcast_to({32, 64}), 2.0f); }));
   CHECK(matches_oracle([&] { return src.broadcast_to({32, 64}) > 0.0f; }));

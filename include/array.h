@@ -556,7 +556,8 @@ class array {
 
   // Widen to `shape` (sum_to's dual, and the VJP of a reduction): the added
   // and size-1 axes get stride 0, so this is a view, not a copy. shape() must
-  // broadcast to `shape`.
+  // broadcast to `shape`. An elementwise op on the result walks the whole
+  // widened shape, so apply it to the narrow source before widening.
   array broadcast_to(shape_t shape) const;
 
   // In-place accumulate (eager): this += b, broadcasting b. Mutates the
