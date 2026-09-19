@@ -1034,7 +1034,9 @@ inline void upload_u32(void* native, unsigned val) {
 // buffer (returned via `contents`). They are DISTINCT memory — the mirror's
 // dirty state copies between them on demand (device_read_/sync_to_host). storage
 // keeps native != contents, like Metal (MTLBuffer handle vs .contents pointer).
-inline void* alloc(int64_t bytes, float** contents) {
+// `host_fill` (the host writes it first) needs nothing here: the host copy is
+// its own allocation, which no queued work writes.
+inline void* alloc(int64_t bytes, float** contents, bool /*host_fill*/ = false) {
   auto& c = context::get();
   if (!c.ready) return nullptr;
   size_t nb = bytes > 0 ? (size_t)bytes : 4;
@@ -2587,7 +2589,7 @@ inline bool layer_norm_bwd(void* x, int64_t xo, void* g, int64_t go, void* dy,
 inline bool available() { return false; }
 inline bool pending() { return false; }
 inline void flush() {}
-inline void* alloc(int64_t, float**) { return nullptr; }
+inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
 inline void release(void*, int64_t, float*) {}
 inline bool binary(kop, void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
                    float, float) {

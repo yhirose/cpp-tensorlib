@@ -478,7 +478,9 @@ inline void context::flush_() { flush(); }
 // `contents`). They are DISTINCT memory — the dirty state copies between them
 // on demand. The returned handle is an opaque token, not a pointer to
 // anything dereferenceable; it is only ever a key back into `mirrors`.
-inline void* alloc(int64_t bytes, float** contents) {
+// `host_fill` (the host writes it first) needs nothing here: the host copy is
+// its own malloc, which kernels never write and an upload copies when queued.
+inline void* alloc(int64_t bytes, float** contents, bool /*host_fill*/ = false) {
   auto& c = context::get();
   if (!c.ready) return nullptr;
   size_t nb = bytes > 0 ? (size_t)bytes : 4;
@@ -1311,7 +1313,7 @@ inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
 inline bool available() { return false; }
 inline bool pending() { return false; }
 inline void flush() {}
-inline void* alloc(int64_t, float**) { return nullptr; }
+inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
 inline void release(void*, int64_t, float*) {}
 inline void sync_to_host(void*, bool) {}
 inline bool binary(kop, void*, int64_t, void*, int64_t, void*, int64_t, int64_t,

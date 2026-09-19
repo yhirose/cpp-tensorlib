@@ -1813,3 +1813,99 @@ attn_bwd_dkv_<128, 1, 8>(device const float*, device const float*,
                          device const float*, device const float*,
                          device const float*, device float*, device float*,
                          constant attn_params&, uint2, uint2, uint);
+
+// ---------------------------------------------------------------------------
+// Cross-entropy and the optimizer: cuda's tl_gather_axis, tl_row_logsumexp,
+// tl_xent_bwd and tl_adam_step, the same arithmetic.
+// ---------------------------------------------------------------------------
+
+struct gather_axis_params {
+  uint size;
+  uint n;
+};
+
+// out[i] = src[i*size + idx[i]]: the one element each position labels.
+kernel void gather_axis_(device const float* src [[buffer(0)]],
+                         device const float* idx [[buffer(1)]],
+                         device float* out       [[buffer(2)]],
+                         constant gather_axis_params& p [[buffer(3)]],
+                         uint i [[thread_position_in_grid]]) {
+  if (i >= p.n) return;
+  out[i] = src[i * p.size + uint(idx[i] + 0.5f)];
+}
+
+// Row logsumexp in one pass: each thread carries a running (max, sum of exp
+// below that max) over its columns and the tree merges the pairs.
+kernel void row_logsumexp_(device const float* in [[buffer(0)]],
+                           device float* out      [[buffer(1)]],
+                           constant reduce_params& p [[buffer(2)]],
+                           uint row [[threadgroup_position_in_grid]],
+                           uint lid [[thread_index_in_threadgroup]]) {
+  constexpr uint T = 256;
+  threadgroup float sm[T], ss[T];
+  device const float* src = in + row * p.cols;
+  float m = -FLT_MAX, s = 0.0f;
+  for (uint c = lid; c < p.cols; c += T) {
+    float v = src[c];
+    if (v > m) {
+      s *= exp(m - v);  // s is 0 on the first step, so -FLT_MAX is safe here
+      m = v;
+    }
+    s += exp(v - m);
+  }
+  sm[lid] = m;
+  ss[lid] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint h = T / 2; h > 0; h >>= 1) {
+    if (lid < h) {
+      float m1 = sm[lid], s1 = ss[lid], m2 = sm[lid + h], s2 = ss[lid + h];
+      float mm = max(m1, m2);
+      ss[lid] = s1 * exp(m1 - mm) + s2 * exp(m2 - mm);
+      sm[lid] = mm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (lid == 0) out[row] = (sm[0] + log(ss[0])) * p.scale + p.offset;
+}
+
+struct xent_bwd_params {
+  uint cols;
+  uint n;
+};
+
+// dx[i,j] = g[i] · (exp(x[i,j] - lse[i]) - [j == target[i]]).
+kernel void xent_bwd_(device const float* x   [[buffer(0)]],
+                      device const float* lse [[buffer(1)]],
+                      device const float* tgt [[buffer(2)]],
+                      device const float* g   [[buffer(3)]],
+                      device float* out       [[buffer(4)]],
+                      constant xent_bwd_params& p [[buffer(5)]],
+                      uint i [[thread_position_in_grid]]) {
+  if (i >= p.n) return;
+  uint row = i / p.cols, col = i % p.cols;
+  float e = exp(x[i] - lse[row]);
+  if (col == uint(tgt[row] + 0.5f)) e -= 1.0f;
+  out[i] = e * g[row];
+}
+
+struct adam_params {
+  float b1, b2, eps, lr_over_bc1, inv_bc2;
+  uint n;
+};
+
+// Adam's update in one pass: m and v advance, p moves by the bias-corrected
+// ratio the host folded into lr_over_bc1 and inv_bc2.
+kernel void adam_step_(device float* p_      [[buffer(0)]],
+                       device float* m       [[buffer(1)]],
+                       device float* v       [[buffer(2)]],
+                       device const float* g [[buffer(3)]],
+                       constant adam_params& p [[buffer(4)]],
+                       uint i [[thread_position_in_grid]]) {
+  if (i >= p.n) return;
+  float gi = g[i];
+  float mi = p.b1 * m[i] + (1.0f - p.b1) * gi;
+  float vi = p.b2 * v[i] + (1.0f - p.b2) * gi * gi;
+  m[i] = mi;
+  v[i] = vi;
+  p_[i] -= (mi * p.lr_over_bc1) / (sqrt(vi * p.inv_bc2) + p.eps);
+}

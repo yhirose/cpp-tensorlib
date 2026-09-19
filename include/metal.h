@@ -28,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 extern "C" void* MTLCreateSystemDefaultDevice(void);
@@ -56,7 +57,8 @@ enum class kop {
   layer_norm_,                                       // the fused layer norm
   layer_norm_bwd_dx_, layer_norm_bwd_gb_, layer_norm_bwd_gb_fold_,  // its pullback
   attn_prefill_64_, attn_prefill_128_,  // causal prefill attention, per D
-  attn_bwd_dq_64_, attn_bwd_dq_128_, attn_bwd_dkv_64_, attn_bwd_dkv_128_
+  attn_bwd_dq_64_, attn_bwd_dq_128_, attn_bwd_dkv_64_, attn_bwd_dkv_128_,
+  gather_axis_, row_logsumexp_, xent_bwd_, adam_step_  // cross-entropy, Adam
 };
 
 // Comparisons (gt/lt/ge/le/eq/ne) are deliberately NOT kop values: kop is
@@ -96,6 +98,12 @@ struct context {
   // Free-list by byte size; contents pointers cached so a pool hit costs no
   // objc round trip (tiny-tensor workloads allocate per op).
   std::unordered_map<int64_t, std::vector<std::pair<void*, float*>>> free_bufs;
+  // Buffers released while a batch is pending. They go back to the pool at
+  // once — the next owner's kernels are encoded after the work still queued
+  // against them, so the device keeps the order — but work in the batch may
+  // yet write them, so a buffer the host fills skips them (alloc's
+  // host_fill). Cleared by the flush.
+  std::unordered_set<void*> released;
   std::unordered_map<int, objc::id> psos;
   // The kernel the encoder currently has bound (set by bind_): what
   // tl::profile names the next dispatch.
@@ -196,6 +204,10 @@ struct context {
       case kop::attn_bwd_dq_128_: return "attn_bwd_dq_128_";
       case kop::attn_bwd_dkv_64_: return "attn_bwd_dkv_64_";
       case kop::attn_bwd_dkv_128_: return "attn_bwd_dkv_128_";
+      case kop::gather_axis_: return "gather_axis_";
+      case kop::row_logsumexp_: return "row_logsumexp_";
+      case kop::xent_bwd_: return "xent_bwd_";
+      case kop::adam_step_: return "adam_step_";
     }
     return "";
   }
@@ -282,6 +294,7 @@ inline void flush() {
     if (row) profile::detail::device_time(row, (e - s) * 1e6);
   }
   c.timed.clear();
+  c.released.clear();
   objc_autoreleasePoolPop(c.pool);
   c.pool = nullptr;
   c.pending = false;
@@ -289,15 +302,22 @@ inline void flush() {
 
 // Pooled shared-mode MTLBuffer. Returns null when no device (caller falls
 // back to heap). `bytes` is the pool key — pass the same value to release.
-inline void* alloc(int64_t bytes, float** contents) {
+// `host_fill`: the host writes the buffer before any kernel does (a tensor
+// made from host values), so it must not be one the pending batch may still
+// write — on unified memory that write would land over the host's bytes.
+inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
   auto& c = context::get();
   if (!c.device) return nullptr;
   auto it = c.free_bufs.find(bytes);
-  if (it != c.free_bufs.end() && !it->second.empty()) {
-    auto [buf, ptr] = it->second.back();
-    it->second.pop_back();
-    *contents = ptr;
-    return buf;
+  if (it != c.free_bufs.end()) {
+    auto& list = it->second;
+    for (auto at = list.rbegin(); at != list.rend(); ++at) {
+      if (host_fill && c.released.count(at->first)) continue;
+      auto [buf, ptr] = *at;
+      list.erase(std::next(at).base());
+      *contents = ptr;
+      return buf;
+    }
   }
   // MTLResourceStorageModeShared = 0
   void* buf = objc::send(c.device, "newBufferWithLength:options:",
@@ -308,8 +328,11 @@ inline void* alloc(int64_t bytes, float** contents) {
 }
 
 inline void release(void* buf, int64_t bytes, float* contents) {
-  context::get().free_bufs[bytes].emplace_back(buf, contents);
+  auto& c = context::get();
+  if (c.pending) c.released.insert(buf);
+  c.free_bufs[bytes].emplace_back(buf, contents);
 }
+
 
 namespace detail_ {
 
@@ -710,17 +733,54 @@ inline bool scatter_to_axis(void* idx_native, int64_t idxo,
 // Cross-entropy's three: the trailing-axis gather, the one-pass row logsumexp
 // and the pullback that reads it. CUDA-first (allowlisted); array.h composes
 // the same values here.
-inline bool gather_from_axis(void*, int64_t, void*, int64_t, void*, int64_t,
-                             int64_t, int64_t) {
-  return false;
+// out[i] = src[i*size + idx[i]]: the element each position labels along a
+// trailing axis of `size`. One thread per output.
+inline bool gather_from_axis(void* src_native, int64_t so, void* idx_native,
+                             int64_t idxo, void* out_native, int64_t oo,
+                             int64_t n, int64_t size) {
+  auto& c = context::get();
+  if (!c.device || n <= 0) return false;
+  c.bind_(kop::gather_axis_);
+  detail_::set_buf_(c.enc, src_native, so, 0ul);
+  detail_::set_buf_(c.enc, idx_native, idxo, 1ul);
+  detail_::set_buf_(c.enc, out_native, oo, 2ul);
+  const uint32_t p[2] = {static_cast<uint32_t>(size), static_cast<uint32_t>(n)};
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(p),
+             static_cast<unsigned long>(sizeof(p)), 3ul);
+  detail_::dispatch_grid_(
+      c.enc, {(static_cast<unsigned long>(n) + 255ul) / 256ul, 1, 1},
+      {256, 1, 1});
+  return true;
 }
-inline bool row_logsumexp(void*, int64_t, void*, int64_t, int64_t, int64_t,
-                          float, float) {
-  return false;
+
+// Row logsumexp over the last axis, affine epilogue: row_op's shape, one pass
+// over the row (a running max and sum per thread).
+inline bool row_logsumexp(void* in, int64_t io, void* out, int64_t oo,
+                          int64_t rows, int64_t cols, float scale,
+                          float offset) {
+  if (rows <= 0) return false;
+  return row_op(kop::row_logsumexp_, in, io, out, oo, rows, cols, scale,
+                offset);
 }
-inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
-                     int64_t, void*, int64_t, int64_t, int64_t) {
-  return false;
+// Softmax cross-entropy's pullback from the forward's row logsumexp: x and
+// out [rows, cols]; lse, targets and g one value per row.
+inline bool xent_bwd(void* x, int64_t xo, void* lse, int64_t lo, void* tgt,
+                     int64_t to, void* g, int64_t go, void* out, int64_t oo,
+                     int64_t rows, int64_t cols) {
+  auto& c = context::get();
+  if (!c.device || rows <= 0 || cols <= 0) return false;
+  c.bind_(kop::xent_bwd_);
+  detail_::set_buf_(c.enc, x, xo, 0ul);
+  detail_::set_buf_(c.enc, lse, lo, 1ul);
+  detail_::set_buf_(c.enc, tgt, to, 2ul);
+  detail_::set_buf_(c.enc, g, go, 3ul);
+  detail_::set_buf_(c.enc, out, oo, 4ul);
+  const uint32_t n = static_cast<uint32_t>(rows * cols);
+  const uint32_t p[2] = {static_cast<uint32_t>(cols), n};
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(p),
+             static_cast<unsigned long>(sizeof(p)), 5ul);
+  detail_::dispatch_grid_(c.enc, {(n + 255ul) / 256ul, 1, 1}, {256, 1, 1});
+  return true;
 }
 namespace detail_ {
 struct layer_norm_bwd_params {
@@ -775,11 +835,34 @@ inline bool layer_norm_bwd(void* x, int64_t xo, void* g, int64_t go, void* dy,
   return true;
 }
 
-// Adam's fused per-parameter update. CUDA-first (allowlisted); array.h takes
-// its host loop when this declines -- a flush and a memcpy on unified memory.
-inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,
-                      int64_t, int64_t, float, float, float, float, float) {
-  return false;
+namespace detail_ {
+struct adam_params {
+  float b1, b2, eps, lr_over_bc1, inv_bc2;
+  uint32_t n;
+};
+}  // namespace detail_
+
+// Adam's update in place: p, m and v read and written, g read, all one
+// contiguous shape; the bias correction folded into lr_over_bc1 and inv_bc2.
+inline bool adam_step(void* p, int64_t po, void* m, int64_t mo, void* v,
+                      int64_t vo, void* g, int64_t go, int64_t n, float beta1,
+                      float beta2, float eps, float lr_over_bc1,
+                      float inv_bc2) {
+  auto& c = context::get();
+  if (!c.device || n <= 0) return false;
+  c.bind_(kop::adam_step_);
+  detail_::set_buf_(c.enc, p, po, 0ul);
+  detail_::set_buf_(c.enc, m, mo, 1ul);
+  detail_::set_buf_(c.enc, v, vo, 2ul);
+  detail_::set_buf_(c.enc, g, go, 3ul);
+  detail_::adam_params ap{beta1, beta2, eps, lr_over_bc1, inv_bc2,
+                          static_cast<uint32_t>(n)};
+  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&ap),
+             static_cast<unsigned long>(sizeof(ap)), 4ul);
+  detail_::dispatch_grid_(
+      c.enc, {(static_cast<unsigned long>(n) + 255ul) / 256ul, 1, 1},
+      {256, 1, 1});
+  return true;
 }
 
 namespace detail_ {
@@ -1223,7 +1306,7 @@ inline bool attn_prefill_dkv(void* q, void* K, void* V, void* dO, void* stats,
 inline bool available() { return false; }
 inline bool pending() { return false; }
 inline void flush() {}
-inline void* alloc(int64_t, float**) { return nullptr; }
+inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
 inline void release(void*, int64_t, float*) {}
 inline bool binary(kop, void*, int64_t, void*, int64_t, void*, int64_t,
                    int64_t, float, float) {

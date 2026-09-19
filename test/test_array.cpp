@@ -2538,11 +2538,10 @@ static void check_xent_bwd(bool on_gpu) {
   auto targets = array::from({0, 5, 31, 12, 7, 7, 1, 30}, {N});
   auto g = random_array({N}, 47);
   auto got = tl::array::xent_bwd(logits, logits.logsumexp(1), targets, g);
-  // The own CPU always takes it. On a device the kernel is CUDA's, so a CUDA
-  // build must take it; another device declines and its caller composes the
-  // form checked against right here.
+  // The own CPU always takes it, and so do the CUDA and Metal kernels; WebGPU
+  // declines and its caller composes the form checked against right here.
   if (!on_gpu) REQUIRE(got.has_value());
-#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
+#if !defined(TENSORLIB_WEBGPU)
   REQUIRE(got.has_value());
 #endif
   if (!got) {
@@ -2824,4 +2823,24 @@ TEST_CASE("profile: an eager op that declines on its operands leaves no row") {
   for (const auto& r : tl::profile::rows()) {
     CHECK(r.path.find("layer_norm_bwd") == std::string::npos);
   }
+}
+
+// A buffer released while the device still has work queued against it goes
+// straight back to the pool for device work, but not for the host to fill.
+// Here the logsumexp is encoded but not run when its temporary dies (xent_bwd
+// is eager and keeps only the kernel), and ones() asks for the same 32 bytes:
+// handed that buffer and filled at once, its 1s would be overwritten by the
+// queued logsumexp.
+TEST_CASE("host-filled storage skips buffers the pending batch may write") {
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+  tl::use_gpu();
+  auto logits = random_array({8, 32}, 48);
+  auto targets = array::from({0, 5, 31, 12, 7, 7, 1, 30}, {8});
+  auto g = random_array({8}, 49);
+  auto got = tl::array::xent_bwd(logits, logits.logsumexp(1), targets, g);
+  auto ones = tl::array::ones({8});
+  tl::eval(ones);
+  for (int64_t i = 0; i < 8; i++) CHECK(ones.at({i}) == 1.0f);
+  tl::device_ = prev;
 }
