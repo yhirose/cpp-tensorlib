@@ -983,6 +983,11 @@ inline std::optional<array> device_clone_(const array& a);
 // reference in a translation unit that only builds graphs. Null means no
 // backend is installed, and clone() copies on the host as it always did.
 inline std::optional<array> (*device_clone_hook)(const array&) = nullptr;
+
+// clone()'s own-CPU arm is the elementwise driver with the identity (defined
+// with ew_run below).
+template <typename F>
+array map_unary(const array& a, F f);
 }  // namespace detail
 
 inline array array::clone() const {
@@ -1018,6 +1023,10 @@ inline array array::clone() const {
                 static_cast<size_t>(size()) * dtype_size(storage_.dt));
     return out;
   }
+  // Own CPU: any layout copied a run at a time across the pool (a permuted or
+  // transposed view had been the one-thread element walker below, ~1 ms for
+  // 2 MB). The oracle keeps the walker.
+  if (cpu::enabled_) return detail::map_unary(*this, [](float x) { return x; });
   auto out = make_(shape_);
   auto* po = out.storage_.data();
   const auto* pi = raw();
@@ -1147,15 +1156,15 @@ inline array array::to_q4() const {
 namespace detail {
 
 // The own-CPU elementwise driver: the output as `rows` runs of `inner`
-// consecutive elements along which every operand is either contiguous
-// (step 1) or constant (step 0), the runs spread across the thread pool (a
-// lone long run is cut into chunks). One loop shape covers same-shape
-// operands, a scalar, a row or column vector, a leading broadcast axis (the
-// attention mask over [H,T,T]) and a slice with a gap between rows; the
-// per-element walker (for_each_index) is left to transposed views, whose
-// innermost stride is neither 0 nor 1. A run's operand offsets are derived
-// once per run, and the inner loop is stride-1 or a hoisted constant, so it
-// vectorizes. Everything here is fixed-size — no allocation but the output —
+// consecutive elements along which each operand steps by a fixed stride —
+// contiguous (1), constant (0), or a transposed view's gather (anything
+// else) — the runs spread across the thread pool (a lone long run is cut
+// into chunks). One loop shape covers same-shape operands, a scalar, a row
+// or column vector, a leading broadcast axis (the attention mask over
+// [H,T,T]), a slice with a gap between rows and a transposed view. A run's
+// operand offsets are derived once per run; the bodies split out the
+// stride-1 and constant cases, which vectorize, and keep one gather loop for
+// the rest. Everything here is fixed-size — no allocation but the output —
 // since an MLP's [10,30] op is a microsecond. Gated by cpu::enabled_ like the
 // other own-CPU kernels, so the oracle tests compare against the walker.
 // Threads for an own-CPU kernel over `macs` multiply-adds of work; the oracle
@@ -1188,7 +1197,7 @@ struct ew_plan {
   bool ok = false;
   size_t outer_rank = 0;  // axes above the run
   int64_t rows = 0, inner = 0;
-  int step[kEwMaxSrc] = {};  // per operand along the run: 1 contiguous, 0 constant
+  int64_t step[kEwMaxSrc] = {};  // per operand along the run: its innermost stride
 };
 inline ew_plan ew_plan_for(const shape_t& shape, const ew_strides& st) {
   ew_plan p;
@@ -1199,11 +1208,7 @@ inline ew_plan ew_plan_for(const shape_t& shape, const ew_strides& st) {
     p.rows = p.inner = 1;
     return p;
   }
-  for (size_t k = 0; k < st.n; k++) {
-    int64_t s = st.s[k][rank - 1];
-    if (s != 0 && s != 1) return p;
-    p.step[k] = static_cast<int>(s);
-  }
+  for (size_t k = 0; k < st.n; k++) p.step[k] = st.s[k][rank - 1];
   int64_t inner = shape[rank - 1];
   size_t d = rank - 1;
   while (d > 0) {
@@ -1270,11 +1275,14 @@ array map_unary(const array& a, F f) {
       ew_run(a.shape(), st, p,
              [&](int64_t o, const int64_t* offs, int64_t j0, int64_t j1) {
                const float* pai = pa + offs[0];
-               if (p.step[0] == 1) {
+               const int64_t sa = p.step[0];
+               if (sa == 1) {
                  for (int64_t j = j0; j < j1; j++) po[o + j] = f(pai[j]);
-               } else {
+               } else if (sa == 0) {
                  float v = f(pai[0]);
                  for (int64_t j = j0; j < j1; j++) po[o + j] = v;
+               } else {
+                 for (int64_t j = j0; j < j1; j++) po[o + j] = f(pai[j * sa]);
                }
              });
       return out;
@@ -1308,13 +1316,18 @@ array map_binary(const array& a, const array& b, F f) {
                const float* pbi = pb + offs[1];
                // Hoist a constant operand and split on the steps so each variant
                // is a stride-1 (or constant) inner loop that vectorizes; the
-               // generic j*stride form is an unpredictable gather to the compiler.
-               if (p.step[0] == 1 && p.step[1] == 1) {
+               // generic j*stride form is an unpredictable gather to the compiler,
+               // kept for a transposed operand.
+               const int64_t sa = p.step[0], sb = p.step[1];
+               if ((sa != 0 && sa != 1) || (sb != 0 && sb != 1)) {
+                 for (int64_t j = j0; j < j1; j++)
+                   po[o + j] = f(pai[j * sa], pbi[j * sb]);
+               } else if (sa == 1 && sb == 1) {
                  for (int64_t j = j0; j < j1; j++) po[o + j] = f(pai[j], pbi[j]);
-               } else if (p.step[0] == 1) {
+               } else if (sa == 1) {
                  float bv = pbi[0];
                  for (int64_t j = j0; j < j1; j++) po[o + j] = f(pai[j], bv);
-               } else if (p.step[1] == 1) {
+               } else if (sb == 1) {
                  float av = pai[0];
                  for (int64_t j = j0; j < j1; j++) po[o + j] = f(av, pbi[j]);
                } else {
@@ -1466,6 +1479,37 @@ array reduce_axis(const array& a, int axis, bool keepdims, float init, F f,
                    f(po[off[1]], pi[off[0]]);
                  });
   return out;
+}
+
+// sum_to on the own CPU: adjacent axes that are all summed away (or all kept)
+// merge into one — a contiguous buffer reshapes across them for free — and
+// each summed group is one reduce_axis pass, whose contiguous paths split
+// across the pool. The bias gradient [B·T, C] -> [C] is then a single column
+// pass, adding each column in row order as the element walker (ref::sum_to)
+// did, which took ~1 ms at GPT-small sizes on one thread.
+inline array own_sum_to_(const array& a, const shape_t& target, int max_threads) {
+  auto src = a.contiguous() ? a : a.clone();
+  const auto& sh = src.shape();
+  const size_t lead = sh.size() - target.size();
+  shape_t merged;
+  std::vector<bool> summed;
+  for (size_t i = 0; i < sh.size(); i++) {
+    if (sh[i] == 1) continue;  // neither summed nor kept: drops out
+    bool s = i < lead || target[i - lead] == 1;
+    if (!summed.empty() && summed.back() == s) {
+      merged.back() *= sh[i];
+    } else {
+      merged.push_back(sh[i]);
+      summed.push_back(s);
+    }
+  }
+  auto cur = src.reshape(merged);
+  for (size_t ax = 0; ax < merged.size(); ax++) {
+    if (summed[ax])
+      cur = reduce_axis(cur, static_cast<int>(ax), true, 0.0f,
+                        [](float& acc, float v) { acc += v; }, max_threads);
+  }
+  return cur.reshape(target);
 }
 
 }  // namespace detail
@@ -4651,6 +4695,8 @@ struct graph {
         auto a = in(0);
         if (auto g = gpu_sum_to_(a, n.shape)) {
           r = std::move(*g);
+        } else if (cpu::enabled_) {
+          r = own_sum_to_(a, n.shape, own_threads_(a.size() * kStreamMacs));
         } else {
           r = ref::sum_to(a, n.shape);
         }

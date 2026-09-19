@@ -428,9 +428,10 @@ TEST_CASE("batched dot: own CPU gemm per slice matches the ref oracle") {
 TEST_CASE("elementwise: own CPU runs across the pool match the walker oracle") {
   // Every layout ew_plan_for collapses to runs — same shape, a scalar, a row
   // and a column vector, a leading broadcast axis (the attention mask), a
-  // size-1 axis in the middle, a slice with a gap between rows, rank 0 — and
-  // the transposed view it hands back to the walker; a shape big enough to
-  // split across threads; unary through the same driver.
+  // size-1 axis in the middle, a slice with a gap between rows, rank 0, and a
+  // transposed view (a gather along the run) on either side, both, or next to
+  // a broadcast row; a shape big enough to split across threads; unary through
+  // the same driver.
   auto a = random_array({6, 7, 40}, 921), b = random_array({6, 7, 40}, 922);
   auto lead = random_array({1, 7, 40}, 923), mid = random_array({6, 1, 40}, 924);
   auto m = random_array({30, 33}, 925), rowv = random_array({1, 33}, 926);
@@ -443,13 +444,19 @@ TEST_CASE("elementwise: own CPU runs across the pool match the walker oracle") {
   CHECK(cpu_matches_ref([&] { return colv - m; }));
   CHECK(cpu_matches_ref([&] { return m.slice(1, 3, 20) + rowv.slice(1, 3, 20); }));
   CHECK(cpu_matches_ref([&] { return m + t.transpose(); }));
+  CHECK(cpu_matches_ref([&] { return t.transpose() - m; }));
+  CHECK(cpu_matches_ref([&] { return t.transpose() * t.transpose(); }));
+  CHECK(cpu_matches_ref([&] { return t.transpose() + rowv; }));
+  CHECK(cpu_matches_ref([&] {
+    return random_array({64, 512}, 933).transpose() + random_array({512, 64}, 934);
+  }));
   CHECK(cpu_matches_ref([&] { return random_array({}, 929) + random_array({}, 930); }));
   CHECK(cpu_matches_ref([&] { return random_array({8, 256, 256}, 931) + random_array({1, 256, 256}, 932); }));
   CHECK(cpu_matches_ref([&] { return a.exp(); }));
   CHECK(cpu_matches_ref([&] { return t.transpose().exp(); }));
   CHECK(cpu_matches_ref([&] { return m.slice(1, 3, 20).exp(); }));
   // where through the same driver: a broadcast mask over both branches, a
-  // scalar branch, and a transposed branch (walker)
+  // scalar branch, and a transposed branch
   CHECK(cpu_matches_ref([&] { return tl::where(lead > 0.0f, a, b); }));
   CHECK(cpu_matches_ref([&] { return tl::where(a > 0.0f, a, array::full({}, -1.0f)); }));
   CHECK(cpu_matches_ref([&] { return tl::where(m > 0.0f, t.transpose(), m); }));
@@ -1130,6 +1137,56 @@ TEST_CASE("sum_to reduces broadcast dims (VJP of broadcasting)") {
 
   CHECK_THROWS(a.sum_to({4}));
   CHECK_THROWS(a.sum_to({3, 2}));
+}
+
+TEST_CASE("sum_to: own CPU passes match the walker oracle") {
+  // Summed axes leading, trailing, in the middle and on both sides; size-1
+  // axes on the input; a full reduce; a transposed and a broadcast view (both
+  // copied out first); sizes past the thread cap.
+  auto a = random_array({6, 7, 40}, 951), big = random_array({2048, 256}, 952);
+  auto one = random_array({6, 1, 40}, 953);
+  CHECK(cpu_matches_ref([&] { return a.sum_to({40}); }));
+  CHECK(cpu_matches_ref([&] { return a.sum_to({1, 1, 40}); }));
+  CHECK(cpu_matches_ref([&] { return a.sum_to({6, 1, 40}); }));
+  CHECK(cpu_matches_ref([&] { return a.sum_to({6, 7, 1}); }));
+  CHECK(cpu_matches_ref([&] { return a.sum_to({7, 1}); }));
+  CHECK(cpu_matches_ref([&] { return a.sum_to({}); }));
+  CHECK(cpu_matches_ref([&] { return a.sum_to({6, 7, 40}); }));
+  CHECK(cpu_matches_ref([&] { return one.sum_to({40}); }));
+  CHECK(cpu_matches_ref([&] { return big.sum_to({256}); }));
+  CHECK(cpu_matches_ref([&] { return big.sum_to({2048, 1}); }));
+  CHECK(cpu_matches_ref([&] { return big.transpose().sum_to({256, 1}); }));
+  CHECK(cpu_matches_ref([&] { return random_array({40}, 954).broadcast_to({6, 7, 40}).sum_to({7, 1}); }));
+  // The bias gradient adds each column in row order, as the walker does.
+  auto fast = big.sum_to({256}).eval();
+  tl::cpu::enabled_ = false;
+  auto oracle = big.sum_to({256}).eval();
+  tl::cpu::enabled_ = true;
+  CHECK(std::memcmp(fast.raw(), oracle.raw(), 256 * sizeof(float)) == 0);
+}
+
+TEST_CASE("clone: own CPU copies any layout exactly") {
+  // Contiguous, a permuted view (innermost contiguous), a transposed view
+  // (innermost strided), a broadcast view (stride 0), and a slice with a gap
+  // between rows — each bit for bit what the walker copies, -0.0 included.
+  auto x = random_array({8, 16, 4, 32}, 961);
+  auto m = random_array({300, 200}, 962);
+  std::vector<float> signs = {-0.0f, 1.0f, -2.0f, 0.0f, -0.0f, 3.0f};
+  auto z = array::from(signs, {2, 3});
+  auto exact = [](auto build) {
+    auto fast = build().clone();
+    tl::cpu::enabled_ = false;
+    auto oracle = build().clone();
+    tl::cpu::enabled_ = true;
+    return fast.shape() == oracle.shape() &&
+           std::memcmp(fast.raw(), oracle.raw(), fast.size() * sizeof(float)) == 0;
+  };
+  CHECK(exact([&] { return m; }));
+  CHECK(exact([&] { return x.transpose({0, 2, 1, 3}); }));
+  CHECK(exact([&] { return m.transpose(); }));
+  CHECK(exact([&] { return z.transpose(); }));
+  CHECK(exact([&] { return random_array({1, 200}, 963).broadcast_to({300, 200}); }));
+  CHECK(exact([&] { return m.slice(1, 10, 150); }));
 }
 
 TEST_CASE("sum_to GPU dispatch matches the CPU oracle") {
