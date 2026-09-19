@@ -1236,9 +1236,8 @@ inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
 }
 
 // ---- causal prefill attention and its pullback ------------------------------
-// cuda.h's contracts. 128 threads per threadgroup; the tiles (rows of queries
-// or keys a threadgroup owns) are the MSL instantiations' and must match them:
-// the forward holds 32 queries at D=64 and 16 at D=128, each pullback half 16.
+// cuda.h's contracts. 128 threads per threadgroup, owning 32 rows (queries,
+// or keys for the key/value half): the MSL kernels' 4 simdgroups × 8.
 
 namespace detail_ {
 struct attn_params {
@@ -1247,12 +1246,12 @@ struct attn_params {
 };
 
 inline void attn_dispatch_(objc::id enc, const attn_params& p,
-                           unsigned long idx, int64_t heads, int64_t T,
-                           unsigned long tile) {
+                           unsigned long idx, int64_t heads, int64_t T) {
+  constexpr unsigned long rows = 32;
   set_bytes_(enc, p, idx);
   dispatch_grid_(enc,
                  {static_cast<unsigned long>(heads),
-                  (static_cast<unsigned long>(T) + tile - 1) / tile, 1},
+                  (static_cast<unsigned long>(T) + rows - 1) / rows, 1},
                  {128, 1, 1});
 }
 }  // namespace detail_
@@ -1276,7 +1275,7 @@ inline bool attn_prefill(void* q, void* K, void* V, void* out,
                          static_cast<uint32_t>(kv_max * D),
                          static_cast<uint32_t>(n_q_heads / n_kv_heads),
                          static_cast<uint32_t>(pos0), scale};
-  detail_::attn_dispatch_(c.enc, p, 4ul, n_q_heads, T, D == 64 ? 32 : 16);
+  detail_::attn_dispatch_(c.enc, p, 4ul, n_q_heads, T);
   return true;
 }
 
@@ -1291,7 +1290,7 @@ inline bool attn_prefill_dq(void* q, void* K, void* V, void* dO, void* O,
   void* bufs[] = {q, K, V, dO, O, dq, stats};
   for (unsigned long i = 0; i < 7; i++) detail_::set_buf_(c.enc, bufs[i], 0, i);
   detail_::attn_params p{static_cast<uint32_t>(T), 0, 0, 0, scale};
-  detail_::attn_dispatch_(c.enc, p, 7ul, H, T, 16);
+  detail_::attn_dispatch_(c.enc, p, 7ul, H, T);
   return true;
 }
 
@@ -1305,7 +1304,7 @@ inline bool attn_prefill_dkv(void* q, void* K, void* V, void* dO, void* stats,
   void* bufs[] = {q, K, V, dO, stats, dK, dV};
   for (unsigned long i = 0; i < 7; i++) detail_::set_buf_(c.enc, bufs[i], 0, i);
   detail_::attn_params p{static_cast<uint32_t>(T), 0, 0, 0, scale};
-  detail_::attn_dispatch_(c.enc, p, 7ul, H, T, 16);
+  detail_::attn_dispatch_(c.enc, p, 7ul, H, T);
   return true;
 }
 

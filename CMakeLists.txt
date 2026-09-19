@@ -255,6 +255,12 @@ endif()
 add_executable(tensorlib_bench bench/shared/speed/bench_main.cpp)
 target_link_libraries(tensorlib_bench PRIVATE tensorlib)
 
+if(APPLE)
+  # The Metal twin of tensorlib_bench_attn_bwd: fused attention per layer.
+  add_executable(tensorlib_bench_attn_bwd_metal bench/metal/speed/bench_attn_bwd.cpp)
+  target_link_libraries(tensorlib_bench_attn_bwd_metal PRIVATE tensorlib)
+endif()
+
 # auto-mode CPU/GPU crossover census (misc/census.cpp). Device-agnostic array
 # API, so the gpu:: facade routes it to Metal on Apple and CUDA off-Apple —
 # tensorlib_enable_cuda below embeds the PTX so gpu_available() is true.
