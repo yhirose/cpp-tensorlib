@@ -35,12 +35,19 @@ struct storage {
 
   // `host_fill`: the host fills it before any kernel touches it (see
   // gpu::alloc).
-  static storage make(int64_t n, dtype dt = dtype::f32, bool host_fill = false);
+  static storage make(int64_t n, dtype dt = dtype::f32, bool host_fill = false) {
+    return make_bytes(n, plain_bytes_(n, dt), dt, host_fill);
+  }
+  // `elems` is the logical element count, `bytes` the physical buffer size —
+  // they differ only for q4, whose bytes aren't elems x width. Like make, it
+  // reaches the device through the hook under TL_RUNTIME_HOOKS, so a caller
+  // names no backend.
+  static storage make_bytes(int64_t elems, int64_t bytes, dtype dt,
+                            bool host_fill = false);
 
-  // Explicit-byte allocation: device-preferred (Metal/CUDA pool) with a heap
-  // fallback. `elems` is the logical element count, `bytes` the physical buffer
-  // size — they differ only for q4, whose bytes aren't elems x width. The two
-  // named entry points below are this one with the byte count filled in.
+  // The device-preferred allocation (Metal/CUDA pool) with a heap fallback
+  // that make_bytes reaches: directly in the default build, only via the
+  // installed hook under TL_RUNTIME_HOOKS.
   static storage make_bytes_(int64_t elems, int64_t bytes, dtype dt,
                              bool host_fill = false) {
     storage s;
@@ -60,17 +67,6 @@ struct storage {
 
   // Plain elems x width in bytes; the allocators clamp the empty case.
   static int64_t plain_bytes_(int64_t n, dtype dt) { return n * dtype_size(dt); }
-
-  // Device-preferred allocation. Referenced directly in the default build; only
-  // via the installed hook under TL_RUNTIME_HOOKS.
-  static storage make_device_(int64_t n, dtype dt = dtype::f32,
-                              bool host_fill = false) {
-    return make_bytes_(n, plain_bytes_(n, dt), dt, host_fill);
-  }
-
-  static storage make_heap_(int64_t n, dtype dt = dtype::f32) {
-    return heap_bytes_(n, plain_bytes_(n, dt), dt);
-  }
 
  private:
   // A zero-length allocation still needs a distinct, dereferenceable address —
@@ -92,7 +88,7 @@ struct storage {
 namespace detail {
 
 // Runtime hooks (see the storage comment). Null until installed.
-inline storage (*storage_make_hook)(int64_t, dtype, bool) = nullptr;
+inline storage (*storage_make_hook)(int64_t, int64_t, dtype, bool) = nullptr;
 inline void (*cpu_barrier_hook)() = nullptr;
 // Host↔device coherence (CUDA device-mirror). Called with (native, for_write)
 // before a CPU read/write of a managed buffer to pull the device copy back
@@ -106,14 +102,15 @@ inline bool (*gpu_pending_hook)() = nullptr;
 
 }  // namespace detail
 
-inline storage storage::make(int64_t n, dtype dt, bool host_fill) {
+inline storage storage::make_bytes(int64_t elems, int64_t bytes, dtype dt,
+                                   bool host_fill) {
 #ifdef TL_RUNTIME_HOOKS
   if (detail::storage_make_hook) {
-    return detail::storage_make_hook(n, dt, host_fill);
+    return detail::storage_make_hook(elems, bytes, dt, host_fill);
   }
-  return make_heap_(n, dt);
+  return heap_bytes_(elems, bytes, dt);
 #else
-  return make_device_(n, dt, host_fill);
+  return make_bytes_(elems, bytes, dt, host_fill);
 #endif
 }
 

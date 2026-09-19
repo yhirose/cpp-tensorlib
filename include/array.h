@@ -1033,8 +1033,7 @@ inline array array::clone() const {
     array out;
     out.shape_ = shape_;
     out.strides_ = strides_;
-    out.storage_ = q4 ? storage::make_bytes_(size(), bytes, storage_.dt)
-                      : storage::make(size(), storage_.dt);
+    out.storage_ = storage::make_bytes(size(), bytes, storage_.dt);
     detail::barrier_();
     detail::host_sync_(storage_.native, /*for_write=*/false);
     std::memcpy(out.storage_.data(), storage_.data(), static_cast<size_t>(bytes));
@@ -1135,7 +1134,7 @@ inline array array::to_q4() const {
   array out;
   out.shape_ = shape_;  // logical [K,N]
   out.strides_ = detail::contiguous_strides(shape_);
-  out.storage_ = storage::make_bytes_(N * K, tl::q4_bytes(N, K), tl::dtype::q4);
+  out.storage_ = storage::make_bytes(N * K, tl::q4_bytes(N, K), tl::dtype::q4);
   auto* base = reinterpret_cast<uint8_t*>(out.storage_.data());
   std::memset(base, 0, static_cast<size_t>(tl::q4_bytes(N, K)));
   uint8_t* qw = base;
@@ -5461,7 +5460,7 @@ inline array concat(const std::vector<array>& parts) { return concat(parts, 0); 
 // the only function referencing the evaluator and device backends by name —
 // keep it out of translation units that must stay backend-free.
 inline void install_runtime_hooks() {
-  detail::storage_make_hook = &storage::make_device_;
+  detail::storage_make_hook = &storage::make_bytes_;
   detail::cpu_barrier_hook = &gpu::cpu_barrier;
   detail::host_sync_hook = &gpu::sync_to_host;
   detail::gpu_pending_hook = &gpu::pending;
