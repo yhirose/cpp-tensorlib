@@ -1692,6 +1692,30 @@ TEST_CASE("fused prefill attention matches an explicit causal softmax(qKt)V") {
   CHECK_THROWS(tl::array::attn_prefill(q, K, V.reshape({H, D, T}), scale));
 }
 
+TEST_CASE("attention and rope read a strided view as its packed copy") {
+  // A window along T (or D) is neither contiguous nor at the buffer's head;
+  // the row-indexed kernels must see the same values the packed copy holds.
+  const int64_t H = 2, T = 5;
+  for (int64_t D : {8, 64}) {
+    float scale = 1.0f / std::sqrt((float)D);
+    auto win = [&](int seed) {
+      return random_array({H, T + 3, D}, seed).slice(1, 2, T);
+    };
+    auto q = win(830), K = win(831), V = win(832);
+    CHECK(allclose(tl::array::attn_prefill(q, K, V, scale).eval(),
+                   tl::array::attn_prefill(q.clone(), K.clone(), V.clone(),
+                                           scale).eval()));
+    CHECK(allclose(array::rope(q, 3, 10000.0f).eval(),
+                   array::rope(q.clone(), 3, 10000.0f).eval()));
+    auto q1 = random_array({H, D + 2}, 833).slice(1, 1, D);
+    CHECK(allclose(tl::array::attn_decode(q1, K, V, scale).eval(),
+                   tl::array::attn_decode(q1.clone(), K.clone(), V.clone(),
+                                          scale).eval()));
+    CHECK(allclose(array::rope(q1, 3, 10000.0f).eval(),
+                   array::rope(q1.clone(), 3, 10000.0f).eval()));
+  }
+}
+
 // The attention pullback's query half checked on one device: the own CPU
 // (on_gpu false) or the GPU.
 static void check_attn_bwd_dq(bool on_gpu, int64_t D = 64) {

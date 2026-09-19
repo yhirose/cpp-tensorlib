@@ -4632,6 +4632,12 @@ struct graph {
       if (x.storage_.dt != tl::dtype::f32) x = x.to_f32();
       return x;
     };
+    // For the kernels that index rows as `base + r * D` (attention, rope): a
+    // strided view (a narrow along T or D) is packed first.
+    auto packed = [&](size_t i) {
+      array x = in(i);
+      return x.contiguous() ? x : x.clone();
+    };
     array r;
     bool epi_done = false;  // epilogue already applied inside the op body
     bool bias_owed = false;  // a fused dot bias not yet added (fused_bias_)
@@ -4816,7 +4822,7 @@ struct graph {
                                wrap(*n.inputs[2]))) {
           r = std::move(*g);
         } else {
-          r = ref_attn_(in(0), in(1), in(2), n.arg0);
+          r = ref_attn_(packed(0), packed(1), packed(2), n.arg0);
         }
         break;
       }
@@ -4825,10 +4831,13 @@ struct graph {
                                        wrap(*n.inputs[1]),
                                        wrap(*n.inputs[2]))) {
           r = std::move(*g);
-        } else if (auto c = cpu_attn_prefill_(in(0), in(1), in(2), n.arg0)) {
+          break;
+        }
+        auto q = packed(0), K = packed(1), V = packed(2);
+        if (auto c = cpu_attn_prefill_(q, K, V, n.arg0)) {
           r = std::move(*c);
         } else {
-          r = ref_attn_prefill_(in(0), in(1), in(2), n.arg0);
+          r = ref_attn_prefill_(q, K, V, n.arg0);
         }
         break;
       }
@@ -4836,7 +4845,7 @@ struct graph {
         if (auto g = gpu_rope_(n, wrap(*n.inputs[0]))) {
           r = std::move(*g);
         } else {
-          r = ref_rope_(in(0), n.axis, n.arg0);
+          r = ref_rope_(packed(0), n.axis, n.arg0);
         }
         break;
       }
