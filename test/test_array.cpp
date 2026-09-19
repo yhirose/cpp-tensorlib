@@ -369,6 +369,20 @@ TEST_CASE("batched dot: GPU dispatch matches the ref oracle") {
     auto b = random_array({2, 3, 8, 5}, 18);
     return a.transpose({0, 1, 3, 2}).dot(b);
   }));
+  // A batch slice that starts past the buffer's head: one head of attention.
+  CHECK(matches_gpu_oracle([&] {
+    auto q = random_array({4, 6, 8}, 19);
+    auto k = random_array({4, 6, 8}, 20);
+    return q.slice(0, 1, 2).dot(k.slice(0, 1, 2).transpose({0, 2, 1}));
+  }));
+  // The same past a permuted batch, which the one-launch gemm hands back to
+  // the per-slice loop.
+  CHECK(matches_gpu_oracle([&] {
+    auto a = random_array({2, 3, 6, 8}, 26);
+    auto b = random_array({2, 3, 8, 5}, 27);
+    return a.transpose({1, 0, 2, 3}).slice(0, 1, 2).dot(
+        b.transpose({1, 0, 2, 3}).slice(0, 1, 2));
+  }));
 }
 
 TEST_CASE("batched dot: one-launch GPU gemm matches the ref oracle") {
@@ -423,6 +437,11 @@ TEST_CASE("batched dot: own CPU gemm per slice matches the ref oracle") {
   CHECK(cpu_matches_ref([&] { return a.dot(k.transpose({0, 2, 1})); }));
   CHECK(cpu_matches_ref([&] { return a4.transpose({0, 1, 3, 2}).dot(b4); }));
   CHECK(cpu_matches_ref([&] { return a.dot(b) * 0.5f + 1.0f; }));  // epilogue
+  // A batch slice that starts past the buffer's head: one head of attention.
+  CHECK(cpu_matches_ref([&] { return a.slice(0, 1, 2).dot(b.slice(0, 1, 2)); }));
+  CHECK(cpu_matches_ref([&] {
+    return a.slice(0, 3, 1).dot(k.slice(0, 3, 1).transpose({0, 2, 1}));
+  }));
 }
 
 TEST_CASE("elementwise: own CPU runs across the pool match the walker oracle") {

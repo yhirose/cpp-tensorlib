@@ -3022,12 +3022,14 @@ struct graph {
 
   // The batch walk gpu_bdot_/cpu_bdot_ share with ref::bdot: the batch axes
   // may carry any strides (a permuted view, a slice), so each slice's element
-  // offset is the batch index dotted with them. `step` advances the odometer.
+  // offset is the batch index dotted with them, relative to the view's start:
+  // a device buffer adds x.offset_, a raw() pointer already has it. `step`
+  // advances the odometer.
   struct batch_walk_ {
     std::vector<int64_t> idx;
     explicit batch_walk_(size_t batch_rank) : idx(batch_rank, 0) {}
     int64_t offset(const array& x) const {
-      int64_t off = x.offset_;
+      int64_t off = 0;
       for (size_t d = 0; d < idx.size(); d++) off += idx[d] * x.strides()[d];
       return off;
     }
@@ -3103,8 +3105,9 @@ struct graph {
     }
     batch_walk_ w(r - 2);
     for (int64_t bi = 0; bi < batch; bi++, w.step(a)) {
-      if (!gpu::gemm(a.storage_.native, w.offset(a) * 4, la->ld, la->trans,
-                     b.storage_.native, w.offset(b) * 4, lb->ld, lb->trans,
+      if (!gpu::gemm(a.storage_.native, (a.offset_ + w.offset(a)) * 4, la->ld,
+                     la->trans, b.storage_.native,
+                     (b.offset_ + w.offset(b)) * 4, lb->ld, lb->trans,
                      out.storage_.native, (out.offset_ + bi * m * nn) * 4, m,
                      nn, k, n.scale, n.offset)) {
         return std::nullopt;
