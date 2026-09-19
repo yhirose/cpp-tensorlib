@@ -2303,6 +2303,13 @@ TEST_CASE("index_add: index_select's dual, scatter-adds rows by index") {
   CHECK(out.at({1, 1}) == doctest::Approx(60));
   CHECK(out.at({2, 0}) == doctest::Approx(0));   // untouched row stays zero
   CHECK(out.at({3, 0}) == doctest::Approx(0));
+
+  // Indices as a strided view (stride 0): every row lands on row 2.
+  auto same = tl::index_add(array::from({2}, {1}).broadcast_to({3}), values,
+                            {4, 2});
+  CHECK(same.at({2, 0}) == doctest::Approx(41));
+  CHECK(same.at({2, 1}) == doctest::Approx(62));
+  CHECK(same.at({0, 0}) == doctest::Approx(0));
 }
 
 TEST_CASE("index_add: is index_select's exact transpose (dot-product check)") {

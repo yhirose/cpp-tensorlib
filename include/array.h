@@ -1934,7 +1934,8 @@ inline array index_add(const array& indices, const array& values,
   std::vector<int64_t> idx(r, 0);
   int64_t n = values.size();
   for (int64_t i = 0; i < n; i++) {
-    int64_t row = static_cast<int64_t>(std::llround(pidx[idx[0]]));
+    int64_t row = static_cast<int64_t>(
+        std::llround(pidx[idx[0] * indices.strides()[0]]));
     int64_t src_off = 0;
     for (size_t d = 0; d < r; d++) src_off += idx[d] * v_strides[d];
     int64_t dst_off = row * out_strides[0];
