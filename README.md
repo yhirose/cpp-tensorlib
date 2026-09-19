@@ -209,7 +209,9 @@ bf16/q4 array, so call `to_f32()` first.
 ### Opt-in headers
 
 `#include <tokenizer.h>` gives `tl::tokenizer(gguf_path)` with `encode()`,
-`decode()`, `bos_id()`, `eos_id()`. `#include <gguf.h>` gives
+`decode()`, `bos_id()`, `eos_id()` — GPT-2 byte-level BPE, read from the
+model's own GGUF metadata, so it serves any model of that family (Qwen2 is
+the one the tests pin against). `#include <gguf.h>` gives
 `tl::gguf::model(path)` — an mmap'd reader with `tensor(name)`, `tensors()`,
 `kv(key)`, `metadata()`. Both are used by the LLM pipeline below.
 

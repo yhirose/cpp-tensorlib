@@ -1,10 +1,12 @@
 #pragma once
-// Qwen2 (GPT-2 byte-level BPE) tokenizer. Loads the vocab/merges/special
-// tokens from a GGUF model's metadata (tokenizer.ggml.*) and implements the
-// GPT-2 pretokenizer regex (hand-rolled — no std::regex), the byte->unicode
-// symbol mapping, and greedy rank-ordered BPE merging. encode() reproduces
-// HF Qwen2TokenizerFast token-for-token; decode() inverts it back to raw
-// UTF-8 bytes (special tokens decode to their literal <|...|> text).
+// GPT-2 byte-level BPE tokenizer — the family Qwen2, GPT-2 and their
+// relatives share. Loads the vocab/merges/special tokens from a GGUF model's
+// metadata (tokenizer.ggml.*) and implements the GPT-2 pretokenizer regex
+// (hand-rolled — no std::regex), the byte->unicode symbol mapping, and greedy
+// rank-ordered BPE merging. encode() reproduces HF's fast tokenizer for such a
+// model token-for-token (checked against Qwen2TokenizerFast); decode() inverts
+// it back to raw UTF-8 bytes (special tokens decode to their literal <|...|>
+// text).
 //
 // Header-only, C++17, stdlib only (gguf.h adds POSIX mmap).
 
@@ -171,7 +173,7 @@ class tokenizer {
       bpe_(data + off[i], off[e] - off[i], out);
   }
 
-  // Hand-rolled Qwen2/GPT-2 pretokenizer regex. Returns [start,end) codepoint
+  // Hand-rolled GPT-2 pretokenizer regex. Returns [start,end) codepoint
   // spans. At each position the FIRST matching alternative wins.
   static std::vector<std::pair<size_t, size_t>> pretokenize_(
       const std::vector<uint32_t>& cp) {

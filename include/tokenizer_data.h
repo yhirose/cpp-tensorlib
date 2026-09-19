@@ -1,10 +1,10 @@
 #pragma once
-// Auto-generated unicode tables for the Qwen2 (GPT-2 byte-level BPE) tokenizer.
+// Auto-generated unicode tables for the GPT-2 byte-level BPE tokenizer.
 // Generated from Python unicodedata (categories L*, N*) + str.isspace() and the
 // GPT-2 bytes_to_unicode() map. Consumed by tokenizer.h. Do not hand-edit.
 #include <cstdint>
 namespace tl::tokdata {
-// GPT-2/Qwen byte->unicode-codepoint map: byte b (0..255) renders as codepoint
+// GPT-2 byte->unicode-codepoint map: byte b (0..255) renders as codepoint
 // byte2cp[b]; a token string is a sequence of these codepoints, UTF-8 encoded.
 inline constexpr uint32_t byte2cp[256] = {
   256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269, 270, 271,
