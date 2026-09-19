@@ -1997,6 +1997,306 @@ attn_bwd_dkv_<128, 16>(device const float*, device const float*,
                        constant attn_params&, uint2, uint2, uint, uint, uint);
 
 // ---------------------------------------------------------------------------
+// Decode GEMV: y[n] = sum_k a[k]·B[k,n], cuda's tl_gemv_f32/tl_gemv_bf16.
+// Batch~1 decode is memory-bandwidth bound on the K×N weight, so one thread
+// owns one output column and consecutive threads read consecutive columns —
+// the B reads coalesce. `a` is staged a tile at a time, one read per
+// threadgroup rather than one per thread.
+//
+// Split-K over the grid's y: a narrow layer (N/256 threadgroups) leaves most
+// of the GPU idle and runs slower than the M=1 GEMM it replaces. Each slice
+// sums its own K range into out[s·n + col] and a combine pass adds the slices
+// up; with one slice `out` is y itself and the pass is skipped.
+// ---------------------------------------------------------------------------
+
+struct gemv_params {
+  uint n, k, chunk;
+};
+
+// The weight as f32: bf16 is the top 16 bits of the pattern.
+static inline float widen_(float w) { return w; }
+static inline float widen_(ushort h) { return as_type<float>(uint(h) << 16); }
+
+// `as` is the caller's threadgroup tile of NT floats (threadgroup memory can
+// only be declared in a kernel).
+template <typename WT>
+static inline void gemv_(device const float* a, device const WT* B,
+                         device float* out, constant gemv_params& p,
+                         threadgroup float* as, uint2 tgp, uint tid) {
+  constexpr uint NT = 256;
+  const uint col = tgp.x * NT + tid;
+  const uint k0 = tgp.y * p.chunk;
+  const uint k1 = min(p.k, k0 + p.chunk);
+  float acc = 0.0f;
+  for (uint kt = k0; kt < k1; kt += NT) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    as[tid] = kt + tid < k1 ? a[kt + tid] : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint kn = min(NT, k1 - kt);
+    if (col < p.n) {
+      device const WT* Bk = B + (ulong)kt * p.n + col;
+      for (uint i = 0; i < kn; i++) {
+        acc += as[i] * widen_(Bk[(ulong)i * p.n]);
+      }
+    }
+  }
+  if (col < p.n) out[(ulong)tgp.y * p.n + col] = acc;
+}
+
+kernel void gemv_f32_(device const float* a   [[buffer(0)]],
+                      device const float* B   [[buffer(1)]],
+                      device float* out       [[buffer(2)]],
+                      constant gemv_params& p [[buffer(3)]],
+                      uint2 tgp [[threadgroup_position_in_grid]],
+                      uint tid  [[thread_index_in_threadgroup]]) {
+  threadgroup float as[256];
+  gemv_<float>(a, B, out, p, as, tgp, tid);
+}
+
+kernel void gemv_bf16_(device const float* a   [[buffer(0)]],
+                       device const ushort* B  [[buffer(1)]],
+                       device float* out       [[buffer(2)]],
+                       constant gemv_params& p [[buffer(3)]],
+                       uint2 tgp [[threadgroup_position_in_grid]],
+                       uint tid  [[thread_index_in_threadgroup]]) {
+  threadgroup float as[256];
+  gemv_<ushort>(a, B, out, p, as, tgp, tid);
+}
+
+// Sum the split-K slices: parts × n partials down to y[n].
+struct gemv_combine_params {
+  uint n, parts;
+};
+
+kernel void gemv_combine_(device const float* parts        [[buffer(0)]],
+                          device float* y                  [[buffer(1)]],
+                          constant gemv_combine_params& p  [[buffer(2)]],
+                          uint col [[thread_position_in_grid]]) {
+  if (col >= p.n) return;
+  float acc = 0.0f;
+  for (uint s = 0; s < p.parts; s++) acc += parts[(ulong)s * p.n + col];
+  y[col] = acc;
+}
+
+// int4 weights: cuda's tl_gemv_q4. One threadgroup per output row, whose
+// quantization groups are contiguous in the [N,K] packing; a thread takes one
+// word (8 packed int4) per step and the threadgroup reduces at the end.
+struct gemv_q4_params {
+  uint n, k, group;
+};
+
+kernel void gemv_q4_(device const float* a       [[buffer(0)]],
+                     device const uint* qw       [[buffer(1)]],
+                     device const float* scales  [[buffer(2)]],
+                     device float* y             [[buffer(3)]],
+                     constant gemv_q4_params& p  [[buffer(4)]],
+                     uint row  [[threadgroup_position_in_grid]],
+                     uint tid  [[thread_index_in_threadgroup]],
+                     uint nt   [[threads_per_threadgroup]],
+                     uint sgid [[simdgroup_index_in_threadgroup]],
+                     uint nsg  [[simdgroups_per_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float red[8];
+  device const uint* qrow = qw + (ulong)row * (p.k >> 3);
+  device const float* srow = scales + (ulong)row * (p.k / p.group);
+  float acc = 0.0f;
+  for (uint k0 = tid * 8; k0 < p.k; k0 += nt * 8) {
+    const uint w = qrow[k0 >> 3];
+    const float sc = srow[k0 / p.group];
+    _Pragma("clang loop unroll(full)")
+    for (uint j = 0; j < 8; j++) {
+      const int q = int((w >> (j * 4)) & 0xFu) - 8;
+      acc += a[k0 + j] * (sc * float(q));
+    }
+  }
+  const float s = simd_sum(acc);
+  if (lane == 0) red[sgid] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float t = 0.0f;
+    for (uint w = 0; w < nsg; w++) t += red[w];
+    y[row] = t;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fused decode attention: one query row against the whole cache. cuda's
+// attn_decode_core, the same online softmax and merge. A threadgroup owns one
+// query head as AD threads, so a lane holds the output dims lane, lane + 32,
+// …; each simdgroup walks every NW-th key, reduces the score with simd_sum,
+// and the simdgroups' softmax states are merged through threadgroup memory.
+//
+// Split-KV: a model with few heads leaves most of the GPU idle at one
+// threadgroup a head, so the keys are cut into chunks over the grid's y, each
+// chunk writing its own (m, l, acc) partial for attn_combine_ to merge.
+// ---------------------------------------------------------------------------
+
+struct attn_decode_params {
+  uint ctx, kv_stride, group, chunk;
+  float scale;
+};
+
+// The softmax state of keys [k0, k1) for this threadgroup's head: `gm`, `gl`
+// and this thread's output dim `o`. The threadgroup arrays are the caller's
+// (threadgroup memory can only be declared in a kernel): qs [AD], sm/sl [NW]
+// and sacc [NW][AD].
+template <int AD>
+static inline void attn_span_(device const float* qh, device const float* Kh,
+                             device const float* Vh, uint k0, uint k1,
+                             float scale, threadgroup float* qs,
+                             threadgroup float* sm, threadgroup float* sl,
+                             threadgroup float* sacc, uint tid, uint sgid,
+                             uint lane, thread float& gm, thread float& gl,
+                             thread float& o) {
+  constexpr int NW = AD / 32;
+  qs[tid] = qh[tid];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float m = -1e30f, l = 0.0f, acc[NW];
+  _Pragma("clang loop unroll(full)")
+  for (int r = 0; r < NW; r++) acc[r] = 0.0f;
+  for (uint i = k0 + sgid; i < k1; i += NW) {
+    device const float* Ki = Kh + i * AD;
+    float dot = 0.0f;
+    _Pragma("clang loop unroll(full)")
+    for (int r = 0; r < NW; r++) dot += qs[lane + r * 32] * Ki[lane + r * 32];
+    const float sc = simd_sum(dot) * scale;
+    const float m_new = max(m, sc);
+    const float corr = exp(m - m_new), pr = exp(sc - m_new);
+    l = l * corr + pr;
+    device const float* Vi = Vh + i * AD;
+    _Pragma("clang loop unroll(full)")
+    for (int r = 0; r < NW; r++)
+      acc[r] = acc[r] * corr + pr * Vi[lane + r * 32];
+    m = m_new;
+  }
+
+  // Merge the simdgroups' states (one whose key range was empty carries
+  // m = -1e30 and l = 0, so it contributes nothing).
+  if (lane == 0) {
+    sm[sgid] = m;
+    sl[sgid] = l;
+  }
+  _Pragma("clang loop unroll(full)")
+  for (int r = 0; r < NW; r++) sacc[sgid * AD + lane + r * 32] = acc[r];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  gm = -1e30f;
+  _Pragma("clang loop unroll(full)")
+  for (int w = 0; w < NW; w++) gm = max(gm, sm[w]);
+  gl = 0.0f;
+  o = 0.0f;
+  _Pragma("clang loop unroll(full)")
+  for (int w = 0; w < NW; w++) {
+    const float e = exp(sm[w] - gm);
+    gl += sl[w] * e;
+    o += sacc[w * AD + tid] * e;
+  }
+}
+
+template <int AD>
+kernel void attn_decode_(device const float* q          [[buffer(0)]],
+                         device const float* K          [[buffer(1)]],
+                         device const float* V          [[buffer(2)]],
+                         device float* out              [[buffer(3)]],
+                         constant attn_decode_params& p [[buffer(4)]],
+                         uint h    [[threadgroup_position_in_grid]],
+                         uint tid  [[thread_index_in_threadgroup]],
+                         uint sgid [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int NW = AD / 32;
+  threadgroup float qs[AD], sm[NW], sl[NW], sacc[NW * AD];
+  const uint kv_h = p.group ? h / p.group : h;
+  float gm, gl, o;
+  attn_span_<AD>(q + h * AD, K + kv_h * p.kv_stride, V + kv_h * p.kv_stride, 0,
+                 p.ctx, p.scale, qs, sm, sl, sacc, tid, sgid, lane, gm, gl, o);
+  out[h * AD + tid] = o / gl;
+}
+template [[host_name("attn_decode_64_")]] kernel void
+attn_decode_<64>(device const float*, device const float*, device const float*,
+                 device float*, constant attn_decode_params&, uint, uint, uint,
+                 uint);
+template [[host_name("attn_decode_128_")]] kernel void
+attn_decode_<128>(device const float*, device const float*, device const float*,
+                  device float*, constant attn_decode_params&, uint, uint, uint,
+                  uint);
+
+// One key chunk of one head: partials pm[H*S] | pl[H*S] | pacc[H*S*AD], the
+// layout attn_combine_ reads (cuda's attn_partials).
+template <int AD>
+kernel void attn_decode_split_(device const float* q          [[buffer(0)]],
+                               device const float* K          [[buffer(1)]],
+                               device const float* V          [[buffer(2)]],
+                               device float* parts            [[buffer(3)]],
+                               constant attn_decode_params& p [[buffer(4)]],
+                               uint2 tgp [[threadgroup_position_in_grid]],
+                               uint2 ntg [[threadgroups_per_grid]],
+                               uint tid  [[thread_index_in_threadgroup]],
+                               uint sgid [[simdgroup_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int NW = AD / 32;
+  threadgroup float qs[AD], sm[NW], sl[NW], sacc[NW * AD];
+  const uint h = tgp.x, s = tgp.y;
+  const uint kv_h = p.group ? h / p.group : h;
+  const uint k0 = s * p.chunk, k1 = min(p.ctx, k0 + p.chunk);
+  float gm = -1e30f, gl = 0.0f, o = 0.0f;
+  if (k0 < k1) {
+    attn_span_<AD>(q + h * AD, K + kv_h * p.kv_stride, V + kv_h * p.kv_stride,
+                   k0, k1, p.scale, qs, sm, sl, sacc, tid, sgid, lane, gm, gl,
+                   o);
+  }
+  const uint hs = ntg.x * ntg.y, at = h * ntg.y + s;
+  if (tid == 0) {
+    parts[at] = gm;
+    parts[hs + at] = gl;
+  }
+  parts[2 * hs + at * AD + tid] = o;
+}
+template [[host_name("attn_decode_split_64_")]] kernel void
+attn_decode_split_<64>(device const float*, device const float*,
+                       device const float*, device float*,
+                       constant attn_decode_params&, uint2, uint2, uint, uint,
+                       uint);
+template [[host_name("attn_decode_split_128_")]] kernel void
+attn_decode_split_<128>(device const float*, device const float*,
+                        device const float*, device float*,
+                        constant attn_decode_params&, uint2, uint2, uint, uint,
+                        uint);
+
+// Merge one head's S partials, rescaling each by exp(m_s − max m).
+struct attn_combine_params {
+  uint splits;
+};
+
+template <int AD>
+kernel void attn_combine_(device const float* parts        [[buffer(0)]],
+                          device float* out                [[buffer(1)]],
+                          constant attn_combine_params& p  [[buffer(2)]],
+                          uint h   [[threadgroup_position_in_grid]],
+                          uint ntg [[threadgroups_per_grid]],
+                          uint tid [[thread_index_in_threadgroup]]) {
+  const uint S = p.splits, hs = ntg * S;
+  device const float* pm = parts + h * S;
+  device const float* pl = parts + hs + h * S;
+  device const float* pacc = parts + 2 * hs + (ulong)h * S * AD;
+  float gm = -1e30f;
+  for (uint s = 0; s < S; s++) gm = max(gm, pm[s]);
+  float gl = 0.0f, o = 0.0f;
+  for (uint s = 0; s < S; s++) {
+    const float e = exp(pm[s] - gm);
+    gl += pl[s] * e;
+    o += pacc[(ulong)s * AD + tid] * e;
+  }
+  out[h * AD + tid] = o / gl;
+}
+template [[host_name("attn_combine_64_")]] kernel void
+attn_combine_<64>(device const float*, device float*,
+                  constant attn_combine_params&, uint, uint, uint);
+template [[host_name("attn_combine_128_")]] kernel void
+attn_combine_<128>(device const float*, device float*,
+                   constant attn_combine_params&, uint, uint, uint);
+
+// ---------------------------------------------------------------------------
 // Cross-entropy and the optimizer: cuda's tl_gather_axis, tl_row_logsumexp,
 // tl_xent_bwd and tl_adam_step, the same arithmetic.
 // ---------------------------------------------------------------------------

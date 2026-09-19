@@ -59,6 +59,11 @@ enum class kop {
   layer_norm_bwd_dx_, layer_norm_bwd_gb_, layer_norm_bwd_gb_fold_,  // its pullback
   attn_prefill_64_, attn_prefill_128_,  // causal prefill attention, per D
   attn_bwd_dq_64_, attn_bwd_dq_128_, attn_bwd_dkv_64_, attn_bwd_dkv_128_,
+  attn_decode_64_, attn_decode_128_,  // fused decode attention, per D
+  attn_decode_split_64_, attn_decode_split_128_,  // its split-KV pass
+  attn_combine_64_, attn_combine_128_,            // and their partials
+  gemv_f32_, gemv_bf16_, gemv_q4_,   // decode GEMVs, per weight dtype
+  gemv_combine_,                     // their split-K partials
   gather_axis_, row_logsumexp_, xent_bwd_, adam_step_  // cross-entropy, Adam
 };
 
@@ -114,6 +119,12 @@ struct context {
   // The kernel the encoder currently has bound (set by bind_): what
   // tl::profile names the next dispatch.
   const char* bound = nullptr;
+  // Grow-on-demand scratch (the split-K GEMV's partials), kept across calls so
+  // a decode loop allocates once. Freed with the context, which is leaked.
+  void* scratch = nullptr;
+  float* scratch_contents = nullptr;
+  int64_t scratch_bytes = 0;
+
   // Command buffers committed but not yet waited on (flush waits the last).
   // Under a profile there is one per dispatch, with the row owed its GPU
   // time; the row is null for an untimed buffer.
@@ -210,6 +221,16 @@ struct context {
       case kop::attn_bwd_dq_128_: return "attn_bwd_dq_128_";
       case kop::attn_bwd_dkv_64_: return "attn_bwd_dkv_64_";
       case kop::attn_bwd_dkv_128_: return "attn_bwd_dkv_128_";
+      case kop::attn_decode_64_: return "attn_decode_64_";
+      case kop::attn_decode_128_: return "attn_decode_128_";
+      case kop::attn_decode_split_64_: return "attn_decode_split_64_";
+      case kop::attn_decode_split_128_: return "attn_decode_split_128_";
+      case kop::attn_combine_64_: return "attn_combine_64_";
+      case kop::attn_combine_128_: return "attn_combine_128_";
+      case kop::gemv_f32_: return "gemv_f32_";
+      case kop::gemv_bf16_: return "gemv_bf16_";
+      case kop::gemv_q4_: return "gemv_q4_";
+      case kop::gemv_combine_: return "gemv_combine_";
       case kop::gather_axis_: return "gather_axis_";
       case kop::row_logsumexp_: return "row_logsumexp_";
       case kop::xent_bwd_: return "xent_bwd_";
@@ -339,6 +360,19 @@ inline void release(void* buf, int64_t bytes, float* contents) {
   auto& c = context::get();
   c.free_bufs[bytes].push_back({buf, contents, c.pending ? c.batch : 0});
 }
+
+namespace detail_ {
+// The kernel scratch, grown to `bytes` (see context::scratch).
+inline void* scratch_(int64_t bytes) {
+  auto& c = context::get();
+  if (bytes > c.scratch_bytes) {
+    if (c.scratch) release(c.scratch, c.scratch_bytes, c.scratch_contents);
+    c.scratch = alloc(bytes, &c.scratch_contents);
+    c.scratch_bytes = c.scratch ? bytes : 0;
+  }
+  return c.scratch;
+}
+}  // namespace detail_
 
 namespace detail_ {
 
@@ -1245,6 +1279,40 @@ struct attn_params {
   float scale;
 };
 
+struct gemv_params {
+  uint32_t n, k, chunk;
+};
+
+struct gemv_combine_params {
+  uint32_t n, parts;
+};
+
+struct gemv_q4_params {
+  uint32_t n, k, group;
+};
+
+struct attn_decode_params {
+  uint32_t ctx, kv_stride, group, chunk;
+  float scale;
+};
+
+struct attn_combine_params {
+  uint32_t splits;
+};
+
+// Keys per split, or 0 for the single-pass kernel: one threadgroup a head
+// leaves most of a 16-core GPU idle when a model has few heads, so cut the
+// keys until there are enough threadgroups (cuda's attn_split_count).
+inline unsigned long attn_split_chunk_(int64_t heads, int64_t ctx) {
+  constexpr long kWantGroups = 64, kMinKeys = 128;
+  if (heads <= 0 || heads >= kWantGroups || ctx < 2 * kMinKeys) return 0;
+  long want = (kWantGroups + heads - 1) / heads;
+  const long most = ctx / kMinKeys;
+  if (want > most) want = most;
+  if (want <= 1) return 0;
+  return static_cast<unsigned long>((ctx + want - 1) / want);
+}
+
 inline void attn_dispatch_(objc::id enc, const attn_params& p,
                            unsigned long idx, int64_t heads, int64_t T) {
   constexpr unsigned long rows = 32;
@@ -1276,6 +1344,122 @@ inline bool attn_prefill(void* q, void* K, void* V, void* out,
                          static_cast<uint32_t>(n_q_heads / n_kv_heads),
                          static_cast<uint32_t>(pos0), scale};
   detail_::attn_dispatch_(c.enc, p, 4ul, n_q_heads, T);
+  return true;
+}
+
+// y[1,N] = a[1,K] · B[K,N] with f32 or bf16 weights, all contiguous: the
+// decode projection. A narrow layer's N/256 threadgroups leave the GPU idle,
+// so K is split across the grid's y and a combine pass sums the slices.
+inline bool gemv_(kop op, void* a, void* B, void* y, int64_t n, int64_t k) {
+  auto& c = context::get();
+  if (!c.device || n <= 0 || k <= 0) return false;
+  constexpr unsigned long NT = 256, kGroupsWanted = 64;
+  const unsigned long cols = (static_cast<unsigned long>(n) + NT - 1) / NT;
+  unsigned long parts = cols >= kGroupsWanted ? 1 : kGroupsWanted / cols;
+  unsigned long chunk = (static_cast<unsigned long>(k) + parts - 1) / parts;
+  chunk = (chunk + NT - 1) / NT * NT;  // whole `a` tiles
+  parts = (static_cast<unsigned long>(k) + chunk - 1) / chunk;
+  void* out = y;
+  if (parts > 1) {
+    out = detail_::scratch_(static_cast<int64_t>(parts) * n * 4);
+    if (!out) parts = 1, chunk = static_cast<unsigned long>(k), out = y;
+  }
+  c.bind_(op);
+  detail_::set_buf_(c.enc, a, 0, 0ul);
+  detail_::set_buf_(c.enc, B, 0, 1ul);
+  detail_::set_buf_(c.enc, out, 0, 2ul);
+  detail_::gemv_params p{static_cast<uint32_t>(n), static_cast<uint32_t>(k),
+                         static_cast<uint32_t>(chunk)};
+  detail_::set_bytes_(c.enc, p, 3ul);
+  detail_::dispatch_grid_(c.enc, {cols, parts, 1}, {NT, 1, 1});
+  if (parts == 1) return true;
+  c.bind_(kop::gemv_combine_);
+  detail_::set_buf_(c.enc, out, 0, 0ul);
+  detail_::set_buf_(c.enc, y, 0, 1ul);
+  detail_::gemv_combine_params cp{static_cast<uint32_t>(n),
+                                  static_cast<uint32_t>(parts)};
+  detail_::set_bytes_(c.enc, cp, 2ul);
+  detail_::dispatch_grid_(c.enc, {cols, 1, 1}, {NT, 1, 1});
+  return true;
+}
+
+inline bool gemv_f32(void* a, void* B, void* y, int64_t n, int64_t k) {
+  return gemv_(kop::gemv_f32_, a, B, y, n, k);
+}
+
+inline bool gemv_bf16(void* a, void* B, void* y, int64_t n, int64_t k) {
+  return gemv_(kop::gemv_bf16_, a, B, y, n, k);
+}
+
+// int4 weights: one threadgroup per output row. `scales` is the caller's
+// pointer arithmetic on the q4 buffer (a device address on CUDA); here the two
+// name one MTLBuffer, so the difference is the scales block's byte offset.
+inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
+                    int64_t K, int64_t group) {
+  auto& c = context::get();
+  if (!c.device || N <= 0 || K <= 0 || group <= 0) return false;
+  if (K % group != 0 || group % 8 != 0) return false;
+  const unsigned long soff = static_cast<unsigned long>(
+      static_cast<char*>(scales) - static_cast<char*>(qw));
+  c.bind_(kop::gemv_q4_);
+  detail_::set_buf_(c.enc, a, 0, 0ul);
+  detail_::set_buf_(c.enc, qw, 0, 1ul);
+  detail_::set_buf_(c.enc, qw, soff, 2ul);
+  detail_::set_buf_(c.enc, y, 0, 3ul);
+  detail_::gemv_q4_params p{static_cast<uint32_t>(N), static_cast<uint32_t>(K),
+                            static_cast<uint32_t>(group)};
+  detail_::set_bytes_(c.enc, p, 4ul);
+  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(N), 1, 1},
+                          {256, 1, 1});
+  return true;
+}
+
+// One decode step: q [n_q_heads,D] against a [n_kv_heads,kv_max,D] cache read
+// over [0,ctx). GQA via the head ratio; no bf16 cache on this backend.
+inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
+                        int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
+                        int64_t D, float scale, bool kv_bf16 = false) {
+  auto& c = context::get();
+  if (!c.device || kv_bf16 || (D != 64 && D != 128)) return false;
+  if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || ctx <= 0) return false;
+  const bool d64 = D == 64;
+  unsigned long chunk = detail_::attn_split_chunk_(n_q_heads, ctx);
+  const unsigned long splits =
+      chunk ? (static_cast<unsigned long>(ctx) + chunk - 1) / chunk : 1;
+  void* dst = out;
+  if (splits > 1) {
+    // pm[H*S] | pl[H*S] | pacc[H*S*D], the layout attn_combine_ reads.
+    const int64_t hs = n_q_heads * static_cast<int64_t>(splits);
+    dst = detail_::scratch_((hs * 2 + hs * D) * 4);
+    if (!dst) chunk = 0, dst = out;
+  }
+  const bool split = chunk != 0;
+  if (split) {
+    c.bind_(d64 ? kop::attn_decode_split_64_ : kop::attn_decode_split_128_);
+  } else {
+    c.bind_(d64 ? kop::attn_decode_64_ : kop::attn_decode_128_);
+  }
+  detail_::set_buf_(c.enc, q, 0, 0ul);
+  detail_::set_buf_(c.enc, K, 0, 1ul);
+  detail_::set_buf_(c.enc, V, 0, 2ul);
+  detail_::set_buf_(c.enc, dst, 0, 3ul);
+  detail_::attn_decode_params p{static_cast<uint32_t>(ctx),
+                                static_cast<uint32_t>(kv_max * D),
+                                static_cast<uint32_t>(n_q_heads / n_kv_heads),
+                                static_cast<uint32_t>(chunk), scale};
+  detail_::set_bytes_(c.enc, p, 4ul);
+  detail_::dispatch_grid_(c.enc,
+                          {static_cast<unsigned long>(n_q_heads),
+                           split ? splits : 1ul, 1},
+                          {static_cast<unsigned long>(D), 1, 1});
+  if (!split) return true;
+  c.bind_(d64 ? kop::attn_combine_64_ : kop::attn_combine_128_);
+  detail_::set_buf_(c.enc, dst, 0, 0ul);
+  detail_::set_buf_(c.enc, out, 0, 1ul);
+  detail_::attn_combine_params cp{static_cast<uint32_t>(splits)};
+  detail_::set_bytes_(c.enc, cp, 2ul);
+  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(n_q_heads), 1, 1},
+                          {static_cast<unsigned long>(D), 1, 1});
   return true;
 }
 
@@ -1437,6 +1621,15 @@ inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,
 inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
   return false;
 }
+inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
+inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
+inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
+  return false;
+}
+inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
+                        int64_t, int64_t, float, bool = false) {
+  return false;
+}
 
 #endif
 
@@ -1446,21 +1639,6 @@ inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
 inline bool gemm_bias(void*, int64_t, int64_t, bool, void*, int64_t, int64_t,
                       bool, void*, int64_t, void*, int64_t, int64_t, int64_t,
                       int64_t, float, float) {
-  return false;
-}
-
-// ---- LLM decode ops with no MSL kernel yet (M7/M8/M9) -----------------------
-// Outside the #if/#else on purpose: both branches would define them identically,
-// and returning false is the whole implementation either way — it sends the
-// evaluator down the widen-to-F32 CPU fallback. Keeps the gpu:: facade
-// symmetric with CUDA, so the one platform #ifdef stays the namespace alias.
-inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
-inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
-inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
-                        int64_t, int64_t, float) {
-  return false;
-}
-inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
   return false;
 }
 

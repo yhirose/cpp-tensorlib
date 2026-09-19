@@ -1649,6 +1649,20 @@ TEST_CASE("fused decode attention matches an explicit softmax(qKt)V") {
     }
   }
 
+  // the device kernel against the ref oracle at both head widths, past the
+  // tiny-tensor cutoffs, with a context off the kernel's key stride and one
+  // of a single key
+  for (int64_t d : {64, 128}) {
+    for (int64_t c : {2048, 2045, 1}) {
+      const float sc = 1.0f / std::sqrt((float)d);
+      CHECK(matches_gpu_oracle([&] {
+        return tl::array::attn_decode(random_array({8, d}, 850),
+                                      random_array({8, c, d}, 851),
+                                      random_array({8, c, d}, 852), sc);
+      }));
+    }
+  }
+
   // shape validation: q must be [H,D] rank-2, K/V rank-3 and equal
   CHECK_THROWS(tl::array::attn_decode(K, K, V, scale));       // q rank 3
   CHECK_THROWS(tl::array::attn_decode(q, K, q.reshape({H, D}), scale));  // V rank 2
@@ -1914,6 +1928,48 @@ TEST_CASE("the fused pullback's dK and dV match explicit softmax math") {
     check_attn_bwd_dkv(true, 128);
   }
   tl::device_ = prev;
+}
+
+TEST_CASE("decode GEMV matches the ref oracle") {
+  // a [1,K] · W [K,N] is the decode projection, which the GPU takes through
+  // its own GEMV rather than the M=1 GEMM. Qwen-0.5B's two projection shapes,
+  // then an N off the kernel's column tile and a single-column weight.
+  struct { int64_t k, n; } shapes[] = {
+      {896, 4864}, {4864, 896}, {896, 4865}, {896, 1}};
+  // Tolerance: a K-long dot summed in a different order (the kernel splits K
+  // across threadgroups) differs in the last bits, and an output near zero is
+  // cancellation, so the relative error there is meaningless. The absolute
+  // agreement below is ~1e-4 on outputs of order 10-100; a kernel that lost or
+  // misplaced a term is off by far more than atol.
+  const float rtol = 1e-3f, atol = 1e-3f;
+  int seed = 870;
+  for (auto s : shapes) {
+    const int ka = seed++, kw = seed++;  // fixed: build() runs twice
+    CHECK(matches_gpu_oracle(
+        [&] {
+          return random_array({1, s.k}, ka).dot(random_array({s.k, s.n}, kw));
+        },
+        rtol, atol));
+    // bf16 weights take their own kernel. The oracle widens the same bf16
+    // values, so this compares the GEMV, not the cast.
+    CHECK(matches_gpu_oracle(
+        [&] {
+          return random_array({1, s.k}, ka)
+              .dot(random_array({s.k, s.n}, kw).to_bf16());
+        },
+        rtol, atol));
+  }
+  // int4 weights, one threadgroup per output row: K a multiple of the group.
+  for (auto s : {std::pair<int64_t, int64_t>{896, 4864},
+                 std::pair<int64_t, int64_t>{4864, 1}}) {
+    const int ka = seed++, kw = seed++;
+    CHECK(matches_gpu_oracle(
+        [&] {
+          return random_array({1, s.first}, ka)
+              .dot(random_array({s.first, s.second}, kw).to_q4());
+        },
+        rtol, atol));
+  }
 }
 
 TEST_CASE("q4 weight storage: decode dot + widen fallback vs dequant oracle") {
