@@ -10,7 +10,9 @@
 //     same bytes, no residency tracking, no transfers.
 //   - One long-lived command buffer/encoder: dispatches accumulate without
 //     committing; flush() (end + commit + waitUntilCompleted) runs when the
-//     graph evaluation finishes or a CPU-side read needs the data.
+//     graph evaluation finishes or a CPU-side read needs the data. Under a
+//     tl::profile each dispatch is committed as its own buffer instead, so
+//     its GPU time can be read back.
 //   - Kernels JIT-compile once from the #embed'd MSL source on first GPU
 //     dispatch. Editing metal_kernels.metal requires rebuilding the host.
 //
@@ -28,7 +30,6 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 extern "C" void* MTLCreateSystemDefaultDevice(void);
@@ -51,7 +52,7 @@ enum class kop {
   where_nd, copy_nd,             // N-D select / clone()'s strided gather
   gt_, lt_, ge_, le_, eq_, ne_,  // comparisons -- cmp_op maps onto these
   tanh_, sin_, cos_,             // unary_ext_op maps onto these
-  clamp_, sum_to_,               // dedicated ops, mirroring cuda.h's own
+  clamp_, sum_to_, sum_to_blocked_,  // dedicated ops, mirroring cuda.h's own
   concat_part_, rope_,           // ditto -- Tensor.concat / RoPE's own dispatch
   pow_s_, gt_s_, lt_s_, ge_s_, le_s_, eq_s_, ne_s_,  // scalar_op maps onto these
   layer_norm_,                                       // the fused layer norm
@@ -91,28 +92,32 @@ struct context {
   objc::id device = nullptr;
   objc::id queue = nullptr;
   objc::id library = nullptr;
-  objc::id cb = nullptr;   // command buffer (while pending)
-  objc::id enc = nullptr;  // compute encoder (while pending)
+  objc::id cb = nullptr;   // open command buffer (null once committed)
+  objc::id enc = nullptr;  // its compute encoder
   void* pool = nullptr;    // autorelease pool for the pending batch
   bool pending = false;
   // Free-list by byte size; contents pointers cached so a pool hit costs no
-  // objc round trip (tiny-tensor workloads allocate per op).
-  std::unordered_map<int64_t, std::vector<std::pair<void*, float*>>> free_bufs;
-  // Buffers released while a batch is pending. They go back to the pool at
-  // once — the next owner's kernels are encoded after the work still queued
-  // against them, so the device keeps the order — but work in the batch may
-  // yet write them, so a buffer the host fills skips them (alloc's
-  // host_fill). Cleared by the flush.
-  std::unordered_set<void*> released;
+  // objc round trip (tiny-tensor workloads allocate per op). A buffer
+  // released while a batch is pending goes back at once — the next owner's
+  // kernels are encoded after the work still queued against it, so the
+  // device keeps the order — but that work may yet read or write it, so it
+  // carries the batch and a buffer the host fills skips it (alloc's
+  // host_fill) until the flush moves `batch` on.
+  struct pooled {
+    void* buf;
+    float* contents;
+    uint64_t released_in;  // the pending batch it was released under, or 0
+  };
+  std::unordered_map<int64_t, std::vector<pooled>> free_bufs;
+  uint64_t batch = 1;  // the batch being encoded; the flush advances it
   std::unordered_map<int, objc::id> psos;
   // The kernel the encoder currently has bound (set by bind_): what
   // tl::profile names the next dispatch.
   const char* bound = nullptr;
-  // Under a profile each dispatch is its own command buffer, committed
-  // unwaited, so its GPU time can be read back per launch once the batch
-  // flushes; the row is null for a buffer of dispatches made before the
-  // profile started.
-  std::vector<std::pair<objc::id, profile::row*>> timed;
+  // Command buffers committed but not yet waited on (flush waits the last).
+  // Under a profile there is one per dispatch, with the row owed its GPU
+  // time; the row is null for an untimed buffer.
+  std::vector<std::pair<objc::id, profile::row*>> committed;
 
   static context& get() {
     static auto* c = new context();  // leaked: outlives all storage deleters
@@ -185,6 +190,7 @@ struct context {
       case kop::cos_: return "cos_";
       case kop::clamp_: return "clamp_";
       case kop::sum_to_: return "sum_to_";
+      case kop::sum_to_blocked_: return "sum_to_blocked_";
       case kop::concat_part_: return "concat_part_";
       case kop::rope_: return "rope_";
       case kop::pow_s_: return "pow_s_";
@@ -264,7 +270,7 @@ struct context {
   void commit_(profile::row* r) {
     objc::send(enc, "endEncoding");
     objc::send(cb, "commit");
-    timed.emplace_back(cb, r);
+    committed.emplace_back(cb, r);
     cb = enc = nullptr;
   }
 };
@@ -282,19 +288,21 @@ inline void flush() {
     // One queue runs its command buffers in commit order: the last one done
     // is all of them done.
     profile::detail::blocked waiting;
-    objc::send(c.timed.back().first, "waitUntilCompleted");
+    objc::send(c.committed.back().first, "waitUntilCompleted");
   }
   // A row is owed its time even if the profile stopped before this flush:
   // the rows live until the next start(), which drains first.
-  for (auto [cb, row] : c.timed) {
+  const bool profiling = profile::active();
+  for (auto [cb, row] : c.committed) {
+    if (!row && !profiling) continue;  // nothing would record it
     const double s = objc::send<double>(cb, "GPUStartTime");
     const double e = objc::send<double>(cb, "GPUEndTime");
     if (e <= s) continue;
     profile::detail::batch_device((e - s) * 1e6);
     if (row) profile::detail::device_time(row, (e - s) * 1e6);
   }
-  c.timed.clear();
-  c.released.clear();
+  c.committed.clear();
+  c.batch++;
   objc_autoreleasePoolPop(c.pool);
   c.pool = nullptr;
   c.pending = false;
@@ -304,7 +312,7 @@ inline void flush() {
 // back to heap). `bytes` is the pool key — pass the same value to release.
 // `host_fill`: the host writes the buffer before any kernel does (a tensor
 // made from host values), so it must not be one the pending batch may still
-// write — on unified memory that write would land over the host's bytes.
+// read or write — on unified memory the host's bytes would race that work.
 inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
   auto& c = context::get();
   if (!c.device) return nullptr;
@@ -312,10 +320,10 @@ inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
   if (it != c.free_bufs.end()) {
     auto& list = it->second;
     for (auto at = list.rbegin(); at != list.rend(); ++at) {
-      if (host_fill && c.released.count(at->first)) continue;
-      auto [buf, ptr] = *at;
+      if (host_fill && at->released_in == c.batch) continue;
+      void* buf = at->buf;
+      *contents = at->contents;
       list.erase(std::next(at).base());
-      *contents = ptr;
       return buf;
     }
   }
@@ -329,10 +337,8 @@ inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
 
 inline void release(void* buf, int64_t bytes, float* contents) {
   auto& c = context::get();
-  if (c.pending) c.released.insert(buf);
-  c.free_bufs[bytes].emplace_back(buf, contents);
+  c.free_bufs[bytes].push_back({buf, contents, c.pending ? c.batch : 0});
 }
-
 
 namespace detail_ {
 
@@ -461,6 +467,12 @@ struct layer_norm_params {
 inline void set_buf_(objc::id enc, void* buf, int64_t off, unsigned long idx) {
   objc::send(enc, "setBuffer:offset:atIndex:", buf,
              static_cast<unsigned long>(off), idx);
+}
+
+template <class P>
+inline void set_bytes_(objc::id enc, const P& p, unsigned long idx) {
+  objc::send(enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), idx);
 }
 
 }  // namespace detail_
@@ -661,18 +673,17 @@ struct gather_params {
 struct index_add_params {
   uint32_t row_size;
   uint32_t k;
-  uint32_t n;
 };
 struct scatter_axis_params {
   uint32_t size;
   uint32_t n;
 };
 
-// Shared by index_select()/index_add()/scatter_to_axis() below: all three
-// are a gather into `out` from two source buffers plus a small params blob,
-// differing only in which kop/buffers/params struct they use and how `n`
-// (the dispatch bound) is derived -- mirrors dispatch_pad_fold_ above, which
-// extracts the same kind of shared tail for pad()/fold().
+// Shared by index_select()/scatter_to_axis()/gather_from_axis() below: all
+// three are a gather into `out` from two source buffers plus a small params
+// blob, differing only in which kop/buffers/params struct they use and how
+// `n` (the dispatch bound) is derived -- mirrors dispatch_pad_fold_ above,
+// which extracts the same kind of shared tail for pad()/fold().
 inline bool dispatch_gather3_(kop op, void* buf0, int64_t off0, void* buf1,
                               int64_t off1, void* out_native, int64_t oo,
                               const void* params, unsigned long params_size,
@@ -702,19 +713,26 @@ inline bool index_select(void* a_native, int64_t ao, void* idx_native,
                                     sizeof(p), p.n);
 }
 
-// index_select's dual, rewritten as a gather: Metal's device-memory atomics
-// are int/uint only (no float atomicAdd), the same gap pad_/fold_ above work
-// around, so this sums over every source row matching each OUTPUT row
-// instead of scattering into a pre-zeroed buffer -- no zeroing needed.
+// index_select's dual as a gather (float atomics would need MSL 3): each
+// output row sums the source rows whose index matches it, in source order --
+// no zeroing needed.
 inline bool index_add(void* idx_native, int64_t idxo, void* values_native,
                       int64_t vo, void* out_native, int64_t oo,
                       int64_t row_size, int64_t k, int64_t out_n) {
-  detail_::index_add_params p{static_cast<uint32_t>(row_size),
-                              static_cast<uint32_t>(k),
-                              static_cast<uint32_t>(out_n)};
-  return detail_::dispatch_gather3_(kop::index_add, idx_native, idxo,
-                                    values_native, vo, out_native, oo, &p,
-                                    sizeof(p), p.n);
+  auto& c = context::get();
+  if (!c.device || row_size <= 0) return false;
+  // A threadgroup per output row (see index_add_ in the MSL).
+  c.bind_(kop::index_add);
+  detail_::set_buf_(c.enc, idx_native, idxo, 0ul);
+  detail_::set_buf_(c.enc, values_native, vo, 1ul);
+  detail_::set_buf_(c.enc, out_native, oo, 2ul);
+  detail_::set_bytes_(c.enc,
+                      detail_::index_add_params{static_cast<uint32_t>(row_size),
+                                                static_cast<uint32_t>(k)},
+                      3ul);
+  detail_::dispatch_grid_(
+      c.enc, {static_cast<unsigned long>(out_n / row_size), 1, 1}, {256, 1, 1});
+  return true;
 }
 
 // One-hot scatter into a new trailing axis, as a gather: out[pos,k] =
@@ -731,26 +749,18 @@ inline bool scatter_to_axis(void* idx_native, int64_t idxo,
 }
 
 // Cross-entropy's three: the trailing-axis gather, the one-pass row logsumexp
-// and the pullback that reads it. CUDA-first (allowlisted); array.h composes
-// the same values here.
+// and the pullback that reads it.
+
 // out[i] = src[i*size + idx[i]]: the element each position labels along a
 // trailing axis of `size`. One thread per output.
 inline bool gather_from_axis(void* src_native, int64_t so, void* idx_native,
                              int64_t idxo, void* out_native, int64_t oo,
                              int64_t n, int64_t size) {
-  auto& c = context::get();
-  if (!c.device || n <= 0) return false;
-  c.bind_(kop::gather_axis_);
-  detail_::set_buf_(c.enc, src_native, so, 0ul);
-  detail_::set_buf_(c.enc, idx_native, idxo, 1ul);
-  detail_::set_buf_(c.enc, out_native, oo, 2ul);
+  if (n <= 0) return false;
   const uint32_t p[2] = {static_cast<uint32_t>(size), static_cast<uint32_t>(n)};
-  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(p),
-             static_cast<unsigned long>(sizeof(p)), 3ul);
-  detail_::dispatch_grid_(
-      c.enc, {(static_cast<unsigned long>(n) + 255ul) / 256ul, 1, 1},
-      {256, 1, 1});
-  return true;
+  return detail_::dispatch_gather3_(kop::gather_axis_, src_native, so,
+                                    idx_native, idxo, out_native, oo, p,
+                                    sizeof(p), p[1]);
 }
 
 // Row logsumexp over the last axis, affine epilogue: row_op's shape, one pass
@@ -762,6 +772,7 @@ inline bool row_logsumexp(void* in, int64_t io, void* out, int64_t oo,
   return row_op(kop::row_logsumexp_, in, io, out, oo, rows, cols, scale,
                 offset);
 }
+
 // Softmax cross-entropy's pullback from the forward's row logsumexp: x and
 // out [rows, cols]; lse, targets and g one value per row.
 inline bool xent_bwd(void* x, int64_t xo, void* lse, int64_t lo, void* tgt,
@@ -777,8 +788,7 @@ inline bool xent_bwd(void* x, int64_t xo, void* lse, int64_t lo, void* tgt,
   detail_::set_buf_(c.enc, out, oo, 4ul);
   const uint32_t n = static_cast<uint32_t>(rows * cols);
   const uint32_t p[2] = {static_cast<uint32_t>(cols), n};
-  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(p),
-             static_cast<unsigned long>(sizeof(p)), 5ul);
+  detail_::set_bytes_(c.enc, p, 5ul);
   detail_::dispatch_grid_(c.enc, {(n + 255ul) / 256ul, 1, 1}, {256, 1, 1});
   return true;
 }
@@ -801,10 +811,6 @@ inline bool layer_norm_bwd(void* x, int64_t xo, void* g, int64_t go, void* dy,
   detail_::layer_norm_bwd_params p{
       static_cast<uint32_t>(rows), static_cast<uint32_t>(cols),
       static_cast<uint32_t>(per_chunk), static_cast<uint32_t>(chunks), eps};
-  auto bytes = [&](unsigned long idx) {
-    objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
-               static_cast<unsigned long>(sizeof(p)), idx);
-  };
   const auto ur = static_cast<unsigned long>(rows);
   const auto uc = static_cast<unsigned long>(cols);
   const auto uk = static_cast<unsigned long>(chunks);
@@ -815,7 +821,7 @@ inline bool layer_norm_bwd(void* x, int64_t xo, void* g, int64_t go, void* dy,
   detail_::set_buf_(c.enc, dy, dyo, 2ul);
   detail_::set_buf_(c.enc, dx, 0, 3ul);
   detail_::set_buf_(c.enc, stats, 0, 4ul);
-  bytes(5ul);
+  detail_::set_bytes_(c.enc, p, 5ul);
   detail_::dispatch_grid_(c.enc, {ur, 1, 1}, {256, 1, 1});
 
   c.bind_(kop::layer_norm_bwd_gb_);
@@ -823,14 +829,14 @@ inline bool layer_norm_bwd(void* x, int64_t xo, void* g, int64_t go, void* dy,
   detail_::set_buf_(c.enc, dy, dyo, 1ul);
   detail_::set_buf_(c.enc, stats, 0, 2ul);
   detail_::set_buf_(c.enc, partials, 0, 3ul);
-  bytes(4ul);
+  detail_::set_bytes_(c.enc, p, 4ul);
   detail_::dispatch_grid_(c.enc, {(uc + 31) / 32, uk, 1}, {32, 8, 1});
 
   c.bind_(kop::layer_norm_bwd_gb_fold_);
   detail_::set_buf_(c.enc, partials, 0, 0ul);
   detail_::set_buf_(c.enc, dg, 0, 1ul);
   detail_::set_buf_(c.enc, db, 0, 2ul);
-  bytes(3ul);
+  detail_::set_bytes_(c.enc, p, 3ul);
   detail_::dispatch_grid_(c.enc, {(uc + 255) / 256, 1, 1}, {256, 1, 1});
   return true;
 }
@@ -857,8 +863,7 @@ inline bool adam_step(void* p, int64_t po, void* m, int64_t mo, void* v,
   detail_::set_buf_(c.enc, g, go, 3ul);
   detail_::adam_params ap{beta1, beta2, eps, lr_over_bc1, inv_bc2,
                           static_cast<uint32_t>(n)};
-  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&ap),
-             static_cast<unsigned long>(sizeof(ap)), 4ul);
+  detail_::set_bytes_(c.enc, ap, 4ul);
   detail_::dispatch_grid_(
       c.enc, {(static_cast<unsigned long>(n) + 255ul) / 256ul, 1, 1},
       {256, 1, 1});
@@ -1119,7 +1124,10 @@ inline bool sum_to(void* a, int64_t ao, const int64_t* a_shape,
                    int64_t out_n, int64_t reduced_n, void* out, int64_t oo) {
   auto& c = context::get();
   if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
-  c.bind_(kop::sum_to_);
+  // A deep reduction (a bias gradient sums its column over every row) earns a
+  // threadgroup per output, as on CUDA; a shallow one keeps a thread per output.
+  const bool blocked = reduced_n >= 64;
+  c.bind_(blocked ? kop::sum_to_blocked_ : kop::sum_to_);
   detail_::set_buf_(c.enc, a, ao, 0ul);
   detail_::set_buf_(c.enc, out, oo, 1ul);
   detail_::sum_to_params p{};
@@ -1133,8 +1141,9 @@ inline bool sum_to(void* a, int64_t ao, const int64_t* a_shape,
   p.reduced_n = static_cast<uint32_t>(reduced_n);
   objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
              static_cast<unsigned long>(sizeof(p)), 2ul);
-  unsigned long groups = (static_cast<unsigned long>(out_n) + 255ul) / 256ul;
-  detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
+  const auto un = static_cast<unsigned long>(out_n);
+  detail_::dispatch_grid_(c.enc, {blocked ? un : (un + 255ul) / 256ul, 1, 1},
+                          {256, 1, 1});
   return true;
 }
 namespace detail_ {
@@ -1240,8 +1249,7 @@ struct attn_params {
 inline void attn_dispatch_(objc::id enc, const attn_params& p,
                            unsigned long idx, int64_t heads, int64_t T,
                            unsigned long tile) {
-  objc::send(enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
-             static_cast<unsigned long>(sizeof(p)), idx);
+  set_bytes_(enc, p, idx);
   dispatch_grid_(enc,
                  {static_cast<unsigned long>(heads),
                   (static_cast<unsigned long>(T) + tile - 1) / tile, 1},

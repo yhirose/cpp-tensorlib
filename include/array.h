@@ -607,8 +607,7 @@ class array {
   // array (a weight, an activation) feeds many ops.
   mutable detail::node_ptr const_node_;
 
-  static array make_(shape_t shape);
-  static array make_host_filled_(shape_t shape);
+  static array make_(shape_t shape, bool host_fill = false);
   void ensure_() const;    // materialize (evaluate + adopt) if lazy, then sync
   void realize_() const;   // same, but leave kernels in flight (no sync)
   void materialize_(bool do_flush) const;  // shared body
@@ -717,18 +716,11 @@ inline array make_view_(const array& base, shape_t shape,
   return v;
 }
 
-inline array array::make_(shape_t shape) {
+inline array array::make_(shape_t shape, bool host_fill) {
   array a;
   a.strides_ = detail::contiguous_strides(shape);
-  a.storage_ = storage::make(detail::num_elements(shape));
-  a.shape_ = std::move(shape);
-  return a;
-}
-
-inline array array::make_host_filled_(shape_t shape) {
-  array a;
-  a.strides_ = detail::contiguous_strides(shape);
-  a.storage_ = storage::make_host_filled(detail::num_elements(shape));
+  a.storage_ = storage::make(detail::num_elements(shape), tl::dtype::f32,
+                             host_fill);
   a.shape_ = std::move(shape);
   return a;
 }
@@ -754,10 +746,10 @@ inline array array::lazy_view_(detail::node::vkind kind, shape_t vshape,
 inline array array::empty(shape_t shape) { return make_(std::move(shape)); }
 
 // Host-born data: filled from the host before any kernel touches the buffer,
-// so it takes storage no pending work may still write (storage::
-// make_host_filled) and needs no barrier.
+// so it takes storage no pending work may still read or write (make_'s
+// host_fill) and needs no barrier.
 inline array array::full(shape_t shape, float v) {
-  auto a = make_host_filled_(std::move(shape));
+  auto a = make_(std::move(shape), /*host_fill=*/true);
   auto* p = a.storage_.data();
   for (int64_t i = 0; i < a.size(); i++) p[i] = v;
   return a;
@@ -776,7 +768,7 @@ inline array array::from(std::vector<float> v, shape_t shape) {
     throw std::invalid_argument("tl::from: size mismatch with shape " +
                                 detail::shape_str(shape));
   }
-  auto a = make_host_filled_(std::move(shape));
+  auto a = make_(std::move(shape), /*host_fill=*/true);
   std::copy(v.begin(), v.end(), a.storage_.data());
   return a;
 }
@@ -5472,7 +5464,6 @@ inline void install_runtime_hooks() {
   detail::storage_make_hook = &storage::make_device_;
   detail::cpu_barrier_hook = &gpu::cpu_barrier;
   detail::host_sync_hook = &gpu::sync_to_host;
-  detail::storage_make_host_filled_hook = &storage::make_device_host_filled_;
   detail::gpu_pending_hook = &gpu::pending;
   detail::run_hook = &detail::graph::run;
   detail::run_noflush_hook = &detail::graph::run_noflush;

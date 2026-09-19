@@ -906,6 +906,42 @@ static inline float tree_sum_(threadgroup float* scratch, uint lid, float v) {
   return total;
 }
 
+// tree_sum_ for two values at once, in the same order; `scratch` holds 2·256.
+static inline float2 tree_sum2_(threadgroup float* scratch, uint lid, float a,
+                                float b) {
+  constexpr uint T = 256;
+  scratch[lid] = a;
+  scratch[T + lid] = b;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = T / 2; s > 0; s >>= 1) {
+    if (lid < s) {
+      scratch[lid] += scratch[lid + s];
+      scratch[T + lid] += scratch[T + lid + s];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  float2 total = float2(scratch[0], scratch[T]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return total;
+}
+
+// A row's mean and 1/sqrt(biased variance + eps), the sums layer_norm_ takes
+// (cuda's tl_row_stats_).
+static inline float2 row_stats_(threadgroup float* scratch, uint lid,
+                                device const float* src, uint cols, float eps) {
+  constexpr uint T = 256;
+  float inv_n = 1.0f / float(cols);
+  float sum = 0.0f;
+  for (uint c = lid; c < cols; c += T) sum += src[c];
+  float mu = tree_sum_(scratch, lid, sum) * inv_n;
+  float ss = 0.0f;
+  for (uint c = lid; c < cols; c += T) {
+    float v = src[c] - mu;
+    ss += v * v;
+  }
+  return float2(mu, 1.0f / sqrt(tree_sum_(scratch, lid, ss) * inv_n + eps));
+}
+
 kernel void layer_norm_bwd_dx_(device const float* x  [[buffer(0)]],
                                device const float* g  [[buffer(1)]],
                                device const float* dy [[buffer(2)]],
@@ -915,30 +951,22 @@ kernel void layer_norm_bwd_dx_(device const float* x  [[buffer(0)]],
                                uint row [[threadgroup_position_in_grid]],
                                uint lid [[thread_index_in_threadgroup]]) {
   constexpr uint T = 256;
-  threadgroup float scratch[T];
+  threadgroup float scratch[2 * T];
   device const float* src = x + row * p.cols;
   device const float* gy = dy + row * p.cols;
   device float* dst = dx + row * p.cols;
   float inv_n = 1.0f / float(p.cols);
 
-  float sum = 0.0f;
-  for (uint c = lid; c < p.cols; c += T) sum += src[c];
-  float mu = tree_sum_(scratch, lid, sum) * inv_n;
-  float ss = 0.0f;
-  for (uint c = lid; c < p.cols; c += T) {
-    float v = src[c] - mu;
-    ss += v * v;
-  }
-  float inv = 1.0f / sqrt(tree_sum_(scratch, lid, ss) * inv_n + p.eps);
-
+  const float2 st = row_stats_(scratch, lid, src, p.cols, p.eps);
+  const float mu = st.x, inv = st.y;
   float sg = 0.0f, sgx = 0.0f;
   for (uint c = lid; c < p.cols; c += T) {
     float gh = gy[c] * g[c];
     sg += gh;
     sgx += gh * (src[c] - mu) * inv;
   }
-  float mean_g = tree_sum_(scratch, lid, sg) * inv_n;
-  float mean_gx = tree_sum_(scratch, lid, sgx) * inv_n;
+  const float2 sums = tree_sum2_(scratch, lid, sg, sgx);
+  const float mean_g = sums.x * inv_n, mean_gx = sums.y * inv_n;
   for (uint c = lid; c < p.cols; c += T) {
     float xhat = (src[c] - mu) * inv;
     dst[c] = inv * (gy[c] * g[c] - mean_g - xhat * mean_gx);
@@ -1156,12 +1184,10 @@ kernel void fold_(device const float* a [[buffer(0)]],
 // index_select and scatter_to_axis are gathers already (every output element
 // is written by exactly one invocation, reading whatever it needs), so they
 // port the CUDA kernel body directly. index_add is CUDA's one true scatter+
-// atomicAdd here — repeated indices really do collide — and Metal's
-// device-memory atomics are int/uint only (no float atomicAdd), the same gap
-// pad_/fold_ above worked around. So index_add_ is rewritten as a gather too:
-// one invocation per OUTPUT element, summing over every source row whose
-// index matches it (bounded by p.k, the number of source rows) instead of
-// scattering into a pre-zeroed buffer.
+// atomicAdd here — repeated indices really do collide. Float atomics would
+// need MSL 3 for the whole library, so index_add_ is a gather too: each
+// output row sums the source rows whose index matches it, in source order,
+// which also keeps it deterministic.
 // ---------------------------------------------------------------------------
 
 struct gather_params {
@@ -1183,21 +1209,57 @@ kernel void index_select_(device const float* a [[buffer(0)]],
 struct index_add_params {
   uint row_size;
   uint k;  // number of source rows to scan
-  uint n;  // dispatch bound: target_rows * row_size
 };
 
+// A threadgroup per output row. The 256 threads scan the indices a block of
+// 2048 at a time, 8 consecutive each, and compact the matching source rows
+// into `list` in source order (a scan over the per-thread counts); then each
+// thread adds those rows into the columns it owns. Every index is read once
+// per output row rather than once per output element, and the sums run in
+// ascending source order as a plain loop over k would.
 kernel void index_add_(device const float* idx [[buffer(0)]],
                        device const float* values [[buffer(1)]],
                        device float* out [[buffer(2)]],
                        constant index_add_params& p [[buffer(3)]],
-                       uint i [[thread_position_in_grid]]) {
-  if (i >= p.n) return;
-  uint row = i / p.row_size, col = i % p.row_size;
-  float sum = 0.0f;
-  for (uint k = 0; k < p.k; k++) {
-    if (uint(idx[k] + 0.5f) == row) sum += values[k * p.row_size + col];
+                       uint row [[threadgroup_position_in_grid]],
+                       uint lid [[thread_index_in_threadgroup]]) {
+  constexpr uint T = 256, PER = 8, BLOCK = T * PER;
+  threadgroup uint list[BLOCK];
+  threadgroup uint offsets[T + 1];
+  device float* dst = out + row * p.row_size;
+  for (uint c = lid; c < p.row_size; c += T) dst[c] = 0.0f;
+
+  for (uint b = 0; b < p.k; b += BLOCK) {
+    const uint s0 = b + lid * PER;
+    uint hit = 0;  // bit j: source row s0 + j matches
+    for (uint j = 0; j < PER; j++) {
+      const uint s = s0 + j;
+      if (s < p.k && uint(idx[s] + 0.5f) == row) hit |= 1u << j;
+    }
+    offsets[lid + 1] = popcount(hit);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0) {
+      offsets[0] = 0;
+      for (uint t = 1; t <= T; t++) offsets[t] += offsets[t - 1];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint at = offsets[lid];
+    for (uint j = 0; j < PER; j++) {
+      if (hit & (1u << j)) list[at++] = s0 + j;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint total = offsets[T];
+    if (total != 0) {
+      for (uint c = lid; c < p.row_size; c += T) {
+        float sum = dst[c];
+        for (uint m = 0; m < total; m++) {
+          sum += values[list[m] * p.row_size + c];
+        }
+        dst[c] = sum;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);  // list/offsets reused
   }
-  out[i] = sum;
 }
 
 struct scatter_axis_params {
@@ -1338,36 +1400,70 @@ struct sum_to_params {
   uint reduced_n;  // product of a_shape over exactly the zero-acc axes
 };
 
+// Output t's reduction: where it starts in `a` and which axes it walks.
+struct sum_to_walk {
+  uint base;
+  uint red_axis[kPadFoldMaxRank];
+  uint red_count;
+};
+
+static inline sum_to_walk sum_to_walk_of_(constant sum_to_params& p, uint t) {
+  sum_to_walk w;
+  w.base = 0;
+  w.red_count = 0;
+  for (uint d = 0; d < p.rank; d++) {
+    if (p.acc[d] != 0) {
+      uint idx = (t / p.acc[d]) % p.a_shape[d];
+      w.base += idx * p.a_strides[d];
+    } else {
+      w.red_axis[w.red_count++] = d;
+    }
+  }
+  return w;
+}
+
+// The offset in `a` of the reduction's r-th element, the last axis fastest.
+static inline uint sum_to_offset_(constant sum_to_params& p,
+                                  thread const sum_to_walk& w, uint r) {
+  uint rem = r;
+  uint off = w.base;
+  for (int k = int(w.red_count) - 1; k >= 0; k--) {
+    uint d = w.red_axis[k];
+    uint dim = p.a_shape[d];
+    uint coord = rem % dim;
+    rem /= dim;
+    off += coord * p.a_strides[d];
+  }
+  return off;
+}
+
 kernel void sum_to_(device const float* a [[buffer(0)]],
                     device float* out [[buffer(1)]],
                     constant sum_to_params& p [[buffer(2)]],
                     uint t [[thread_position_in_grid]]) {
   if (t >= p.out_n) return;
-  uint base = 0;
-  uint red_axis[kPadFoldMaxRank];
-  uint red_count = 0;
-  for (uint d = 0; d < p.rank; d++) {
-    if (p.acc[d] != 0) {
-      uint idx = (t / p.acc[d]) % p.a_shape[d];
-      base += idx * p.a_strides[d];
-    } else {
-      red_axis[red_count++] = d;
-    }
-  }
+  const sum_to_walk w = sum_to_walk_of_(p, t);
   float sum = 0.0f;
-  for (uint r = 0; r < p.reduced_n; r++) {
-    uint rem = r;
-    uint off = base;
-    for (int k = int(red_count) - 1; k >= 0; k--) {
-      uint d = red_axis[k];
-      uint dim = p.a_shape[d];
-      uint coord = rem % dim;
-      rem /= dim;
-      off += coord * p.a_strides[d];
-    }
-    sum += a[off];
-  }
+  for (uint r = 0; r < p.reduced_n; r++) sum += a[sum_to_offset_(p, w, r)];
   out[t] = sum;
+}
+
+// sum_to_ with a threadgroup per output element: the flat kernel above walks
+// the whole reduced range on one thread, so a [N, C] -> [C] bias gradient does
+// N adds in sequence per column. Here 256 threads stride over that range and
+// finish in a tree, as cuda's tl_sum_to_blocked does.
+kernel void sum_to_blocked_(device const float* a [[buffer(0)]],
+                            device float* out [[buffer(1)]],
+                            constant sum_to_params& p [[buffer(2)]],
+                            uint t [[threadgroup_position_in_grid]],
+                            uint lid [[thread_index_in_threadgroup]]) {
+  constexpr uint T = 256;
+  threadgroup float scratch[T];
+  const sum_to_walk w = sum_to_walk_of_(p, t);
+  float sum = 0.0f;
+  for (uint r = lid; r < p.reduced_n; r += T) sum += a[sum_to_offset_(p, w, r)];
+  const float total = tree_sum_(scratch, lid, sum);
+  if (lid == 0) out[t] = total;
 }
 
 // concat_part: writes `a` (contiguous, one part of an N-ary Tensor.concat)

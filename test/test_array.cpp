@@ -1227,6 +1227,16 @@ TEST_CASE("sum_to GPU dispatch matches the CPU oracle") {
   CHECK(matches_gpu_oracle([&] { return x.sum_to({1, 1, 32}); }));
   CHECK(matches_gpu_oracle([&] { return x.sum_to({4, 1, 1}); }));
 
+  // Deep reductions (64 rows or more take a threadgroup per output) on random
+  // data: a bias gradient over more rows than the 256 threads, one short of a
+  // full stride, and a rank-3 one keeping its middle axis.
+  auto deep = random_array({300, 40}, 1240);
+  CHECK(matches_gpu_oracle([&] { return deep.sum_to({40}); }));
+  CHECK(matches_gpu_oracle([&] { return random_array({64, 9}, 1241).sum_to({9}); }));
+  auto deep3 = random_array({70, 6, 24}, 1242);
+  CHECK(matches_gpu_oracle([&] { return deep3.sum_to({6, 1}); }));
+  CHECK(matches_gpu_oracle([&] { return deep3.sum_to({1, 1, 24}); }));
+
   // Non-contiguous input (a view) falls back to the CPU oracle honestly
   // (gpu_sum_to_ gates on a.contiguous()) rather than mis-dispatching.
   auto t = array::from({1, 2, 3, 4, 5, 6}, {2, 3}).transpose();  // shape (3,2)
@@ -2366,6 +2376,15 @@ TEST_CASE("index_add: GPU dispatch matches the ref oracle (repeated indices)") {
     auto values = random_array({8, 16}, 22);
     return tl::index_add(idx, values, {64, 16});
   }));
+  // More source rows than one 2048-row scan block, a target hit in both
+  // blocks and one hit by none, and rows wider than the 256 threads.
+  std::vector<float> ix(4500);
+  for (size_t i = 0; i < ix.size(); i++) ix[i] = float((i * 7) % 37);
+  ix[100] = ix[3000] = 36.0f;
+  auto idx = array::from(std::move(ix), {4500});
+  auto values = random_array({4500, 300}, 23);
+  CHECK(matches_gpu_oracle([&] { return tl::index_add(idx, values, {40, 300}); },
+                           1e-4f, 1e-4f));
 }
 
 TEST_CASE("index_select/index_add: bad shapes throw") {

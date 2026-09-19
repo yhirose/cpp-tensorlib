@@ -146,8 +146,8 @@ inline void wait(double us) {
   r.host_us += us;
 }
 
-// The device time of one finished batch, where the backend only knows it per
-// batch (Metal's command buffer).
+// The device time of one finished command buffer (Metal's): with a row per
+// launch under a profile, or a batch of launches the row cannot name.
 inline void batch_device(double us) {
   auto& s = st();
   if (!s.active) return;

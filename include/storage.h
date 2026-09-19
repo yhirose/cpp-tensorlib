@@ -33,9 +33,9 @@ struct storage {
 
   float* data() const { return ptr; }
 
-  static storage make(int64_t n, dtype dt = dtype::f32);
-  // Storage the host fills before any kernel touches it (see gpu::alloc).
-  static storage make_host_filled(int64_t n, dtype dt = dtype::f32);
+  // `host_fill`: the host fills it before any kernel touches it (see
+  // gpu::alloc).
+  static storage make(int64_t n, dtype dt = dtype::f32, bool host_fill = false);
 
   // Explicit-byte allocation: device-preferred (Metal/CUDA pool) with a heap
   // fallback. `elems` is the logical element count, `bytes` the physical buffer
@@ -63,11 +63,9 @@ struct storage {
 
   // Device-preferred allocation. Referenced directly in the default build; only
   // via the installed hook under TL_RUNTIME_HOOKS.
-  static storage make_device_(int64_t n, dtype dt = dtype::f32) {
-    return make_bytes_(n, plain_bytes_(n, dt), dt);
-  }
-  static storage make_device_host_filled_(int64_t n, dtype dt = dtype::f32) {
-    return make_bytes_(n, plain_bytes_(n, dt), dt, /*host_fill=*/true);
+  static storage make_device_(int64_t n, dtype dt = dtype::f32,
+                              bool host_fill = false) {
+    return make_bytes_(n, plain_bytes_(n, dt), dt, host_fill);
   }
 
   static storage make_heap_(int64_t n, dtype dt = dtype::f32) {
@@ -94,13 +92,12 @@ struct storage {
 namespace detail {
 
 // Runtime hooks (see the storage comment). Null until installed.
-inline storage (*storage_make_hook)(int64_t, dtype) = nullptr;
+inline storage (*storage_make_hook)(int64_t, dtype, bool) = nullptr;
 inline void (*cpu_barrier_hook)() = nullptr;
 // Host↔device coherence (CUDA device-mirror). Called with (native, for_write)
 // before a CPU read/write of a managed buffer to pull the device copy back
 // (D2H) and, on write, invalidate it. Null / no-op on unified backends (Metal).
 inline void (*host_sync_hook)(void*, bool) = nullptr;
-inline storage (*storage_make_host_filled_hook)(int64_t, dtype) = nullptr;
 // GPU-pipeline query for the eager-tiny decision in the graph builders.
 // Behind a hook (not a direct gpu::pending() call) so those always-live
 // builders reference no Metal symbol in a no-tensor binary — null means no
@@ -109,23 +106,14 @@ inline bool (*gpu_pending_hook)() = nullptr;
 
 }  // namespace detail
 
-inline storage storage::make(int64_t n, dtype dt) {
+inline storage storage::make(int64_t n, dtype dt, bool host_fill) {
 #ifdef TL_RUNTIME_HOOKS
-  if (detail::storage_make_hook) return detail::storage_make_hook(n, dt);
-  return make_heap_(n, dt);
-#else
-  return make_device_(n, dt);
-#endif
-}
-
-inline storage storage::make_host_filled(int64_t n, dtype dt) {
-#ifdef TL_RUNTIME_HOOKS
-  if (detail::storage_make_host_filled_hook) {
-    return detail::storage_make_host_filled_hook(n, dt);
+  if (detail::storage_make_hook) {
+    return detail::storage_make_hook(n, dt, host_fill);
   }
   return make_heap_(n, dt);
 #else
-  return make_device_host_filled_(n, dt);
+  return make_device_(n, dt, host_fill);
 #endif
 }
 
