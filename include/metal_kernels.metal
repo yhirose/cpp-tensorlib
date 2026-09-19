@@ -881,6 +881,129 @@ kernel void layer_norm_(device const float* x [[buffer(0)]],
     dst[c] = ((src[c] - mu) * inv * g[c] + b[c]) * p.scale + p.offset;
 }
 
+// ---- layer norm's pullback over the last axis, in three launches ----
+// cuda's tl_layer_norm_bwd_*: with x̂ = (x − μ)·s and ĝ = dy ⊙ γ,
+// dx = s · (ĝ − mean(ĝ) − x̂ · mean(ĝ ⊙ x̂)), dγ = Σ_rows dy ⊙ x̂, dβ = Σ_rows dy.
+// The dx kernel recomputes (μ, s) as layer_norm_ does and leaves them in
+// `stats` [2, rows] for the column sums, which fold in a fixed order.
+struct layer_norm_bwd_params {
+  uint rows, cols, rows_per_chunk, chunks;
+  float eps;
+};
+
+// Tree-sum one value per thread through `scratch`, handing every thread the
+// total; the trailing barrier lets a second sum reuse `scratch`.
+static inline float tree_sum_(threadgroup float* scratch, uint lid, float v) {
+  constexpr uint T = 256;
+  scratch[lid] = v;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = T / 2; s > 0; s >>= 1) {
+    if (lid < s) scratch[lid] += scratch[lid + s];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  float total = scratch[0];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return total;
+}
+
+kernel void layer_norm_bwd_dx_(device const float* x  [[buffer(0)]],
+                               device const float* g  [[buffer(1)]],
+                               device const float* dy [[buffer(2)]],
+                               device float* dx       [[buffer(3)]],
+                               device float* stats    [[buffer(4)]],
+                               constant layer_norm_bwd_params& p [[buffer(5)]],
+                               uint row [[threadgroup_position_in_grid]],
+                               uint lid [[thread_index_in_threadgroup]]) {
+  constexpr uint T = 256;
+  threadgroup float scratch[T];
+  device const float* src = x + row * p.cols;
+  device const float* gy = dy + row * p.cols;
+  device float* dst = dx + row * p.cols;
+  float inv_n = 1.0f / float(p.cols);
+
+  float sum = 0.0f;
+  for (uint c = lid; c < p.cols; c += T) sum += src[c];
+  float mu = tree_sum_(scratch, lid, sum) * inv_n;
+  float ss = 0.0f;
+  for (uint c = lid; c < p.cols; c += T) {
+    float v = src[c] - mu;
+    ss += v * v;
+  }
+  float inv = 1.0f / sqrt(tree_sum_(scratch, lid, ss) * inv_n + p.eps);
+
+  float sg = 0.0f, sgx = 0.0f;
+  for (uint c = lid; c < p.cols; c += T) {
+    float gh = gy[c] * g[c];
+    sg += gh;
+    sgx += gh * (src[c] - mu) * inv;
+  }
+  float mean_g = tree_sum_(scratch, lid, sg) * inv_n;
+  float mean_gx = tree_sum_(scratch, lid, sgx) * inv_n;
+  for (uint c = lid; c < p.cols; c += T) {
+    float xhat = (src[c] - mu) * inv;
+    dst[c] = inv * (gy[c] * g[c] - mean_g - xhat * mean_gx);
+  }
+  if (lid == 0) {
+    stats[row] = mu;
+    stats[p.rows + row] = inv;
+  }
+}
+
+// The column sums: a threadgroup per (32-column strip, chunk of rows), 32×8
+// threads, into `partials` [2, chunks, cols] (dγ's plane first).
+kernel void layer_norm_bwd_gb_(device const float* x      [[buffer(0)]],
+                               device const float* dy     [[buffer(1)]],
+                               device const float* stats  [[buffer(2)]],
+                               device float* partials     [[buffer(3)]],
+                               constant layer_norm_bwd_params& p [[buffer(4)]],
+                               uint2 tg [[threadgroup_position_in_grid]],
+                               uint2 tid [[thread_position_in_threadgroup]]) {
+  threadgroup float sg[8][32], sgx[8][32];
+  uint tx = tid.x, ty = tid.y;
+  uint c = tg.x * 32 + tx;
+  uint chunk = tg.y;
+  uint r0 = chunk * p.rows_per_chunk;
+  uint r1 = min(r0 + p.rows_per_chunk, p.rows);
+  float ag = 0.0f, agx = 0.0f;
+  if (c < p.cols) {
+    for (uint r = r0 + ty; r < r1; r += 8) {
+      float gy = dy[r * p.cols + c];
+      float xhat = (x[r * p.cols + c] - stats[r]) * stats[p.rows + r];
+      ag += gy;
+      agx += gy * xhat;
+    }
+  }
+  sg[ty][tx] = ag;
+  sgx[ty][tx] = agx;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (ty == 0 && c < p.cols) {
+    float tg_ = 0.0f, tgx = 0.0f;
+    for (uint l = 0; l < 8; l++) {
+      tg_ += sg[l][tx];
+      tgx += sgx[l][tx];
+    }
+    uint at = chunk * p.cols + c;
+    partials[at] = tgx;
+    partials[p.chunks * p.cols + at] = tg_;
+  }
+}
+
+// The second half: a thread per column folds its chunks into dγ and dβ.
+kernel void layer_norm_bwd_gb_fold_(device const float* partials [[buffer(0)]],
+                                    device float* dg             [[buffer(1)]],
+                                    device float* db             [[buffer(2)]],
+                                    constant layer_norm_bwd_params& p [[buffer(3)]],
+                                    uint c [[thread_position_in_grid]]) {
+  if (c >= p.cols) return;
+  float tg_ = 0.0f, tb = 0.0f;
+  for (uint k = 0; k < p.chunks; k++) {
+    tg_ += partials[k * p.cols + c];
+    tb += partials[(p.chunks + k) * p.cols + c];
+  }
+  dg[c] = tg_;
+  db[c] = tb;
+}
+
 #define ROW_REDUCE(name, init, combine, finish)                              \
   kernel void name(device const float* in [[buffer(0)]],                     \
                    device float* out       [[buffer(1)]],                    \
@@ -1314,3 +1437,379 @@ kernel void rope_(device const float* x [[buffer(0)]],
   out[bi + j] = x0 * c - x1 * s;
   out[bi + j + p.half_] = x0 * s + x1 * c;
 }
+
+// ---------------------------------------------------------------------------
+// Causal prefill attention and its pullback: cuda's attn_prefill_tiled_core /
+// attn_bwd_dq_core / attn_bwd_dkv_core, the same online softmax, causal rule
+// and summation order. 128 threads as 16 rows × 8 lanes, a row's lanes one
+// aligned octet of a simdgroup, so the octet's reductions are simd shuffles.
+// Tiles are template parameters: Metal's 32 KB of threadgroup memory holds
+// less than CUDA's 48 KB, so each D gets the largest tile that fits.
+// ---------------------------------------------------------------------------
+
+struct attn_params {
+  uint T, kv_stride, group, pos0;
+  float scale;
+};
+
+static inline float octet_max_(float v) {
+  for (ushort off = 4; off > 0; off >>= 1) v = max(v, simd_shuffle_xor(v, off));
+  return v;
+}
+static inline float octet_sum_(float v) {
+  for (ushort off = 4; off > 0; off >>= 1) v += simd_shuffle_xor(v, off);
+  return v;
+}
+
+// q, out [H,T,D]; K/V a cache of kv_stride floats per kv head read over
+// [0, pos0+T); query p sits at pos0+p. QPT queries per row, TK keys per tile.
+template <int AD, int QPT, int TK>
+kernel void attn_prefill_(device const float* q   [[buffer(0)]],
+                          device const float* K   [[buffer(1)]],
+                          device const float* V   [[buffer(2)]],
+                          device float* out       [[buffer(3)]],
+                          constant attn_params& p [[buffer(4)]],
+                          uint2 tg  [[threadgroup_position_in_grid]],
+                          uint2 ntg [[threadgroups_per_grid]],
+                          uint tid  [[thread_index_in_threadgroup]]) {
+  constexpr int NT = 128, LANES = 8, ROWS = NT / LANES;
+  constexpr int BQ = ROWS * QPT;
+  constexpr int DG = AD / LANES;
+  constexpr int SPT = TK / LANES;
+  threadgroup float Qs[BQ][AD + 1];
+  threadgroup float Ks[TK][AD + 1];
+  threadgroup float Vs[TK][AD];
+  threadgroup float Ps[BQ][TK + 1];
+
+  const uint T = p.T;
+  const uint h = tg.x;
+  const uint qbase = (ntg.y - 1u - tg.y) * BQ;  // heaviest tiles first
+  const uint kv_h = p.group ? h / p.group : h;
+  device const float* Kh = K + kv_h * p.kv_stride;
+  device const float* Vh = V + kv_h * p.kv_stride;
+  const uint qr0 = tid >> 3, dg = tid & 7u;
+
+  for (uint i = tid; i < BQ * AD; i += NT) {
+    const uint r = i / AD, c = i % AD;
+    Qs[r][c] = (qbase + r < T) ? q[(h * T + qbase + r) * AD + c] : 0.f;
+  }
+  const uint last = qbase + BQ - 1 < T ? qbase + BQ - 1 : T - 1;
+  const uint kmax = p.pos0 + last;
+
+  float acc[QPT][DG];
+  float m[QPT], l[QPT];
+  for (int u = 0; u < QPT; u++) {
+    m[u] = -1e30f;
+    l[u] = 0.0f;
+    for (int d = 0; d < DG; d++) acc[u][d] = 0.0f;
+  }
+
+  for (uint kt = 0; kt <= kmax; kt += TK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < TK * AD; i += NT) {
+      const uint r = i / AD, c = i % AD;
+      const uint kk = kt + r;
+      Ks[r][c] = kk <= kmax ? Kh[kk * AD + c] : 0.f;
+      Vs[r][c] = kk <= kmax ? Vh[kk * AD + c] : 0.f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int u = 0; u < QPT; u++) {
+      const uint row = qr0 + u * ROWS;
+      const uint pabs = p.pos0 + qbase + row;
+      float sc[SPT], mt = -1e30f;
+      for (int t2 = 0; t2 < SPT; t2++) {
+        const uint kk = kt + dg * SPT + t2;
+        float dot = 0.0f;
+        for (int d = 0; d < AD; d++) dot += Qs[row][d] * Ks[dg * SPT + t2][d];
+        sc[t2] = (kk <= pabs) ? dot * p.scale : -1e30f;  // causal mask
+        mt = max(mt, sc[t2]);
+      }
+      mt = octet_max_(mt);
+      const float m_new = max(m[u], mt);
+      const float corr = exp(m[u] - m_new);
+      float ls = 0.0f;
+      for (int t2 = 0; t2 < SPT; t2++) {
+        const float e = exp(sc[t2] - m_new);
+        Ps[row][dg * SPT + t2] = e;
+        ls += e;
+      }
+      ls = octet_sum_(ls);
+      l[u] = l[u] * corr + ls;
+      m[u] = m_new;
+      for (int d = 0; d < DG; d++) acc[u][d] *= corr;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int kk = 0; kk < TK; kk++) {
+      for (int u = 0; u < QPT; u++) {
+        const float pv = Ps[qr0 + u * ROWS][kk];
+        for (int d = 0; d < DG; d++) acc[u][d] += pv * Vs[kk][d * LANES + dg];
+      }
+    }
+  }
+
+  for (int u = 0; u < QPT; u++) {
+    const uint qi = qbase + qr0 + u * ROWS;
+    if (qi >= T) continue;
+    const float inv = 1.0f / l[u];
+    for (int d = 0; d < DG; d++)
+      out[(h * T + qi) * AD + d * LANES + dg] = acc[u][d] * inv;
+  }
+}
+template [[host_name("attn_prefill_64_")]] kernel void
+attn_prefill_<64, 2, 32>(device const float*, device const float*,
+                         device const float*, device float*,
+                         constant attn_params&, uint2, uint2, uint);
+template [[host_name("attn_prefill_128_")]] kernel void
+attn_prefill_<128, 1, 16>(device const float*, device const float*,
+                          device const float*, device float*,
+                          constant attn_params&, uint2, uint2, uint);
+
+// The query half of the pullback: dq and `stats` [2,H,T] (the row logsumexp,
+// then Δ = dO·O) for the key/value half. See cuda's attn_bwd_dq_core.
+template <int AD, int QPT, int TK>
+kernel void attn_bwd_dq_(device const float* q     [[buffer(0)]],
+                         device const float* K     [[buffer(1)]],
+                         device const float* V     [[buffer(2)]],
+                         device const float* dO    [[buffer(3)]],
+                         device const float* O     [[buffer(4)]],
+                         device float* dq          [[buffer(5)]],
+                         device float* stats       [[buffer(6)]],
+                         constant attn_params& p   [[buffer(7)]],
+                         uint2 tg  [[threadgroup_position_in_grid]],
+                         uint2 ntg [[threadgroups_per_grid]],
+                         uint tid  [[thread_index_in_threadgroup]]) {
+  constexpr int NT = 128, LANES = 8, ROWS = NT / LANES;
+  constexpr int BQ = ROWS * QPT;
+  constexpr int DG = AD / LANES;
+  constexpr int SPT = TK / LANES;
+  threadgroup float Qs[BQ][AD + 1];
+  threadgroup float Gs[BQ][AD + 1];  // dO's rows
+  threadgroup float Ks[TK][AD + 1];
+  threadgroup float Vs[TK][AD + 1];
+  threadgroup float Cs[BQ][TK + 1];  // exp(s − m)·(dP − Δ)
+  threadgroup float Ds[BQ];          // Δ per row
+
+  const uint T = p.T;
+  const uint h = tg.x;
+  const uint qbase = (ntg.y - 1u - tg.y) * BQ;
+  const uint qr0 = tid >> 3, dg = tid & 7u;
+  device const float* qh = q + h * T * AD;
+  device const float* Kh = K + h * T * AD;
+  device const float* Vh = V + h * T * AD;
+  device const float* Gh = dO + h * T * AD;
+  device const float* Oh = O + h * T * AD;
+
+  for (uint i = tid; i < BQ * AD; i += NT) {
+    const uint r = i / AD, c = i % AD;
+    const bool live = qbase + r < T;
+    Qs[r][c] = live ? qh[(qbase + r) * AD + c] : 0.f;
+    Gs[r][c] = live ? Gh[(qbase + r) * AD + c] : 0.f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint r = tid; r < uint(BQ); r += NT) {
+    float d = 0.f;
+    if (qbase + r < T) {
+      device const float* op = Oh + (qbase + r) * AD;
+      for (int c = 0; c < AD; c++) d += Gs[r][c] * op[c];
+    }
+    Ds[r] = d;
+  }
+  const uint last = qbase + BQ - 1 < T ? qbase + BQ - 1 : T - 1;
+
+  float acc[QPT][DG];
+  float m[QPT], l[QPT];
+  for (int u = 0; u < QPT; u++) {
+    m[u] = -1e30f;
+    l[u] = 0.0f;
+    for (int d = 0; d < DG; d++) acc[u][d] = 0.0f;
+  }
+
+  for (uint kt = 0; kt <= last; kt += TK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < TK * AD; i += NT) {
+      const uint r = i / AD, c = i % AD;
+      const uint kk = kt + r;
+      Ks[r][c] = kk <= last ? Kh[kk * AD + c] : 0.f;
+      Vs[r][c] = kk <= last ? Vh[kk * AD + c] : 0.f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int u = 0; u < QPT; u++) {
+      const uint row = qr0 + u * ROWS;
+      const uint pabs = qbase + row;
+      float sc[SPT], dp[SPT], mt = -1e30f;
+      for (int t2 = 0; t2 < SPT; t2++) {
+        const uint kk = kt + dg * SPT + t2;
+        float dot = 0.0f, dpd = 0.0f;
+        for (int d = 0; d < AD; d++) {
+          dot += Qs[row][d] * Ks[dg * SPT + t2][d];
+          dpd += Gs[row][d] * Vs[dg * SPT + t2][d];
+        }
+        sc[t2] = (kk <= pabs) ? dot * p.scale : -1e30f;
+        dp[t2] = dpd;
+        mt = max(mt, sc[t2]);
+      }
+      mt = octet_max_(mt);
+      const float m_new = max(m[u], mt);
+      const float corr = exp(m[u] - m_new);
+      const float delta = Ds[row];
+      float ls = 0.0f;
+      for (int t2 = 0; t2 < SPT; t2++) {
+        const float e = exp(sc[t2] - m_new);
+        Cs[row][dg * SPT + t2] = e * (dp[t2] - delta);
+        ls += e;
+      }
+      ls = octet_sum_(ls);
+      l[u] = l[u] * corr + ls;
+      m[u] = m_new;
+      for (int d = 0; d < DG; d++) acc[u][d] *= corr;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int kk = 0; kk < TK; kk++) {
+      for (int u = 0; u < QPT; u++) {
+        const float c = Cs[qr0 + u * ROWS][kk];
+        for (int d = 0; d < DG; d++) acc[u][d] += c * Ks[kk][d * LANES + dg];
+      }
+    }
+  }
+
+  for (int u = 0; u < QPT; u++) {
+    const uint qi = qbase + qr0 + u * ROWS;
+    if (qi >= T) continue;
+    const float f = p.scale / l[u];
+    for (int d = 0; d < DG; d++)
+      dq[(h * T + qi) * AD + d * LANES + dg] = acc[u][d] * f;
+    if (dg == 0) {
+      const uint row = h * T + qi;
+      stats[row] = m[u] + log(l[u]);
+      stats[ntg.x * T + row] = Ds[qr0 + u * ROWS];
+    }
+  }
+}
+template [[host_name("attn_bwd_dq_64_")]] kernel void
+attn_bwd_dq_<64, 1, 32>(device const float*, device const float*,
+                        device const float*, device const float*,
+                        device const float*, device float*, device float*,
+                        constant attn_params&, uint2, uint2, uint);
+template [[host_name("attn_bwd_dq_128_")]] kernel void
+attn_bwd_dq_<128, 1, 8>(device const float*, device const float*,
+                        device const float*, device const float*,
+                        device const float*, device float*, device float*,
+                        constant attn_params&, uint2, uint2, uint);
+
+// The key/value half: one threadgroup per (head, key tile), walking the query
+// tiles that can see those keys, P read off the dq half's stats. See cuda's
+// attn_bwd_dkv_core.
+template <int AD, int KPT, int TQ>
+kernel void attn_bwd_dkv_(device const float* q     [[buffer(0)]],
+                          device const float* K     [[buffer(1)]],
+                          device const float* V     [[buffer(2)]],
+                          device const float* dO    [[buffer(3)]],
+                          device const float* stats [[buffer(4)]],
+                          device float* dK          [[buffer(5)]],
+                          device float* dV          [[buffer(6)]],
+                          constant attn_params& p   [[buffer(7)]],
+                          uint2 tg  [[threadgroup_position_in_grid]],
+                          uint2 ntg [[threadgroups_per_grid]],
+                          uint tid  [[thread_index_in_threadgroup]]) {
+  constexpr int NT = 128, LANES = 8, ROWS = NT / LANES;
+  constexpr int BK = ROWS * KPT;
+  constexpr int DG = AD / LANES;
+  constexpr int SPT = TQ / LANES;
+  threadgroup float Ks[BK][AD + 1];
+  threadgroup float Vs[BK][AD + 1];
+  threadgroup float Qs[TQ][AD + 1];
+  threadgroup float Gs[TQ][AD + 1];
+  threadgroup float Ps[BK][TQ + 1];
+  threadgroup float Cs[BK][TQ + 1];
+  threadgroup float Ls[TQ], Ds[TQ];
+
+  const uint T = p.T;
+  const uint h = tg.x;
+  const uint kbase = tg.y * BK;
+  const uint kr0 = tid >> 3, dg = tid & 7u;
+  device const float* qh = q + h * T * AD;
+  device const float* Kh = K + h * T * AD;
+  device const float* Vh = V + h * T * AD;
+  device const float* Gh = dO + h * T * AD;
+  device const float* Lh = stats + h * T;
+  device const float* Dh = stats + ntg.x * T + h * T;
+
+  for (uint i = tid; i < BK * AD; i += NT) {
+    const uint r = i / AD, c = i % AD;
+    const bool live = kbase + r < T;
+    Ks[r][c] = live ? Kh[(kbase + r) * AD + c] : 0.f;
+    Vs[r][c] = live ? Vh[(kbase + r) * AD + c] : 0.f;
+  }
+
+  float dk[KPT][DG], dv[KPT][DG];
+  for (int u = 0; u < KPT; u++)
+    for (int d = 0; d < DG; d++) dk[u][d] = dv[u][d] = 0.0f;
+
+  for (uint qt = (kbase / TQ) * TQ; qt < T; qt += TQ) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < TQ * AD; i += NT) {
+      const uint r = i / AD, c = i % AD;
+      const bool live = qt + r < T;
+      Qs[r][c] = live ? qh[(qt + r) * AD + c] : 0.f;
+      Gs[r][c] = live ? Gh[(qt + r) * AD + c] : 0.f;
+    }
+    for (uint r = tid; r < uint(TQ); r += NT) {
+      const bool live = qt + r < T;
+      Ls[r] = live ? Lh[qt + r] : 0.f;
+      Ds[r] = live ? Dh[qt + r] : 0.f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int u = 0; u < KPT; u++) {
+      const uint row = kr0 + u * ROWS;
+      const uint kabs = kbase + row;
+      float sc[SPT], dpd[SPT];
+      for (int t2 = 0; t2 < SPT; t2++) sc[t2] = dpd[t2] = 0.0f;
+      for (int d = 0; d < AD; d++) {
+        const float kd = Ks[row][d], vd = Vs[row][d];
+        for (int t2 = 0; t2 < SPT; t2++) {
+          sc[t2] += Qs[dg * SPT + t2][d] * kd;
+          dpd[t2] += Gs[dg * SPT + t2][d] * vd;
+        }
+      }
+      for (int t2 = 0; t2 < SPT; t2++) {
+        const uint ql = dg * SPT + t2, qi = qt + ql;
+        const float e =
+            (qi < T && kabs <= qi) ? exp(sc[t2] * p.scale - Ls[ql]) : 0.f;
+        Ps[row][ql] = e;
+        Cs[row][ql] = e * (dpd[t2] - Ds[ql]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int qq = 0; qq < TQ; qq++) {
+      for (int u = 0; u < KPT; u++) {
+        const float e = Ps[kr0 + u * ROWS][qq], c = Cs[kr0 + u * ROWS][qq];
+        for (int d = 0; d < DG; d++) {
+          dv[u][d] += e * Gs[qq][d * LANES + dg];
+          dk[u][d] += c * Qs[qq][d * LANES + dg];
+        }
+      }
+    }
+  }
+
+  for (int u = 0; u < KPT; u++) {
+    const uint kj = kbase + kr0 + u * ROWS;
+    if (kj >= T) continue;
+    for (int d = 0; d < DG; d++) {
+      dK[(h * T + kj) * AD + d * LANES + dg] = dk[u][d] * p.scale;
+      dV[(h * T + kj) * AD + d * LANES + dg] = dv[u][d];
+    }
+  }
+}
+template [[host_name("attn_bwd_dkv_64_")]] kernel void
+attn_bwd_dkv_<64, 1, 32>(device const float*, device const float*,
+                         device const float*, device const float*,
+                         device const float*, device float*, device float*,
+                         constant attn_params&, uint2, uint2, uint);
+template [[host_name("attn_bwd_dkv_128_")]] kernel void
+attn_bwd_dkv_<128, 1, 8>(device const float*, device const float*,
+                         device const float*, device const float*,
+                         device const float*, device float*, device float*,
+                         constant attn_params&, uint2, uint2, uint);

@@ -53,7 +53,10 @@ enum class kop {
   clamp_, sum_to_,               // dedicated ops, mirroring cuda.h's own
   concat_part_, rope_,           // ditto -- Tensor.concat / RoPE's own dispatch
   pow_s_, gt_s_, lt_s_, ge_s_, le_s_, eq_s_, ne_s_,  // scalar_op maps onto these
-  layer_norm_                                        // the fused layer norm
+  layer_norm_,                                       // the fused layer norm
+  layer_norm_bwd_dx_, layer_norm_bwd_gb_, layer_norm_bwd_gb_fold_,  // its pullback
+  attn_prefill_64_, attn_prefill_128_,  // causal prefill attention, per D
+  attn_bwd_dq_64_, attn_bwd_dq_128_, attn_bwd_dkv_64_, attn_bwd_dkv_128_
 };
 
 // Comparisons (gt/lt/ge/le/eq/ne) are deliberately NOT kop values: kop is
@@ -179,6 +182,15 @@ struct context {
       case kop::eq_s_: return "eq_s_";
       case kop::ne_s_: return "ne_s_";
       case kop::layer_norm_: return "layer_norm_";
+      case kop::layer_norm_bwd_dx_: return "layer_norm_bwd_dx_";
+      case kop::layer_norm_bwd_gb_: return "layer_norm_bwd_gb_";
+      case kop::layer_norm_bwd_gb_fold_: return "layer_norm_bwd_gb_fold_";
+      case kop::attn_prefill_64_: return "attn_prefill_64_";
+      case kop::attn_prefill_128_: return "attn_prefill_128_";
+      case kop::attn_bwd_dq_64_: return "attn_bwd_dq_64_";
+      case kop::attn_bwd_dq_128_: return "attn_bwd_dq_128_";
+      case kop::attn_bwd_dkv_64_: return "attn_bwd_dkv_64_";
+      case kop::attn_bwd_dkv_128_: return "attn_bwd_dkv_128_";
     }
     return "";
   }
@@ -690,12 +702,57 @@ inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
                      int64_t, void*, int64_t, int64_t, int64_t) {
   return false;
 }
-// Layer norm's pullback. CUDA-first (allowlisted); the caller composes the
-// unfused form when this declines.
-inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
-                           void*, void*, void*, void*, void*, int64_t, int64_t,
-                           int64_t, int64_t, float) {
-  return false;
+namespace detail_ {
+struct layer_norm_bwd_params {
+  uint32_t rows, cols, rows_per_chunk, chunks;
+  float eps;
+};
+}  // namespace detail_
+
+// Layer norm's pullback: cuda.h's contract and its three launches -- a row
+// kernel (dx and the row stats), a column-strip kernel, a fold.
+inline bool layer_norm_bwd(void* x, int64_t xo, void* g, int64_t go, void* dy,
+                           int64_t dyo, void* dx, void* dg, void* db,
+                           void* stats, void* partials, int64_t rows,
+                           int64_t cols, int64_t per_chunk, int64_t chunks,
+                           float eps) {
+  auto& c = context::get();
+  if (!c.device || rows <= 0 || cols <= 0 || chunks <= 0) return false;
+  detail_::layer_norm_bwd_params p{
+      static_cast<uint32_t>(rows), static_cast<uint32_t>(cols),
+      static_cast<uint32_t>(per_chunk), static_cast<uint32_t>(chunks), eps};
+  auto bytes = [&](unsigned long idx) {
+    objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+               static_cast<unsigned long>(sizeof(p)), idx);
+  };
+  const auto ur = static_cast<unsigned long>(rows);
+  const auto uc = static_cast<unsigned long>(cols);
+  const auto uk = static_cast<unsigned long>(chunks);
+
+  c.bind_(kop::layer_norm_bwd_dx_);
+  detail_::set_buf_(c.enc, x, xo, 0ul);
+  detail_::set_buf_(c.enc, g, go, 1ul);
+  detail_::set_buf_(c.enc, dy, dyo, 2ul);
+  detail_::set_buf_(c.enc, dx, 0, 3ul);
+  detail_::set_buf_(c.enc, stats, 0, 4ul);
+  bytes(5ul);
+  detail_::dispatch_grid_(c.enc, {ur, 1, 1}, {256, 1, 1});
+
+  c.bind_(kop::layer_norm_bwd_gb_);
+  detail_::set_buf_(c.enc, x, xo, 0ul);
+  detail_::set_buf_(c.enc, dy, dyo, 1ul);
+  detail_::set_buf_(c.enc, stats, 0, 2ul);
+  detail_::set_buf_(c.enc, partials, 0, 3ul);
+  bytes(4ul);
+  detail_::dispatch_grid_(c.enc, {(uc + 31) / 32, uk, 1}, {32, 8, 1});
+
+  c.bind_(kop::layer_norm_bwd_gb_fold_);
+  detail_::set_buf_(c.enc, partials, 0, 0ul);
+  detail_::set_buf_(c.enc, dg, 0, 1ul);
+  detail_::set_buf_(c.enc, db, 0, 2ul);
+  bytes(3ul);
+  detail_::dispatch_grid_(c.enc, {(uc + 255) / 256, 1, 1}, {256, 1, 1});
+  return true;
 }
 
 // Adam's fused per-parameter update. CUDA-first (allowlisted); array.h takes
@@ -1066,6 +1123,81 @@ inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
   return true;
 }
 
+// ---- causal prefill attention and its pullback ------------------------------
+// cuda.h's contracts. 128 threads per threadgroup; the tiles (rows of queries
+// or keys a threadgroup owns) are the MSL instantiations' and must match them:
+// the forward holds 32 queries at D=64 and 16 at D=128, each pullback half 16.
+
+namespace detail_ {
+struct attn_params {
+  uint32_t T, kv_stride, group, pos0;
+  float scale;
+};
+
+inline void attn_dispatch_(objc::id enc, const attn_params& p,
+                           unsigned long idx, int64_t heads, int64_t T,
+                           unsigned long tile) {
+  objc::send(enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
+             static_cast<unsigned long>(sizeof(p)), idx);
+  dispatch_grid_(enc,
+                 {static_cast<unsigned long>(heads),
+                  (static_cast<unsigned long>(T) + tile - 1) / tile, 1},
+                 {128, 1, 1});
+}
+}  // namespace detail_
+
+// q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D] cache read over
+// [0,pos0+T), query p at absolute position pos0+p. GQA via the head ratio.
+// D∈{64,128}; no bf16 cache on this backend.
+inline bool attn_prefill(void* q, void* K, void* V, void* out,
+                         int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
+                         int64_t kv_max, int64_t D, float scale,
+                         bool kv_bf16 = false, int64_t pos0 = 0) {
+  auto& c = context::get();
+  if (!c.device || kv_bf16 || (D != 64 && D != 128)) return false;
+  if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || T <= 0) return false;
+  c.bind_(D == 64 ? kop::attn_prefill_64_ : kop::attn_prefill_128_);
+  detail_::set_buf_(c.enc, q, 0, 0ul);
+  detail_::set_buf_(c.enc, K, 0, 1ul);
+  detail_::set_buf_(c.enc, V, 0, 2ul);
+  detail_::set_buf_(c.enc, out, 0, 3ul);
+  detail_::attn_params p{static_cast<uint32_t>(T),
+                         static_cast<uint32_t>(kv_max * D),
+                         static_cast<uint32_t>(n_q_heads / n_kv_heads),
+                         static_cast<uint32_t>(pos0), scale};
+  detail_::attn_dispatch_(c.enc, p, 4ul, n_q_heads, T, D == 64 ? 32 : 16);
+  return true;
+}
+
+// The query half of the pullback: q, K, V, dO, O and dq all [H,T,D]
+// contiguous, `stats` [2,H,T] the row logsumexp and dO·O.
+inline bool attn_prefill_dq(void* q, void* K, void* V, void* dO, void* O,
+                            void* dq, void* stats, int64_t H, int64_t T,
+                            int64_t D, float scale) {
+  auto& c = context::get();
+  if (!c.device || (D != 64 && D != 128) || H <= 0 || T <= 0) return false;
+  c.bind_(D == 64 ? kop::attn_bwd_dq_64_ : kop::attn_bwd_dq_128_);
+  void* bufs[] = {q, K, V, dO, O, dq, stats};
+  for (unsigned long i = 0; i < 7; i++) detail_::set_buf_(c.enc, bufs[i], 0, i);
+  detail_::attn_params p{static_cast<uint32_t>(T), 0, 0, 0, scale};
+  detail_::attn_dispatch_(c.enc, p, 7ul, H, T, 16);
+  return true;
+}
+
+// The key/value half, reading the stats the call above wrote.
+inline bool attn_prefill_dkv(void* q, void* K, void* V, void* dO, void* stats,
+                             void* dK, void* dV, int64_t H, int64_t T,
+                             int64_t D, float scale) {
+  auto& c = context::get();
+  if (!c.device || (D != 64 && D != 128) || H <= 0 || T <= 0) return false;
+  c.bind_(D == 64 ? kop::attn_bwd_dkv_64_ : kop::attn_bwd_dkv_128_);
+  void* bufs[] = {q, K, V, dO, stats, dK, dV};
+  for (unsigned long i = 0; i < 7; i++) detail_::set_buf_(c.enc, bufs[i], 0, i);
+  detail_::attn_params p{static_cast<uint32_t>(T), 0, 0, 0, scale};
+  detail_::attn_dispatch_(c.enc, p, 7ul, H, T, 16);
+  return true;
+}
+
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals
 
 inline bool available() { return false; }
@@ -1134,11 +1266,21 @@ inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
                      int64_t, void*, int64_t, int64_t, int64_t) {
   return false;
 }
-// Layer norm's pullback. CUDA-first (allowlisted); the caller composes the
-// unfused form when this declines.
 inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
                            void*, void*, void*, void*, void*, int64_t, int64_t,
                            int64_t, int64_t, float) {
+  return false;
+}
+inline bool attn_prefill(void*, void*, void*, void*, int64_t, int64_t, int64_t,
+                         int64_t, int64_t, float, bool = false, int64_t = 0) {
+  return false;
+}
+inline bool attn_prefill_dq(void*, void*, void*, void*, void*, void*, void*,
+                            int64_t, int64_t, int64_t, float) {
+  return false;
+}
+inline bool attn_prefill_dkv(void*, void*, void*, void*, void*, void*, void*,
+                             int64_t, int64_t, int64_t, float) {
   return false;
 }
 inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,
@@ -1206,18 +1348,6 @@ inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
                         int64_t, int64_t, float) {
-  return false;
-}
-inline bool attn_prefill(void*, void*, void*, void*, int64_t, int64_t, int64_t,
-                         int64_t, int64_t, float, bool = false, int64_t = 0) {
-  return false;
-}
-inline bool attn_prefill_dq(void*, void*, void*, void*, void*, void*, void*,
-                            int64_t, int64_t, int64_t, float) {
-  return false;
-}
-inline bool attn_prefill_dkv(void*, void*, void*, void*, void*, void*, void*,
-                             int64_t, int64_t, int64_t, float) {
   return false;
 }
 inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {

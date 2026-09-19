@@ -1415,10 +1415,10 @@ TEST_CASE("layer_norm_bwd matches the composed pullback on the GPU and the own C
     if (on_gpu) tl::use_gpu();
     auto got = tl::array::layer_norm_bwd(x, g, dy);
     tl::use_cpu();
-    // The own CPU takes every contiguous input. On a device the kernels are
-    // CUDA's; another device declines and its caller composes the form above.
+    // The own CPU takes every contiguous input, and so do the CUDA and Metal
+    // kernels; WebGPU declines and its caller composes the form above.
     if (!on_gpu) REQUIRE(got.has_value());
-#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
+#if !defined(TENSORLIB_WEBGPU)
     REQUIRE(got.has_value());
 #endif
     if (!got) return;
@@ -1692,6 +1692,19 @@ TEST_CASE("fused prefill attention matches an explicit causal softmax(qKt)V") {
     }));
   }
 
+  // the device kernel against the ref oracle at both head widths, with rows
+  // off every query tile (70) and a single row
+  for (int64_t d : {64, 128}) {
+    for (int64_t t : {70, 1}) {
+      const float sc = 1.0f / std::sqrt((float)d);
+      CHECK(matches_gpu_oracle([&] {
+        return tl::array::attn_prefill(random_array({3, t, d}, 820),
+                                       random_array({3, t, d}, 821),
+                                       random_array({3, t, d}, 822), sc);
+      }));
+    }
+  }
+
   // shape validation: q, K, V must all be [H,T,D] and agree
   CHECK_THROWS(tl::array::attn_prefill(q.reshape({H * T, D}), K, V, scale));
   CHECK_THROWS(tl::array::attn_prefill(q, K, V.reshape({H, D, T}), scale));
@@ -1736,11 +1749,11 @@ static void check_attn_bwd_dq(bool on_gpu, int64_t D = 64) {
 
   auto out = tl::array::attn_prefill(q, K, V, scale);
   auto got = tl::array::attn_prefill_bwd_dq(q, K, V, dO, out, scale);
-  // The own CPU always takes it. On a device the kernels are CUDA's, so a CUDA
-  // build must take them — while a device of another kind declines and its
-  // caller composes the unfused form, which the gradient tests above cover.
+  // The own CPU always takes it, and so do the CUDA and Metal kernels — while
+  // WebGPU declines and its caller composes the unfused form, which the
+  // gradient tests above cover.
   if (!on_gpu) REQUIRE(got.has_value());
-#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
+#if !defined(TENSORLIB_WEBGPU)
   REQUIRE(got.has_value());
 #endif
   if (!got) {
@@ -1799,7 +1812,10 @@ TEST_CASE("the fused pullback's dq and logsumexp match explicit softmax math") {
   auto prev = tl::device_;
   check_attn_bwd_dq(false);
   check_attn_bwd_dq(false, 48);  // the own CPU takes any head width
-  if (tl::gpu_available()) check_attn_bwd_dq(true);
+  if (tl::gpu_available()) {
+    check_attn_bwd_dq(true);
+    check_attn_bwd_dq(true, 128);
+  }
   tl::device_ = prev;
 }
 
@@ -1818,8 +1834,8 @@ static void check_attn_bwd_dkv(bool on_gpu, int64_t D = 64) {
                                                    scale)
                  : std::nullopt;
   if (!on_gpu) REQUIRE(got.has_value());
-#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
-  REQUIRE(got.has_value());  // as above: the kernels are CUDA's
+#if !defined(TENSORLIB_WEBGPU)
+  REQUIRE(got.has_value());  // as above
 #endif
   if (!got) {
     MESSAGE("no fused attention pullback on this backend — skipping");
@@ -1883,7 +1899,10 @@ TEST_CASE("the fused pullback's dK and dV match explicit softmax math") {
   auto prev = tl::device_;
   check_attn_bwd_dkv(false);
   check_attn_bwd_dkv(false, 48);
-  if (tl::gpu_available()) check_attn_bwd_dkv(true);
+  if (tl::gpu_available()) {
+    check_attn_bwd_dkv(true);
+    check_attn_bwd_dkv(true, 128);
+  }
   tl::device_ = prev;
 }
 
