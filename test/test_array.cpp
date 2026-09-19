@@ -1546,6 +1546,11 @@ TEST_CASE("bf16 storage: round-trip, widen fallback, dot fast path") {
   for (int64_t i = 0; i < 3; i++)
     for (int64_t j = 0; j < 2; j++) CHECK(back.at({i, j}) == w.at({i, j}));
 
+  // views stay legal (unlike q4): to_f32() walks their offset and strides
+  CHECK(tl::array_equal(wb.slice(1, 2).to_f32(), back.slice(1, 2)));
+  CHECK(tl::array_equal(wb.slice(1, 1, 1).to_f32(), back.slice(1, 1, 1)));
+  CHECK(tl::array_equal(wb.transpose().to_f32(), back.transpose()));
+
   // rounding: values needing more than 8 mantissa bits round to nearest-even
   auto x = array::from({1.00390625f});  // 1 + 2^-8: exactly between bf16 steps
   float rt = x.to_bf16().to_f32().at({0});
@@ -1929,6 +1934,17 @@ TEST_CASE("q4 weight storage: decode dot + widen fallback vs dequant oracle") {
     CHECK(std::string(e.what()).find("q4") != std::string::npos);
     CHECK(std::string(e.what()).find("bf16") == std::string::npos);
   }
+
+  // views of q4 throw instead of silently reading the packed buffer from its
+  // start with the view's shape (the layout has no per-element strides)
+  CHECK_THROWS_AS(wq.slice(0, 32, 32), std::logic_error);
+  CHECK_THROWS_AS(wq.transpose(), std::logic_error);
+  CHECK_THROWS_AS(wq.reshape({N, K}), std::logic_error);
+
+  // clone byte-copies the packed buffer (q4_bytes, not size()*4)
+  auto wqc = wq.clone();
+  CHECK(wqc.dt() == tl::dtype::q4);
+  CHECK(tl::array_equal(wqc.to_f32(), deq));
 
   // non-decode shape (M=2) widens q4 -> f32; matches the same dequant oracle
   auto a2v = std::vector<float>(2 * K);

@@ -703,6 +703,11 @@ bool allclose(const array& a, const array& b, float rtol = 1e-5f,
 
 inline array make_view_(const array& base, shape_t shape,
                         std::vector<int64_t> strides, int64_t offset) {
+  // Packed q4 has no per-element strides; its consumers assume to_q4()'s layout.
+  if (base.storage_.dt == tl::dtype::q4)
+    throw std::logic_error(
+        "tl::view: q4 arrays can't be viewed; view the f32 weights before "
+        "to_q4(), or to_f32() first");
   array v;
   v.shape_ = std::move(shape);
   v.strides_ = std::move(strides);
@@ -1013,18 +1018,22 @@ inline array array::clone() const {
   }
   ensure_();
   if (storage_.dt != tl::dtype::f32) {
-    // bf16 arrays are contiguous weight leaves (to_bf16 output); byte-copy.
-    if (!contiguous() || offset_ != 0) {
+    // bf16/q4 arrays are weight leaves (to_bf16/to_q4 output); byte-copy.
+    // q4 can't be a view (make_view_ refuses it) and its bytes are packed.
+    const bool q4 = storage_.dt == tl::dtype::q4;
+    if (!q4 && (!contiguous() || offset_ != 0)) {
       throw std::logic_error("tl::clone: non-contiguous bf16 view");
     }
+    const int64_t bytes = q4 ? tl::q4_bytes(shape_[1], shape_[0])
+                             : size() * dtype_size(storage_.dt);
     array out;
     out.shape_ = shape_;
     out.strides_ = strides_;
-    out.storage_ = storage::make(size(), storage_.dt);
+    out.storage_ = q4 ? storage::make_bytes_(size(), bytes, storage_.dt)
+                      : storage::make(size(), storage_.dt);
     detail::barrier_();
     detail::host_sync_(storage_.native, /*for_write=*/false);
-    std::memcpy(out.storage_.data(), storage_.data(),
-                static_cast<size_t>(size()) * dtype_size(storage_.dt));
+    std::memcpy(out.storage_.data(), storage_.data(), static_cast<size_t>(bytes));
     return out;
   }
   // Own CPU: any layout copied a run at a time across the pool (a permuted or
@@ -3199,9 +3208,8 @@ struct graph {
     if (Wq.storage_.dt != tl::dtype::q4 || Wq.rank() != 2) return std::nullopt;
     int64_t K = Wq.shape()[0], N = Wq.shape()[1];  // logical [K,N]
     auto a = gemv_act_(a_in, K, N);
-    // No contiguity test on Wq: q4 bytes aren't elems×width, so its strides are
-    // nominal — the zero offset is what says the packed buffer starts at base.
-    if (!a || Wq.offset_ != 0 || !Wq.storage_.native) return std::nullopt;
+    // No layout checks on Wq: make_view_ refuses q4, so it is always to_q4()'s leaf.
+    if (!a || !Wq.storage_.native) return std::nullopt;
     array out = array::empty({int64_t{1}, N});
     if (!out.storage_.native) return std::nullopt;
     if (N == 0) return out.reshape(n.shape);
