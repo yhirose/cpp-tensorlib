@@ -1373,8 +1373,7 @@ TEST_CASE("layer_norm matches its composition, across the pool and on the GPU") 
   CHECK_THROWS(array::layer_norm(x2, g33, random_array({2, 33}, 1118)));
 }
 
-TEST_CASE("layer_norm_bwd matches the composed pullback on the GPU") {
-  if (!tl::gpu_available()) return;
+TEST_CASE("layer_norm_bwd matches the composed pullback on the GPU and the own CPU") {
   // The closed form the fused kernels replace, spelled with the unfused ops
   // on the CPU: dx = s·(ĝ − mean ĝ − x̂·mean(ĝ⊙x̂)), dγ = Σ dy⊙x̂, dβ = Σ dy.
   auto composed = [](const array& x, const array& g, const array& dy) {
@@ -1392,12 +1391,14 @@ TEST_CASE("layer_norm_bwd matches the composed pullback on the GPU") {
     return std::array<array, 3>{dx.eval(), dg.eval(), db.eval()};
   };
   auto prev = tl::device_;
+  bool on_gpu = false;
   auto check = [&](const array& x, const array& g, const array& dy) {
-    tl::use_gpu();
+    if (on_gpu) tl::use_gpu();
     auto got = tl::array::layer_norm_bwd(x, g, dy);
     tl::use_cpu();
-    // The kernels are CUDA's; another device declines and its caller
-    // composes the form above.
+    // The own CPU takes every contiguous input. On a device the kernels are
+    // CUDA's; another device declines and its caller composes the form above.
+    if (!on_gpu) REQUIRE(got.has_value());
 #if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
     REQUIRE(got.has_value());
 #endif
@@ -1411,18 +1412,22 @@ TEST_CASE("layer_norm_bwd matches the composed pullback on the GPU") {
   // A short input (one row chunk, a partial column strip), a rank-3 one with
   // gamma as [1, d], a row wider than the 256-thread block, 200 rows in 64-row
   // chunks with a partial last (64·3 + 8), and 4200 rows where the chunks
-  // grow past 64 rows to stay at 64 of them (66 each, the last 42).
-  check(random_array({7, 33}, 1201), random_array({33}, 1202),
-        random_array({7, 33}, 1203));
-  check(random_array({4, 6, 40}, 1204), random_array({1, 40}, 1205),
-        random_array({4, 6, 40}, 1206));
-  check(random_array({3, 700}, 1207), random_array({700}, 1208),
-        random_array({3, 700}, 1209));
-  check(random_array({200, 300}, 1210), random_array({300}, 1211),
-        random_array({200, 300}, 1212));
-  check(random_array({4200, 40}, 1219), random_array({40}, 1220),
-        random_array({4200, 40}, 1221));
-  tl::use_gpu();
+  // grow past 64 rows to stay at 64 of them (66 each, the last 42) — the own
+  // CPU chunks its column sums the same way.
+  for (bool gpu : {false, true}) {
+    if (gpu && !tl::gpu_available()) continue;
+    on_gpu = gpu;
+    check(random_array({7, 33}, 1201), random_array({33}, 1202),
+          random_array({7, 33}, 1203));
+    check(random_array({4, 6, 40}, 1204), random_array({1, 40}, 1205),
+          random_array({4, 6, 40}, 1206));
+    check(random_array({3, 700}, 1207), random_array({700}, 1208),
+          random_array({3, 700}, 1209));
+    check(random_array({200, 300}, 1210), random_array({300}, 1211),
+          random_array({200, 300}, 1212));
+    check(random_array({4200, 40}, 1219), random_array({40}, 1220),
+          random_array({4200, 40}, 1221));
+  }
   auto x = random_array({7, 33}, 1213), dy = random_array({7, 33}, 1214);
   CHECK_THROWS(tl::array::layer_norm_bwd(x, random_array({32}, 1215), dy));
   CHECK_THROWS(tl::array::layer_norm_bwd(x, random_array({2, 33}, 1216), dy));
@@ -1668,29 +1673,30 @@ TEST_CASE("fused prefill attention matches an explicit causal softmax(qKt)V") {
   CHECK_THROWS(tl::array::attn_prefill(q, K, V.reshape({H, D, T}), scale));
 }
 
-TEST_CASE("the fused pullback's dq and logsumexp match explicit softmax math") {
-  if (!tl::gpu_available()) return;
-  auto prev = tl::device_;
-  tl::use_gpu();
+// The attention pullback's query half checked on one device: the own CPU
+// (on_gpu false) or the GPU.
+static void check_attn_bwd_dq(bool on_gpu, int64_t D = 64) {
+  if (on_gpu) tl::use_gpu(); else tl::use_cpu();
 
-  // T sits off the 32-query tile, so the last block carries rows past the end
-  // and the first tile it walks is a partial one.
-  const int64_t H = 3, T = 70, D = 64;
+  // T sits off the 32-query tile (and the own CPU's 64-row one), so the last
+  // block carries rows past the end and the first tile it walks is a partial
+  // one.
+  const int64_t H = 3, T = 70;
   auto q = random_array({H, T, D}, 900), K = random_array({H, T, D}, 901),
        V = random_array({H, T, D}, 902), dO = random_array({H, T, D}, 903);
   const float scale = 1.0f / std::sqrt((float)D);
 
   auto out = tl::array::attn_prefill(q, K, V, scale);
   auto got = tl::array::attn_prefill_bwd_dq(q, K, V, dO, out, scale);
-  // The pullback's kernels are CUDA's, so a CUDA build must take them — while
-  // a device of another kind declines and its caller composes the unfused
-  // form, which is what the gradient tests above already cover.
+  // The own CPU always takes it. On a device the kernels are CUDA's, so a CUDA
+  // build must take them — while a device of another kind declines and its
+  // caller composes the unfused form, which the gradient tests above cover.
+  if (!on_gpu) REQUIRE(got.has_value());
 #if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
   REQUIRE(got.has_value());
 #endif
   if (!got) {
     MESSAGE("no fused attention pullback on this backend — skipping");
-    tl::device_ = prev;
     return;
   }
   const array& dq = got->first;
@@ -1727,7 +1733,7 @@ TEST_CASE("the fused pullback's dq and logsumexp match explicit softmax math") {
       CHECK(stats.at({0, h, t}) ==
             doctest::Approx(mx + std::log(sum)).epsilon(1e-4));
       CHECK(stats.at({1, h, t}) == doctest::Approx(delta).epsilon(1e-3));
-      for (int64_t d : {0, 31, 63}) {
+      for (int64_t d : {int64_t{0}, D / 2, D - 1}) {
         float e = 0;
         for (int64_t j = 0; j <= t; j++)
           e += p[j] * (dp[j] - delta) * K.at({h, j, d});
@@ -1739,16 +1745,21 @@ TEST_CASE("the fused pullback's dq and logsumexp match explicit softmax math") {
   // Same shape rule as the forward, extended to the two gradients.
   CHECK_THROWS(tl::array::attn_prefill_bwd_dq(q, K, V, dO.reshape({H, D, T}),
                                               out, scale));
+}
 
+TEST_CASE("the fused pullback's dq and logsumexp match explicit softmax math") {
+  auto prev = tl::device_;
+  check_attn_bwd_dq(false);
+  check_attn_bwd_dq(false, 48);  // the own CPU takes any head width
+  if (tl::gpu_available()) check_attn_bwd_dq(true);
   tl::device_ = prev;
 }
 
-TEST_CASE("the fused pullback's dK and dV match explicit softmax math") {
-  if (!tl::gpu_available()) return;
-  auto prev = tl::device_;
-  tl::use_gpu();
+// The key/value half, on one device as check_attn_bwd_dq.
+static void check_attn_bwd_dkv(bool on_gpu, int64_t D = 64) {
+  if (on_gpu) tl::use_gpu(); else tl::use_cpu();
 
-  const int64_t H = 3, T = 70, D = 64;
+  const int64_t H = 3, T = 70;
   auto q = random_array({H, T, D}, 900), K = random_array({H, T, D}, 901),
        V = random_array({H, T, D}, 902), dO = random_array({H, T, D}, 903);
   const float scale = 1.0f / std::sqrt((float)D);
@@ -1758,12 +1769,12 @@ TEST_CASE("the fused pullback's dK and dV match explicit softmax math") {
   auto got = dqs ? tl::array::attn_prefill_bwd_dkv(q, K, V, dO, dqs->second,
                                                    scale)
                  : std::nullopt;
+  if (!on_gpu) REQUIRE(got.has_value());
 #if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
   REQUIRE(got.has_value());  // as above: the kernels are CUDA's
 #endif
   if (!got) {
     MESSAGE("no fused attention pullback on this backend — skipping");
-    tl::device_ = prev;
     return;
   }
   const array& dK = got->first;
@@ -1800,10 +1811,10 @@ TEST_CASE("the fused pullback's dK and dV match explicit softmax math") {
         delta[i] += pr[j] * gd;
       }
     }
-    // The first key (every query sees it), one off the 32-key tile, and the
-    // last (one query sees it).
-    for (int64_t j : {0, 37, 69}) {
-      for (int64_t d : {0, 31, 63}) {
+    // The first key (every query sees it), one off the 32-key tile, one past
+    // the own CPU's 64-key tile, and the last (one query sees it).
+    for (int64_t j : {0, 37, 64, 69}) {
+      for (int64_t d : {int64_t{0}, D / 2, D - 1}) {
         float ev = 0, ek = 0;
         for (int64_t i = j; i < T; i++) {
           const float p = P[(size_t)i * T + j];
@@ -1818,7 +1829,13 @@ TEST_CASE("the fused pullback's dK and dV match explicit softmax math") {
 
   // stats is [2,H,T], not the forward's output.
   CHECK_THROWS(tl::array::attn_prefill_bwd_dkv(q, K, V, dO, out, scale));
+}
 
+TEST_CASE("the fused pullback's dK and dV match explicit softmax math") {
+  auto prev = tl::device_;
+  check_attn_bwd_dkv(false);
+  check_attn_bwd_dkv(false, 48);
+  if (tl::gpu_available()) check_attn_bwd_dkv(true);
   tl::device_ = prev;
 }
 
@@ -2428,26 +2445,23 @@ TEST_CASE("logsumexp: GPU dispatch matches the ref oracle") {
   }));
 }
 
-TEST_CASE("xent_bwd: the fused pullback matches (softmax - onehot) * g") {
-  // A CUDA build with no driver (the CI's fallback job) has the kernel
-  // compiled in but no device to run it on, so the REQUIRE below has to sit
-  // behind this, not just behind the build's own #if.
-  if (!tl::gpu_available()) return;
-  auto prev = tl::device_;
-  tl::use_gpu();
+// xent_bwd on one device: the own CPU (on_gpu false) or the GPU.
+static void check_xent_bwd(bool on_gpu) {
+  if (on_gpu) tl::use_gpu(); else tl::use_cpu();
   const int64_t N = 8, C = 32;
   auto logits = random_array({N, C}, 46);
   auto targets = array::from({0, 5, 31, 12, 7, 7, 1, 30}, {N});
   auto g = random_array({N}, 47);
   auto got = tl::array::xent_bwd(logits, logits.logsumexp(1), targets, g);
-  // The kernel is CUDA's, so a CUDA build must take it; another device
-  // declines and its caller composes the form checked against right here.
+  // The own CPU always takes it. On a device the kernel is CUDA's, so a CUDA
+  // build must take it; another device declines and its caller composes the
+  // form checked against right here.
+  if (!on_gpu) REQUIRE(got.has_value());
 #if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
   REQUIRE(got.has_value());
 #endif
   if (!got) {
     MESSAGE("no fused cross-entropy pullback on this backend — skipping");
-    tl::device_ = prev;
     return;
   }
   CHECK(got->shape() == tl::shape_t{N, C});
@@ -2460,6 +2474,15 @@ TEST_CASE("xent_bwd: the fused pullback matches (softmax - onehot) * g") {
             doctest::Approx(want.at({i, j})).epsilon(1e-4));
     }
   }
+}
+
+TEST_CASE("xent_bwd: the fused pullback matches (softmax - onehot) * g") {
+  // A CUDA build with no driver (the CI's fallback job) has the kernel
+  // compiled in but no device to run it on, so the device pass sits behind
+  // this, not just behind the build's own #if.
+  auto prev = tl::device_;
+  check_xent_bwd(false);
+  if (tl::gpu_available()) check_xent_bwd(true);
   tl::device_ = prev;
 }
 
@@ -2696,7 +2719,7 @@ TEST_CASE("profile: scopes nest into paths and launches land under them") {
 }
 
 // An eager op names itself only past its operand checks: one that declines
-// there (CPU mode, or a strided operand on a device) leaves no row.
+// there (a strided operand, or the oracle with the own CPU off) leaves no row.
 TEST_CASE("profile: an eager op that declines on its operands leaves no row") {
   auto x = random_array({8, 32}, 1510), g = random_array({32}, 1511),
        dy = random_array({8, 32}, 1512);
@@ -2704,7 +2727,10 @@ TEST_CASE("profile: an eager op that declines on its operands leaves no row") {
   auto prev = tl::device_;
   tl::use_cpu();
   tl::profile::start();
+  CHECK(!tl::array::layer_norm_bwd(strided, g, dy));
+  tl::cpu::enabled_ = false;
   CHECK(!tl::array::layer_norm_bwd(x, g, dy));
+  tl::cpu::enabled_ = true;
   if (tl::gpu_available()) {
     tl::use_gpu();
     CHECK(!tl::array::layer_norm_bwd(strided, g, dy));

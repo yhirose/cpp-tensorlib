@@ -483,9 +483,11 @@ class array {
   // can derive neither and reads them instead.
   //
   // Eager, not graph nodes: they run inside a backward pass, and a node per
-  // gradient would rebuild the scores once each. nullopt when no GPU kernel
-  // takes the shape (head width off {64,128}, an operand not device-resident,
-  // CPU mode) — the caller then composes the unfused pullback.
+  // gradient would rebuild the scores once each. The own CPU runs both halves
+  // as tiled gemms; nullopt when neither takes it (in GPU mode a head width
+  // off {64,128} or an operand not device-resident, a non-contiguous operand,
+  // the oracle with cpu::enabled_ off) — the caller then composes the unfused
+  // pullback.
   //
   // dq takes q, K, V, the gradient `dout` of the forward's output and that
   // output `out` (all [H,T,D]) and returns {dq, stats}; dkv takes those stats
@@ -500,9 +502,10 @@ class array {
   // Softmax cross-entropy's pullback, given the forward's row logsumexp:
   // out[i,j] = g[i] · (exp(logits[i,j] - lse[i]) - [j == targets[i]]) in one
   // pass. logits and the result are [N, C]; lse, targets and g are [N].
-  // Eager for the same reason the attention pullback is, and nullopt when no
-  // kernel takes it — the caller then composes (softmax - onehot) · g, which
-  // walks that matrix four more times.
+  // Eager for the same reason the attention pullback is: the device kernel,
+  // or rows across the own CPU's pool, and nullopt when neither takes it —
+  // the caller then composes (softmax - onehot) · g, which walks that matrix
+  // four more times.
   static std::optional<array> xent_bwd(const array& logits, const array& lse,
                                        const array& targets, const array& g);
 
@@ -530,9 +533,10 @@ class array {
                           float eps = 1e-5f);
   // Its pullback, fused: given the forward's x and gamma and the gradient
   // `dout` of its output, {dx, dgamma, dbeta} — dgamma and dbeta as [d].
-  // Eager and GPU-only, like the attention halves below: nullopt when no
-  // kernel takes it (CPU mode, an operand not device-resident or not
-  // contiguous), and the caller composes the unfused form.
+  // Eager, like the attention halves below: the device kernels, or chunks of
+  // rows across the own CPU's pool; nullopt when neither takes it (an operand
+  // not device-resident in GPU mode or not contiguous, the oracle), and the
+  // caller composes the unfused form.
   static std::optional<std::array<array, 3>> layer_norm_bwd(
       const array& x, const array& gamma, const array& dout,
       float eps = 1e-5f);
@@ -3305,8 +3309,9 @@ struct graph {
   // launches under it means the caller composed the unfused form.
 
   // Cross-entropy's pullback from the forward's row logsumexp (see
-  // array::xent_bwd). Eager and GPU-only, the same bargain the attention
-  // halves below make: one pass here, or the caller's composition.
+  // array::xent_bwd). Eager, the same bargain the attention halves below
+  // make: one pass here, or the caller's composition. The device kernel in
+  // GPU mode; on the own CPU, rows across the pool with the vector exp.
   static std::optional<array> xent_bwd(const array& x, const array& lse,
                                        const array& tgt, const array& g) {
     const auto& s = x.shape();
@@ -3324,7 +3329,8 @@ struct graph {
           ", targets " + shape_str(tgt.shape()) + ", g " +
           shape_str(g.shape()));
     }
-    if (!gpu_mode_(rows * cols, kernel_class::elementwise)) return std::nullopt;
+    const bool gpu = gpu_mode_(rows * cols, kernel_class::elementwise);
+    if (!gpu && !cpu::enabled_) return std::nullopt;  // the oracle composes
     x.realize();
     lse.realize();
     tgt.realize();
@@ -3333,6 +3339,7 @@ struct graph {
         !g.contiguous()) {
       return std::nullopt;
     }
+    if (!gpu) return cpu_xent_bwd_(x, lse, tgt, g);
     if (!x.storage_.native || !lse.storage_.native || !tgt.storage_.native ||
         !g.storage_.native) {
       return std::nullopt;
@@ -3349,6 +3356,31 @@ struct graph {
     return out;
   }
 
+  // xent_bwd on the own CPU, the kernel's arithmetic: p = exp(x - lse), minus
+  // 1 at the target, times g.
+  static array cpu_xent_bwd_(const array& x, const array& lse, const array& tgt,
+                             const array& g) {
+    profile::scope ps("xent_bwd");
+    const int64_t rows = x.shape()[0], cols = x.shape()[1];
+    auto out = array::empty(x.shape());
+    const float *px = x.raw(), *pl = lse.raw(), *pt = tgt.raw(), *pg = g.raw();
+    float* po = out.data();
+    cpu::thread_pool::instance().parallel_for(
+        rows,
+        [&](int64_t r0, int64_t r1) {
+          for (int64_t r = r0; r < r1; r++) {
+            float* dst = po + r * cols;
+            cpu::exp_shifted(dst, px + r * cols, 1, cols, pl[r]);
+            int64_t k = static_cast<int64_t>(std::llround(pt[r]));
+            if (k >= 0 && k < cols) dst[k] -= 1.0f;
+            const float gr = pg[r];
+            for (int64_t c = 0; c < cols; c++) dst[c] *= gr;
+          }
+        },
+        own_threads_(x.size() * 128));
+    return out;
+  }
+
   // Layer norm's fused pullback (see array::layer_norm_bwd): graph::layer_norm's
   // shape rules, with dout on x's shape.
   static std::optional<std::array<array, 3>> layer_norm_bwd(
@@ -3362,13 +3394,15 @@ struct graph {
           shape_str(gamma.shape()) + ", dout " + shape_str(dout.shape()));
     }
     int64_t rows = x.size() / d;
-    if (!gpu_mode_(x.size(), kernel_class::reduction)) return std::nullopt;
+    const bool gpu = gpu_mode_(x.size(), kernel_class::reduction);
+    if (!gpu && !cpu::enabled_) return std::nullopt;  // the oracle composes
     x.realize();
     gamma.realize();
     dout.realize();
     if (!x.contiguous() || !gamma.contiguous() || !dout.contiguous()) {
       return std::nullopt;
     }
+    if (!gpu) return cpu_layer_norm_bwd_(x, gamma, dout, eps);
     if (!x.storage_.native || !gamma.storage_.native ||
         !dout.storage_.native) {
       return std::nullopt;
@@ -3394,6 +3428,73 @@ struct graph {
       return std::nullopt;
     }
     return std::array<array, 3>{dx, dg, db};
+  }
+
+  // layer_norm_bwd on the own CPU, the kernels' arithmetic: each row's mean
+  // and rstd recomputed as ref::layer_norm folds them, dx = rstd · (ĝ −
+  // mean(ĝ) − x̂ · mean(ĝ ⊙ x̂)) with ĝ = dout ⊙ γ. dγ and dβ sum over rows in
+  // fixed chunks folded in chunk order, so the pool's split does not move a
+  // bit. Chunks across the pool.
+  static std::array<array, 3> cpu_layer_norm_bwd_(const array& x,
+                                                  const array& gamma,
+                                                  const array& dout, float eps) {
+    profile::scope ps("layer_norm_bwd");
+    const int64_t d = x.shape().back(), rows = x.size() / d;
+    const int64_t per_chunk = std::max<int64_t>(64, (rows + 63) / 64);
+    const int64_t chunks = (rows + per_chunk - 1) / per_chunk;
+    array dx = array::empty(x.shape()), dg = array::empty({d}),
+          db = array::empty({d});
+    std::vector<float> partials(static_cast<size_t>(2 * chunks * d), 0.0f);
+    const float *px = x.raw(), *pgam = gamma.raw(), *pdy = dout.raw();
+    float* pdx = dx.data();
+    const float inv_d = 1.0f / static_cast<float>(d);
+    auto add = [](float& a, float v) { a += v; };
+    cpu::thread_pool::instance().parallel_for(
+        chunks,
+        [&](int64_t c0, int64_t c1) {
+          static thread_local std::vector<float> xh, gh, tmp;
+          xh.resize(d);
+          gh.resize(d);
+          tmp.resize(d);
+          for (int64_t c = c0; c < c1; c++) {
+            float* sg = partials.data() + c * 2 * d;  // Σ dy ⊙ x̂, then Σ dy
+            float* sb = sg + d;
+            for (int64_t r = c * per_chunk; r < std::min(rows, (c + 1) * per_chunk); r++) {
+              const float* src = px + r * d;
+              const float* dy = pdy + r * d;
+              float mu = detail::fold_lanes(src, 1, d, 0.0f, add) * inv_d;
+              for (int64_t j = 0; j < d; j++) {
+                float v = src[j] - mu;
+                tmp[j] = v * v;
+              }
+              float var = detail::fold_lanes(tmp.data(), 1, d, 0.0f, add) * inv_d;
+              float rstd = 1.0f / std::sqrt(var + eps);
+              for (int64_t j = 0; j < d; j++) {
+                xh[j] = (src[j] - mu) * rstd;
+                gh[j] = dy[j] * pgam[j];
+                tmp[j] = gh[j] * xh[j];
+                sg[j] += dy[j] * xh[j];
+                sb[j] += dy[j];
+              }
+              float mg = detail::fold_lanes(gh.data(), 1, d, 0.0f, add) * inv_d;
+              float mgx = detail::fold_lanes(tmp.data(), 1, d, 0.0f, add) * inv_d;
+              float* out = pdx + r * d;
+              for (int64_t j = 0; j < d; j++)
+                out[j] = rstd * (gh[j] - mg - xh[j] * mgx);
+            }
+          }
+        },
+        own_threads_(x.size() * 4 * kStreamMacs));
+    float *pdg = dg.data(), *pdb = db.data();
+    for (int64_t j = 0; j < d; j++) pdg[j] = pdb[j] = 0.0f;
+    for (int64_t c = 0; c < chunks; c++) {
+      const float* sg = partials.data() + c * 2 * d;
+      for (int64_t j = 0; j < d; j++) {
+        pdg[j] += sg[j];
+        pdb[j] += sg[d + j];
+      }
+    }
+    return {dx, dg, db};
   }
 
   // Adam's fused update (see array::adam_step). Eager, and in place on p, m
@@ -3459,9 +3560,9 @@ struct graph {
   }
 
   // The query half of the fused pullback (see array::attn_prefill_bwd_dq).
-  // Eager and GPU-only: the kernel writes dq and L, or this declines and the
-  // caller composes the unfused form. The shape rules are the forward's, plus
-  // dout and out on the same [H,T,D].
+  // Eager: the kernel (or the own CPU's tiles) writes dq and the stats, or this
+  // declines and the caller composes the unfused form. The shape rules are the
+  // forward's, plus dout and out on the same [H,T,D].
   static std::optional<std::pair<array, array>> attn_prefill_bwd_dq(
       const array& q, const array& K, const array& V, const array& dout,
       const array& out, float scale) {
@@ -3475,12 +3576,20 @@ struct graph {
           ", out " + shape_str(out.shape()));
     }
     int64_t H = s[0], T = s[1], D = s[2];
-    if (!gpu_mode_(H * T * T * D, kernel_class::matmul)) return std::nullopt;
+    const bool gpu = gpu_mode_(H * T * T * D, kernel_class::matmul);
+    if (!gpu && !cpu::enabled_) return std::nullopt;  // the oracle composes
     q.realize();
     K.realize();
     V.realize();
     dout.realize();
     out.realize();
+    if (!gpu) {
+      if (H * T * D == 0 || !q.contiguous() || !K.contiguous() ||
+          !V.contiguous() || !dout.contiguous() || !out.contiguous()) {
+        return std::nullopt;
+      }
+      return cpu_attn_bwd_dq_(q, K, V, dout, out, scale);
+    }
     if (!attn_operands_ready_(q, K, V) ||
         !attn_operands_ready_(dout, out, out)) {
       return std::nullopt;
@@ -3513,12 +3622,20 @@ struct graph {
           shape_str(dout.shape()) + ", stats " + shape_str(stats.shape()));
     }
     int64_t H = s[0], T = s[1], D = s[2];
-    if (!gpu_mode_(H * T * T * D, kernel_class::matmul)) return std::nullopt;
+    const bool gpu = gpu_mode_(H * T * T * D, kernel_class::matmul);
+    if (!gpu && !cpu::enabled_) return std::nullopt;  // the oracle composes
     q.realize();
     K.realize();
     V.realize();
     dout.realize();
     stats.realize();
+    if (!gpu) {
+      if (H * T * D == 0 || !q.contiguous() || !K.contiguous() ||
+          !V.contiguous() || !dout.contiguous() || !stats.contiguous()) {
+        return std::nullopt;
+      }
+      return cpu_attn_bwd_dkv_(q, K, V, dout, stats, scale);
+    }
     if (!attn_operands_ready_(q, K, V) ||
         !attn_operands_ready_(dout, stats, stats)) {
       return std::nullopt;
@@ -3592,6 +3709,118 @@ struct graph {
         },
         max_threads);
     return out;
+  }
+
+  // The fused pullback's query half on the own CPU, tiled like the forward
+  // (head × BQ query rows, alternating ends, gemms inline on the worker). A
+  // tile rebuilds S = scale · Q Kᵀ over keys [0, t1), its causal softmax P and
+  // each row's logsumexp L, then dP = dO Vᵀ, dS = P ⊙ (dP − Δ) with Δ = dO·O,
+  // and dq = scale · dS K. stats [2,H,T] carries L and Δ to the key half, as
+  // the CUDA kernels' does.
+  static std::pair<array, array> cpu_attn_bwd_dq_(const array& q, const array& K,
+                                                  const array& V, const array& dout,
+                                                  const array& out, float scale) {
+    profile::scope ps("attn_prefill_bwd_dq");
+    const int64_t H = q.shape()[0], T = q.shape()[1], D = q.shape()[2];
+    array dq = array::empty(q.shape()), stats = array::empty({2, H, T});
+    const float *pq = q.raw(), *pk = K.raw(), *pv = V.raw(), *pdo = dout.raw(),
+                *po = out.raw();
+    float *pdq = dq.data(), *pst = stats.data();
+    constexpr int64_t BQ = 64;
+    const int64_t ntiles = (T + BQ - 1) / BQ, items = H * ntiles;
+    cpu::thread_pool::instance().parallel_for(
+        items,
+        [&](int64_t i0, int64_t i1) {
+          static thread_local std::vector<float> s, dp;
+          if (s.size() < static_cast<size_t>(BQ * T)) s.resize(BQ * T);
+          if (dp.size() < static_cast<size_t>(BQ * T)) dp.resize(BQ * T);
+          for (int64_t i = i0; i < i1; i++) {
+            const int64_t slot = i / H, h = i % H;
+            const int64_t tile = slot % 2 == 0 ? slot / 2 : ntiles - 1 - slot / 2;
+            const int64_t t0 = tile * BQ, t1 = std::min(T, t0 + BQ), rows = t1 - t0;
+            const float* qh = pq + (h * T + t0) * D;
+            const float* doh = pdo + (h * T + t0) * D;
+            const float* Kh = pk + h * T * D;
+            const float* Vh = pv + h * T * D;
+            cpu::sgemm_(qh, D, 1, Kh, 1, D, s.data(), rows, t1, D, scale, 1);
+            cpu::sgemm_(doh, D, 1, Vh, 1, D, dp.data(), rows, t1, D, 1.0f, 1);
+            for (int64_t r = 0; r < rows; r++) {
+              const int64_t t = t0 + r;
+              float* srow = s.data() + r * t1;
+              float* drow = dp.data() + r * t1;
+              float mx = detail::fold_lanes(srow, 1, t + 1, srow[0],
+                                            [](float& a, float v) { a = std::max(a, v); });
+              float sum = cpu::exp_shifted(srow, srow, 1, t + 1, mx);
+              float inv = 1.0f / sum;
+              const float* orow = po + (h * T + t) * D;
+              const float* dorow = doh + r * D;
+              float delta = 0.0f;
+              for (int64_t e = 0; e < D; e++) delta += dorow[e] * orow[e];
+              for (int64_t j = 0; j <= t; j++) drow[j] = srow[j] * inv * (drow[j] - delta);
+              for (int64_t j = t + 1; j < t1; j++) drow[j] = 0.0f;
+              pst[h * T + t] = mx + std::log(sum);
+              pst[H * T + h * T + t] = delta;
+            }
+            cpu::sgemm_(dp.data(), t1, 1, Kh, D, 1, pdq + (h * T + t0) * D, rows, D,
+                        t1, scale, 1);
+          }
+        },
+        cpu::threads_for_(H * T * T * D));
+    return {dq, stats};
+  }
+
+  // The key half on the own CPU: a tile of BK keys [k0, k1) is attended by
+  // queries [k0, T), so it rebuilds S = scale · Q Kᵀ over those, P = exp(S −
+  // L) under the causal mask from the stats, dS = P ⊙ (dO Vᵀ − Δ), then
+  // dV = Pᵀ dO and dK = scale · dSᵀ Q. Early key tiles see the most queries,
+  // so the items alternate ends as the query half's do.
+  static std::pair<array, array> cpu_attn_bwd_dkv_(const array& q, const array& K,
+                                                   const array& V, const array& dout,
+                                                   const array& stats, float scale) {
+    profile::scope ps("attn_prefill_bwd_dkv");
+    const int64_t H = q.shape()[0], T = q.shape()[1], D = q.shape()[2];
+    array dK = array::empty(q.shape()), dV = array::empty(q.shape());
+    const float *pq = q.raw(), *pk = K.raw(), *pv = V.raw(), *pdo = dout.raw(),
+                *pst = stats.raw();
+    float *pdk = dK.data(), *pdv = dV.data();
+    constexpr int64_t BK = 64;
+    const int64_t ntiles = (T + BK - 1) / BK, items = H * ntiles;
+    cpu::thread_pool::instance().parallel_for(
+        items,
+        [&](int64_t i0, int64_t i1) {
+          static thread_local std::vector<float> s, dp;
+          if (s.size() < static_cast<size_t>(T * BK)) s.resize(T * BK);
+          if (dp.size() < static_cast<size_t>(T * BK)) dp.resize(T * BK);
+          for (int64_t i = i0; i < i1; i++) {
+            const int64_t slot = i / H, h = i % H;
+            const int64_t tile = slot % 2 == 0 ? slot / 2 : ntiles - 1 - slot / 2;
+            const int64_t k0 = tile * BK, k1 = std::min(T, k0 + BK), nk = k1 - k0;
+            const int64_t nq = T - k0;
+            const float* qh = pq + (h * T + k0) * D;   // queries k0..T-1
+            const float* doh = pdo + (h * T + k0) * D;
+            const float* Kt = pk + (h * T + k0) * D;   // this tile's keys
+            const float* Vt = pv + (h * T + k0) * D;
+            const float* L = pst + h * T + k0;
+            const float* delta = pst + H * T + h * T + k0;
+            cpu::sgemm_(qh, D, 1, Kt, 1, D, s.data(), nq, nk, D, scale, 1);
+            cpu::sgemm_(doh, D, 1, Vt, 1, D, dp.data(), nq, nk, D, 1.0f, 1);
+            for (int64_t r = 0; r < nq; r++) {
+              // Query k0 + r sees this tile's keys k0 .. k0 + r.
+              const int64_t len = std::min(nk, r + 1);
+              float* srow = s.data() + r * nk;
+              float* drow = dp.data() + r * nk;
+              cpu::exp_shifted(srow, srow, 1, len, L[r]);
+              for (int64_t j = 0; j < len; j++) drow[j] = srow[j] * (drow[j] - delta[r]);
+              for (int64_t j = len; j < nk; j++) srow[j] = drow[j] = 0.0f;
+            }
+            cpu::sgemm_(s.data(), 1, nk, doh, D, 1, pdv + (h * T + k0) * D, nk, D, nq,
+                        1.0f, 1);
+            cpu::sgemm_(dp.data(), 1, nk, qh, D, 1, pdk + (h * T + k0) * D, nk, D, nq,
+                        scale, 1);
+          }
+        },
+        cpu::threads_for_(H * T * T * D));
+    return {dK, dV};
   }
 
   // CPU reference causal prefill attention (the oracle, and the fallback when
