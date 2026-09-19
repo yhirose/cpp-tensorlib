@@ -100,6 +100,11 @@ struct context {
   // The kernel the encoder currently has bound (set by bind_): what
   // tl::profile names the next dispatch.
   const char* bound = nullptr;
+  // Under a profile each dispatch is its own command buffer, committed
+  // unwaited, so its GPU time can be read back per launch once the batch
+  // flushes; the row is null for a buffer of dispatches made before the
+  // profile started.
+  std::vector<std::pair<objc::id, profile::row*>> timed;
 
   static context& get() {
     static auto* c = new context();  // leaked: outlives all storage deleters
@@ -199,6 +204,7 @@ struct context {
   // pending encoder, opened if there is none.
   void bind_(kop op) {
     objc::id pso = pso_(op);
+    if (cb && profile::active()) commit_(nullptr);  // untimed dispatches
     ensure_encoder_();
     objc::send(enc, "setComputePipelineState:", pso);
     bound = kernel_name_(op);
@@ -235,10 +241,19 @@ struct context {
 
   void ensure_encoder_() {
     if (cb) return;
-    pool = objc_autoreleasePoolPush();
+    if (!pool) pool = objc_autoreleasePoolPush();
     cb = objc::send(queue, "commandBuffer");
     enc = objc::send(cb, "computeCommandEncoder");
     pending = true;
+  }
+
+  // End and commit the open command buffer without waiting, owed `r`'s
+  // device time; the batch stays pending until flush() waits for it.
+  void commit_(profile::row* r) {
+    objc::send(enc, "endEncoding");
+    objc::send(cb, "commit");
+    timed.emplace_back(cb, r);
+    cb = enc = nullptr;
   }
 };
 
@@ -250,20 +265,24 @@ inline bool pending() { return context::get().pending; }
 inline void flush() {
   auto& c = context::get();
   if (!c.pending) return;
-  objc::send(c.enc, "endEncoding");
-  objc::send(c.cb, "commit");
+  if (c.cb) c.commit_(nullptr);
   {
+    // One queue runs its command buffers in commit order: the last one done
+    // is all of them done.
     profile::detail::blocked waiting;
-    objc::send(c.cb, "waitUntilCompleted");
+    objc::send(c.timed.back().first, "waitUntilCompleted");
   }
-  if (profile::active()) {
-    // The GPU time is known per command buffer, not per dispatch.
-    const double s = objc::send<double>(c.cb, "GPUStartTime");
-    const double e = objc::send<double>(c.cb, "GPUEndTime");
-    if (e > s) profile::detail::batch_device((e - s) * 1e6);
+  // A row is owed its time even if the profile stopped before this flush:
+  // the rows live until the next start(), which drains first.
+  for (auto [cb, row] : c.timed) {
+    const double s = objc::send<double>(cb, "GPUStartTime");
+    const double e = objc::send<double>(cb, "GPUEndTime");
+    if (e <= s) continue;
+    profile::detail::batch_device((e - s) * 1e6);
+    if (row) profile::detail::device_time(row, (e - s) * 1e6);
   }
+  c.timed.clear();
   objc_autoreleasePoolPop(c.pool);
-  c.cb = c.enc = nullptr;
   c.pool = nullptr;
   c.pending = false;
 }
@@ -301,8 +320,9 @@ inline void dispatch_grid_(objc::id enc, mtl_size grid, mtl_size tg) {
       enc, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"),
       grid, tg);
   if (profile::active()) {
-    const char* name = context::get().bound;
-    profile::detail::launch(name ? name : "?");
+    auto& c = context::get();
+    c.commit_(profile::detail::launch(c.bound ? c.bound : "?"));
+    profile::detail::drain_hook = &flush;
   }
 }
 

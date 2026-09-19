@@ -10,8 +10,9 @@
 // kernel under it, each phase spent its time in.
 //
 // What a backend can stamp differs: CUDA brackets every launch with events and
-// hands the elapsed time back when it drains; Metal knows the GPU time of each
-// command buffer (one batch, not one launch); WebGPU counts. A row therefore
+// hands the elapsed time back when it drains; Metal, which knows GPU time only
+// per command buffer, commits each launch as its own buffer while a profile
+// runs and reads them back at the flush; WebGPU counts. A row therefore
 // says how many of its launches its device time covers (`device_timed`) — an
 // untimed launch is not a free one, and a zero must not read as fast. An
 // event pair spans from where the stream reached the launch to where the

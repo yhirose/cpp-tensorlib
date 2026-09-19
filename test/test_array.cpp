@@ -2727,9 +2727,8 @@ TEST_CASE("add_ invalidates the device copy the GPU will read next") {
 }
 
 // tl::profile: the evaluator opens a scope per op under the caller's own, and
-// what a backend launches lands under the innermost one. Only the backend
-// actually driving the device stamps a per-launch time, so that part is asked
-// of CUDA alone; every backend counts.
+// what a backend launches lands under the innermost one. CUDA and Metal stamp
+// a per-launch time; every backend counts.
 TEST_CASE("profile: scopes nest into paths and launches land under them") {
   using tl::profile::row;
   auto a = random_array({96, 96}, 1500), b = random_array({96, 96}, 1501);
@@ -2775,7 +2774,7 @@ TEST_CASE("profile: scopes nest into paths and launches land under them") {
     const row* wait = find("phase/mm", row::kind_t::wait);
     REQUIRE(wait);
     CHECK(wait->count >= 1);
-#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
+#if !defined(TENSORLIB_WEBGPU)
     for (const row* r : launches) {
       CHECK(r->device_timed == r->count);
       CHECK(r->device_us > 0);
