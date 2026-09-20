@@ -15,10 +15,9 @@ attn_decode
 attn_prefill
 
 # The model path (gpu.h): what a decoder runs on raw buffers between its
-# GEMVs and attention. CUDA and Metal have all of it but the two CUDA-only
-# weight layouts — the warp-per-row bf16 GEMV and the bf16-weight GEMM the
-# batched prefill is built on (Metal prefills token by token meanwhile) —
-# and WebGPU has none of it yet.
+# GEMVs and attention. CUDA and Metal have all of it, including the two [N,K]
+# weight layouts (the row bf16 GEMV and the GEMM the batched prefill is built
+# on); WebGPU has none of it yet.
 kv_append
 kv_fill
 argmax

@@ -161,6 +161,16 @@ inline void* off_f32(void* p, int64_t nfloats) {
   return static_cast<char*>(p) + nfloats * 4;
 }
 
+// The same slice where a pointer cannot name one: `n` floats from element
+// `from` of `src` into the start of `dst`. An affine unary carries a byte
+// offset on every backend, a pointer only where gpu::caps::flat_addressing
+// says a device pointer is an address. The model fuses its projections
+// either way — what the cap decides is whether reading the fused output back
+// costs a copy.
+inline void copy_out(void* src, int64_t from, void* dst, int64_t n) {
+  gpu::unary(gpu::kop::affine, src, from * 4, dst, 0, n, 1.0f, 0.0f);
+}
+
 // Make a device buffer's bytes readable on the host: drain the queue (on
 // unified memory that is all it takes) and pull the mirror back where there is
 // one. The one place that knows both backends' coherence rules.
@@ -193,9 +203,7 @@ struct Layer {
   array wq, bq, wk, bk, wv, bv, wo, wg, wu, wd, an, fn;
   // Fused decode weights (imperative path only): wqkv = [wq|wk|wv], wgu = [wg|wu]
   // concatenated. One GEMV each instead of 3/2, amortizing the per-launch floor.
-  // The separate wq/.../wu stay resident as the array-path oracle — and are
-  // what the decode GEMVs read where Model::fused_qkv is false, which is why
-  // wqkv is then not loaded at all.
+  // The separate wq/.../wu stay resident as the array-path oracle.
   //
   // Layout depends on the storage dtype (set in build): in bf16 mode these hold
   // ROW-major [N,K] and feed the warp-per-row gemv_bf16_row (lever A, ~1.4-1.9x
@@ -225,9 +233,10 @@ struct Scratch {
   storage res[2];       // residual ping-pong [NE]
   storage hb;           // input-norm out [NE]
   storage h2b;          // post-attn norm out [NE]
-  storage qb;           // [NH*HD] q, when the projection is not fused — and
-                        // bench_qwen_ctx's isolated-attention query fixture
-  storage kb, vb;       // [NKV*HD] k and v, likewise
+  storage qb;           // [NH*HD] query fixture (bench_qwen_ctx's isolated-
+                        // attention timing; decode reads q as a slice of qkvb)
+  storage kb, vb;       // [NKV*HD] k and v copied out of qkvb, where a
+                        // pointer cannot name that slice (see copy_out)
   storage qkvb;         // fused QKV out [(NH+2*NKV)*HD] = [1152]
   storage ab;           // attn out [NH*HD]
   storage mb;           // swiglu out [FF]
@@ -271,10 +280,11 @@ struct PrefillScratch {
   storage h;       // input-norm out [cap, NE]
   storage h2;      // post-attn norm out [cap, NE]
   storage qkv;     // fused QKV out [cap, (NH+2*NKV)*HD]
-  // q|k|v head-major in ONE buffer [NH+2*NKV, cap, HD]: the fused projection
-  // already emits them contiguously per token, so one split_heads pass covers
-  // every head, and k/v are just mid-buffer pointers into it.
-  storage qkvh;
+  // q|k|v head-major. Fused: ONE buffer [NH+2*NKV, cap, HD], one split_heads
+  // pass over every head, k/v mid-buffer pointers into it. Unfused: one
+  // buffer and one pass each, with that head block's own bias (bq/bk/bv
+  // rather than the concatenated bqkv).
+  storage qkvh, qh, kh, vh;
   storage ah;  // attn out head-major [NH, cap, HD]
   storage at;  // attn out token-major [cap, NH*HD]
   storage gu;  // fused gate|up [cap, 2*FF]
@@ -292,7 +302,13 @@ struct PrefillScratch {
     h = scratch_f32(cap * NE);
     h2 = scratch_f32(cap * NE);
     qkv = scratch_f32(cap * (NH + 2 * NKV) * HD);
-    qkvh = scratch_f32((NH + 2 * NKV) * cap * HD);
+    if (gpu::caps::flat_addressing) {
+      qkvh = scratch_f32((NH + 2 * NKV) * cap * HD);
+    } else {
+      qh = scratch_f32(NH * cap * HD);
+      kh = scratch_f32(NKV * cap * HD);
+      vh = scratch_f32(NKV * cap * HD);
+    }
     ah = scratch_f32(NH * cap * HD);
     at = scratch_f32(cap * NH * HD);
     gu = scratch_f32(cap * 2 * FF);
@@ -314,12 +330,6 @@ struct Model {
   bool row = false;  // imperative gemvs use warp-per-row [N,K] (bf16 only)
   bool q4_mlp = false;     // imperative MLP gemvs (wgu, wd) use q4
   bool q4_lmhead = false;  // imperative lm_head gemv uses q4
-  // One QKV projection instead of three. Its whole point is that q|k|v come
-  // out contiguous and the decoder reads each by offsetting the output
-  // pointer — which names a location only under flat addressing, so where a
-  // pointer is a buffer handle the three projections take three buffers.
-  // (gate|up stays fused everywhere: swiglu reads both halves itself.)
-  static constexpr bool fused_qkv = gpu::caps::flat_addressing;
 };
 
 // Decode GEMV picking the weight-dtype kernel: y(n) = a(1,k) @ W[k,n].
@@ -381,17 +391,31 @@ inline void prefill_chunk_(Model& M, int64_t T) {
     Layer& L = M.layers[l];
     void* ro = P.res[l & 1].native;
     gpu::gemm_bf16_nt(P.h.native, L.wqkv.native(), P.qkv.native, T, QKVN, NE);
-    // One pass turns the fused [T, q|k|v] output into head-major [18, T, D] and
-    // adds the fused bias — rope's own fused-bias form only indexes correctly at
-    // T == 1, so the bias rides along here instead.
-    gpu::split_heads(P.qkv.native, L.bqkv.native(), P.qkvh.native, T, QKVN, 0,
-                     NH + 2 * NKV, HD);
-    void* kh = off_f32(P.qkvh.native, NH * T * HD);
-    void* vh = off_f32(P.qkvh.native, (NH + NKV) * T * HD);
+    // split_heads turns the [T, q|k|v] output into head-major [H, T, D] and
+    // adds the bias — rope's own fused-bias form only indexes correctly at
+    // T == 1, so the bias rides along here instead. Its `off` names the
+    // column block, so the unfused form is the same pass three times, each
+    // with that block's own bias.
+    void *qh, *kh, *vh;
+    if (gpu::caps::flat_addressing) {
+      gpu::split_heads(P.qkv.native, L.bqkv.native(), P.qkvh.native, T, QKVN, 0,
+                       NH + 2 * NKV, HD);
+      qh = P.qkvh.native;
+      kh = off_f32(qh, NH * T * HD);
+      vh = off_f32(qh, (NH + NKV) * T * HD);
+    } else {
+      qh = P.qh.native;
+      kh = P.kh.native;
+      vh = P.vh.native;
+      gpu::split_heads(P.qkv.native, L.bq.native(), qh, T, QKVN, 0, NH, HD);
+      gpu::split_heads(P.qkv.native, L.bk.native(), kh, T, QKVN, NH * HD, NKV, HD);
+      gpu::split_heads(P.qkv.native, L.bv.native(), vh, T, QKVN,
+                       (NH + NKV) * HD, NKV, HD);
+    }
     // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
-    gpu::rope(P.qkvh.native, P.qkvh.native, NH * T, T, HD, pos0, ROPE_BASE);
+    gpu::rope(qh, qh, NH * T, T, HD, pos0, ROPE_BASE);
     gpu::rope(kh, kh, NKV * T, T, HD, pos0, ROPE_BASE);
-    L.cache.prefill(P.qkvh.native, kh, vh, P.ah.native, T, NH, SCALE);
+    L.cache.prefill(qh, kh, vh, P.ah.native, T, NH, SCALE);
     gpu::merge_heads(P.ah.native, P.at.native, T, NH, HD);
     gpu::gemm_bf16_nt(P.at.native, L.wo_row.native(), ro, T, NE, NH * HD);
     gpu::rmsnorm_res(ro, x, L.fn.native(), ro, P.h2.native, NE, EPS, T);
@@ -450,9 +474,10 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
     prefill_chunk_(M, last);
   }
   // Only the final row of the final chunk needs logits — one GEMV for the whole
-  // prompt rather than one per chunk.
-  gemv_w(M.outwT, off_f32(M.pscratch.h.native, (last - 1) * NE),
-         M.scratch.logits.native, VOCAB, NE);
+  // prompt rather than one per chunk. The row is copied into the decode's own
+  // norm buffer rather than pointed at in place — see copy_out.
+  copy_out(M.pscratch.h.native, (last - 1) * NE, M.scratch.hb.native, NE);
+  gemv_w(M.outwT, M.scratch.hb.native, M.scratch.logits.native, VOCAB, NE);
   return argmax_logits(M);
 }
 
@@ -511,9 +536,8 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
         // split-K. +466MB over 24 layers either way. wo_row/wd_row (bf16 only)
         // are the row copies of the two shared weights (+247MB), keeping the
         // total under the WSL2 ~2GB cliff (lm_head deliberately not copied).
-        .wqkv = !Model::fused_qkv ? array{}
-                : row              ? load_w_T_cat_row(m, qkv_parts, NE)
-                                   : load_w_T_cat(m, qkv_parts, NE, wdt),
+        .wqkv = row ? load_w_T_cat_row(m, qkv_parts, NE)
+                    : load_w_T_cat(m, qkv_parts, NE, wdt),
         // wgu: bf16-row when row & !q4m; column [K,N] in f32; empty when q4m
         // (replaced by wgu_q4). wd_row likewise.
         .wgu = row ? (q4m ? array{} : load_w_T_cat_row(m, gu_parts, NE))
@@ -723,22 +747,19 @@ inline void run_layers_(Model& M, void* x0, int64_t pos, void* d_pos = nullptr,
     void* ro = S.res[l & 1].native;  // res_out (x1 then x2), ping-pong
     // Fused QKV: one GEMV -> [q(NH*HD) | k(NKV*HD) | v(NKV*HD)] in S.qkvb, then
     // slice: rope q & k in place, bias-add v. Same per-column split-K as the
-    // separate wq/wk/wv GEMVs (bx=1, chunk=32), so bit-identical per column —
-    // which is also why the unfused form below is not a different answer, only
-    // a different number of dispatches.
-    void *qp, *kp, *vp;
-    if (M.fused_qkv) {
-      gv(L.wqkv, S.hb.native, S.qkvb.native, (NH + 2 * NKV) * HD, NE);
-      qp = S.qkvb.native;
+    // separate wq/wk/wv GEMVs (bx=1, chunk=32), so bit-identical per column.
+    // q is the slice at offset 0, which every backend can name; k and v are
+    // copied out where a pointer cannot (two 128-float copies a layer).
+    gv(L.wqkv, S.hb.native, S.qkvb.native, (NH + 2 * NKV) * HD, NE);
+    void* qp = S.qkvb.native;
+    void* kp = S.kb.native;
+    void* vp = S.vb.native;
+    if (gpu::caps::flat_addressing) {
       kp = off_f32(qp, NH * HD);
       vp = off_f32(qp, (NH + NKV) * HD);
     } else {
-      qp = S.qb.native;
-      kp = S.kb.native;
-      vp = S.vb.native;
-      gv(L.wq, S.hb.native, qp, NH * HD, NE);
-      gv(L.wk, S.hb.native, kp, NKV * HD, NE);
-      gv(L.wv, S.hb.native, vp, NKV * HD, NE);
+      copy_out(qp, NH * HD, kp, NKV * HD);
+      copy_out(qp, (NH + NKV) * HD, vp, NKV * HD);
     }
     if (cap) {
       gpu::rope_dpos(qp, qp, NH, 1, HD, d_pos, ROPE_BASE, L.bq.native());

@@ -3060,6 +3060,45 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
     CHECK(idx == 77777);
   }
 
+  SUBCASE("the [N,K] bf16 weight layout: row GEMV and the prefill GEMM") {
+    // GGML stores a linear weight as [out, in], and both of these read it in
+    // place. The oracle is the same product through the array API, against
+    // the weights ROUNDED to bf16 — the kernels see those bits, so comparing
+    // with the f32 originals would measure the rounding, not the kernel.
+    //
+    // Shapes are deliberately ragged: N = 96 leaves a half-width column
+    // block, M = 37 a partial row block (so both edge stores run), and
+    // K = 72 a partial K tile on top of the GEMV's k % 8 == 0 requirement.
+    const int64_t N = 96, K = 72, M = 37;
+    array W = random_array({N, K}, 940);
+    array Wb = dev(W.to_bf16()), Wt = dev(W.to_bf16().to_f32().transpose());
+
+    if (gpu::caps::row_gemv) {
+      array a = dev(random_array({1, K}, 941));
+      array y = array::empty({1, N});
+      REQUIRE(gpu::gemv_bf16_row(a.native(), Wb.native(), y.native(), N, K));
+      tl::gpu::flush();
+      CHECK(same(y, a.dot(Wt), 1e-4f));
+    }
+    if (gpu::caps::bf16_gemm) {
+      array A = dev(random_array({M, K}, 942));
+      array C = array::empty({M, N});
+      REQUIRE(gpu::gemm_bf16_nt(A.native(), Wb.native(), C.native(), M, N, K));
+      tl::gpu::flush();
+      CHECK(same(C, A.dot(Wt), 1e-4f));
+      // Row m of the GEMM is the GEMV of row m — the prefill and the decode
+      // paths have to agree on the same weight, which is what makes a
+      // prompt's last token continue into generation.
+      if (gpu::caps::row_gemv) {
+        array row = dev(A.slice(0, 7, 1).clone());
+        array y1 = array::empty({1, N});
+        REQUIRE(gpu::gemv_bf16_row(row.native(), Wb.native(), y1.native(), N, K));
+        tl::gpu::flush();
+        CHECK(same(y1, C.slice(0, 7, 1), 1e-4f));
+      }
+    }
+  }
+
   SUBCASE("split_heads and merge_heads are inverses through the fused layout") {
     const int64_t T = 5, H = 18, D = 64, ld = H * D;
     array src = dev(random_array({T, ld}, 930)), bias = dev(random_array({H, D}, 931));

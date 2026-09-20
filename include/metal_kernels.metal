@@ -2111,9 +2111,59 @@ kernel void gemv_combine_(device const float* parts        [[buffer(0)]],
   y[col] = acc;
 }
 
-// int4 weights: cuda's tl_gemv_q4. One threadgroup per output row, whose
+// The [N,K] weight layouts (K contiguous per output row — GGML's own, so the
+// loader drops the transpose) take one threadgroup per output row, its
+// threads splitting K. That is the whole difference from the [K,N] GEMV
+// above: no split-K grid, because the row IS the parallel axis, and a
+// threadgroup reduction instead of a per-thread column.
+//
+// The reduce is shared by the bf16 and int4 forms, which differ only in how a
+// thread reads its slice. `red` is the caller's [8] threadgroup scratch
+// (threadgroup memory can only be declared in a kernel); 8 covers the
+// 256-thread cap the host dispatches.
+static inline void gemv_row_store_(float acc, threadgroup float* red,
+                                   device float* y_n, uint tid, uint sgid,
+                                   uint nsg, uint lane) {
+  const float s = simd_sum(acc);
+  if (lane == 0) red[sgid] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float t = 0.0f;
+    for (uint w = 0; w < nsg; w++) t += red[w];
+    *y_n = t;
+  }
+}
+
+struct gemv_row_params {
+  uint n, k;
+};
+
+// bf16 weights in [N,K]: cuda's tl_gemv_bf16_row. Eight contiguous halves per
+// thread per step, so consecutive threads read consecutive 16-byte spans of
+// the row. Requires k % 8 == 0 (every transformer dim; the host checks).
+kernel void gemv_bf16_row_(device const float* a      [[buffer(0)]],
+                           device const ushort* B     [[buffer(1)]],
+                           device float* y            [[buffer(2)]],
+                           constant gemv_row_params& p [[buffer(3)]],
+                           uint row  [[threadgroup_position_in_grid]],
+                           uint tid  [[thread_index_in_threadgroup]],
+                           uint nt   [[threads_per_threadgroup]],
+                           uint sgid [[simdgroup_index_in_threadgroup]],
+                           uint nsg  [[simdgroups_per_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float red[8];
+  device const ushort* brow = B + (ulong)row * p.k;
+  float acc = 0.0f;
+  for (uint k0 = tid * 8; k0 < p.k; k0 += nt * 8) {
+    _Pragma("clang loop unroll(full)")
+    for (uint j = 0; j < 8; j++) acc += a[k0 + j] * widen_(brow[k0 + j]);
+  }
+  gemv_row_store_(acc, red, y + row, tid, sgid, nsg, lane);
+}
+
+// int4 weights: cuda's tl_gemv_q4. Same one-threadgroup-per-row shape, whose
 // quantization groups are contiguous in the [N,K] packing; a thread takes one
-// word (8 packed int4) per step and the threadgroup reduces at the end.
+// word (8 packed int4) per step.
 struct gemv_q4_params {
   uint n, k, group;
 };
@@ -2142,15 +2192,109 @@ kernel void gemv_q4_(device const float* a       [[buffer(0)]],
       acc += a[k0 + j] * (sc * float(q));
     }
   }
-  const float s = simd_sum(acc);
-  if (lane == 0) red[sgid] = s;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (tid == 0) {
-    float t = 0.0f;
-    for (uint w = 0; w < nsg; w++) t += red[w];
-    y[row] = t;
+  gemv_row_store_(acc, red, y + row, tid, sgid, nsg, lane);
+}
+
+// ---------------------------------------------------------------------------
+// bf16-weight NT GEMM: C[M,N] = A[M,K] · B[N,K]ᵀ, cuda's tl_gemm_bf16_nt —
+// the batched prefill's projection, where the same weight serves a whole
+// chunk of prompt tokens at once.
+//
+// Its own body rather than a dtype parameter of sgemm_body_ because the
+// operand layout is what differs: that one stages B as [k][n], and reading
+// this [N,K] weight into it costs one strided device read per element. Here
+// both operands stage in their own row-major order, so every device read is
+// contiguous, and the B fragment is transposed on the way OUT of threadgroup
+// memory, which simdgroup_load does for free. Tiles, MMA shape and the
+// edge-tile store otherwise follow sgemm_body_.
+// ---------------------------------------------------------------------------
+
+struct gemm_nt_params {
+  uint M, N, K;
+};
+
+template <uint BM, uint BN, uint BK>
+void gemm_nt_body_(device const float* A, device const ushort* B,
+                   device float* C, constant gemm_nt_params& p,
+                   threadgroup float* As, threadgroup float* Bs, uint3 tgid,
+                   uint tid, uint sid, uint lane) {
+  constexpr uint N_SM = 2, N_SN = 2, TM = BM / N_SM, TN = BN / N_SN;
+  constexpr uint FM = TM / 8, FN = TN / 8, THREADS = N_SM * N_SN * 32;
+  constexpr uint S = BK + 4;  // both staged row-major in K; padding kills
+                              // the bank conflicts of the fragment reads
+
+  const uint wm = sid / N_SN, wn = sid % N_SN;
+  const uint row0 = tgid.y * BM, col0 = tgid.x * BN;
+  simdgroup_matrix<float, 8, 8> acc[FM][FN];
+  for (uint i = 0; i < FM; i++)
+    for (uint j = 0; j < FN; j++) acc[i][j] = simdgroup_matrix<float, 8, 8>(0);
+
+  for (uint k0 = 0; k0 < p.K; k0 += BK) {
+    for (uint i = tid; i < BM * BK; i += THREADS) {
+      const uint r = i / BK, c = i % BK, gr = row0 + r, gc = k0 + c;
+      As[r * S + c] = (gr < p.M && gc < p.K) ? A[(ulong)gr * p.K + gc] : 0.0f;
+    }
+    for (uint i = tid; i < BN * BK; i += THREADS) {
+      const uint r = i / BK, c = i % BK, gr = col0 + r, gc = k0 + c;
+      Bs[r * S + c] =
+          (gr < p.N && gc < p.K) ? widen_(B[(ulong)gr * p.K + gc]) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kk = 0; kk < BK; kk += 8) {
+      simdgroup_matrix<float, 8, 8> af[FM], bf[FN];
+      for (uint i = 0; i < FM; i++)
+        simdgroup_load(af[i], &As[(wm * TM + i * 8) * S + kk], S);
+      // Bs holds [n][k]; the MMA wants [k][n], which the transposing load
+      // produces without a second staging pass.
+      for (uint j = 0; j < FN; j++)
+        simdgroup_load(bf[j], &Bs[(wn * TN + j * 8) * S + kk], S, ulong2(0, 0),
+                       true);
+      for (uint i = 0; i < FM; i++)
+        for (uint j = 0; j < FN; j++)
+          simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
+    }
+    // Also guards the store below, which reuses As as scratch.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  for (uint i = 0; i < FM; i++) {
+    for (uint j = 0; j < FN; j++) {
+      const uint r = row0 + wm * TM + i * 8, c = col0 + wn * TN + j * 8;
+      if (r + 8 <= p.M && c + 8 <= p.N) {
+        simdgroup_store(acc[i][j], C + (ulong)r * p.N + c, p.N);
+      } else if (r < p.M && c < p.N) {
+        threadgroup float* sc = As;  // per-simdgroup region, 4 × 64 floats
+        simdgroup_store(acc[i][j], &sc[sid * 64], 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = lane; e < 64; e += 32) {
+          const uint er = r + e / 8, ec = c + e % 8;
+          if (er < p.M && ec < p.N) C[(ulong)er * p.N + ec] = sc[sid * 64 + e];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+      }
+    }
   }
 }
+
+#define TL_GEMM_NT_KERNEL(name, BM, BN, BK)                                  \
+  kernel void name(device const float* A [[buffer(0)]],                      \
+                   device const ushort* B [[buffer(1)]],                     \
+                   device float* C [[buffer(2)]],                            \
+                   constant gemm_nt_params& p [[buffer(3)]],                 \
+                   uint3 tgid [[threadgroup_position_in_grid]],              \
+                   uint tid [[thread_index_in_threadgroup]],                 \
+                   uint sid [[simdgroup_index_in_threadgroup]],              \
+                   uint lane [[thread_index_in_simdgroup]]) {                \
+    threadgroup float As[BM * (BK + 4)];                                     \
+    threadgroup float Bs[BN * (BK + 4)];                                     \
+    gemm_nt_body_<BM, BN, BK>(A, B, C, p, As, Bs, tgid, tid, sid, lane);     \
+  }
+
+TL_GEMM_NT_KERNEL(gemm_bf16_nt_, 64, 64, 16)
+// A prompt chunk is a few hundred rows, so a 64-row tile leaves most of the
+// grid on one M block; the 32-row one doubles the M blocks for short chunks.
+TL_GEMM_NT_KERNEL(gemm_bf16_nt32_, 32, 64, 16)
+#undef TL_GEMM_NT_KERNEL
 
 // ---------------------------------------------------------------------------
 // Fused decode attention: one query row against the whole cache. cuda's

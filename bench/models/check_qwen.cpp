@@ -37,11 +37,13 @@ int main(int argc, char** argv) {
   }
   tl::use_gpu();
   std::printf("building model (F32, transposing linear weights)...\n");
+  const int64_t NP = sizeof(qwenoracle::prompt_ids) / sizeof(int);
+  bool imp_ok = true, bf16_ok = true, ok_f32 = false;
+  {  // scoped so the F32 weights are back in the pool before the bf16 build
   qm::Model M = qm::build(m);
   std::printf("model built — %lld layers, GQA %lldq/%lldkv, head_dim=%lld\n",
               (long long)qm::NL, (long long)qm::NH, (long long)qm::NKV, (long long)qm::HD);
 
-  const int64_t NP = sizeof(qwenoracle::prompt_ids) / sizeof(int);
   std::vector<float> l0, fnorm, last_logits;
   int64_t pos = 0;
   for (int64_t i = 0; i < NP; i++) {
@@ -99,7 +101,6 @@ int main(int argc, char** argv) {
   // above validated. They are meant to compute the same thing, so at F32 the
   // greedy sequence must be identical — which makes every one of them gated
   // against the numpy reference too, without a second oracle.
-  bool imp_ok = true;
   if (tl::gpu::caps::model_path) {
     qm::reset_cache(M);
     int64_t p = 0, tok = 0;
@@ -115,8 +116,58 @@ int main(int argc, char** argv) {
     std::printf("\nimperative path: backend has no model path — skipped\n");
   }
 
-  bool ok = emb_mr < 1e-3 && l0_mr < 5e-3 && fn_mr < 5e-3 && logit_mr < 5e-3 &&
-            top1_ok && greedy_ok && imp_ok;
+  ok_f32 = emb_mr < 1e-3 && l0_mr < 5e-3 && fn_mr < 5e-3 && logit_mr < 5e-3 &&
+           top1_ok && greedy_ok && imp_ok;
+  }
+
+  // The bf16 weight path is the one a chat actually runs: [N,K] weights for
+  // the row GEMV, and the batched prefill's GEMM over a whole chunk of prompt
+  // at once. Rounding makes it a different program from the F32 reference
+  // above, so the gate is internal consistency — the batched prefill plus the
+  // imperative decode must produce the same greedy tokens as THIS model's own
+  // array path, which reaches the same rounded weights through .dot() and the
+  // separate projections. It is the wiring that check catches: a decode GEMV
+  // pointed at the [K,N] oracle weight instead of the [N,K] copy reads the
+  // right number of bytes in the wrong order, and nothing but a comparison
+  // like this one notices.
+  const int64_t NB = 8;
+  {
+    std::printf("\nbf16 weights (row GEMV + batched prefill) vs this model's array path:\n");
+    qm::Model B = qm::build(m, tl::dtype::bf16);
+    std::vector<int> ids(qwenoracle::prompt_ids, qwenoracle::prompt_ids + NP);
+    if (!qm::can_prefill_batched(B, NP)) {
+      std::printf("  backend has no bf16 weight GEMM — skipped\n");
+    } else {
+      std::vector<int64_t> want, got;
+      {
+        qm::reset_cache(B);
+        int64_t p = 0;
+        std::vector<float> lg;
+        for (int64_t i = 0; i < NP; i++) lg = qm::step(B, ids[i], p++);
+        int64_t next = qm::argmax(lg);
+        for (int64_t i = 0; i < NB; i++) {
+          want.push_back(next);
+          lg = qm::step(B, next, p++);
+          next = qm::argmax(lg);
+        }
+      }
+      qm::reset_cache(B);
+      int64_t next = qm::prefill_batched(B, ids);
+      int64_t p = B.layers[0].cache.pos;
+      for (int64_t i = 0; i < NB; i++) {
+        got.push_back(next);
+        next = qm::step_imperative(B, next, p++);
+      }
+      std::printf("  array:");
+      for (auto t : want) std::printf(" %lld", (long long)t);
+      std::printf("\n  fused:");
+      for (auto t : got) std::printf(" %lld", (long long)t);
+      bf16_ok = got == want;
+      std::printf("\n  greedy %s\n", bf16_ok ? "MATCH" : "DIVERGE");
+    }
+  }
+
+  bool ok = ok_f32 && bf16_ok;
   std::printf("\n%s\n", ok ? "ALL OK" : "FAILURES");
   return ok ? 0 : 1;
 }

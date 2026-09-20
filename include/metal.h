@@ -69,6 +69,8 @@ enum class kop {
   argmax_, rmsnorm_, swiglu_, split_heads_, merge_heads_,  // the decode step's rest
   gemv_f32_, gemv_bf16_, gemv_q4_,   // decode GEMVs, per weight dtype
   gemv_combine_,                     // their split-K partials
+  gemv_bf16_row_,                    // ... and the [N,K] weight layout's own
+  gemm_bf16_nt_, gemm_bf16_nt32_,    // the prefill's bf16 GEMM, per M tile
   gather_axis_, row_logsumexp_, xent_bwd_, adam_step_  // cross-entropy, Adam
 };
 
@@ -255,6 +257,9 @@ struct context {
       case kop::gemv_bf16_: return "gemv_bf16_";
       case kop::gemv_q4_: return "gemv_q4_";
       case kop::gemv_combine_: return "gemv_combine_";
+      case kop::gemv_bf16_row_: return "gemv_bf16_row_";
+      case kop::gemm_bf16_nt_: return "gemm_bf16_nt_";
+      case kop::gemm_bf16_nt32_: return "gemm_bf16_nt32_";
       case kop::gather_axis_: return "gather_axis_";
       case kop::row_logsumexp_: return "row_logsumexp_";
       case kop::xent_bwd_: return "xent_bwd_";
@@ -1329,6 +1334,14 @@ struct gemv_combine_params {
   uint32_t n, parts;
 };
 
+struct gemv_row_params {
+  uint32_t n, k;
+};
+
+struct gemm_nt_params {
+  uint32_t M, N, K;
+};
+
 struct gemv_q4_params {
   uint32_t n, k, group;
 };
@@ -1454,6 +1467,54 @@ inline bool gemv_f32(void* a, void* B, void* y, int64_t n, int64_t k) {
 
 inline bool gemv_bf16(void* a, void* B, void* y, int64_t n, int64_t k) {
   return gemv_(kop::gemv_bf16_, a, B, y, n, k);
+}
+
+// y[1,N] = a[1,K] · W[N,K]ᵀ with the weight row-major (GGML-native). One
+// threadgroup per output row, so a narrow layer parallelizes over N without
+// the [K,N] path's split-K; the threadgroup size follows cuda's own policy,
+// the smallest that still gives every thread ~one 8-wide step. Requires
+// k % 8 == 0 (host-gated; the caller keeps to the [K,N] GEMV otherwise).
+inline bool gemv_bf16_row(void* a, void* B, void* y, int64_t n, int64_t k) {
+  auto& c = context::get();
+  if (!c.device || n <= 0 || k <= 0 || (k % 8) != 0) return false;
+  unsigned long nt = 32;
+  for (unsigned long bs = 64; bs <= 256; bs += 32) {
+    if ((k + 8 * (int64_t)nt - 1) / (8 * (int64_t)nt) >
+        (k + 8 * (int64_t)bs - 1) / (8 * (int64_t)bs)) {
+      nt = bs;
+    }
+  }
+  c.bind_(kop::gemv_bf16_row_);
+  detail_::set_buf_(c.enc, a, 0, 0ul);
+  detail_::set_buf_(c.enc, B, 0, 1ul);
+  detail_::set_buf_(c.enc, y, 0, 2ul);
+  detail_::gemv_row_params p{static_cast<uint32_t>(n),
+                             static_cast<uint32_t>(k)};
+  detail_::set_bytes_(c.enc, p, 3ul);
+  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(n), 1, 1},
+                          {nt, 1, 1});
+  return true;
+}
+
+// C[M,N] = A[M,K] · B[N,K]ᵀ, B bf16: the batched prefill's projection, where
+// one weight serves a whole chunk of prompt tokens. The 32-row tile for a
+// short chunk (more M blocks to fill the GPU), the 64-row one otherwise.
+inline bool gemm_bf16_nt(void* A, void* B, void* C, int64_t M, int64_t N,
+                         int64_t K) {
+  auto& c = context::get();
+  if (!c.device || M <= 0 || N <= 0 || K <= 0) return false;
+  const unsigned long BM = M <= 64 ? 32 : 64;
+  c.bind_(M <= 64 ? kop::gemm_bf16_nt32_ : kop::gemm_bf16_nt_);
+  detail_::set_buf_(c.enc, A, 0, 0ul);
+  detail_::set_buf_(c.enc, B, 0, 1ul);
+  detail_::set_buf_(c.enc, C, 0, 2ul);
+  detail_::gemm_nt_params p{static_cast<uint32_t>(M), static_cast<uint32_t>(N),
+                            static_cast<uint32_t>(K)};
+  detail_::set_bytes_(c.enc, p, 3ul);
+  const unsigned long gx = (static_cast<unsigned long>(N) + 63) / 64;
+  const unsigned long gy = (static_cast<unsigned long>(M) + BM - 1) / BM;
+  detail_::dispatch_grid_(c.enc, {gx, gy, 1}, {128, 1, 1});
+  return true;
 }
 
 // int4 weights: one threadgroup per output row. `scales` is the caller's
@@ -1862,6 +1923,10 @@ inline bool split_heads(void*, void*, void*, int64_t, int64_t, int64_t, int64_t,
 inline bool merge_heads(void*, void*, int64_t, int64_t, int64_t) { return false; }
 inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
+inline bool gemv_bf16_row(void*, void*, void*, int64_t, int64_t) { return false; }
+inline bool gemm_bf16_nt(void*, void*, void*, int64_t, int64_t, int64_t) {
+  return false;
+}
 inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
   return false;
 }
@@ -1881,8 +1946,8 @@ struct caps {
   // otherwise (there is no CPU fallback under that row).
   static constexpr bool model_path = true;
   static constexpr bool graph_capture = false;
-  static constexpr bool row_gemv = false;   // gemv_bf16_row: weights as [N,K]
-  static constexpr bool bf16_gemm = false;  // gemm_bf16_nt: a bf16-weight GEMM
+  static constexpr bool row_gemv = true;   // gemv_bf16_row: weights as [N,K]
+  static constexpr bool bf16_gemm = true;  // gemm_bf16_nt: a bf16-weight GEMM
   // `native` is an MTLBuffer handle, not an address: arithmetic on it names
   // nothing, so a model writes each piece to its own buffer rather than
   // slicing one kernel's output. (The generic kernels still take byte
@@ -1911,10 +1976,6 @@ inline bool kv_append_dpos(void*, void*, void*, void*, void*, int64_t, int64_t,
 }
 inline bool attn_decode_dpos(void*, void*, void*, void*, int64_t, int64_t, void*,
                              int64_t, int64_t, float, void*) {
-  return false;
-}
-inline bool gemv_bf16_row(void*, void*, void*, int64_t, int64_t) { return false; }
-inline bool gemm_bf16_nt(void*, void*, void*, int64_t, int64_t, int64_t) {
   return false;
 }
 inline int64_t attn_dpos_partials_bytes(int64_t, int64_t, int64_t) { return 0; }
