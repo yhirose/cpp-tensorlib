@@ -1448,7 +1448,7 @@ inline bool gemm_bias(void*, int64_t, int64_t, bool, void*, int64_t, int64_t,
 inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
-                        int64_t, int64_t, float) {
+                        int64_t, int64_t, float, bool = false) {
   return false;
 }
 inline bool attn_prefill(void*, void*, void*, void*, int64_t, int64_t, int64_t,

@@ -1,12 +1,13 @@
 // M9 end-to-end: a multi-layer llama-style decode loop wired to the persistent
-// cuda::kv_cache (GQA), driven greedily, verified vs a from-scratch CPU
+// tl::kv_cache (GQA), driven greedily, verified vs a from-scratch CPU
 // reference at every step. This is the "runnable LLM" proof — it composes the
 // pure array ops (rmsnorm/rope/swiglu + dot) for the per-token math and bridges
 // each layer's attention to the stateful cache via array::native(). Random-but-
 // fixed weights + integer token ids indexing a random embedding table (no GGUF /
 // tokenizer yet — that is the follow-on to actually chat).
 //
-// CUDA-only (uses tl::cuda::kv_cache). Returns nonzero on any logits mismatch or
+// CUDA-gated by its CMake target; the cache itself is backend-neutral now.
+// Returns nonzero on any logits mismatch or
 // divergent greedy token, so it gates the wiring.
 
 #include <kv_cache.h>

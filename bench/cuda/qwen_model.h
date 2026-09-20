@@ -3,10 +3,12 @@
 // by check_qwen (numeric validation) and chat_qwen (real text generation). The
 // weights are loaded F32 (exact F16 widen), linear weights transposed from GGML's
 // [out,in] to our dot's [K,N]. Structure: RMSNorm(eps=1e-6) -> QKV proj + bias ->
-// RoPE(base=1e6, half-split) -> GQA(14q/2kv) attn via kv_cache -> o proj -> res ->
-// RMSNorm -> SwiGLU MLP -> res, x24, then final RMSNorm -> logits (output.weight).
-// CUDA-only (tl::cuda::kv_cache).
+// RoPE(base=1e6, half-split) -> GQA(14q/2kv) attn via tl::kv_cache -> o proj ->
+// res -> RMSNorm -> SwiGLU MLP -> res, x24, then final RMSNorm -> logits
+// (output.weight). CUDA-only still: the imperative decode path and the batched
+// prefill call cuda:: directly (graph capture, the row/bf16 weight layouts).
 
+#include <kv_cache.h>
 #include <tensorlib.h>
 #include "gguf.h"
 
@@ -186,7 +188,7 @@ struct Layer {
   // bf16 fields stay empty), saving memory. Attention proj (QKV.fused, wo) stays
   // bf16-row — q4 loses there (still floor-bound; dequant > byte savings).
   array wgu_q4, wd_q4;
-  tl::cuda::kv_cache cache;
+  tl::kv_cache cache;
 };
 
 // Persistent device scratch for the imperative decode step (C1): every per-step
