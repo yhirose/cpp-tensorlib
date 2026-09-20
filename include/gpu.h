@@ -5,7 +5,7 @@
 // identical API and shares tl::metal::kop, which makes the alias below a
 // drop-in. The contract, i.e. everything array.h/storage.h may call:
 //   lifecycle  available / pending / flush / cpu_barrier
-//   memory     alloc / release / sync_to_host
+//   memory     alloc / release / sync_to_host / upload
 //   kernels    binary / binary_bcast / binary_bcast_nd / where_nd / copy_nd / unary /
 //              gemm / gemm_batched / gemm_bias / row_op / pad / fold /
 //              index_select / index_add / scatter_to_axis / gather_from_axis /
@@ -25,12 +25,14 @@
 // so a model checks the return and keeps to the array ops where it is false.
 //
 // Beyond the kernels, each backend states what a model may assume of it in
-// `caps` (model_path, graph_capture, row_gemv, bf16_gemm), and carries the
-// graph-capture group — graph_available / capture_begin / capture_end /
-// graph_launch / graph_destroy / upload / upload_u32 / incr_u32 / rope_dpos /
+// `caps` (model_path, graph_capture, row_gemv, bf16_gemm, flat_addressing),
+// and carries the graph-capture group — graph_available / capture_begin /
+// capture_end /
+// graph_launch / graph_destroy / upload_u32 / incr_u32 / rope_dpos /
 // kv_append_dpos / attn_decode_dpos / attn_dpos_partials_bytes — as no-ops
 // where the capability is false, so a decoder is written once and branches on
-// caps.
+// caps. `upload` (staging host bytes into a device buffer) is memory, not
+// capture: every decoder needs it for the embedding row it feeds each step.
 //
 // Each backend compiles to stubs unless its own gate holds, so including all of
 // them is free: metal.h is real only on __APPLE__, cuda.h only on

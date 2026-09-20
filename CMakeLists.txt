@@ -167,23 +167,6 @@ if(TENSORLIB_CUDA)
   tensorlib_enable_cuda(tensorlib_check_attn64)
   add_test(NAME attn64 COMMAND tensorlib_check_attn64)
 
-  # M9 "actually chat": load a real Qwen2.5-0.5B GGUF (F16) and run the decoder
-  # end to end vs a tight numpy reference on the same weights. Not a ctest (needs
-  # the ~1.2 GB model file, which lives outside the repo). Run manually.
-  add_executable(tensorlib_check_qwen bench/cuda/check/check_qwen.cpp)
-  target_include_directories(tensorlib_check_qwen BEFORE PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench/cuda)
-  target_link_libraries(tensorlib_check_qwen PRIVATE tensorlib)
-  tensorlib_enable_cuda(tensorlib_check_qwen)
-
-  # End-to-end chat: own GGUF loader + own BPE tokenizer + own CUDA kernels.
-  # prompt string -> generated text. Not a ctest (needs the external model).
-  add_executable(tensorlib_chat_qwen bench/cuda/chat_qwen.cpp)
-  target_include_directories(tensorlib_chat_qwen BEFORE PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench/cuda)
-  target_link_libraries(tensorlib_chat_qwen PRIVATE tensorlib)
-  tensorlib_enable_cuda(tensorlib_chat_qwen)
-
   # M9 decode-overhead census: per-region wall-clock breakdown of one decode
   # step (StepProf). Locates the 6.7x gap to llama.cpp. Not a ctest (external
   # model file); short/isolated per the WSL2 sysmem-cliff discipline.
@@ -305,6 +288,18 @@ add_executable(tensorlib_check_llm_block bench/shared/check/check_llm_block.cpp)
 target_link_libraries(tensorlib_check_llm_block PRIVATE tensorlib)
 add_test(NAME llm_block COMMAND tensorlib_check_llm_block)
 
+# The Qwen2.5-0.5B driver (bench/models/qwen2.h): backend-neutral, so both of
+# these build wherever tensorlib does and run on whatever gpu:: resolves to.
+# Neither is a ctest — they need the ~1.2 GB GGUF, which lives outside the repo.
+#   check_qwen: the decoder end to end vs a numpy reference on the same weights.
+#   chat_qwen:  own GGUF loader + own BPE tokenizer -> prompt in, text out.
+foreach(qwen_target check_qwen chat_qwen)
+  add_executable(tensorlib_${qwen_target} bench/models/${qwen_target}.cpp)
+  target_include_directories(tensorlib_${qwen_target} BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench/models)
+  target_link_libraries(tensorlib_${qwen_target} PRIVATE tensorlib)
+endforeach()
+
 # These benches drive the GPU through the backend-agnostic eval seam; on a CUDA
 # build they must carry the embedded PTX + TENSORLIB_CUDA define, same as the
 # tests, or gpu_available() stays false and every GPU section silently skips.
@@ -316,6 +311,8 @@ if(TENSORLIB_CUDA)
   tensorlib_enable_cuda(tensorlib_bench_llm)
   tensorlib_enable_cuda(tensorlib_bench_mlp)
   tensorlib_enable_cuda(tensorlib_check_llm_block)
+  tensorlib_enable_cuda(tensorlib_check_qwen)
+  tensorlib_enable_cuda(tensorlib_chat_qwen)
 endif()
 
 # Own CPU GEMM bench (M5 tuning). Links OpenBLAS for the off-Apple gate when

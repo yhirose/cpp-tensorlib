@@ -5,10 +5,18 @@
 // [out,in] to our dot's [K,N]. Structure: RMSNorm(eps=1e-6) -> QKV proj + bias ->
 // RoPE(base=1e6, half-split) -> GQA(14q/2kv) attn via tl::kv_cache -> o proj ->
 // res -> RMSNorm -> SwiGLU MLP -> res, x24, then final RMSNorm -> logits
-// (output.weight). CUDA-only still: the imperative decode path and the batched
-// prefill call cuda:: directly (graph capture, the row/bf16 weight layouts).
+// (output.weight).
+//
+// Backend-neutral: every device call goes through tl::gpu (the facade gpu.h
+// picks), every scratch buffer is a tl::storage (the backend's pool reclaims
+// it), and the three things only CUDA has today are asked of gpu::caps rather
+// than of a #ifdef — graph_capture (the captured decoder), bf16_gemm (the
+// batched prefill) and row_gemv ([N,K] weights). Where a cap is false the
+// model keeps the path that every backend has: re-encode per token, prefill
+// token by token, column-major [K,N] weights.
 
 #include <kv_cache.h>
+#include <storage.h>
 #include <tensorlib.h>
 #include "gguf.h"
 
@@ -25,7 +33,9 @@
 namespace qwenmodel {
 
 using tl::array;
+using tl::storage;
 namespace gg = tl::gguf;
+namespace gpu = tl::gpu;
 
 constexpr int64_t NL = 24, NE = 896, NH = 14, NKV = 2, HD = 64, FF = 4864;
 constexpr int64_t VOCAB = 151936, MAXC = 4096;
@@ -137,15 +147,27 @@ inline array load_w_T_row(const gg::model& m, const std::string& n, int64_t in,
   return load_w_T_cat_row(m, {{n, out}}, in);
 }
 
-// Allocate `n` f32 of device scratch (no host mirror — these buffers are only
-// ever read by kernels). The scratch structs below are lists of these.
-inline void* alloc_f32(int64_t n) { return tl::cuda::alloc(n * 4, nullptr); }
+// `n` f32 of device scratch. A tl::storage rather than a raw gpu::alloc: the
+// pool is keyed by byte size and a hand-paired alloc/release is one edit away
+// from returning a buffer under the wrong key, whereas storage carries its own
+// deleter. `.native` is the device handle, `.ptr` the host-readable bytes
+// (unified on Metal, the mirror on CUDA).
+inline storage scratch_f32(int64_t n) { return storage::make(n); }
 
 // Slice a device f32 buffer by element offset. The result is a mid-buffer
-// pointer: reads through it are stream-ordered after whatever wrote the base and
+// pointer: reads through it are ordered after whatever wrote the base and
 // need no host sync, since the base is already device-live.
 inline void* off_f32(void* p, int64_t nfloats) {
   return static_cast<char*>(p) + nfloats * 4;
+}
+
+// Make a device buffer's bytes readable on the host: drain the queue (on
+// unified memory that is all it takes) and pull the mirror back where there is
+// one. The one place that knows both backends' coherence rules.
+inline const float* host_read(const storage& s) {
+  gpu::cpu_barrier();
+  gpu::sync_to_host(s.native, false);
+  return s.ptr;
 }
 
 // Several F32 1-D tensors laid end to end -> array [1, sum(len)]. The q|k|v
@@ -171,7 +193,9 @@ struct Layer {
   array wq, bq, wk, bk, wv, bv, wo, wg, wu, wd, an, fn;
   // Fused decode weights (imperative path only): wqkv = [wq|wk|wv], wgu = [wg|wu]
   // concatenated. One GEMV each instead of 3/2, amortizing the per-launch floor.
-  // The separate wq/.../wu stay resident as the array-path oracle.
+  // The separate wq/.../wu stay resident as the array-path oracle — and are
+  // what the decode GEMVs read where Model::fused_qkv is false, which is why
+  // wqkv is then not loaded at all.
   //
   // Layout depends on the storage dtype (set in build): in bf16 mode these hold
   // ROW-major [N,K] and feed the warp-per-row gemv_bf16_row (lever A, ~1.4-1.9x
@@ -198,37 +222,39 @@ struct Layer {
 // q/k/v and gate/up live only as slices of their fused projection outputs
 // (qkvb, gub).
 struct Scratch {
-  void* res[2] = {nullptr, nullptr};  // residual ping-pong [NE]
-  void* hb = nullptr;                 // input-norm out [NE]
-  void* h2b = nullptr;                // post-attn norm out [NE]
-  void* qb = nullptr;                 // [NH*HD] query fixture (bench_qwen_ctx's
-                                      // isolated-attention timing; decode reads
-                                      // q as a slice of qkvb)
-  void* qkvb = nullptr;               // fused QKV out [(NH+2*NKV)*HD] = [1152]
-  void* ab = nullptr;                 // attn out [NH*HD]
-  void* mb = nullptr;                 // swiglu out [FF]
-  void* gub = nullptr;                // fused gate|up out [2*FF] = [9728]
-  void* mdb = nullptr;                // mlp-down out [NE]
-  void* logitsb = nullptr;            // [VOCAB]
-  void* logits_scratch = nullptr;     // [VOCAB] sink for forwards run only for
-                                      // their side effects (capture warm-up)
-  float* logits_host = nullptr;       // host mirror of logitsb (divergence checks)
-  void* embedb = nullptr;             // staged embedding row [NE] (capture input)
-  float* embed_host = nullptr;        // embedb's own host mirror (gather target)
+  storage res[2];       // residual ping-pong [NE]
+  storage hb;           // input-norm out [NE]
+  storage h2b;          // post-attn norm out [NE]
+  storage qb;           // [NH*HD] q, when the projection is not fused — and
+                        // bench_qwen_ctx's isolated-attention query fixture
+  storage kb, vb;       // [NKV*HD] k and v, likewise
+  storage qkvb;         // fused QKV out [(NH+2*NKV)*HD] = [1152]
+  storage ab;           // attn out [NH*HD]
+  storage mb;           // swiglu out [FF]
+  storage gub;          // fused gate|up out [2*FF] = [9728]
+  storage mdb;          // mlp-down out [NE]
+  storage logits;       // [VOCAB]
+  storage logits_sink;  // [VOCAB] sink for forwards run only for their side
+                        // effects (capture warm-up)
+  storage embed;        // staged embedding row [NE] (the step's input)
+  std::vector<float> embed_stage;  // host gather target, uploaded into embed
   void init() {
-    embedb = tl::cuda::alloc(NE * 4, &embed_host);  // host mirror: gather target
-    logitsb = tl::cuda::alloc(VOCAB * 4, &logits_host);
-    res[0] = alloc_f32(NE);
-    res[1] = alloc_f32(NE);
-    hb = alloc_f32(NE);
-    h2b = alloc_f32(NE);
-    qb = alloc_f32(NH * HD);
-    qkvb = alloc_f32((NH + 2 * NKV) * HD);
-    ab = alloc_f32(NH * HD);
-    mb = alloc_f32(FF);
-    gub = alloc_f32(2 * FF);
-    mdb = alloc_f32(NE);
-    logits_scratch = alloc_f32(VOCAB);
+    embed = scratch_f32(NE);
+    embed_stage.assign(NE, 0.0f);
+    logits = scratch_f32(VOCAB);
+    res[0] = scratch_f32(NE);
+    res[1] = scratch_f32(NE);
+    hb = scratch_f32(NE);
+    h2b = scratch_f32(NE);
+    qb = scratch_f32(NH * HD);
+    kb = scratch_f32(NKV * HD);
+    vb = scratch_f32(NKV * HD);
+    qkvb = scratch_f32((NH + 2 * NKV) * HD);
+    ab = scratch_f32(NH * HD);
+    mb = scratch_f32(FF);
+    gub = scratch_f32(2 * FF);
+    mdb = scratch_f32(NE);
+    logits_sink = scratch_f32(VOCAB);
   }
 };
 
@@ -240,48 +266,39 @@ struct Scratch {
 // rather than run in one [T_prompt, ...] pass under the WSL2 ~2 GB cliff.
 struct PrefillScratch {
   int64_t cap = 0;
-  void* emb = nullptr;                // embedding rows [cap, NE]
-  void* res[2] = {nullptr, nullptr};  // residual ping-pong [cap, NE]
-  void* h = nullptr;                  // input-norm out [cap, NE]
-  void* h2 = nullptr;                 // post-attn norm out [cap, NE]
-  void* qkv = nullptr;                // fused QKV out [cap, (NH+2*NKV)*HD]
+  storage emb;     // embedding rows [cap, NE]
+  storage res[2];  // residual ping-pong [cap, NE]
+  storage h;       // input-norm out [cap, NE]
+  storage h2;      // post-attn norm out [cap, NE]
+  storage qkv;     // fused QKV out [cap, (NH+2*NKV)*HD]
   // q|k|v head-major in ONE buffer [NH+2*NKV, cap, HD]: the fused projection
   // already emits them contiguously per token, so one split_heads pass covers
   // every head, and k/v are just mid-buffer pointers into it.
-  void* qkvh = nullptr;
-  void* ah = nullptr;                 // attn out head-major [NH, cap, HD]
-  void* at = nullptr;                 // attn out token-major [cap, NH*HD]
-  void* gu = nullptr;                 // fused gate|up [cap, 2*FF]
-  void* mb = nullptr;                 // swiglu out [cap, FF]
-  void* md = nullptr;                 // mlp-down out [cap, NE]
-  float* emb_host = nullptr;          // emb's own host mirror (gather target)
+  storage qkvh;
+  storage ah;  // attn out head-major [NH, cap, HD]
+  storage at;  // attn out token-major [cap, NH*HD]
+  storage gu;  // fused gate|up [cap, 2*FF]
+  storage mb;  // swiglu out [cap, FF]
+  storage md;  // mlp-down out [cap, NE]
+  std::vector<float> emb_stage;  // host gather target, uploaded into emb
 
   bool init(int64_t chunk) {
     if (cap >= chunk) return true;  // already big enough
-    destroy();
     cap = chunk;
-    emb = tl::cuda::alloc(cap * NE * 4, &emb_host);
-    res[0] = alloc_f32(cap * NE);
-    res[1] = alloc_f32(cap * NE);
-    h = alloc_f32(cap * NE);
-    h2 = alloc_f32(cap * NE);
-    qkv = alloc_f32(cap * (NH + 2 * NKV) * HD);
-    qkvh = alloc_f32((NH + 2 * NKV) * cap * HD);
-    ah = alloc_f32(NH * cap * HD);
-    at = alloc_f32(cap * NH * HD);
-    gu = alloc_f32(cap * 2 * FF);
-    mb = alloc_f32(cap * FF);
-    md = alloc_f32(cap * NE);
-    return md != nullptr;
-  }
-  void destroy() {
-    for (void** p : {&emb, &res[0], &res[1], &h, &h2, &qkv, &qkvh, &ah, &at,
-                     &gu, &mb, &md}) {
-      if (*p) tl::cuda::release(*p, 0, nullptr);
-      *p = nullptr;
-    }
-    emb_host = nullptr;
-    cap = 0;
+    emb = scratch_f32(cap * NE);
+    emb_stage.assign((size_t)cap * NE, 0.0f);
+    res[0] = scratch_f32(cap * NE);
+    res[1] = scratch_f32(cap * NE);
+    h = scratch_f32(cap * NE);
+    h2 = scratch_f32(cap * NE);
+    qkv = scratch_f32(cap * (NH + 2 * NKV) * HD);
+    qkvh = scratch_f32((NH + 2 * NKV) * cap * HD);
+    ah = scratch_f32(NH * cap * HD);
+    at = scratch_f32(cap * NH * HD);
+    gu = scratch_f32(cap * 2 * FF);
+    mb = scratch_f32(cap * FF);
+    md = scratch_f32(cap * NE);
+    return md.native != nullptr;
   }
 };
 
@@ -297,20 +314,25 @@ struct Model {
   bool row = false;  // imperative gemvs use warp-per-row [N,K] (bf16 only)
   bool q4_mlp = false;     // imperative MLP gemvs (wgu, wd) use q4
   bool q4_lmhead = false;  // imperative lm_head gemv uses q4
+  // One QKV projection instead of three. Its whole point is that q|k|v come
+  // out contiguous and the decoder reads each by offsetting the output
+  // pointer — which names a location only under flat addressing, so where a
+  // pointer is a buffer handle the three projections take three buffers.
+  // (gate|up stays fused everywhere: swiglu reads both halves itself.)
+  static constexpr bool fused_qkv = gpu::caps::flat_addressing;
 };
 
 // Decode GEMV picking the weight-dtype kernel: y(n) = a(1,k) @ W[k,n].
 inline bool gemv_w(const array& W, void* a, void* y, int64_t n, int64_t k) {
-  return W.dt() == tl::dtype::bf16
-             ? tl::cuda::gemv_bf16(a, W.native(), y, n, k)
-             : tl::cuda::gemv_f32(a, W.native(), y, n, k);
+  return W.dt() == tl::dtype::bf16 ? gpu::gemv_bf16(a, W.native(), y, n, k)
+                                   : gpu::gemv_f32(a, W.native(), y, n, k);
 }
 
 // Greedy token from the logits the most recent forward left in scratch (the one
-// terminal sync of a step lives inside cuda::argmax).
+// terminal sync of a step lives inside gpu::argmax).
 inline int64_t argmax_logits(Model& M) {
   int64_t idx = 0;
-  tl::cuda::argmax(M.scratch.logitsb, VOCAB, &idx);
+  gpu::argmax(M.scratch.logits.native, VOCAB, &idx);
   return idx;
 }
 
@@ -347,37 +369,37 @@ inline void set_cache_pos(Model& M, int64_t p) {
 // bf16 row-major weights only (the layout gemm_bf16_nt shares with the decode
 // GEMV); callers check Model.row and fall back to token-by-token otherwise.
 inline void prefill_chunk_(Model& M, int64_t T) {
-  namespace cu = tl::cuda;
   PrefillScratch& P = M.pscratch;
   // Absolute position of this chunk's first token — the caches are all at the
   // same place, and kv_cache::prefill appends there, so rope reads it from the
   // same source rather than taking it as a parameter that could disagree.
   const int64_t pos0 = M.layers[0].cache.pos;
   constexpr int64_t QKVN = (NH + 2 * NKV) * HD;
-  void* x = P.emb;
-  cu::rmsnorm(x, M.layers[0].an.native(), P.h, NE, EPS, T);
+  void* x = P.emb.native;
+  gpu::rmsnorm(x, M.layers[0].an.native(), P.h.native, NE, EPS, T);
   for (int64_t l = 0; l < NL; l++) {
     Layer& L = M.layers[l];
-    void* ro = P.res[l & 1];
-    cu::gemm_bf16_nt(P.h, L.wqkv.native(), P.qkv, T, QKVN, NE);
+    void* ro = P.res[l & 1].native;
+    gpu::gemm_bf16_nt(P.h.native, L.wqkv.native(), P.qkv.native, T, QKVN, NE);
     // One pass turns the fused [T, q|k|v] output into head-major [18, T, D] and
     // adds the fused bias — rope's own fused-bias form only indexes correctly at
     // T == 1, so the bias rides along here instead.
-    cu::split_heads(P.qkv, L.bqkv.native(), P.qkvh, T, QKVN, 0, NH + 2 * NKV, HD);
-    void* kh = off_f32(P.qkvh, NH * T * HD);
-    void* vh = off_f32(P.qkvh, (NH + NKV) * T * HD);
+    gpu::split_heads(P.qkv.native, L.bqkv.native(), P.qkvh.native, T, QKVN, 0,
+                     NH + 2 * NKV, HD);
+    void* kh = off_f32(P.qkvh.native, NH * T * HD);
+    void* vh = off_f32(P.qkvh.native, (NH + NKV) * T * HD);
     // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
-    cu::rope(P.qkvh, P.qkvh, NH * T, T, HD, pos0, ROPE_BASE);
-    cu::rope(kh, kh, NKV * T, T, HD, pos0, ROPE_BASE);
-    L.cache.prefill(P.qkvh, kh, vh, P.ah, T, NH, SCALE);
-    cu::merge_heads(P.ah, P.at, T, NH, HD);
-    cu::gemm_bf16_nt(P.at, L.wo_row.native(), ro, T, NE, NH * HD);
-    cu::rmsnorm_res(ro, x, L.fn.native(), ro, P.h2, NE, EPS, T);
-    cu::gemm_bf16_nt(P.h2, L.wgu.native(), P.gu, T, 2 * FF, NE);
-    cu::swiglu(P.gu, P.mb, FF, T);
-    cu::gemm_bf16_nt(P.mb, L.wd_row.native(), P.md, T, NE, FF);
+    gpu::rope(P.qkvh.native, P.qkvh.native, NH * T, T, HD, pos0, ROPE_BASE);
+    gpu::rope(kh, kh, NKV * T, T, HD, pos0, ROPE_BASE);
+    L.cache.prefill(P.qkvh.native, kh, vh, P.ah.native, T, NH, SCALE);
+    gpu::merge_heads(P.ah.native, P.at.native, T, NH, HD);
+    gpu::gemm_bf16_nt(P.at.native, L.wo_row.native(), ro, T, NE, NH * HD);
+    gpu::rmsnorm_res(ro, x, L.fn.native(), ro, P.h2.native, NE, EPS, T);
+    gpu::gemm_bf16_nt(P.h2.native, L.wgu.native(), P.gu.native, T, 2 * FF, NE);
+    gpu::swiglu(P.gu.native, P.mb.native, FF, T);
+    gpu::gemm_bf16_nt(P.mb.native, L.wd_row.native(), P.md.native, T, NE, FF);
     void* nextw = (l + 1 < NL) ? M.layers[l + 1].an.native() : M.onorm.native();
-    cu::rmsnorm_res(ro, P.md, nextw, ro, P.h, NE, EPS, T);
+    gpu::rmsnorm_res(ro, P.md.native, nextw, ro, P.h.native, NE, EPS, T);
     x = ro;
   }
   // Leaves P.h holding the final RMSNorm for every row of the chunk. Logits are
@@ -398,18 +420,19 @@ inline void gather_embed_rows_(const Model& M, const int* ids, int64_t n,
 // Stage `n` prompt embeddings starting at ids[from] into the batched scratch.
 inline void stage_embed_rows_(Model& M, const std::vector<int>& ids, int64_t from,
                               int64_t n) {
-  float* v = M.pscratch.emb_host;
+  float* v = M.pscratch.emb_stage.data();
   gather_embed_rows_(M, ids.data() + from, n, v);
-  tl::cuda::upload(M.pscratch.emb, v, n * NE);
+  gpu::upload(M.pscratch.emb.native, v, n * NE);
 }
 
 // Whether a prompt of `T` tokens should go through the batched prefill: the
-// weights must be the bf16 row-major ones its GEMM consumes, the prompt must be
-// long enough to be worth a batched pass, and it must fit the cache. One place
-// answers it, so build(), begin() and prefill_batched() cannot disagree.
+// backend must have the bf16-weight GEMM, the weights must be the row-major
+// ones it consumes, the prompt must be long enough to be worth a batched pass,
+// and it must fit the cache. One place answers it, so build(), begin() and
+// prefill_batched() cannot disagree.
 inline bool can_prefill_batched(const Model& M, int64_t T) {
-  return M.row && !M.q4_mlp && !M.layers.empty() && T >= PREFILL_MIN &&
-         M.layers[0].cache.pos + T <= MAXC;
+  return gpu::caps::bf16_gemm && M.row && !M.q4_mlp && !M.layers.empty() &&
+         T >= PREFILL_MIN && M.layers[0].cache.pos + T <= MAXC;
 }
 
 // Prefill a whole prompt in chunks and return the greedy next token. Leaves the
@@ -428,8 +451,8 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
   }
   // Only the final row of the final chunk needs logits — one GEMV for the whole
   // prompt rather than one per chunk.
-  gemv_w(M.outwT, off_f32(M.pscratch.h, (last - 1) * NE), M.scratch.logitsb,
-         VOCAB, NE);
+  gemv_w(M.outwT, off_f32(M.pscratch.h.native, (last - 1) * NE),
+         M.scratch.logits.native, VOCAB, NE);
   return argmax_logits(M);
 }
 
@@ -440,7 +463,10 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
 // F16 oracle; validated by coherence + divergence, not greedy-exact.
 inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
                    bool q4_mlp = false, bool q4_lmhead = false) {
-  const bool row = (wdt == tl::dtype::bf16);  // warp-per-row [N,K] imperative gemvs
+  // Row-major [N,K] weights exist only to feed gemv_bf16_row and the prefill
+  // GEMM; a backend without them decodes from the column-major [K,N] split-K
+  // GEMV every dtype has, so the layout follows the cap, not just the dtype.
+  const bool row = (wdt == tl::dtype::bf16) && gpu::caps::row_gemv;
   const bool q4m = q4_mlp && row;             // q4 requires the bf16/row base
   const bool q4lm = q4_lmhead && row;
   const tl::dtype f32 = tl::dtype::f32;
@@ -485,8 +511,9 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
         // split-K. +466MB over 24 layers either way. wo_row/wd_row (bf16 only)
         // are the row copies of the two shared weights (+247MB), keeping the
         // total under the WSL2 ~2GB cliff (lm_head deliberately not copied).
-        .wqkv = row ? load_w_T_cat_row(m, qkv_parts, NE)
-                    : load_w_T_cat(m, qkv_parts, NE, wdt),
+        .wqkv = !Model::fused_qkv ? array{}
+                : row              ? load_w_T_cat_row(m, qkv_parts, NE)
+                                   : load_w_T_cat(m, qkv_parts, NE, wdt),
         // wgu: bf16-row when row & !q4m; column [K,N] in f32; empty when q4m
         // (replaced by wgu_q4). wd_row likewise.
         .wgu = row ? (q4m ? array{} : load_w_T_cat_row(m, gu_parts, NE))
@@ -521,7 +548,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
   // releases: attention only ever reads [0, pos), so the stale rows are
   // unreachable.
   if (prefill_batched(M, std::vector<int>((size_t)PREFILL_MIN, 0)) >= 0) {
-    tl::cuda::flush();
+    gpu::flush();
     reset_cache(M);
   }
   return M;
@@ -623,12 +650,12 @@ inline int64_t step_greedy(Model& M, int64_t id, int64_t pos,
   array logits = forward(M, id, pos, nullptr, nullptr, prof);
   double t = prof ? StepProf::now_ms() : 0.0;
   // realize() (not eval()): the lm_head gemv launches without syncing; the
-  // argmax kernel is stream-ordered after it and cuda::argmax does the single
-  // terminal CtxSynchronize before its 4-byte D2H. One sync for the whole step.
+  // argmax kernel is ordered after it and gpu::argmax does the single terminal
+  // drain before its 4-byte read. One sync for the whole step.
   logits.realize();
   if (prof) { prof->logits_eval += StepProf::now_ms() - t; t = StepProf::now_ms(); }
   int64_t idx = 0;
-  if (!tl::cuda::argmax(logits.native(), VOCAB, &idx)) {
+  if (!gpu::argmax(logits.native(), VOCAB, &idx)) {
     const float* p = logits.raw();
     idx = 0;
     for (int64_t i = 1; i < VOCAB; i++)
@@ -651,13 +678,14 @@ inline int64_t argmax(const std::vector<float>& v) {
 inline bool gemv_q4_w(const array& Wq, void* a, void* y) {
   const int64_t K = Wq.shape()[0], N = Wq.shape()[1];
   void* scales = static_cast<char*>(Wq.native()) + N * K / 2;
-  return tl::cuda::gemv_q4(a, Wq.native(), scales, y, N, K, tl::kQ4Group);
+  return gpu::gemv_q4(a, Wq.native(), scales, y, N, K, tl::kQ4Group);
 }
 
-// The 24 decoder layers + final RMSNorm + lm_head gemv as direct cuda:: calls
+// The 24 decoder layers + final RMSNorm + lm_head gemv as direct gpu:: calls
 // on the Scratch buffers, reading layer-0 residual from x0 and writing logits
-// to S.logitsb. NO array nodes, NO host sync / blocking copy — so this region
-// is CUDA-graph-capturable (embed staging + argmax stay outside). All kernels
+// to S.logits. NO array nodes, NO host sync / blocking copy — so this region
+// is graph-capturable where a backend has capture (embed staging + argmax stay
+// outside). All kernels
 // target context.stream (default null, or the capture stream during recording).
 // logits_out (optional): where the lm_head writes. Defaults to the scratch
 // logits every reader expects; a caller running the forward only for its side
@@ -671,11 +699,10 @@ inline bool gemv_q4_w(const array& Wq, void* a, void* y) {
 // layer is at the same sequence position). d_pos==nullptr = the normal host path.
 inline void run_layers_(Model& M, void* x0, int64_t pos, void* d_pos = nullptr,
                         void* logits_out = nullptr) {
-  namespace cu = tl::cuda;
   const bool cap = d_pos != nullptr;
   Scratch& S = M.scratch;
   // Fused seams (kills 4 elementwise launches/layer): q/k bias folds into rope
-  // (cu::rope bias arg); the two residual adds fold into the following RMSNorms
+  // (gpu::rope's bias arg); the two residual adds fold into the following RMSNorms
   // via rmsnorm_res (writes the residual sum AND its norm). The layer input's
   // norm is therefore produced by the *previous* layer's mlp seam — so precompute
   // layer 0's here, and carry each layer's next-input norm in hb.
@@ -686,62 +713,74 @@ inline void run_layers_(Model& M, void* x0, int64_t pos, void* d_pos = nullptr,
   // below are unchanged.
   const bool row = M.row;
   auto gv = [&](const array& W, void* a, void* y, int64_t n, int64_t k) {
-    if (row) tl::cuda::gemv_bf16_row(a, W.native(), y, n, k);
+    if (row) gpu::gemv_bf16_row(a, W.native(), y, n, k);
     else gemv_w(W, a, y, n, k);
   };
   void* x = x0;
-  cu::rmsnorm(x, M.layers[0].an.native(), S.hb, NE, EPS);
+  gpu::rmsnorm(x, M.layers[0].an.native(), S.hb.native, NE, EPS);
   for (int64_t l = 0; l < NL; l++) {
     Layer& L = M.layers[l];
-    void* ro = S.res[l & 1];  // res_out (x1 then x2) for this layer (ping-pong)
+    void* ro = S.res[l & 1].native;  // res_out (x1 then x2), ping-pong
     // Fused QKV: one GEMV -> [q(NH*HD) | k(NKV*HD) | v(NKV*HD)] in S.qkvb, then
     // slice: rope q & k in place, bias-add v. Same per-column split-K as the
-    // separate wq/wk/wv GEMVs (bx=1, chunk=32), so bit-identical per column.
-    gv(L.wqkv, S.hb, S.qkvb, (NH + 2 * NKV) * HD, NE);
-    void* qp = S.qkvb;
-    void* kp = off_f32(S.qkvb, NH * HD);
-    void* vp = off_f32(S.qkvb, (NH + NKV) * HD);
-    if (cap) {
-      cu::rope_dpos(qp, qp, NH, 1, HD, d_pos, ROPE_BASE, L.bq.native());
-      cu::rope_dpos(kp, kp, NKV, 1, HD, d_pos, ROPE_BASE, L.bk.native());
+    // separate wq/wk/wv GEMVs (bx=1, chunk=32), so bit-identical per column —
+    // which is also why the unfused form below is not a different answer, only
+    // a different number of dispatches.
+    void *qp, *kp, *vp;
+    if (M.fused_qkv) {
+      gv(L.wqkv, S.hb.native, S.qkvb.native, (NH + 2 * NKV) * HD, NE);
+      qp = S.qkvb.native;
+      kp = off_f32(qp, NH * HD);
+      vp = off_f32(qp, (NH + NKV) * HD);
     } else {
-      cu::rope(qp, qp, NH, 1, HD, pos, ROPE_BASE, L.bq.native());
-      cu::rope(kp, kp, NKV, 1, HD, pos, ROPE_BASE, L.bk.native());
+      qp = S.qb.native;
+      kp = S.kb.native;
+      vp = S.vb.native;
+      gv(L.wq, S.hb.native, qp, NH * HD, NE);
+      gv(L.wk, S.hb.native, kp, NKV * HD, NE);
+      gv(L.wv, S.hb.native, vp, NKV * HD, NE);
     }
-    cu::binary(cu::kop::add, vp, 0, L.bv.native(), 0, vp, 0, NKV * HD, 1, 0);
+    if (cap) {
+      gpu::rope_dpos(qp, qp, NH, 1, HD, d_pos, ROPE_BASE, L.bq.native());
+      gpu::rope_dpos(kp, kp, NKV, 1, HD, d_pos, ROPE_BASE, L.bk.native());
+    } else {
+      gpu::rope(qp, qp, NH, 1, HD, pos, ROPE_BASE, L.bq.native());
+      gpu::rope(kp, kp, NKV, 1, HD, pos, ROPE_BASE, L.bk.native());
+    }
+    gpu::binary(gpu::kop::add, vp, 0, L.bv.native(), 0, vp, 0, NKV * HD, 1, 0);
     if (cap) {
       L.cache.append_dpos(kp, vp, d_pos);
-      L.cache.attn_dpos(qp, S.ab, NH, d_pos, SCALE);
+      L.cache.attn_dpos(qp, S.ab.native, NH, d_pos, SCALE);
     } else {
       L.cache.append(kp, vp);
-      L.cache.attn(qp, S.ab, NH, SCALE);
+      L.cache.attn(qp, S.ab.native, NH, SCALE);
     }
-    gv(row ? L.wo_row : L.wo, S.ab, ro, NE, NH * HD);  // ro = attn @ wo
+    gv(row ? L.wo_row : L.wo, S.ab.native, ro, NE, NH * HD);  // ro = attn @ wo
     // x1 = x + (attn@wo); h2 = rmsnorm(x1, fn) — fused.
-    cu::rmsnorm_res(ro, x, L.fn.native(), ro, S.h2b, NE, EPS);
+    gpu::rmsnorm_res(ro, x, L.fn.native(), ro, S.h2b.native, NE, EPS);
     // Fused gate|up: one GEMV -> [gate(FF) | up(FF)] in S.gub; swiglu reads both.
-    if (M.q4_mlp) gemv_q4_w(L.wgu_q4, S.h2b, S.gub);  // [K=NE, N=2*FF]
-    else gv(L.wgu, S.h2b, S.gub, 2 * FF, NE);
-    cu::swiglu(S.gub, S.mb, FF);
-    if (M.q4_mlp) gemv_q4_w(L.wd_q4, S.mb, S.mdb);    // [K=FF, N=NE]
-    else gv(row ? L.wd_row : L.wd, S.mb, S.mdb, NE, FF);
+    if (M.q4_mlp) gemv_q4_w(L.wgu_q4, S.h2b.native, S.gub.native);  // [NE, 2*FF]
+    else gv(L.wgu, S.h2b.native, S.gub.native, 2 * FF, NE);
+    gpu::swiglu(S.gub.native, S.mb.native, FF);
+    if (M.q4_mlp) gemv_q4_w(L.wd_q4, S.mb.native, S.mdb.native);  // [FF, NE]
+    else gv(row ? L.wd_row : L.wd, S.mb.native, S.mdb.native, NE, FF);
     // x2 = x1 + mlp; next input norm = rmsnorm(x2, next an | final onorm) — fused.
     void* nextw = (l + 1 < NL) ? M.layers[l + 1].an.native() : M.onorm.native();
-    cu::rmsnorm_res(ro, S.mdb, nextw, ro, S.hb, NE, EPS);
+    gpu::rmsnorm_res(ro, S.mdb.native, nextw, ro, S.hb.native, NE, EPS);
     x = ro;
   }
   // hb now holds the final RMSNorm output (folded into the last layer's seam).
-  void* logits = logits_out ? logits_out : S.logitsb;
-  if (M.q4_lmhead) gemv_q4_w(M.outwT_q4, S.hb, logits);  // [K=NE, N=VOCAB]
-  else gemv_w(M.outwT, S.hb, logits, VOCAB, NE);
+  void* logits = logits_out ? logits_out : S.logits.native;
+  if (M.q4_lmhead) gemv_q4_w(M.outwT_q4, S.hb.native, logits);  // [NE, VOCAB]
+  else gemv_w(M.outwT, S.hb.native, logits, VOCAB, NE);
   // Tail of the captured region: advance the shared device pos so the next
   // graph replay reads pos+1 (lm_head is pos-independent, so order vs it is free).
-  if (cap) cu::incr_u32(d_pos);
+  if (cap) gpu::incr_u32(d_pos);
 }
 
 // Fully imperative decode step (C1): embed row -> run_layers_ -> GPU argmax.
 // Kills the ~45% host graph-construction cost and per-step allocation; one sync
-// (inside cuda::argmax). Numerically identical to step_greedy (same
+// (inside gpu::argmax). Numerically identical to step_greedy (same
 // gemv/rope/attn kernels; fused rmsnorm/swiglu match the array compositions) —
 // guarded greedy-exact by check_qwen and bench_qwen_decode. Returns the token.
 inline int64_t step_imperative(Model& M, int64_t id, int64_t pos) {
@@ -752,23 +791,22 @@ inline int64_t step_imperative(Model& M, int64_t id, int64_t pos) {
 }
 
 // Run the imperative forward and return the logits [VOCAB] on the host (device
-// mirror of scratch.logitsb). For the q4-vs-bf16 divergence measurement — the
+// mirror of scratch.logits). For the q4-vs-bf16 divergence measurement — the
 // quantization-quality analogue of step_imperative's greedy token.
 inline const float* imperative_logits(Model& M, int64_t id, int64_t pos) {
   array e = embed_row(M, id);
   e.realize();
   run_layers_(M, e.native(), pos);
-  tl::cuda::sync_to_host(M.scratch.logitsb, false);
-  return M.scratch.logits_host;
+  return host_read(M.scratch.logits);
 }
 
-// Gather the embedding row for token `id` into the staged capture buffer
-// S.embedb (host gather + blocking upload; marks it device-current). Kept out
-// of the captured region since it involves a host gather + blocking copy.
+// Gather the embedding row for token `id` into the staged step input S.embed
+// (host gather + blocking upload; marks it device-current). Kept out of a
+// captured region since it involves a host gather + blocking copy.
 inline void stage_embed(Model& M, int64_t id) {
   const int one = (int)id;
-  gather_embed_rows_(M, &one, 1, M.scratch.embed_host);
-  tl::cuda::upload(M.scratch.embedb, M.scratch.embed_host, NE);
+  gather_embed_rows_(M, &one, 1, M.scratch.embed_stage.data());
+  gpu::upload(M.scratch.embed.native, M.scratch.embed_stage.data(), NE);
 }
 
 // CUDA-graph-captured greedy decoder (A-min). Captures the device-pos forward
@@ -789,9 +827,9 @@ inline void stage_embed(Model& M, int64_t id) {
 // reconciled at the phase boundary, the only point where a caller could switch
 // to a host-pos API.
 struct captured_decoder {
-  void* d_pos = nullptr;
-  tl::cuda::CUgraphExec exec = nullptr;  // opaque handle; non-null == captured
-  int64_t cur_pos = 0, max_ctx = 0;      // capacity bound owned by the mechanism
+  storage d_pos;                      // device u32 position counter (capture)
+  gpu::graph_exec exec = nullptr;     // opaque handle; non-null == captured
+  int64_t cur_pos = 0, max_ctx = 0;   // capacity bound owned by the mechanism
   double capture_ms = 0;  // one-time init cost (warm + record + instantiate)
   bool batched = false;   // begin() ran the prompt as GEMMs, not token-by-token
 
@@ -807,23 +845,23 @@ struct captured_decoder {
     capture_ms = StepProf::now_ms() - t0;
   }
   void init_(Model& M, int64_t first_id, int64_t pos) {
-    namespace cu = tl::cuda;
     if (M.layers.empty()) return;
     max_ctx = M.layers[0].cache.max_ctx;  // bound applies to the fallback too
     cur_pos = pos;
-    if (!cu::graph_available()) return;
-    d_pos = cu::alloc(4, nullptr);
-    if (!d_pos) return;
+    if (!gpu::graph_available()) return;
+    d_pos = storage::make(1);
+    if (!d_pos.native) return;
+    void* dp = d_pos.native;
     stage_embed(M, first_id);
-    cu::upload_u32(d_pos, (unsigned)pos);
+    gpu::upload_u32(dp, (unsigned)pos);
     // Warm run: real launches, but its logits go to the throwaway sink so a
     // prompt's logits (already in scratch when begin() batched) survive.
-    run_layers_(M, M.scratch.embedb, pos, d_pos, M.scratch.logits_scratch);
-    cu::flush();
-    cu::upload_u32(d_pos, (unsigned)pos);          // reset after warm
-    if (!cu::capture_begin()) return;
-    run_layers_(M, M.scratch.embedb, pos, d_pos);  // recorded, not executed
-    exec = cu::capture_end();
+    run_layers_(M, M.scratch.embed.native, pos, dp, M.scratch.logits_sink.native);
+    gpu::flush();
+    gpu::upload_u32(dp, (unsigned)pos);  // reset after warm
+    if (!gpu::capture_begin()) return;
+    run_layers_(M, M.scratch.embed.native, pos, dp);  // recorded, not executed
+    exec = gpu::capture_end();
   }
 
   // Consume a whole prompt and return the first generated token (the greedy
@@ -872,14 +910,13 @@ struct captured_decoder {
   // Skipping argmax saves its 4-byte D2H *sync* per token (~6%, the replay-only
   // vs replay+argmax gap in bench_qwen_decode) — safe because the next
   // stage_embed's H2D is a blocking null-stream copy, so it cannot overwrite
-  // S.embedb while the previous replay still reads it. Without a graph this is
+  // S.embed while the previous replay still reads it. Without a graph this is
   // step_imperative minus the argmax, on the same scratch and host cache pos.
   bool feed(Model& M, int64_t id) {
-    namespace cu = tl::cuda;
     if (cur_pos >= max_ctx) return false;
-    stage_embed(M, id);  // gather id's row -> S.embedb (host + blocking H2D)
-    if (exec) cu::graph_launch(exec);  // replay: append@d_pos, attn, logits, incr
-    else run_layers_(M, M.scratch.embedb, cur_pos);  // host-pos imperative
+    stage_embed(M, id);  // gather id's row -> S.embed (host + blocking H2D)
+    if (exec) gpu::graph_launch(exec);  // replay: append@d_pos, attn, logits, incr
+    else run_layers_(M, M.scratch.embed.native, cur_pos);  // host-pos imperative
     cur_pos++;
     return true;
   }
@@ -896,11 +933,9 @@ struct captured_decoder {
 
   bool ok() const { return exec != nullptr; }
   void destroy() {
-    namespace cu = tl::cuda;
-    if (exec) cu::graph_destroy(exec);
-    if (d_pos) cu::release(d_pos, 0, nullptr);
+    if (exec) gpu::graph_destroy(exec);
     exec = nullptr;
-    d_pos = nullptr;
+    d_pos = storage{};  // the pool takes the counter back
   }
 };
 

@@ -969,6 +969,9 @@ struct caps {
   static constexpr bool graph_capture = true;
   static constexpr bool row_gemv = true;   // gemv_bf16_row: weights as [N,K]
   static constexpr bool bf16_gemm = true;  // gemm_bf16_nt: the batched prefill
+  // A device pointer is an address, so base + n names a mid-buffer location
+  // and a fused kernel's output can be read back in slices.
+  static constexpr bool flat_addressing = true;
 };
 using graph_exec = CUgraphExec;
 

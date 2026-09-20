@@ -18,7 +18,7 @@
 //
 // Usage: bench_qwen_prefill [model.gguf] [max_T]
 
-#include "qwen_model.h"
+#include "../../models/qwen2.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -136,8 +136,8 @@ int main(int argc, char** argv) {
     std::printf("=== 0. every prefill path vs the array reference (T=%lld) ===\n",
                 (long long)T);
     auto compare = [&](const char* name, int64_t got_tok) {
-      cu::sync_to_host(M.scratch.logitsb, false);
-      const float* got = M.scratch.logits_host;
+      cu::sync_to_host(M.scratch.logits.native, false);
+      const float* got = M.scratch.logits.ptr;
       double maxrel = 0;
       for (int64_t i = 0; i < qm::VOCAB; i++)
         maxrel = std::max(maxrel, (double)std::fabs(got[i] - ref[(size_t)i]) /

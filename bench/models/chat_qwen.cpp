@@ -1,13 +1,13 @@
 // M9 "actually chat" — the real thing. Load a Qwen2.5-0.5B-Instruct GGUF, tokenize
 // a prompt with the Qwen2 chat template (tl::tokenizer), run the decoder
-// (qwen_model.h) greedily, and detokenize the generated ids back to text. This is
-// the end-to-end proof: prompt string in, generated text out, on hand-written CUDA
-// kernels + own GGUF loader + own BPE tokenizer, zero third-party runtime deps.
+// (qwen2.h) greedily, and detokenize the generated ids back to text. This is
+// the end-to-end proof: prompt string in, generated text out, on this repo's own
+// GPU kernels + own GGUF loader + own BPE tokenizer, zero third-party runtime deps.
 //
 // Usage: chat_qwen [model.gguf] ["your prompt"]
 // Greedy decoding (deterministic); stops at <|im_end|> or the token budget.
 
-#include "qwen_model.h"
+#include "qwen2.h"
 #include "tokenizer.h"
 
 #include <chrono>
@@ -24,7 +24,7 @@ namespace qm = qwenmodel;
 
 int main(int argc, char** argv) {
   if (!tl::gpu_available()) {
-    std::printf("no CUDA device — skipping chat\n");
+    std::printf("no GPU device — skipping chat\n");
     return 0;
   }
   std::string path = argc > 1 ? argv[1] : qm::default_path();
@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
   double prefill_ms = ms_since(t_prefill) - dec.capture_ms;  // prompt work only
   std::printf("prefill: %s | decode: %s\n\n",
               dec.batched ? "batched GEMM" : "token-by-token",
-              dec.ok() ? "CUDA-graph capture" : "imperative");
+              dec.ok() ? "graph capture" : "imperative");
 
   std::vector<int> gen;
   auto t_dec = clk::now();

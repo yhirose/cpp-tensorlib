@@ -1506,6 +1506,7 @@ struct caps {
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = false;
   static constexpr bool bf16_gemm = false;
+  static constexpr bool flat_addressing = false;  // `native` is a WGPUBuffer
 };
 using graph_exec = void*;
 inline bool graph_available() { return false; }

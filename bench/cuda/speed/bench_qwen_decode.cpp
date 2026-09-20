@@ -8,7 +8,7 @@
 //   Reports ms/token and the embed / qkv-eval(sync) / x2-eval(sync) /
 //   logits-eval / logits-D2H / host-argmax split, plus tok/s.
 
-#include "qwen_model.h"
+#include "../../models/qwen2.h"
 
 #include <algorithm>
 #include <chrono>
@@ -133,19 +133,19 @@ int main(int argc, char** argv) {
     std::printf("captured decode: unavailable (no graph support or q4) — skipped\n");
   } else {
     const int64_t P = pos;
-    void* d_pos = cap.d_pos;
+    void* d_pos = cap.d_pos.native;
     // (1) host-pos reference logits at P; (2) dpos forward at the same P (writes
     // row P identically) — the dpos KERNELS must match the host-pos kernels.
     qm::stage_embed(M, next);
     qm::set_cache_pos(M, P);
-    qm::run_layers_(M, M.scratch.embedb, P);
-    cu::sync_to_host(M.scratch.logitsb, false);
-    std::vector<float> ref(M.scratch.logits_host, M.scratch.logits_host + qm::VOCAB);
+    qm::run_layers_(M, M.scratch.embed.native, P);
+    cu::sync_to_host(M.scratch.logits.native, false);
+    std::vector<float> ref(M.scratch.logits.ptr, M.scratch.logits.ptr + qm::VOCAB);
     qm::set_cache_pos(M, P);
     cu::upload_u32(d_pos, (unsigned)P);
-    qm::run_layers_(M, M.scratch.embedb, P, d_pos);
-    cu::sync_to_host(M.scratch.logitsb, false);
-    const float* got = M.scratch.logits_host;
+    qm::run_layers_(M, M.scratch.embed.native, P, d_pos);
+    cu::sync_to_host(M.scratch.logits.native, false);
+    const float* got = M.scratch.logits.ptr;
     int mism = 0;
     double maxrel = 0.0;
     for (int64_t i = 0; i < qm::VOCAB; i++) {
@@ -163,9 +163,9 @@ int main(int argc, char** argv) {
     // device state) — its argmax must equal the host-pos reference.
     cu::upload_u32(d_pos, (unsigned)P);
     cu::graph_launch(cap.exec);
-    cu::sync_to_host(M.scratch.logitsb, false);
+    cu::sync_to_host(M.scratch.logits.native, false);
     int64_t cap_arg = qm::argmax(std::vector<float>(
-        M.scratch.logits_host, M.scratch.logits_host + qm::VOCAB));
+        M.scratch.logits.ptr, M.scratch.logits.ptr + qm::VOCAB));
     std::printf("captured-replay argmax: graph=%lld ref=%lld %s\n",
                 (long long)cap_arg, (long long)ref_arg,
                 cap_arg == ref_arg ? "(MATCH)" : "(!! stale/incomplete graph)");
@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
     double raw_min = bench([&](int64_t) { cu::graph_launch(cap.exec); });
     double ra_min = bench([&](int64_t) {
       cu::graph_launch(cap.exec);
-      cu::argmax(M.scratch.logitsb, qm::VOCAB, &di);
+      cu::argmax(M.scratch.logits.native, qm::VOCAB, &di);
     });
     double cap_min = bench([&](int64_t) { idx = cap.step(M, idx); });
     std::printf("=== correct captured decode (device-pos) ===\n");

@@ -1,13 +1,14 @@
 // M9 "actually chat" — numeric proof. Load a real Qwen2.5-0.5B-Instruct GGUF (F16
 // weights) and run the decoder end to end, verified against a tight numpy
-// reference that reads the SAME F16 weights (bench/cuda/qwen_oracle_data.h). Identical
+// reference that reads the SAME F16 weights (qwen_oracle_data.h here). Identical
 // weights => the C++ forward must match the reference to ~1e-4 at every checkpoint
 // (embedding, layer-0 residual, final norm, top-5 logits) AND reproduce the greedy
 // token sequence exactly. Proves weight loading + GGML->our layout transpose +
-// Qwen2 structure + the head_dim=64 attention kernels. Tokenizer/sampling are
+// Qwen2 structure + the head_dim=64 attention kernels, on whatever backend
+// gpu:: resolves to. Tokenizer/sampling are
 // separate (see chat_qwen). Model path: argv[1] or ~/models/...fp16.gguf.
 
-#include "qwen_model.h"
+#include "qwen2.h"
 #include "qwen_oracle_data.h"
 
 #include <cstdio>
@@ -24,7 +25,7 @@ static double maxrel(const std::vector<float>& a, const float* b, int64_t n) {
 
 int main(int argc, char** argv) {
   if (!tl::gpu_available()) {
-    std::printf("no CUDA device — skipping Qwen forward check\n");
+    std::printf("no GPU device — skipping Qwen forward check\n");
     return 0;
   }
   std::string path = argc > 1 ? argv[1] : qm::default_path();
@@ -92,8 +93,30 @@ int main(int argc, char** argv) {
   for (int64_t i = 0; i < NG; i++) std::printf(" %d", qwenoracle::greedy30[i]);
   std::printf("\n  greedy %s\n", greedy_ok ? "MATCH" : "DIVERGE");
 
+  // The same sequence again, on the imperative path: the fused model-path
+  // kernels (rmsnorm/rmsnorm_res/swiglu, the decode GEMVs, kv_append,
+  // attn_decode, argmax) instead of the array compositions the checkpoints
+  // above validated. They are meant to compute the same thing, so at F32 the
+  // greedy sequence must be identical — which makes every one of them gated
+  // against the numpy reference too, without a second oracle.
+  bool imp_ok = true;
+  if (tl::gpu::caps::model_path) {
+    qm::reset_cache(M);
+    int64_t p = 0, tok = 0;
+    for (int64_t i = 0; i < NP; i++) tok = qm::step_imperative(M, qwenoracle::prompt_ids[i], p++);
+    std::printf("\nimperative path (same weights, fused kernels):\n  cpp:");
+    for (int64_t i = 0; i < NG; i++) {
+      std::printf(" %lld", (long long)tok);
+      if (tok != qwenoracle::greedy30[i]) imp_ok = false;
+      tok = qm::step_imperative(M, tok, p++);
+    }
+    std::printf("\n  greedy %s\n", imp_ok ? "MATCH" : "DIVERGE");
+  } else {
+    std::printf("\nimperative path: backend has no model path — skipped\n");
+  }
+
   bool ok = emb_mr < 1e-3 && l0_mr < 5e-3 && fn_mr < 5e-3 && logit_mr < 5e-3 &&
-            top1_ok && greedy_ok;
+            top1_ok && greedy_ok && imp_ok;
   std::printf("\n%s\n", ok ? "ALL OK" : "FAILURES");
   return ok ? 0 : 1;
 }

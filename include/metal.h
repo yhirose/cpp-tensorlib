@@ -385,6 +385,19 @@ inline void release(void* buf, int64_t bytes, float* contents) {
   c.free_bufs[bytes].push_back({buf, contents, c.pending ? c.batch : 0});
 }
 
+// Stage `n` host floats into a device buffer. Unified memory has nothing to
+// transfer, but the same hazard `host_fill` covers applies: a queued kernel may
+// still be reading these bytes, so the batch drains before the store. Which is
+// why `src` must be the caller's own memory here rather than the buffer's
+// contents (a shortcut CUDA's mirror allows): writing those first would be the
+// race this drain exists to prevent.
+inline void upload(void* native, const float* src, int64_t n) {
+  if (!native || n <= 0) return;
+  if (pending()) flush();
+  auto* dst = static_cast<float*>(objc::send(native, "contents"));
+  if (dst && src != dst) std::memcpy(dst, src, (size_t)n * sizeof(float));
+}
+
 namespace detail_ {
 // The kernel scratch, grown to `bytes` (see context::scratch).
 inline void* scratch_(int64_t bytes) {
@@ -1700,6 +1713,7 @@ inline bool pending() { return false; }
 inline void flush() {}
 inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
 inline void release(void*, int64_t, float*) {}
+inline void upload(void*, const float*, int64_t) {}
 inline bool binary(kop, void*, int64_t, void*, int64_t, void*, int64_t,
                    int64_t, float, float) {
   return false;
@@ -1869,6 +1883,11 @@ struct caps {
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = false;   // gemv_bf16_row: weights as [N,K]
   static constexpr bool bf16_gemm = false;  // gemm_bf16_nt: a bf16-weight GEMM
+  // `native` is an MTLBuffer handle, not an address: arithmetic on it names
+  // nothing, so a model writes each piece to its own buffer rather than
+  // slicing one kernel's output. (The generic kernels still take byte
+  // offsets — it is only a *pointer* that cannot carry one.)
+  static constexpr bool flat_addressing = false;
 };
 
 // The capture group, cuda.h's contracts: absent here, so each answers false
@@ -1880,7 +1899,6 @@ inline bool capture_begin() { return false; }
 inline graph_exec capture_end() { return nullptr; }
 inline bool graph_launch(graph_exec) { return false; }
 inline void graph_destroy(graph_exec) {}
-inline void upload(void*, const float*, int64_t) {}
 inline void upload_u32(void*, unsigned) {}
 inline bool incr_u32(void*) { return false; }
 inline bool rope_dpos(void*, void*, int64_t, int64_t, int64_t, void*, float,
