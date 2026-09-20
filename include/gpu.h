@@ -25,11 +25,12 @@
 // so a model checks the return and keeps to the array ops where it is false.
 //
 // Beyond the kernels, each backend states what a model may assume of it in
-// `caps` (graph_capture, row_gemv, bf16_gemm), and carries the graph-capture
-// group — graph_available / capture_begin / capture_end / graph_launch /
-// graph_destroy / upload / upload_u32 / incr_u32 / rope_dpos / kv_append_dpos /
-// attn_decode_dpos / attn_dpos_partials_bytes — as no-ops where the
-// capability is false, so a decoder is written once and branches on caps.
+// `caps` (model_path, graph_capture, row_gemv, bf16_gemm), and carries the
+// graph-capture group — graph_available / capture_begin / capture_end /
+// graph_launch / graph_destroy / upload / upload_u32 / incr_u32 / rope_dpos /
+// kv_append_dpos / attn_decode_dpos / attn_dpos_partials_bytes — as no-ops
+// where the capability is false, so a decoder is written once and branches on
+// caps.
 //
 // Each backend compiles to stubs unless its own gate holds, so including all of
 // them is free: metal.h is real only on __APPLE__, cuda.h only on

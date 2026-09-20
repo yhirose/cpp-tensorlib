@@ -1497,6 +1497,10 @@ inline bool gemm_bf16_nt(void*, void*, void*, int64_t, int64_t, int64_t) {
 // and the graph-capture group it names: none of it here, so each answers
 // false or does nothing and a decoder takes its host-position path.
 struct caps {
+  // Whether the model-path row is real here, or answers false: a decoder
+  // runs on raw buffers only where it is true, and keeps to the array ops
+  // otherwise (there is no CPU fallback under that row).
+  static constexpr bool model_path = false;
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = false;
   static constexpr bool bf16_gemm = false;

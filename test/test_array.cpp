@@ -2924,10 +2924,11 @@ TEST_CASE("host-filled storage skips buffers the pending batch may write") {
 TEST_CASE("the KV cache and the decode step's kernels match their array forms") {
   // The model path runs on raw device buffers through gpu::, outside the lazy
   // graph; each kernel here is checked against the array composition that
-  // defines it, on the GPU (no-op where there is none). Shapes are Qwen2's
-  // head geometry (D=64, 14 q heads over 2 kv heads) at a context past the
-  // split-KV cutoff, plus the D=128 instantiation.
-  if (!tl::gpu_available()) return;
+  // defines it. Shapes are Qwen2's head geometry (D=64, 14 q heads over 2 kv
+  // heads) at a context past the split-KV cutoff, plus the D=128
+  // instantiation. Nothing to compare where the backend answers false for the
+  // whole row (gpu::caps::model_path) or has no device at all.
+  if (!tl::gpu_available() || !tl::gpu::caps::model_path) return;
   auto prev = tl::device_;
   tl::use_gpu();
   namespace gpu = tl::gpu;

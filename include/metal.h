@@ -1860,6 +1860,10 @@ inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
 // lists every backend's). No graph capture: a Metal command buffer is cheap to
 // encode, so a decode step re-encodes each token.
 struct caps {
+  // Whether the model-path row is real here, or answers false: a decoder
+  // runs on raw buffers only where it is true, and keeps to the array ops
+  // otherwise (there is no CPU fallback under that row).
+  static constexpr bool model_path = true;
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = false;   // gemv_bf16_row: weights as [N,K]
   static constexpr bool bf16_gemm = false;  // gemm_bf16_nt: a bf16-weight GEMM
