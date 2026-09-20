@@ -960,6 +960,14 @@ inline void flush() {
 // replay it as a single submit, erasing per-launch host overhead. Only the
 // imperative decode step (no host sync / blocking copy mid-stream) is
 // capturable; embed staging + argmax happen outside the captured region.
+// What a model may ask of this backend beyond the kernel contract (gpu.h).
+struct caps {
+  static constexpr bool graph_capture = true;
+  static constexpr bool row_gemv = true;   // gemv_bf16_row: weights as [N,K]
+  static constexpr bool bf16_gemm = true;  // gemm_bf16_nt: the batched prefill
+};
+using graph_exec = CUgraphExec;
+
 inline bool graph_available() { return context::get().d.graph_ok(); }
 
 // Begin capturing: route every subsequent launch/async-copy onto a private
@@ -2270,91 +2278,15 @@ inline bool swiglu(void* gu, void* out, int64_t ff, int64_t rows = 1) {
   return c.launch_(c.swiglu_(), {gx, (unsigned)rows}, {block}, 0, pg, po, uff);
 }
 
-// Persistent, device-resident KV cache (roadmap M9, A-surface): K,V buffers
-// [n_kv_heads, max_ctx, D] plus a running position. It lives OUTSIDE the lazy
-// graph — decode is inference-only and stateful, which the immutable node model
-// doesn't fit. append() writes one token and advances; attn() runs GQA-aware
-// fused decode attention over the cached prefix [0,pos).
-struct kv_cache {
-  void* K = nullptr;  // native device-buffer handles (see alloc())
-  void* V = nullptr;
-  int64_t n_kv_heads = 0, max_ctx = 0, D = 0, pos = 0;
-  // KV storage dtype (M9 bf16 KV cache). f32 = the exact baseline; bf16 halves
-  // the K,V bytes the attention kernels stream every step (~2x the KV floor) at
-  // a small precision cost. q/out/scratch stay f32. init() picks the width;
-  // append/attn/prefill route to the matching kernel instantiation.
-  bool kv_bf16 = false;
-
-  bool init(int64_t kv_heads, int64_t maxctx, int64_t d, dtype kv_dt = dtype::f32) {
-    n_kv_heads = kv_heads;
-    max_ctx = maxctx;
-    D = d;
-    pos = 0;
-    kv_bf16 = (kv_dt == dtype::bf16);
-    int64_t w = kv_bf16 ? 2 : 4;  // bytes per K/V element
-    K = alloc(n_kv_heads * max_ctx * D * w, nullptr);
-    V = alloc(n_kv_heads * max_ctx * D * w, nullptr);
-    return K && V;
-  }
-  // k_new/v_new: [n_kv_heads, D] device buffers (this step's projected k,v).
-  bool append(void* k_new, void* v_new) {
-    if (pos >= max_ctx) return false;
-    if (!kv_append(K, V, k_new, v_new, pos, max_ctx, n_kv_heads, D, kv_bf16))
-      return false;
-    pos++;
-    return true;
-  }
-  // q/out: [n_q_heads, D] device buffers. Attends over the cached prefix.
-  bool attn(void* q, void* out, int64_t n_q_heads, float scale) {
-    return attn_decode(q, K, V, out, n_q_heads, n_kv_heads, pos, max_ctx, D,
-                       scale, kv_bf16);
-  }
-  // CUDA-graph-capture variants: write row / ctx come from the shared device
-  // scalar d_pos (not the host `pos`), so a captured forward replays at the
-  // advancing position. The host `pos` is NOT touched here — a tl_incr_u32 at the
-  // captured forward's tail advances d_pos, and the orchestrator keeps host `pos`
-  // in step out-of-band. f32 KV only (see the dpos launchers).
-  bool append_dpos(void* k_new, void* v_new, void* d_pos) {
-    return kv_append_dpos(K, V, k_new, v_new, d_pos, max_ctx, n_kv_heads, D);
-  }
-  // The split partials for attn_dpos are graph-lifetime state (a captured graph
-  // bakes their address in), so each cache OWNS its buffer rather than sharing
-  // the growable attn_scratch_ — an unrelated bigger attn call can then never
-  // free memory a live graph still points at. Sized once from the capacity
-  // (attn_split_count at max_ctx) on the first — warm, pre-capture — call.
-  void* dpos_partials = nullptr;
-  bool attn_dpos(void* q, void* out, int64_t n_q_heads, void* d_pos, float scale) {
-    if (!dpos_partials) {
-      unsigned S = attn_split_count((unsigned)n_q_heads, max_ctx);
-      size_t hs = (size_t)n_q_heads * S;
-      dpos_partials = alloc((int64_t)attn_partials::bytes(hs, D), nullptr);
-    }
-    return attn_decode_dpos(q, K, V, out, n_q_heads, n_kv_heads, d_pos, max_ctx,
-                            D, scale, dpos_partials);
-  }
-  // Prefill T tokens: bulk-fill the cache from k_src/v_src ([n_kv_heads,T,D])
-  // and run causal attention (q/out [n_q_heads,T,D]). The block is APPENDED at
-  // the current pos and leaves pos advanced by T, so a long prompt can be run in
-  // chunks and a later turn can extend a live cache; queries attend everything
-  // already cached before them. Starting from pos=0 (a fresh cache) this is the
-  // original whole-prompt-from-row-0 fill.
-  bool prefill(void* q, void* k_src, void* v_src, void* out, int64_t T,
-               int64_t n_q_heads, float scale) {
-    if (T <= 0 || pos + T > max_ctx) return false;
-    if (!kv_fill(K, V, k_src, v_src, T, max_ctx, n_kv_heads, D, kv_bf16, pos))
-      return false;
-    int64_t p0 = pos;
-    pos += T;
-    return attn_prefill(q, K, V, out, n_q_heads, n_kv_heads, T, max_ctx, D,
-                        scale, kv_bf16, p0);
-  }
-  void destroy() {
-    if (K) release(K, 0, nullptr);
-    if (V) release(V, 0, nullptr);
-    if (dpos_partials) release(dpos_partials, 0, nullptr);
-    K = V = dpos_partials = nullptr;
-  }
-};
+// The KV cache itself is tl::kv_cache (kv_cache.h), written once over the
+// gpu:: facade; its graph-capture forms call kv_append_dpos / attn_decode_dpos
+// above and size their partials here.
+inline int64_t attn_dpos_partials_bytes(int64_t n_q_heads, int64_t max_ctx,
+                                        int64_t D) {
+  const unsigned S = attn_split_count(static_cast<unsigned>(n_q_heads), max_ctx);
+  return static_cast<int64_t>(
+      attn_partials::bytes(static_cast<size_t>(n_q_heads) * S, D));
+}
 
 // Split-K (ladder ②) for the f32 gemm: partition K into S z-slices so S× more
 // blocks run concurrently. Split-K partitions K (not replicates it), so A/B

@@ -58,10 +58,15 @@ enum class kop {
   layer_norm_,                                       // the fused layer norm
   layer_norm_bwd_dx_, layer_norm_bwd_gb_, layer_norm_bwd_gb_fold_,  // its pullback
   attn_prefill_64_, attn_prefill_128_,  // causal prefill attention, per D
+  attn_prefill_bf16_64_, attn_prefill_bf16_128_,  // over a bf16 KV cache
   attn_bwd_dq_64_, attn_bwd_dq_128_, attn_bwd_dkv_64_, attn_bwd_dkv_128_,
   attn_decode_64_, attn_decode_128_,  // fused decode attention, per D
   attn_decode_split_64_, attn_decode_split_128_,  // its split-KV pass
   attn_combine_64_, attn_combine_128_,            // and their partials
+  attn_decode_bf16_64_, attn_decode_bf16_128_,    // the same over a bf16 cache
+  attn_decode_split_bf16_64_, attn_decode_split_bf16_128_,
+  kv_append_, kv_append_bf16_, kv_fill_, kv_fill_bf16_,  // the KV cache's writes
+  argmax_, rmsnorm_, swiglu_, split_heads_, merge_heads_,  // the decode step's rest
   gemv_f32_, gemv_bf16_, gemv_q4_,   // decode GEMVs, per weight dtype
   gemv_combine_,                     // their split-K partials
   gather_axis_, row_logsumexp_, xent_bwd_, adam_step_  // cross-entropy, Adam
@@ -119,11 +124,15 @@ struct context {
   // The kernel the encoder currently has bound (set by bind_): what
   // tl::profile names the next dispatch.
   const char* bound = nullptr;
-  // Grow-on-demand scratch (the split-K GEMV's partials), kept across calls so
-  // a decode loop allocates once. Freed with the context, which is leaked.
+  // Grow-on-demand scratch (the split-K GEMV's partials, split-KV attention's),
+  // kept across calls so a decode loop allocates once. Freed with the context,
+  // which is leaked.
   void* scratch = nullptr;
   float* scratch_contents = nullptr;
   int64_t scratch_bytes = 0;
+  // argmax's one-int result, read back after a flush.
+  void* argmax_res = nullptr;
+  float* argmax_res_contents = nullptr;
 
   // Command buffers committed but not yet waited on (flush waits the last).
   // Under a profile there is one per dispatch, with the row owed its GPU
@@ -217,6 +226,8 @@ struct context {
       case kop::layer_norm_bwd_gb_fold_: return "layer_norm_bwd_gb_fold_";
       case kop::attn_prefill_64_: return "attn_prefill_64_";
       case kop::attn_prefill_128_: return "attn_prefill_128_";
+      case kop::attn_prefill_bf16_64_: return "attn_prefill_bf16_64_";
+      case kop::attn_prefill_bf16_128_: return "attn_prefill_bf16_128_";
       case kop::attn_bwd_dq_64_: return "attn_bwd_dq_64_";
       case kop::attn_bwd_dq_128_: return "attn_bwd_dq_128_";
       case kop::attn_bwd_dkv_64_: return "attn_bwd_dkv_64_";
@@ -227,6 +238,19 @@ struct context {
       case kop::attn_decode_split_128_: return "attn_decode_split_128_";
       case kop::attn_combine_64_: return "attn_combine_64_";
       case kop::attn_combine_128_: return "attn_combine_128_";
+      case kop::attn_decode_bf16_64_: return "attn_decode_bf16_64_";
+      case kop::attn_decode_bf16_128_: return "attn_decode_bf16_128_";
+      case kop::attn_decode_split_bf16_64_: return "attn_decode_split_bf16_64_";
+      case kop::attn_decode_split_bf16_128_: return "attn_decode_split_bf16_128_";
+      case kop::kv_append_: return "kv_append_";
+      case kop::kv_append_bf16_: return "kv_append_bf16_";
+      case kop::kv_fill_: return "kv_fill_";
+      case kop::kv_fill_bf16_: return "kv_fill_bf16_";
+      case kop::argmax_: return "argmax_";
+      case kop::rmsnorm_: return "rmsnorm_";
+      case kop::swiglu_: return "swiglu_";
+      case kop::split_heads_: return "split_heads_";
+      case kop::merge_heads_: return "merge_heads_";
       case kop::gemv_f32_: return "gemv_f32_";
       case kop::gemv_bf16_: return "gemv_bf16_";
       case kop::gemv_q4_: return "gemv_q4_";
@@ -1235,19 +1259,21 @@ struct rope_params {
   uint32_t half_;
   float base;
   uint32_t n;
+  uint32_t has_bias;
 };
 }  // namespace detail_
 
 // RoPE (rotary position embedding), half-split (GPT-NeoX / HF-llama)
-// convention -- mirrors tensorlib_cuda.cu's own tl_rope exactly (no fused
-// bias: array.h's gpu_rope_ never passes one). x is [rows, D] contiguous
-// (rows = H*T: a [H,T,D] tensor flattened, or [H,D] with T=1); row r's
-// head-dim vector sits at position `pos + (r % T)`; pairs (j, j+D/2)
-// rotate by angle = position * base^(-2j/D). Dispatched flat over
-// rows*(D/2) (CUDA instead grids by row, blocks by D/2 -- this file's own
-// kernels are all flat-1D, same as sum_to/compare/unary_ext above).
+// convention -- mirrors tensorlib_cuda.cu's own tl_rope exactly. x is
+// [rows, D] contiguous (rows = H*T: a [H,T,D] tensor flattened, or [H,D] with
+// T=1); row r's head-dim vector sits at position `pos + (r % T)`; pairs
+// (j, j+D/2) rotate by angle = position * base^(-2j/D). `bias`, when given,
+// is [rows, D] added before the rotation (a decode step's q/k bias folded
+// in; array.h's gpu_rope_ never passes one). Dispatched flat over rows*(D/2)
+// (CUDA instead grids by row, blocks by D/2 -- this file's own kernels are
+// all flat-1D, same as sum_to/compare/unary_ext above).
 inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
-                 int64_t pos, float base) {
+                 int64_t pos, float base, void* bias = nullptr) {
   auto& c = context::get();
   if (!c.device || D <= 0 || (D & 1)) return false;
   int64_t half = D / 2;
@@ -1255,6 +1281,7 @@ inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
   c.bind_(kop::rope_);
   detail_::set_buf_(c.enc, x, 0, 0ul);
   detail_::set_buf_(c.enc, out, 0, 1ul);
+  detail_::set_buf_(c.enc, bias ? bias : x, 0, 3ul);  // a slot must be bound
   detail_::rope_params p{};
   p.T = static_cast<uint32_t>(T);
   p.D = static_cast<uint32_t>(D);
@@ -1262,6 +1289,7 @@ inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
   p.half_ = static_cast<uint32_t>(half);
   p.base = base;
   p.n = static_cast<uint32_t>(n);
+  p.has_bias = bias ? 1u : 0u;
   objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
              static_cast<unsigned long>(sizeof(p)), 2ul);
   unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
@@ -1300,6 +1328,27 @@ struct attn_combine_params {
   uint32_t splits;
 };
 
+struct kv_params {
+  uint32_t pos, kv_stride, T;
+};
+
+struct argmax_params {
+  uint32_t n;
+};
+
+struct rmsnorm_params {
+  uint32_t n, add;
+  float eps;
+};
+
+struct swiglu_params {
+  uint32_t ff;
+};
+
+struct heads_params {
+  uint32_t T, ld, off, has_bias;
+};
+
 // Keys per split, or 0 for the single-pass kernel: one threadgroup a head
 // leaves most of a 16-core GPU idle when a model has few heads, so cut the
 // keys until there are enough threadgroups (cuda's attn_split_count).
@@ -1326,15 +1375,17 @@ inline void attn_dispatch_(objc::id enc, const attn_params& p,
 
 // q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D] cache read over
 // [0,pos0+T), query p at absolute position pos0+p. GQA via the head ratio.
-// D∈{64,128}; no bf16 cache on this backend.
+// D∈{64,128}; the cache is f32, or bf16 with kv_bf16.
 inline bool attn_prefill(void* q, void* K, void* V, void* out,
                          int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
                          int64_t kv_max, int64_t D, float scale,
                          bool kv_bf16 = false, int64_t pos0 = 0) {
   auto& c = context::get();
-  if (!c.device || kv_bf16 || (D != 64 && D != 128)) return false;
+  if (!c.device || (D != 64 && D != 128)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || T <= 0) return false;
-  c.bind_(D == 64 ? kop::attn_prefill_64_ : kop::attn_prefill_128_);
+  c.bind_(kv_bf16 ? (D == 64 ? kop::attn_prefill_bf16_64_
+                             : kop::attn_prefill_bf16_128_)
+                  : (D == 64 ? kop::attn_prefill_64_ : kop::attn_prefill_128_));
   detail_::set_buf_(c.enc, q, 0, 0ul);
   detail_::set_buf_(c.enc, K, 0, 1ul);
   detail_::set_buf_(c.enc, V, 0, 2ul);
@@ -1415,12 +1466,12 @@ inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
 }
 
 // One decode step: q [n_q_heads,D] against a [n_kv_heads,kv_max,D] cache read
-// over [0,ctx). GQA via the head ratio; no bf16 cache on this backend.
+// over [0,ctx). GQA via the head ratio; the cache is f32, or bf16 with kv_bf16.
 inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
                         int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
                         int64_t D, float scale, bool kv_bf16 = false) {
   auto& c = context::get();
-  if (!c.device || kv_bf16 || (D != 64 && D != 128)) return false;
+  if (!c.device || (D != 64 && D != 128)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || ctx <= 0) return false;
   const bool d64 = D == 64;
   unsigned long chunk = detail_::attn_split_chunk_(n_q_heads, ctx);
@@ -1435,9 +1486,14 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
   }
   const bool split = chunk != 0;
   if (split) {
-    c.bind_(d64 ? kop::attn_decode_split_64_ : kop::attn_decode_split_128_);
+    c.bind_(kv_bf16 ? (d64 ? kop::attn_decode_split_bf16_64_
+                           : kop::attn_decode_split_bf16_128_)
+                    : (d64 ? kop::attn_decode_split_64_
+                           : kop::attn_decode_split_128_));
   } else {
-    c.bind_(d64 ? kop::attn_decode_64_ : kop::attn_decode_128_);
+    c.bind_(kv_bf16 ? (d64 ? kop::attn_decode_bf16_64_
+                           : kop::attn_decode_bf16_128_)
+                    : (d64 ? kop::attn_decode_64_ : kop::attn_decode_128_));
   }
   detail_::set_buf_(c.enc, q, 0, 0ul);
   detail_::set_buf_(c.enc, K, 0, 1ul);
@@ -1460,6 +1516,150 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
   detail_::set_bytes_(c.enc, cp, 2ul);
   detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(n_q_heads), 1, 1},
                           {static_cast<unsigned long>(D), 1, 1});
+  return true;
+}
+
+// ---- the KV cache's writes and the decode step's remaining kernels --------
+// cuda.h's contracts: raw device buffers, so a model's step builds no graph.
+
+// One step's k/v (each [n_kv_heads, D]) into row `pos` of the [n_kv_heads,
+// kv_max, D] cache; narrowed to bf16 when the cache is.
+inline bool kv_append(void* Kc, void* Vc, void* k_new, void* v_new, int64_t pos,
+                      int64_t kv_max, int64_t n_kv_heads, int64_t D,
+                      bool kv_bf16 = false) {
+  auto& c = context::get();
+  if (!c.device || (D != 64 && D != 128) || n_kv_heads <= 0) return false;
+  c.bind_(kv_bf16 ? kop::kv_append_bf16_ : kop::kv_append_);
+  void* bufs[] = {Kc, Vc, k_new, v_new};
+  for (unsigned long i = 0; i < 4; i++) detail_::set_buf_(c.enc, bufs[i], 0, i);
+  detail_::kv_params p{static_cast<uint32_t>(pos),
+                       static_cast<uint32_t>(kv_max * D), 1};
+  detail_::set_bytes_(c.enc, p, 4ul);
+  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(n_kv_heads), 1, 1},
+                          {static_cast<unsigned long>(D), 1, 1});
+  return true;
+}
+
+// A prefill's k/v (each [n_kv_heads, T, D]) into cache rows [pos0, pos0 + T).
+inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
+                    int64_t kv_max, int64_t n_kv_heads, int64_t D,
+                    bool kv_bf16 = false, int64_t pos0 = 0) {
+  auto& c = context::get();
+  if (!c.device || (D != 64 && D != 128) || n_kv_heads <= 0 || T <= 0) {
+    return false;
+  }
+  c.bind_(kv_bf16 ? kop::kv_fill_bf16_ : kop::kv_fill_);
+  void* bufs[] = {Kc, Vc, K, V};
+  for (unsigned long i = 0; i < 4; i++) detail_::set_buf_(c.enc, bufs[i], 0, i);
+  detail_::kv_params p{static_cast<uint32_t>(pos0),
+                       static_cast<uint32_t>(kv_max * D),
+                       static_cast<uint32_t>(T)};
+  detail_::set_bytes_(c.enc, p, 4ul);
+  detail_::dispatch_grid_(c.enc,
+                          {static_cast<unsigned long>(n_kv_heads),
+                           static_cast<unsigned long>(T), 1},
+                          {static_cast<unsigned long>(D), 1, 1});
+  return true;
+}
+
+// The argmax of a length-n vector, the smallest index on ties: greedy
+// decoding reads one int back rather than the logits. Drains the queue.
+inline bool argmax(void* in, int64_t n, int64_t* out_idx) {
+  auto& c = context::get();
+  if (!c.device || !in || n <= 0 || !out_idx) return false;
+  if (!c.argmax_res) {
+    c.argmax_res = alloc(4, &c.argmax_res_contents);
+    if (!c.argmax_res) return false;
+  }
+  c.bind_(kop::argmax_);
+  detail_::set_buf_(c.enc, in, 0, 0ul);
+  detail_::set_buf_(c.enc, c.argmax_res, 0, 1ul);
+  detail_::argmax_params p{static_cast<uint32_t>(n)};
+  detail_::set_bytes_(c.enc, p, 2ul);
+  detail_::dispatch_grid_(c.enc, {1, 1, 1}, {256, 1, 1});
+  flush();
+  *out_idx = *reinterpret_cast<const int*>(c.argmax_res_contents);
+  return true;
+}
+
+// hout = x · rsqrt(mean(x²) + eps) · w, per row of the [rows, n] buffer.
+inline bool rmsnorm(void* x, void* w, void* out, int64_t n, float eps,
+                    int64_t rows = 1) {
+  auto& c = context::get();
+  if (!c.device || n <= 0 || rows <= 0) return false;
+  c.bind_(kop::rmsnorm_);
+  void* bufs[] = {x, x, w, out, out};  // no delta: slots 1 and 3 idle
+  for (unsigned long i = 0; i < 5; i++) detail_::set_buf_(c.enc, bufs[i], 0, i);
+  detail_::rmsnorm_params p{static_cast<uint32_t>(n), 0, eps};
+  detail_::set_bytes_(c.enc, p, 5ul);
+  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(rows), 1, 1},
+                          {256, 1, 1});
+  return true;
+}
+
+// xout = x + delta and hout = rmsnorm(xout) · w: a residual add folded into
+// the norm that follows it. xout may alias x.
+inline bool rmsnorm_res(void* x, void* delta, void* w, void* xout, void* hout,
+                        int64_t n, float eps, int64_t rows = 1) {
+  auto& c = context::get();
+  if (!c.device || n <= 0 || rows <= 0) return false;
+  c.bind_(kop::rmsnorm_);
+  void* bufs[] = {x, delta, w, xout, hout};
+  for (unsigned long i = 0; i < 5; i++) detail_::set_buf_(c.enc, bufs[i], 0, i);
+  detail_::rmsnorm_params p{static_cast<uint32_t>(n), 1, eps};
+  detail_::set_bytes_(c.enc, p, 5ul);
+  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(rows), 1, 1},
+                          {256, 1, 1});
+  return true;
+}
+
+// out[rows, ff] = silu(gate) · up out of the fused gate|up buffer [rows, 2ff].
+inline bool swiglu(void* gu, void* out, int64_t ff, int64_t rows = 1) {
+  auto& c = context::get();
+  if (!c.device || ff <= 0 || rows <= 0) return false;
+  c.bind_(kop::swiglu_);
+  detail_::set_buf_(c.enc, gu, 0, 0ul);
+  detail_::set_buf_(c.enc, out, 0, 1ul);
+  detail_::swiglu_params p{static_cast<uint32_t>(ff)};
+  detail_::set_bytes_(c.enc, p, 2ul);
+  detail_::dispatch_grid_(c.enc,
+                          {(static_cast<unsigned long>(ff) + 255) / 256,
+                           static_cast<unsigned long>(rows), 1},
+                          {256, 1, 1});
+  return true;
+}
+
+// Token-major [T, ld] -> head-major [H, T, D] from column block `off`, adding
+// the optional per-head bias [H, D].
+inline bool split_heads(void* src, void* bias, void* dst, int64_t T, int64_t ld,
+                        int64_t off, int64_t H, int64_t D) {
+  auto& c = context::get();
+  if (!c.device || T <= 0 || H <= 0 || D <= 0) return false;
+  c.bind_(kop::split_heads_);
+  detail_::set_buf_(c.enc, src, 0, 0ul);
+  detail_::set_buf_(c.enc, bias ? bias : src, 0, 1ul);
+  detail_::set_buf_(c.enc, dst, 0, 2ul);
+  detail_::heads_params p{static_cast<uint32_t>(T), static_cast<uint32_t>(ld),
+                          static_cast<uint32_t>(off), bias ? 1u : 0u};
+  detail_::set_bytes_(c.enc, p, 3ul);
+  detail_::dispatch_grid_(
+      c.enc, {static_cast<unsigned long>(H), static_cast<unsigned long>(T), 1},
+      {static_cast<unsigned long>(D), 1, 1});
+  return true;
+}
+
+// Head-major [H, T, D] -> token-major [T, H·D], split_heads' inverse.
+inline bool merge_heads(void* src, void* dst, int64_t T, int64_t H, int64_t D) {
+  auto& c = context::get();
+  if (!c.device || T <= 0 || H <= 0 || D <= 0) return false;
+  c.bind_(kop::merge_heads_);
+  detail_::set_buf_(c.enc, src, 0, 0ul);
+  detail_::set_buf_(c.enc, dst, 0, 1ul);
+  detail_::heads_params p{static_cast<uint32_t>(T), 0, 0, 0};
+  detail_::set_bytes_(c.enc, p, 2ul);
+  detail_::dispatch_grid_(
+      c.enc, {static_cast<unsigned long>(H), static_cast<unsigned long>(T), 1},
+      {static_cast<unsigned long>(D), 1, 1});
   return true;
 }
 
@@ -1618,9 +1818,32 @@ inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,
                         const int64_t*, int, int, int64_t, int64_t) {
   return false;
 }
-inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
+inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float,
+                 void* = nullptr) {
   return false;
 }
+inline bool kv_append(void*, void*, void*, void*, int64_t, int64_t, int64_t,
+                      int64_t, bool = false) {
+  return false;
+}
+inline bool kv_fill(void*, void*, void*, void*, int64_t, int64_t, int64_t,
+                    int64_t, bool = false, int64_t = 0) {
+  return false;
+}
+inline bool argmax(void*, int64_t, int64_t*) { return false; }
+inline bool rmsnorm(void*, void*, void*, int64_t, float, int64_t = 1) {
+  return false;
+}
+inline bool rmsnorm_res(void*, void*, void*, void*, void*, int64_t, float,
+                        int64_t = 1) {
+  return false;
+}
+inline bool swiglu(void*, void*, int64_t, int64_t = 1) { return false; }
+inline bool split_heads(void*, void*, void*, int64_t, int64_t, int64_t, int64_t,
+                        int64_t) {
+  return false;
+}
+inline bool merge_heads(void*, void*, int64_t, int64_t, int64_t) { return false; }
 inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
 inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
@@ -1632,6 +1855,45 @@ inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
 }
 
 #endif
+
+// What a model may ask of this backend beyond the kernel contract (gpu.h
+// lists every backend's). No graph capture: a Metal command buffer is cheap to
+// encode, so a decode step re-encodes each token.
+struct caps {
+  static constexpr bool graph_capture = false;
+  static constexpr bool row_gemv = false;   // gemv_bf16_row: weights as [N,K]
+  static constexpr bool bf16_gemm = false;  // gemm_bf16_nt: a bf16-weight GEMM
+};
+
+// The capture group, cuda.h's contracts: absent here, so each answers false
+// or does nothing, and a model takes its host-position path. Outside the
+// #if/#else like gemm_bias below: the answer is the same either way.
+using graph_exec = void*;
+inline bool graph_available() { return false; }
+inline bool capture_begin() { return false; }
+inline graph_exec capture_end() { return nullptr; }
+inline bool graph_launch(graph_exec) { return false; }
+inline void graph_destroy(graph_exec) {}
+inline void upload(void*, const float*, int64_t) {}
+inline void upload_u32(void*, unsigned) {}
+inline bool incr_u32(void*) { return false; }
+inline bool rope_dpos(void*, void*, int64_t, int64_t, int64_t, void*, float,
+                      void* = nullptr) {
+  return false;
+}
+inline bool kv_append_dpos(void*, void*, void*, void*, void*, int64_t, int64_t,
+                           int64_t) {
+  return false;
+}
+inline bool attn_decode_dpos(void*, void*, void*, void*, int64_t, int64_t, void*,
+                             int64_t, int64_t, float, void*) {
+  return false;
+}
+inline bool gemv_bf16_row(void*, void*, void*, int64_t, int64_t) { return false; }
+inline bool gemm_bf16_nt(void*, void*, void*, int64_t, int64_t, int64_t) {
+  return false;
+}
+inline int64_t attn_dpos_partials_bytes(int64_t, int64_t, int64_t) { return 0; }
 
 // A gemm with its row bias added in the store: CUDA-first; the evaluator adds
 // the bias with the broadcast kernel after gemm here. Outside the #if/#else

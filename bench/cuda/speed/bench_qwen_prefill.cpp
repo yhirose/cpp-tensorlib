@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
               "speedup");
   for (int64_t T : {(int64_t)128, (int64_t)512, (int64_t)2048}) {
     if (T > max_T) break;
-    cu::kv_cache c;
+    tl::kv_cache c;
     if (!c.init(qm::NKV, qm::MAXC, qm::HD)) { std::printf("  cache init failed\n"); return 1; }
     void* ks = zeros(qm::NKV * T * qm::HD);
     void* vs = zeros(qm::NKV * T * qm::HD);
@@ -310,7 +310,6 @@ int main(int argc, char** argv) {
     });
     std::printf("  %6lld  %14.3f  %14.3f  %7.1fx\n", (long long)T, per_tok,
                 batched, per_tok / batched);
-    c.destroy();
     for (void* p : {ks, vs, qs, os}) cu::release(p, 0, nullptr);
   }
   return 0;

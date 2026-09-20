@@ -2,8 +2,8 @@
 """Backend parity checker: which GPU ops does each backend (CUDA/Metal/
 WebGPU) actually implement, vs. which are still a `return false;` stub.
 
-The op surface it checks is the exact "kernels" / "LLM path" lists in
-include/gpu.h's own doc comment -- that comment is the contract array.h/
+The op surface it checks is the exact "kernels" / "LLM path" / "model
+path" lists in include/gpu.h's own doc comment -- that comment is the contract array.h/
 storage.h dispatch through, and every CUDA-first landing so far has already
 had to update it, so it stays in sync without this script needing its own
 copy of the list.
@@ -53,19 +53,15 @@ def canonical_ops():
                  "path comment -- has its wording changed?")
     body = m.group(1)
     # Drop the leading "//" (and any inherited indentation) from every
-    # wrapped comment line before splitting on "/", so the LLM path label
-    # itself doesn't get treated as an identifier.
+    # wrapped comment line, and a row's label ("LLM path", "model path": a
+    # row is a label of one or two words, then its ops), before splitting on
+    # "/", so a label never reads as an identifier.
     lines = [re.sub(r"^\s*//\s*", "", ln) for ln in body.splitlines()]
-    lines = [ln for ln in lines if not ln.strip().startswith("LLM path")]
-    # The "LLM path" line's own identifiers are on the same physical line as
-    # the label in gpu.h, so re-extract them directly instead of dropping
-    # the whole line blindly.
-    llm_m = re.search(r"^//\s*LLM path\s+(.*)$", text, re.MULTILINE)
+    lines = [re.sub(r"^[A-Za-z]+(?: [a-z]+)?\s{2,}", "", ln) for ln in lines]
+    lines = [re.sub(r"^(LLM path|model path)\s+", "", ln) for ln in lines]
     ops = []
     for ln in lines:
         ops += [tok.strip() for tok in ln.split("/") if tok.strip()]
-    if llm_m:
-        ops += [tok.strip() for tok in llm_m.group(1).split("/") if tok.strip()]
     # Keep discovery order but drop duplicates.
     seen = set()
     ordered = []

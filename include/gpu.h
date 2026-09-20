@@ -14,10 +14,22 @@
 //              row_logsumexp / xent_bwd / adam_step
 //   LLM path   gemv_f32 / gemv_bf16 / gemv_q4 / attn_decode / attn_prefill /
 //              attn_prefill_dq / attn_prefill_dkv
+//   model path kv_append / kv_fill / argmax / rmsnorm / rmsnorm_res / swiglu /
+//              split_heads / merge_heads / gemv_bf16_row / gemm_bf16_nt
 // A backend with no kernel for one of these returns false and the evaluator
 // falls back to the CPU — so the LLM row is real on CUDA and stubs elsewhere
 // (tools/check_backend_parity.py checks every name on both lines here
 // against cuda.h/metal.h/webgpu.h and fails CI if one drifts unannounced).
+// The model path is what a decoder (kv_cache.h, bench/models) runs on raw
+// device buffers between its GEMVs and attention; it has no CPU fallback,
+// so a model checks the return and keeps to the array ops where it is false.
+//
+// Beyond the kernels, each backend states what a model may assume of it in
+// `caps` (graph_capture, row_gemv, bf16_gemm), and carries the graph-capture
+// group — graph_available / capture_begin / capture_end / graph_launch /
+// graph_destroy / upload / upload_u32 / incr_u32 / rope_dpos / kv_append_dpos /
+// attn_decode_dpos / attn_dpos_partials_bytes — as no-ops where the
+// capability is false, so a decoder is written once and branches on caps.
 //
 // Each backend compiles to stubs unless its own gate holds, so including all of
 // them is free: metal.h is real only on __APPLE__, cuda.h only on

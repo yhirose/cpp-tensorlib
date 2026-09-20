@@ -16,6 +16,7 @@
 #define TENSORLIB_CUDA
 #endif
 #include "cuda.h"
+#include "kv_cache.h"
 
 #include <algorithm>
 #include <cmath>
@@ -46,7 +47,7 @@ int main() {
   // ---- KV cache + GQA at D=64: grow one token at a time, verify prefix reads +
   // GQA mapping at checkpoints straddling the split-KV boundary (ctx>=256). ----
   {
-    kv_cache cache;
+    tl::kv_cache cache;
     if (!cache.init(HKV, MAXC, D)) { std::printf("  cache init failed\n"); return 1; }
     float *hkn = nullptr, *hvn = nullptr, *hq = nullptr, *ho = nullptr;
     void* kn = alloc(HKV * D * 4, &hkn);
@@ -131,7 +132,6 @@ int main() {
     ok &= dpos_eq;
     std::printf("  attn_dpos (capacity-grid split) vs attn — bit-equal at every "
                 "checkpoint %s\n", dpos_eq ? "OK" : "FAIL");
-    cache.destroy();
     release(kn, 0, nullptr); release(vn, 0, nullptr);
     release(q, 0, nullptr);  release(o, 0, nullptr);
     release(o2, 0, nullptr); release(dp, 0, nullptr);
@@ -148,7 +148,7 @@ int main() {
     for (int64_t i = 0; i < HKV * T * D; i++) { hks[i] = rnd(); hvs[i] = rnd(); }
     for (int64_t i = 0; i < HQ * T * D; i++) hqp[i] = rnd();
 
-    kv_cache cache;
+    tl::kv_cache cache;
     if (!cache.init(HKV, MAXC, D)) { std::printf("  cache init failed\n"); return 1; }
     cache.prefill(qp, ks, vs, op, T, HQ, scale);
     flush();
@@ -228,7 +228,6 @@ int main() {
     std::printf("  prefill->decode handoff @pos=%lld — maxrel %.1e %s\n",
                 (long long)cache.pos - 1, drel, drel < 1e-4 ? "OK" : "FAIL");
 
-    cache.destroy();
     release(ks, 0, nullptr); release(vs, 0, nullptr);
     release(qp, 0, nullptr); release(op, 0, nullptr);
     release(kn, 0, nullptr); release(vn, 0, nullptr);

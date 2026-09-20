@@ -1289,9 +1289,9 @@ inline bool concat_part(void* a_native, int64_t ao, void* out_native,
 // x.offset_ == 0 and hands a fresh allocation for out), so there is no
 // ao/oo in this signature to convert.
 inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
-                 int64_t pos, float base) {
+                 int64_t pos, float base, void* bias = nullptr) {
   auto& c = context::get();
-  if (!c.ready || D <= 0 || (D & 1)) return false;
+  if (!c.ready || D <= 0 || (D & 1) || bias) return false;  // no fused bias
   int64_t half = D / 2;
   int64_t n = rows * half;
   if (n <= 0) return false;
@@ -1425,7 +1425,8 @@ inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,
                         const int64_t*, int, int, int64_t, int64_t) {
   return false;
 }
-inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float) {
+inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float,
+                 void* = nullptr) {
   return false;
 }
 
@@ -1465,6 +1466,63 @@ inline bool attn_prefill_dkv(void*, void*, void*, void*, void*, void*, void*,
 inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
   return false;
 }
+inline bool kv_append(void*, void*, void*, void*, int64_t, int64_t, int64_t,
+                      int64_t, bool = false) {
+  return false;
+}
+inline bool kv_fill(void*, void*, void*, void*, int64_t, int64_t, int64_t,
+                    int64_t, bool = false, int64_t = 0) {
+  return false;
+}
+inline bool argmax(void*, int64_t, int64_t*) { return false; }
+inline bool rmsnorm(void*, void*, void*, int64_t, float, int64_t = 1) {
+  return false;
+}
+inline bool rmsnorm_res(void*, void*, void*, void*, void*, int64_t, float,
+                        int64_t = 1) {
+  return false;
+}
+inline bool swiglu(void*, void*, int64_t, int64_t = 1) { return false; }
+inline bool split_heads(void*, void*, void*, int64_t, int64_t, int64_t, int64_t,
+                        int64_t) {
+  return false;
+}
+inline bool merge_heads(void*, void*, int64_t, int64_t, int64_t) { return false; }
+inline bool gemv_bf16_row(void*, void*, void*, int64_t, int64_t) { return false; }
+inline bool gemm_bf16_nt(void*, void*, void*, int64_t, int64_t, int64_t) {
+  return false;
+}
+
+// What a model may ask of this backend beyond the kernel contract (gpu.h),
+// and the graph-capture group it names: none of it here, so each answers
+// false or does nothing and a decoder takes its host-position path.
+struct caps {
+  static constexpr bool graph_capture = false;
+  static constexpr bool row_gemv = false;
+  static constexpr bool bf16_gemm = false;
+};
+using graph_exec = void*;
+inline bool graph_available() { return false; }
+inline bool capture_begin() { return false; }
+inline graph_exec capture_end() { return nullptr; }
+inline bool graph_launch(graph_exec) { return false; }
+inline void graph_destroy(graph_exec) {}
+inline void upload(void*, const float*, int64_t) {}
+inline void upload_u32(void*, unsigned) {}
+inline bool incr_u32(void*) { return false; }
+inline bool rope_dpos(void*, void*, int64_t, int64_t, int64_t, void*, float,
+                      void* = nullptr) {
+  return false;
+}
+inline bool kv_append_dpos(void*, void*, void*, void*, void*, int64_t, int64_t,
+                           int64_t) {
+  return false;
+}
+inline bool attn_decode_dpos(void*, void*, void*, void*, int64_t, int64_t, void*,
+                             int64_t, int64_t, float, void*) {
+  return false;
+}
+inline int64_t attn_dpos_partials_bytes(int64_t, int64_t, int64_t) { return 0; }
 
 // Every CPU-side buffer read funnels through array::raw()/data(), which call
 // this: one choke point makes mixed CPU/GPU graphs safe.

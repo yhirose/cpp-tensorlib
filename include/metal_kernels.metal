@@ -17,6 +17,25 @@ struct ew_params {
   uint n;
 };
 
+// bf16 is the top 16 bits of the f32 pattern: widen by a shift, narrow with
+// round-to-nearest-even (types.h's f32_to_bf16, and the CUDA path's). A
+// weight or a KV cache is stored as ushort; the arithmetic is always f32.
+static inline float widen_(float w) { return w; }
+static inline float widen_(ushort h) { return as_type<float>(uint(h) << 16); }
+static inline void narrow_(device float* dst, float v) { *dst = v; }
+static inline void narrow_(device ushort* dst, float v) {
+  const uint u = as_type<uint>(v);
+  *dst = ushort((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+}
+// Four consecutive elements as a float4 (i4 counts float4s).
+static inline float4 load4_(device const float* p, uint i4) {
+  return ((device const float4*)p)[i4];
+}
+static inline float4 load4_(device const ushort* p, uint i4) {
+  const ushort4 u = ((device const ushort4*)p)[i4];
+  return float4(widen_(u.x), widen_(u.y), widen_(u.z), widen_(u.w));
+}
+
 #define EW_BINARY(name, expr)                                  \
   kernel void name(device const float* a [[buffer(0)]],        \
                    device const float* b [[buffer(1)]],        \
@@ -1520,11 +1539,15 @@ struct rope_params {
   uint half_;
   float base;
   uint n;
+  uint has_bias;
 };
 
+// `bias` is [rows, D] like x, added before the rotation when has_bias: the
+// decode step's q/k bias folded in (at T == 1 a [H, D] bias is that shape).
 kernel void rope_(device const float* x [[buffer(0)]],
                   device float* out [[buffer(1)]],
                   constant rope_params& p [[buffer(2)]],
+                  device const float* bias [[buffer(3)]],
                   uint i [[thread_position_in_grid]]) {
   if (i >= p.n) return;
   uint r = i / p.half_;
@@ -1538,6 +1561,10 @@ kernel void rope_(device const float* x [[buffer(0)]],
   uint bi = r * p.D;
   float x0 = x[bi + j];
   float x1 = x[bi + j + p.half_];
+  if (p.has_bias) {
+    x0 += bias[bi + j];
+    x1 += bias[bi + j + p.half_];
+  }
   out[bi + j] = x0 * c - x1 * s;
   out[bi + j + p.half_] = x0 * s + x1 * c;
 }
@@ -1572,35 +1599,32 @@ static inline float frag_row_sum_(float v) {
 // Rows [base, end) of row-major [*, AD] sources into ROWS rows of threadgroup
 // tiles; rows past `end` read as zero. Two sources share one loop, so both
 // loads of an iteration are in flight together.
-template <int ROWS, int AD>
+template <int ROWS, int AD, typename KT>
 static inline void attn_stage_rows_(threadgroup float* dst,
-                                    device const float* src, uint base,
-                                    uint end, uint tid) {
+                                    device const KT* src, uint base, uint end,
+                                    uint tid) {
   constexpr uint A4 = AD / 4;
   threadgroup float4* d4 = (threadgroup float4*)dst;
-  device const float4* s4 = (device const float4*)src;
   for (uint i = tid; i < uint(ROWS) * A4; i += 128) {
     const uint r = i / A4;
-    d4[i] = base + r < end ? s4[(base + r) * A4 + i % A4] : float4(0.f);
+    d4[i] = base + r < end ? load4_(src, (base + r) * A4 + i % A4) : float4(0.f);
   }
 }
-template <int ROWS, int AD>
+template <int ROWS, int AD, typename KT>
 static inline void attn_stage_rows_(threadgroup float* dst0,
-                                    device const float* src0,
+                                    device const KT* src0,
                                     threadgroup float* dst1,
-                                    device const float* src1, uint base,
-                                    uint end, uint tid) {
+                                    device const KT* src1, uint base, uint end,
+                                    uint tid) {
   constexpr uint A4 = AD / 4;
   threadgroup float4* d0 = (threadgroup float4*)dst0;
   threadgroup float4* d1 = (threadgroup float4*)dst1;
-  device const float4* s0 = (device const float4*)src0;
-  device const float4* s1 = (device const float4*)src1;
   for (uint i = tid; i < uint(ROWS) * A4; i += 128) {
     const uint r = i / A4;
     const bool live = base + r < end;
     const uint at = (base + r) * A4 + i % A4;
-    d0[i] = live ? s0[at] : float4(0.f);
-    d1[i] = live ? s1[at] : float4(0.f);
+    d0[i] = live ? load4_(src0, at) : float4(0.f);
+    d1[i] = live ? load4_(src1, at) : float4(0.f);
   }
 }
 
@@ -1616,12 +1640,13 @@ static inline void attn_store_row_(device float* row,
   }
 }
 
-// q, out [H,T,D]; K/V a cache of kv_stride floats per kv head read over
-// [0, pos0+T); query p sits at pos0+p. BK keys per tile.
-template <int AD, int BK>
+// q, out [H,T,D]; K/V a cache of kv_stride elements per kv head read over
+// [0, pos0+T); query p sits at pos0+p. BK keys per tile. KT is the cache's
+// element type (f32, or bf16 as ushort).
+template <int AD, int BK, typename KT>
 kernel void attn_prefill_(device const float* q   [[buffer(0)]],
-                          device const float* K   [[buffer(1)]],
-                          device const float* V   [[buffer(2)]],
+                          device const KT* K      [[buffer(1)]],
+                          device const KT* V      [[buffer(2)]],
                           device float* out       [[buffer(3)]],
                           constant attn_params& p [[buffer(4)]],
                           uint2 tg  [[threadgroup_position_in_grid]],
@@ -1639,8 +1664,8 @@ kernel void attn_prefill_(device const float* q   [[buffer(0)]],
   const uint h = tg.x;
   const uint qbase = (ntg.y - 1u - tg.y) * BQ;  // heaviest tiles first
   const uint kv_h = p.group ? h / p.group : h;
-  device const float* Kh = K + kv_h * p.kv_stride;
-  device const float* Vh = V + kv_h * p.kv_stride;
+  device const KT* Kh = K + kv_h * p.kv_stride;
+  device const KT* Vh = V + kv_h * p.kv_stride;
 
   attn_stage_rows_<BQ, AD>(Ks, q + h * T * AD, qbase, T, tid);
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1718,13 +1743,25 @@ kernel void attn_prefill_(device const float* q   [[buffer(0)]],
   if (qi < T) attn_store_row_(out + (h * T + qi) * AD + fn, of, 1.0f / l);
 }
 template [[host_name("attn_prefill_64_")]] kernel void
-attn_prefill_<64, 32>(device const float*, device const float*,
-                      device const float*, device float*,
-                      constant attn_params&, uint2, uint2, uint, uint, uint);
+attn_prefill_<64, 32, float>(device const float*, device const float*,
+                             device const float*, device float*,
+                             constant attn_params&, uint2, uint2, uint, uint,
+                             uint);
 template [[host_name("attn_prefill_128_")]] kernel void
-attn_prefill_<128, 16>(device const float*, device const float*,
-                       device const float*, device float*,
-                       constant attn_params&, uint2, uint2, uint, uint, uint);
+attn_prefill_<128, 16, float>(device const float*, device const float*,
+                              device const float*, device float*,
+                              constant attn_params&, uint2, uint2, uint, uint,
+                              uint);
+template [[host_name("attn_prefill_bf16_64_")]] kernel void
+attn_prefill_<64, 32, ushort>(device const float*, device const ushort*,
+                              device const ushort*, device float*,
+                              constant attn_params&, uint2, uint2, uint, uint,
+                              uint);
+template [[host_name("attn_prefill_bf16_128_")]] kernel void
+attn_prefill_<128, 16, ushort>(device const float*, device const ushort*,
+                               device const ushort*, device float*,
+                               constant attn_params&, uint2, uint2, uint, uint,
+                               uint);
 
 // The query half of the pullback: dq and `stats` [2,H,T] (the row
 // logsumexp, then Δ = dO·O) for the key/value half. dq = scale·C·K / l with
@@ -2013,10 +2050,6 @@ struct gemv_params {
   uint n, k, chunk;
 };
 
-// The weight as f32: bf16 is the top 16 bits of the pattern.
-static inline float widen_(float w) { return w; }
-static inline float widen_(ushort h) { return as_type<float>(uint(h) << 16); }
-
 // `as` is the caller's threadgroup tile of NT floats (threadgroup memory can
 // only be declared in a kernel).
 template <typename WT>
@@ -2140,9 +2173,9 @@ struct attn_decode_params {
 // and this thread's output dim `o`. The threadgroup arrays are the caller's
 // (threadgroup memory can only be declared in a kernel): qs [AD], sm/sl [NW]
 // and sacc [NW][AD].
-template <int AD>
-static inline void attn_span_(device const float* qh, device const float* Kh,
-                             device const float* Vh, uint k0, uint k1,
+template <int AD, typename KT>
+static inline void attn_span_(device const float* qh, device const KT* Kh,
+                             device const KT* Vh, uint k0, uint k1,
                              float scale, threadgroup float* qs,
                              threadgroup float* sm, threadgroup float* sl,
                              threadgroup float* sacc, uint tid, uint sgid,
@@ -2156,18 +2189,19 @@ static inline void attn_span_(device const float* qh, device const float* Kh,
   _Pragma("clang loop unroll(full)")
   for (int r = 0; r < NW; r++) acc[r] = 0.0f;
   for (uint i = k0 + sgid; i < k1; i += NW) {
-    device const float* Ki = Kh + i * AD;
+    device const KT* Ki = Kh + i * AD;
     float dot = 0.0f;
     _Pragma("clang loop unroll(full)")
-    for (int r = 0; r < NW; r++) dot += qs[lane + r * 32] * Ki[lane + r * 32];
+    for (int r = 0; r < NW; r++)
+      dot += qs[lane + r * 32] * widen_(Ki[lane + r * 32]);
     const float sc = simd_sum(dot) * scale;
     const float m_new = max(m, sc);
     const float corr = exp(m - m_new), pr = exp(sc - m_new);
     l = l * corr + pr;
-    device const float* Vi = Vh + i * AD;
+    device const KT* Vi = Vh + i * AD;
     _Pragma("clang loop unroll(full)")
     for (int r = 0; r < NW; r++)
-      acc[r] = acc[r] * corr + pr * Vi[lane + r * 32];
+      acc[r] = acc[r] * corr + pr * widen_(Vi[lane + r * 32]);
     m = m_new;
   }
 
@@ -2194,10 +2228,10 @@ static inline void attn_span_(device const float* qh, device const float* Kh,
   }
 }
 
-template <int AD>
+template <int AD, typename KT>
 kernel void attn_decode_(device const float* q          [[buffer(0)]],
-                         device const float* K          [[buffer(1)]],
-                         device const float* V          [[buffer(2)]],
+                         device const KT* K             [[buffer(1)]],
+                         device const KT* V             [[buffer(2)]],
                          device float* out              [[buffer(3)]],
                          constant attn_decode_params& p [[buffer(4)]],
                          uint h    [[threadgroup_position_in_grid]],
@@ -2213,20 +2247,28 @@ kernel void attn_decode_(device const float* q          [[buffer(0)]],
   out[h * AD + tid] = o / gl;
 }
 template [[host_name("attn_decode_64_")]] kernel void
-attn_decode_<64>(device const float*, device const float*, device const float*,
-                 device float*, constant attn_decode_params&, uint, uint, uint,
-                 uint);
+attn_decode_<64, float>(device const float*, device const float*,
+                        device const float*, device float*,
+                        constant attn_decode_params&, uint, uint, uint, uint);
 template [[host_name("attn_decode_128_")]] kernel void
-attn_decode_<128>(device const float*, device const float*, device const float*,
-                  device float*, constant attn_decode_params&, uint, uint, uint,
-                  uint);
+attn_decode_<128, float>(device const float*, device const float*,
+                         device const float*, device float*,
+                         constant attn_decode_params&, uint, uint, uint, uint);
+template [[host_name("attn_decode_bf16_64_")]] kernel void
+attn_decode_<64, ushort>(device const float*, device const ushort*,
+                         device const ushort*, device float*,
+                         constant attn_decode_params&, uint, uint, uint, uint);
+template [[host_name("attn_decode_bf16_128_")]] kernel void
+attn_decode_<128, ushort>(device const float*, device const ushort*,
+                          device const ushort*, device float*,
+                          constant attn_decode_params&, uint, uint, uint, uint);
 
 // One key chunk of one head: partials pm[H*S] | pl[H*S] | pacc[H*S*AD], the
 // layout attn_combine_ reads (cuda's attn_partials).
-template <int AD>
+template <int AD, typename KT>
 kernel void attn_decode_split_(device const float* q          [[buffer(0)]],
-                               device const float* K          [[buffer(1)]],
-                               device const float* V          [[buffer(2)]],
+                               device const KT* K             [[buffer(1)]],
+                               device const KT* V             [[buffer(2)]],
                                device float* parts            [[buffer(3)]],
                                constant attn_decode_params& p [[buffer(4)]],
                                uint2 tgp [[threadgroup_position_in_grid]],
@@ -2253,15 +2295,25 @@ kernel void attn_decode_split_(device const float* q          [[buffer(0)]],
   parts[2 * hs + at * AD + tid] = o;
 }
 template [[host_name("attn_decode_split_64_")]] kernel void
-attn_decode_split_<64>(device const float*, device const float*,
-                       device const float*, device float*,
-                       constant attn_decode_params&, uint2, uint2, uint, uint,
-                       uint);
+attn_decode_split_<64, float>(device const float*, device const float*,
+                              device const float*, device float*,
+                              constant attn_decode_params&, uint2, uint2, uint,
+                              uint, uint);
 template [[host_name("attn_decode_split_128_")]] kernel void
-attn_decode_split_<128>(device const float*, device const float*,
-                        device const float*, device float*,
-                        constant attn_decode_params&, uint2, uint2, uint, uint,
-                        uint);
+attn_decode_split_<128, float>(device const float*, device const float*,
+                               device const float*, device float*,
+                               constant attn_decode_params&, uint2, uint2, uint,
+                               uint, uint);
+template [[host_name("attn_decode_split_bf16_64_")]] kernel void
+attn_decode_split_<64, ushort>(device const float*, device const ushort*,
+                               device const ushort*, device float*,
+                               constant attn_decode_params&, uint2, uint2, uint,
+                               uint, uint);
+template [[host_name("attn_decode_split_bf16_128_")]] kernel void
+attn_decode_split_<128, ushort>(device const float*, device const ushort*,
+                                device const ushort*, device float*,
+                                constant attn_decode_params&, uint2, uint2,
+                                uint, uint, uint);
 
 // Merge one head's S partials, rescaling each by exp(m_s − max m).
 struct attn_combine_params {
@@ -2295,6 +2347,205 @@ attn_combine_<64>(device const float*, device float*,
 template [[host_name("attn_combine_128_")]] kernel void
 attn_combine_<128>(device const float*, device float*,
                    constant attn_combine_params&, uint, uint, uint);
+
+// ---------------------------------------------------------------------------
+// The decode step's other kernels, cuda's tl_kv_append / tl_kv_fill /
+// tl_argmax / tl_rmsnorm / tl_add_rmsnorm / tl_swiglu / tl_split_heads /
+// tl_merge_heads: what a model runs between its GEMVs and its attention,
+// on raw buffers so a step builds no graph. A row-wise kernel takes its row
+// from the grid's y and serves a decode step (one row) and a batched prefill
+// chunk (a row per token) alike.
+// ---------------------------------------------------------------------------
+
+// One step's k/v ([n_kv_heads, D]) into cache row `pos`; grid (n_kv_heads),
+// D threads. KT is the cache element type.
+struct kv_params {
+  uint pos, kv_stride, T;
+};
+
+template <typename KT>
+kernel void kv_append_(device KT* Kc             [[buffer(0)]],
+                       device KT* Vc             [[buffer(1)]],
+                       device const float* k_new [[buffer(2)]],
+                       device const float* v_new [[buffer(3)]],
+                       constant kv_params& p     [[buffer(4)]],
+                       uint h [[threadgroup_position_in_grid]],
+                       uint d [[thread_index_in_threadgroup]],
+                       uint D [[threads_per_threadgroup]]) {
+  const uint dst = h * p.kv_stride + p.pos * D + d;
+  const uint src = h * D + d;
+  narrow_(Kc + dst, k_new[src]);
+  narrow_(Vc + dst, v_new[src]);
+}
+template [[host_name("kv_append_")]] kernel void
+kv_append_<float>(device float*, device float*, device const float*,
+                  device const float*, constant kv_params&, uint, uint, uint);
+template [[host_name("kv_append_bf16_")]] kernel void
+kv_append_<ushort>(device ushort*, device ushort*, device const float*,
+                   device const float*, constant kv_params&, uint, uint, uint);
+
+// A prefill's k/v ([n_kv_heads, T, D]) into cache rows [pos, pos + T); grid
+// (n_kv_heads, T), D threads.
+template <typename KT>
+kernel void kv_fill_(device KT* Kc             [[buffer(0)]],
+                     device KT* Vc             [[buffer(1)]],
+                     device const float* K     [[buffer(2)]],
+                     device const float* V     [[buffer(3)]],
+                     constant kv_params& p     [[buffer(4)]],
+                     uint2 g  [[threadgroup_position_in_grid]],
+                     uint d   [[thread_index_in_threadgroup]],
+                     uint2 nt [[threads_per_threadgroup]]) {
+  const uint h = g.x, t = g.y, D = nt.x;
+  const uint dst = h * p.kv_stride + (p.pos + t) * D + d;
+  const uint src = (h * p.T + t) * D + d;
+  narrow_(Kc + dst, K[src]);
+  narrow_(Vc + dst, V[src]);
+}
+template [[host_name("kv_fill_")]] kernel void
+kv_fill_<float>(device float*, device float*, device const float*,
+                device const float*, constant kv_params&, uint2, uint, uint2);
+template [[host_name("kv_fill_bf16_")]] kernel void
+kv_fill_<ushort>(device ushort*, device ushort*, device const float*,
+                 device const float*, constant kv_params&, uint2, uint, uint2);
+
+// argmax of one length-n vector, the smallest index on ties (the host scan's
+// `v[i] > best`), so greedy decoding reads one int back instead of the logits.
+struct argmax_params {
+  uint n;
+};
+
+kernel void argmax_(device const float* in      [[buffer(0)]],
+                    device int* out             [[buffer(1)]],
+                    constant argmax_params& p   [[buffer(2)]],
+                    uint tid  [[thread_index_in_threadgroup]],
+                    uint nt   [[threads_per_threadgroup]],
+                    uint sgid [[simdgroup_index_in_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float sval[8];
+  threadgroup int sidx[8];
+  float best = -3.402823466e+38f;
+  int besti = 0;
+  for (uint i = tid; i < p.n; i += nt) {
+    const float v = in[i];
+    if (v > best) {
+      best = v;
+      besti = int(i);
+    }
+  }
+  // Within a simdgroup, then across them: take the other if strictly greater,
+  // or equal with a smaller index.
+  for (ushort off = 16; off > 0; off >>= 1) {
+    const float ov = simd_shuffle_down(best, off);
+    const int oi = simd_shuffle_down(besti, off);
+    if (ov > best || (ov == best && oi < besti)) {
+      best = ov;
+      besti = oi;
+    }
+  }
+  if (lane == 0) {
+    sval[sgid] = best;
+    sidx[sgid] = besti;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    for (uint w = 1; w < nt / 32; w++) {
+      if (sval[w] > sval[0] || (sval[w] == sval[0] && sidx[w] < sidx[0])) {
+        sval[0] = sval[w];
+        sidx[0] = sidx[w];
+      }
+    }
+    out[0] = sidx[0];
+  }
+}
+
+// hout = xout · rsqrt(mean(xout²) + eps) · w per row, where xout is x itself
+// or, with `add`, the residual sum x + delta written back on the way (a
+// layer's residual add folded into the norm that follows it; xout may alias
+// x). One threadgroup a row, 256 threads; 1/sqrt, as the array composition.
+struct rmsnorm_params {
+  uint n, add;
+  float eps;
+};
+
+kernel void rmsnorm_(device const float* x         [[buffer(0)]],
+                     device const float* delta     [[buffer(1)]],
+                     device const float* w         [[buffer(2)]],
+                     device float* xout            [[buffer(3)]],
+                     device float* hout            [[buffer(4)]],
+                     constant rmsnorm_params& p    [[buffer(5)]],
+                     uint row  [[threadgroup_position_in_grid]],
+                     uint tid  [[thread_index_in_threadgroup]],
+                     uint nt   [[threads_per_threadgroup]],
+                     uint sgid [[simdgroup_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float red[8];
+  const uint base = row * p.n;
+  float acc = 0.0f;
+  for (uint i = tid; i < p.n; i += nt) {
+    float v = x[base + i];
+    if (p.add) {
+      v += delta[base + i];
+      xout[base + i] = v;
+    }
+    acc += v * v;
+  }
+  acc = simd_sum(acc);
+  if (lane == 0) red[sgid] = acc;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float ss = 0.0f;
+  for (uint s = 0; s < nt / 32; s++) ss += red[s];
+  const float inv = 1.0f / sqrt(ss / float(p.n) + p.eps);
+  device const float* src = p.add ? xout : x;
+  for (uint i = tid; i < p.n; i += nt) hout[base + i] = src[base + i] * inv * w[i];
+}
+
+// out[row, f] = silu(gate) · up out of the fused gate|up projection
+// gu[row, 2·ff]; grid (ceil(ff / 256), rows).
+struct swiglu_params {
+  uint ff;
+};
+
+kernel void swiglu_(device const float* gu     [[buffer(0)]],
+                    device float* out          [[buffer(1)]],
+                    constant swiglu_params& p  [[buffer(2)]],
+                    uint2 gid [[thread_position_in_grid]]) {
+  const uint f = gid.x, row = gid.y;
+  if (f >= p.ff) return;
+  const uint src = row * 2 * p.ff + f;
+  const float g = gu[src];
+  out[row * p.ff + f] = (g / (1.0f + exp(-g))) * gu[src + p.ff];
+}
+
+// Token-major [T, ld] -> head-major [H, T, D] with an optional per-head bias
+// (`off` picks a column block of a fused projection, so q/k/v come from one
+// GEMM); grid (H, T), D threads. merge_heads_ is its inverse.
+struct heads_params {
+  uint T, ld, off, has_bias;
+};
+
+kernel void split_heads_(device const float* src   [[buffer(0)]],
+                         device const float* bias  [[buffer(1)]],
+                         device float* dst         [[buffer(2)]],
+                         constant heads_params& p  [[buffer(3)]],
+                         uint2 g  [[threadgroup_position_in_grid]],
+                         uint d   [[thread_index_in_threadgroup]],
+                         uint2 nt [[threads_per_threadgroup]]) {
+  const uint h = g.x, t = g.y, D = nt.x;
+  float v = src[t * p.ld + p.off + h * D + d];
+  if (p.has_bias) v += bias[h * D + d];
+  dst[(h * p.T + t) * D + d] = v;
+}
+
+kernel void merge_heads_(device const float* src   [[buffer(0)]],
+                         device float* dst         [[buffer(1)]],
+                         constant heads_params& p  [[buffer(2)]],
+                         uint2 g  [[threadgroup_position_in_grid]],
+                         uint2 ng [[threadgroups_per_grid]],
+                         uint d   [[thread_index_in_threadgroup]],
+                         uint2 nt [[threads_per_threadgroup]]) {
+  const uint h = g.x, t = g.y, H = ng.x, D = nt.x;
+  dst[t * H * D + h * D + d] = src[(h * p.T + t) * D + d];
+}
 
 // ---------------------------------------------------------------------------
 // Cross-entropy and the optimizer: cuda's tl_gather_axis, tl_row_logsumexp,

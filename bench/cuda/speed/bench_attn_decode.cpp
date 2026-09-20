@@ -15,6 +15,7 @@
 #define TENSORLIB_CUDA
 #endif
 #include "cuda.h"
+#include "kv_cache.h"
 
 #include <algorithm>
 #include <chrono>
@@ -206,7 +207,7 @@ int main() {
         "max_ctx=%lld\n",
         (long long)HQ, (long long)HKV, (long long)group, (long long)MAXC);
 
-    kv_cache cache;
+    tl::kv_cache cache;
     if (!cache.init(HKV, MAXC, D)) {
       std::printf("  cache init failed\n");
       return 1;
@@ -314,7 +315,6 @@ int main() {
         (long long)cache.pos, layer_ms, kv_gbs, (long long)HKV, (long long)HQ,
         (double)HQ / HKV);
 
-    cache.destroy();
     release(kn, 0, nullptr);
     release(vn, 0, nullptr);
     release(q, 0, nullptr);
@@ -353,7 +353,7 @@ int main() {
     }
     for (int64_t i = 0; i < HQ * T * D; i++) hqp[i] = rnd();
 
-    kv_cache cache;
+    tl::kv_cache cache;
     if (!cache.init(HKV, MAXC, D)) {
       std::printf("  cache init failed\n");
       return 1;
@@ -457,7 +457,8 @@ int main() {
     for (int r = 0; r < ROUNDS; r++) {
       auto t0 = clk::now();
       for (int i = 0; i < R; i++)
-        attn_prefill(qp, cache.K, cache.V, op, HQ, HKV, T, MAXC, D, scale);
+        attn_prefill(qp, cache.K.native, cache.V.native, op, HQ, HKV, T, MAXC, D,
+                     scale);
       flush();
       ms.push_back(
           std::chrono::duration<double, std::milli>(clk::now() - t0).count() / R);
@@ -466,7 +467,6 @@ int main() {
     std::printf("  prefill attn: %.4f ms for T=%lld (%.1f Ktok/s)\n", pf_ms,
                 (long long)T, T / pf_ms);
 
-    cache.destroy();
     release(ks, 0, nullptr);
     release(vs, 0, nullptr);
     release(qp, 0, nullptr);

@@ -6,13 +6,29 @@
 # The M9 LLM decode fast path: fused single-token attention, and the
 # bf16/int4-quantized GEMVs it composes with for local-LLM inference
 # throughput. Deliberately landed CUDA-first (see project memory
-# project_cpp_tensorlib_handoff.md); Metal has them all now except the bf16
-# KV cache, and WebGPU still takes the CPU fallback for every one.
+# project_cpp_tensorlib_handoff.md); Metal has them all now, and WebGPU still
+# takes the CPU fallback for every one.
 gemv_f32
 gemv_bf16
 gemv_q4
 attn_decode
 attn_prefill
+
+# The model path (gpu.h): what a decoder runs on raw buffers between its
+# GEMVs and attention. CUDA and Metal have all of it but the two CUDA-only
+# weight layouts — the warp-per-row bf16 GEMV and the bf16-weight GEMM the
+# batched prefill is built on (Metal prefills token by token meanwhile) —
+# and WebGPU has none of it yet.
+kv_append
+kv_fill
+argmax
+rmsnorm
+rmsnorm_res
+swiglu
+split_heads
+merge_heads
+gemv_bf16_row
+gemm_bf16_nt
 
 # Causal prefill attention's pullback, the training counterpart of the row
 # above: same CUDA-first reasoning, and it is reachable only from a backward

@@ -1,5 +1,6 @@
 #include "doctest.h"
 
+#include <kv_cache.h>
 #include <tensorlib.h>
 
 #include <random>
@@ -2917,5 +2918,160 @@ TEST_CASE("host-filled storage skips buffers the pending batch may write") {
   auto ones = tl::array::ones({8});
   tl::eval(ones);
   for (int64_t i = 0; i < 8; i++) CHECK(ones.at({i}) == 1.0f);
+  tl::device_ = prev;
+}
+
+TEST_CASE("the KV cache and the decode step's kernels match their array forms") {
+  // The model path runs on raw device buffers through gpu::, outside the lazy
+  // graph; each kernel here is checked against the array composition that
+  // defines it, on the GPU (no-op where there is none). Shapes are Qwen2's
+  // head geometry (D=64, 14 q heads over 2 kv heads) at a context past the
+  // split-KV cutoff, plus the D=128 instantiation.
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+  tl::use_gpu();
+  namespace gpu = tl::gpu;
+
+  // A device buffer from host values, evaluated so native() is valid.
+  auto dev = [](const array& a) {
+    array c = a.clone();
+    c.eval();
+    return c;
+  };
+  auto same = [](const array& got, const array& want, float tol) {
+    return tl::allclose(got, want, tol, tol);
+  };
+
+  SUBCASE("kv_cache: append + attn, prefill, in f32 and bf16") {
+    for (int64_t D : {64, 128}) {
+      for (tl::dtype kv : {tl::dtype::f32, tl::dtype::bf16}) {
+        const int64_t HQ = 14, HKV = 2, MAXC = 300, T = 260;
+        const float scale = 1.0f / std::sqrt((float)D);
+        tl::kv_cache cache;
+        REQUIRE(cache.init(HKV, MAXC, D, kv));
+        // T steps appended one at a time, then a query over all of them.
+        auto K = random_array({HKV, T, D}, 900), V = random_array({HKV, T, D}, 901);
+        for (int64_t t = 0; t < T; t++) {
+          array k = dev(K.slice(1, t, 1).clone());  // [HKV,1,D]
+          array v = dev(V.slice(1, t, 1).clone());
+          REQUIRE(cache.append(k.native(), v.native()));
+        }
+        CHECK(cache.pos == T);
+        array q = dev(random_array({HQ, D}, 902));
+        array out = array::empty({HQ, D});
+        REQUIRE(cache.attn(q.native(), out.native(), HQ, scale));
+        // Explicit: each q head attends its kv head's T rows.
+        auto Kr = kv == tl::dtype::bf16 ? K.to_bf16().to_f32() : K;
+        auto Vr = kv == tl::dtype::bf16 ? V.to_bf16().to_f32() : V;
+        std::vector<float> want((size_t)HQ * D);
+        for (int64_t h = 0; h < HQ; h++) {
+          const int64_t kh = h / (HQ / HKV);
+          std::vector<double> s(T);
+          double m = -1e300, sum = 0;
+          for (int64_t j = 0; j < T; j++) {
+            double a = 0;
+            for (int64_t d = 0; d < D; d++) a += (double)q.at({h, d}) * Kr.at({kh, j, d});
+            s[j] = a * scale;
+            m = std::max(m, s[j]);
+          }
+          for (auto& x : s) sum += (x = std::exp(x - m));
+          for (int64_t d = 0; d < D; d++) {
+            double e = 0;
+            for (int64_t j = 0; j < T; j++) e += s[j] * Vr.at({kh, j, d});
+            want[h * D + d] = (float)(e / sum);
+          }
+        }
+        tl::gpu::flush();
+        CHECK(same(out, array::from(want, {HQ, D}), 1e-4f));
+
+        // The same T rows as one prefill into a fresh cache: the block's own
+        // causal attention, then a decode step after it agrees with above.
+        tl::kv_cache c2;
+        REQUIRE(c2.init(HKV, MAXC, D, kv));
+        array qp = dev(random_array({HQ, T, D}, 903));
+        array Kd = dev(K), Vd = dev(V);
+        array op = array::empty({HQ, T, D});
+        REQUIRE(c2.prefill(qp.native(), Kd.native(), Vd.native(), op.native(), T,
+                           HQ, scale));
+        CHECK(c2.pos == T);
+        array out2 = array::empty({HQ, D});
+        REQUIRE(c2.attn(q.native(), out2.native(), HQ, scale));
+        tl::gpu::flush();
+        CHECK(same(out2, out, 1e-5f));
+        // Row t of the prefill output is the decode of q row t over keys 0..t.
+        const int64_t t = T - 1;
+        array qt = dev(qp.slice(1, t, 1).reshape({HQ, D}).clone());
+        array ot = array::empty({HQ, D});
+        REQUIRE(c2.attn(qt.native(), ot.native(), HQ, scale));
+        tl::gpu::flush();
+        CHECK(same(ot, op.slice(1, t, 1).reshape({HQ, D}), 1e-4f));
+      }
+    }
+  }
+
+  SUBCASE("rmsnorm, rmsnorm_res and swiglu per row") {
+    const int64_t rows = 3, n = 896, ff = 4864;
+    array x = dev(random_array({rows, n}, 910)), d = dev(random_array({rows, n}, 911));
+    array w = dev(random_array({n}, 912));
+    array h = array::empty({rows, n}), xo = array::empty({rows, n}),
+          h2 = array::empty({rows, n});
+    REQUIRE(gpu::rmsnorm(x.native(), w.native(), h.native(), n, 1e-6f, rows));
+    REQUIRE(gpu::rmsnorm_res(x.native(), d.native(), w.native(), xo.native(),
+                             h2.native(), n, 1e-6f, rows));
+    tl::gpu::flush();
+    CHECK(same(h, array::rmsnorm(x, w, 1e-6f), 1e-5f));
+    CHECK(same(xo, x + d, 1e-6f));
+    CHECK(same(h2, array::rmsnorm(x + d, w, 1e-6f), 1e-5f));
+
+    // A row small enough that eps carries the reciprocal: at this scale
+    // mean(x²) is ~1e-8 against eps 1e-6, so dropping eps changes the result
+    // by a factor of ten rather than the last bits.
+    array tiny = dev(x * 1e-4f);
+    array ht = array::empty({rows, n});
+    REQUIRE(gpu::rmsnorm(tiny.native(), w.native(), ht.native(), n, 1e-6f, rows));
+    tl::gpu::flush();
+    CHECK(same(ht, array::rmsnorm(tiny, w, 1e-6f), 1e-5f));
+
+    array gu = dev(random_array({rows, 2 * ff}, 913));
+    array o = array::empty({rows, ff});
+    REQUIRE(gpu::swiglu(gu.native(), o.native(), ff, rows));
+    tl::gpu::flush();
+    array gate = gu.slice(1, 0, ff), up = gu.slice(1, ff, ff);
+    CHECK(same(o, array::swiglu(gate, up), 1e-5f));
+  }
+
+  SUBCASE("rope with a fused bias") {
+    const int64_t H = 14, D = 64;
+    array x = dev(random_array({H, D}, 920)), b = dev(random_array({H, D}, 921));
+    array o = array::empty({H, D});
+    REQUIRE(gpu::rope(x.native(), o.native(), H, 1, D, 37, 1e6f, b.native()));
+    tl::gpu::flush();
+    CHECK(same(o, array::rope(x + b, 37, 1e6f), 1e-5f));
+  }
+
+  SUBCASE("argmax reads back the smallest index among ties") {
+    std::vector<float> v(151936, -1.0f);
+    v[77777] = 5.0f;
+    v[77778] = 5.0f;  // a tie: the smaller index wins, as the host scan does
+    array a = dev(array::from(v, {(int64_t)v.size()}));
+    int64_t idx = -1;
+    REQUIRE(gpu::argmax(a.native(), (int64_t)v.size(), &idx));
+    CHECK(idx == 77777);
+  }
+
+  SUBCASE("split_heads and merge_heads are inverses through the fused layout") {
+    const int64_t T = 5, H = 18, D = 64, ld = H * D;
+    array src = dev(random_array({T, ld}, 930)), bias = dev(random_array({H, D}, 931));
+    array heads = array::empty({H, T, D}), back = array::empty({T, ld});
+    REQUIRE(gpu::split_heads(src.native(), bias.native(), heads.native(), T, ld, 0,
+                             H, D));
+    REQUIRE(gpu::merge_heads(heads.native(), back.native(), T, H, D));
+    tl::gpu::flush();
+    // heads[h, t, :] = src[t, h*D:(h+1)*D] + bias[h]
+    CHECK(same(heads, src.reshape({T, H, D}).transpose({1, 0, 2}) +
+                          bias.reshape({H, 1, D}), 1e-6f));
+    CHECK(same(back, src + bias.reshape({1, ld}), 1e-6f));
+  }
+
   tl::device_ = prev;
 }

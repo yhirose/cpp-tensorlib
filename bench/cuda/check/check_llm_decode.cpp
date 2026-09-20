@@ -9,6 +9,7 @@
 // CUDA-only (uses tl::cuda::kv_cache). Returns nonzero on any logits mismatch or
 // divergent greedy token, so it gates the wiring.
 
+#include <kv_cache.h>
 #include <tensorlib.h>
 
 #include <cmath>
@@ -171,7 +172,7 @@ int64_t argmax(const vec& v) {
 // ---- GPU model (array ops + kv_cache bridge) ----
 struct GpuLayer {
   array Wq, Wk, Wv, Wo, Wg, Wu, Wd, n1, n2;
-  tl::cuda::kv_cache cache;
+  tl::kv_cache cache;
 };
 struct GpuModel {
   array embed, fnorm, lm_head;
