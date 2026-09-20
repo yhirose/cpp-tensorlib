@@ -23,10 +23,16 @@ platform that actually compiles the backend, and only that platform's build
 says so. See misplaced_ops() below.
 
 Usage: tools/check_backend_parity.py
+It also compares each op's PARAMETER LIST across backends. A stub that
+drifts from the real signature compiles fine everywhere except the one
+platform that dispatches through it -- exactly how an attn_decode stub
+missing its kv_bf16 parameter reached the wasm job and nothing else.
+
 Exit status: 0 if every op is REAL or STUB the same way on all three
 backends (a uniform stub is fine -- that just means nobody has ported it
-yet); 1 if any op's status differs across backends, or if any definition
-sits only in a disabled-platform block, printing what is missing where.
+yet) and their signatures agree; 1 if any op's status or signature differs
+across backends, or if any definition sits only in a disabled-platform
+block, printing what is missing where.
 """
 import re
 import sys
@@ -101,6 +107,42 @@ def function_body(text, name):
     return text[body_start:i - 1]
 
 
+def signature(text, name):
+    """The op's parameter list, normalized to compare across backends: types
+    only, since a stub names none of its parameters and a real one names all
+    of them, and without defaults, which each definition may state or not."""
+    m = re.search(rf"^inline bool {re.escape(name)}\s*\(", text, re.MULTILINE)
+    if not m:
+        return None
+    i = text.index("(", m.end() - 1)
+    depth, start = 1, i + 1
+    i += 1
+    while depth:
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+        i += 1
+    # A stub writes types alone ("int64_t"), a real definition writes a name
+    # after them ("int64_t pos"), so a trailing token that is not itself part
+    # of a type is the name.
+    TYPE_WORDS = {"void", "bool", "char", "short", "int", "long", "float",
+                  "double", "unsigned", "signed", "const", "int64_t",
+                  "uint32_t", "uint16_t", "size_t", "kop", "cmp_op",
+                  "scalar_op", "unary_ext_op", "dtype"}
+    params = []
+    for p in re.split(r",(?![^<]*>)", text[start:i - 1]):
+        p = p.split("=", 1)[0]  # drop a default argument
+        p = re.sub(r"\s+", " ", p).replace(" *", "* ").strip()
+        toks = p.split()
+        if len(toks) > 1 and toks[-1] not in TYPE_WORDS and "*" not in toks[-1]:
+            toks.pop()
+        p = " ".join(toks).replace("* ", "*").strip()
+        if p:
+            params.append(p)
+    return ", ".join(params)
+
+
 def status(text, name):
     body = function_body(text, name)
     if body is None:
@@ -162,6 +204,8 @@ def main():
     rows = []
     for op in ops:
         rows.append((op, {b: status(src, op) for b, src in sources.items()}))
+    sigs = {op: {b: signature(src, op) for b, src in sources.items()}
+            for op in ops}
 
     names = list(BACKENDS)
     width = max(len(op) for op, _ in rows) + 2
@@ -194,6 +238,22 @@ def main():
         for op in stale:
             print(f"  {op}")
 
+    # Signatures: every backend that defines the op must take the same
+    # parameters, or the one platform dispatching through the odd one out is
+    # the only build that fails.
+    drifted = []
+    for op in ops:
+        seen = {b: sg for b, sg in sigs[op].items() if sg is not None}
+        if len(set(seen.values())) > 1:
+            drifted.append((op, seen))
+    if drifted:
+        print(f"\nFAIL: {len(drifted)} op(s) whose parameter lists disagree "
+              f"across backends:")
+        for op, seen in drifted:
+            print(f"  {op}:")
+            for b, sg in seen.items():
+                print(f"    {b:<8} ({sg})")
+
     misplaced = [(b, op) for b, src in sources.items()
                  for op in misplaced_ops(src, ops)]
     if misplaced:
@@ -209,7 +269,7 @@ def main():
               f"port the missing backend(s), or add the op to "
               f"{ALLOWLIST_PATH.name} with a reason if the gap is "
               f"deliberate.")
-    return 1 if (unallowed or misplaced) else 0
+    return 1 if (unallowed or misplaced or drifted) else 0
 
 
 if __name__ == "__main__":

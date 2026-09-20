@@ -702,7 +702,8 @@ inline bool binary_bcast(kop op, void* a, int64_t ao, int64_t ars, int64_t acs,
 // loops gemm per slice when this declines (CUDA folds the batch into its grid).
 inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
                          int64_t, int64_t, bool, int64_t, void*, int64_t,
-                         int64_t, int64_t, int64_t, int64_t, float, float) {
+                         int64_t, int64_t, int64_t, int64_t, float, float,
+                         void* = nullptr, int64_t = 0) {
   return false;
 }
 
@@ -1334,7 +1335,8 @@ inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
 }
 inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
                          int64_t, int64_t, bool, int64_t, void*, int64_t,
-                         int64_t, int64_t, int64_t, int64_t, float, float) {
+                         int64_t, int64_t, int64_t, int64_t, float, float,
+                         void* = nullptr, int64_t = 0) {
   return false;
 }
 inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
