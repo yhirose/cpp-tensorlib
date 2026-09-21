@@ -36,14 +36,19 @@
 // One backend is selected below, by the gate its header is written under:
 // webgpu.h under TENSORLIB_WEBGPU && __EMSCRIPTEN__, cuda.h under TENSORLIB_CUDA
 // && !__APPLE__, metal.h under __APPLE__, and gpu_null.h — no device, every op
-// declines — for a build none of them fits. gpu_null.h is also the template:
+// declines — for a build none of them fits. TENSORLIB_HOST_GPU asks for
+// gpu_host.h instead of any of them: the reference backend, whose device is the
+// CPU and whose kernels are plain loops. gpu_null.h is also the template:
 // it is everything this file asks of a backend, with nothing in it. Adding a
 // backend is a header that fills that in, its kernels, and one branch here.
 
 // WebGPU is checked first: a wasm build defines neither __APPLE__ nor
 // TENSORLIB_CUDA, but a host build could define TENSORLIB_WEBGPU by accident
 // and should not take a backend that cannot work there.
-#if defined(TENSORLIB_WEBGPU) && defined(__EMSCRIPTEN__)
+#if defined(TENSORLIB_HOST_GPU)  // asked for by name: the reference backend
+#include "gpu_host.h"
+#define TL_GPU_BACKEND host_gpu
+#elif defined(TENSORLIB_WEBGPU) && defined(__EMSCRIPTEN__)
 #include "webgpu.h"
 #define TL_GPU_BACKEND webgpu
 #elif defined(TENSORLIB_CUDA) && !defined(__APPLE__)

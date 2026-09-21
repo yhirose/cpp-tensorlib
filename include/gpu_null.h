@@ -47,6 +47,10 @@ struct own {};
 // ---- what the shared launch policy may assume of this backend's kernels.
 struct traits {
   static constexpr bool cells_2d = false;
+  // Whether this backend records its own launches under tl::profile (else the
+  // shared layer does), and whether each carries a device time.
+  static constexpr bool profiles_launches = false;
+  static constexpr bool times_launches = false;
 };
 
 // ---- what a model may assume, and the graph-capture plumbing behind

@@ -1428,12 +1428,11 @@ TEST_CASE("layer_norm_bwd matches the composed pullback on the GPU and the own C
     if (on_gpu) tl::use_gpu();
     auto got = tl::array::layer_norm_bwd(x, g, dy);
     tl::use_cpu();
-    // The own CPU takes every contiguous input, and so do the CUDA and Metal
-    // kernels; WebGPU declines and its caller composes the form above.
+    // The own CPU takes every contiguous input, and so does a backend that
+    // has the kernel; one without it declines and its caller composes the
+    // form above.
     if (!on_gpu) REQUIRE(got.has_value());
-#if !defined(TENSORLIB_WEBGPU)
-    REQUIRE(got.has_value());
-#endif
+    if (tl::gpu::has_layer_norm_bwd) REQUIRE(got.has_value());
     if (!got) return;
     auto want = composed(x, g, dy);
     for (int i = 0; i < 3; i++) {
@@ -1776,13 +1775,10 @@ static void check_attn_bwd_dq(bool on_gpu, int64_t D = 64) {
 
   auto out = tl::array::attn_prefill(q, K, V, scale);
   auto got = tl::array::attn_prefill_bwd_dq(q, K, V, dO, out, scale);
-  // The own CPU always takes it, and so do the CUDA and Metal kernels — while
-  // WebGPU declines and its caller composes the unfused form, which the
-  // gradient tests above cover.
-  if (!on_gpu) REQUIRE(got.has_value());
-#if !defined(TENSORLIB_WEBGPU)
-  REQUIRE(got.has_value());
-#endif
+  // The own CPU always takes it, and so does a backend that has the kernel —
+  // while one without it declines and its caller composes the unfused form,
+  // which the gradient tests above cover.
+  if (!on_gpu || tl::gpu::has_attn_prefill_dq) REQUIRE(got.has_value());
   if (!got) {
     MESSAGE("no fused attention pullback on this backend — skipping");
     return;
@@ -1860,10 +1856,7 @@ static void check_attn_bwd_dkv(bool on_gpu, int64_t D = 64) {
   auto got = dqs ? tl::array::attn_prefill_bwd_dkv(q, K, V, dO, dqs->second,
                                                    scale)
                  : std::nullopt;
-  if (!on_gpu) REQUIRE(got.has_value());
-#if !defined(TENSORLIB_WEBGPU)
-  REQUIRE(got.has_value());  // as above
-#endif
+  if (!on_gpu || tl::gpu::has_attn_prefill_dkv) REQUIRE(got.has_value());  // as above
   if (!got) {
     MESSAGE("no fused attention pullback on this backend — skipping");
     return;
@@ -2851,14 +2844,14 @@ TEST_CASE("profile: scopes nest into paths and launches land under them") {
     const row* wait = find("phase/mm", row::kind_t::wait);
     REQUIRE(wait);
     CHECK(wait->count >= 1);
-#if !defined(TENSORLIB_WEBGPU)
-    for (const row* r : launches) {
-      CHECK(r->device_timed == r->count);
-      CHECK(r->device_us > 0);
+    if (tl::gpu::traits::times_launches) {
+      for (const row* r : launches) {
+        CHECK(r->device_timed == r->count);
+        CHECK(r->device_us > 0);
+      }
     }
-#endif
-#ifdef __APPLE__
-    CHECK(tl::profile::summarize().batches >= 1);
+#if defined(__APPLE__) && !defined(TENSORLIB_HOST_GPU)
+    CHECK(tl::profile::summarize().batches >= 1);  // Metal times a batch too
 #endif
   } else {
     CHECK(launches.empty());  // the CPU path launches nothing

@@ -1306,6 +1306,10 @@ struct traits {
   // A [rows, cols] elementwise kernel reads its cell from a 2-D thread
   // position rather than a flat index.
   static constexpr bool cells_2d = true;
+  // Launches are recorded under tl::profile by this backend itself, with
+  // (times_launches) a device time on each.
+  static constexpr bool profiles_launches = true;
+  static constexpr bool times_launches = true;
 };
 
 struct caps {

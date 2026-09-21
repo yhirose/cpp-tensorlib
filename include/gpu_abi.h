@@ -59,6 +59,35 @@ enum class kop {
 };
 inline constexpr size_t kKopCount = static_cast<size_t>(kop::adam_step_) + 1;
 
+// The ids' names, for what reports by kernel (the census, tl::profile).
+inline constexpr const char* kKopNames[] = {
+    "add", "sub", "mul", "div", "pow_", "exp_", "log_", "sqrt_", "sigmoid",
+    "relu", "affine", "badd", "bsub", "bmul", "bdiv", "bpow", "sgemm32",
+    "sgemm32x64", "sgemm64x32", "sgemm64", "steel", "steel32x64", "steel_ta",
+    "steel_tb", "steel32x64_ta", "steel32x64_tb", "softmax", "row_sum",
+    "row_max", "pad", "fold", "index_select", "index_add", "scatter_axis",
+    "badd_nd", "bsub_nd", "bmul_nd", "bdiv_nd", "bpow_nd", "where_nd",
+    "copy_nd", "gt_", "lt_", "ge_", "le_", "eq_", "ne_", "tanh_", "sin_",
+    "cos_", "clamp_", "sum_to_", "sum_to_blocked_", "concat_part_", "rope_",
+    "pow_s_", "gt_s_", "lt_s_", "ge_s_", "le_s_", "eq_s_", "ne_s_",
+    "layer_norm_", "layer_norm_bwd_dx_", "layer_norm_bwd_gb_",
+    "layer_norm_bwd_gb_fold_", "attn_prefill_64_", "attn_prefill_128_",
+    "attn_prefill_bf16_64_", "attn_prefill_bf16_128_", "attn_bwd_dq_64_",
+    "attn_bwd_dq_128_", "attn_bwd_dkv_64_", "attn_bwd_dkv_128_",
+    "attn_decode_64_", "attn_decode_128_", "attn_decode_split_64_",
+    "attn_decode_split_128_", "attn_combine_64_", "attn_combine_128_",
+    "attn_decode_bf16_64_", "attn_decode_bf16_128_",
+    "attn_decode_split_bf16_64_", "attn_decode_split_bf16_128_", "kv_append_",
+    "kv_append_bf16_", "kv_fill_", "kv_fill_bf16_", "argmax_", "rmsnorm_",
+    "add_rmsnorm_", "swiglu_", "split_heads_", "merge_heads_", "gemv_f32_",
+    "gemv_bf16_", "gemv_q4_", "gemv_combine_", "gemv_bf16_row_",
+    "gemm_bf16_nt_", "gemm_bf16_nt32_", "gather_axis_", "row_logsumexp_",
+    "xent_bwd_", "adam_step_",
+};
+static_assert(sizeof(kKopNames) / sizeof(kKopNames[0]) == kKopCount,
+              "kKopNames lists every kop, in order");
+inline const char* kop_name(kop k) { return kKopNames[static_cast<size_t>(k)]; }
+
 // Comparisons (gt/lt/ge/le/eq/ne), the extra unaries and the tensor-scalar
 // ops are their own small vocabularies rather than kop values: each arrived
 // on one backend ahead of the others, and an op keyed by its own enum can be

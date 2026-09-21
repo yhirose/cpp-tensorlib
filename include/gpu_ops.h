@@ -14,6 +14,7 @@
 #include <type_traits>
 
 #include "gpu_abi.h"
+#include "profile.h"
 
 namespace tl {
 namespace gpu {
@@ -26,8 +27,18 @@ namespace gpu {
 namespace detail {
 inline std::array<uint64_t, kKopCount> census_counts{};
 inline uint64_t census_ops_run = 0;
-inline bool ran(bool ok) {
-  if (ok) census_ops_run++;
+// A launch the backend did not record under tl::profile itself is recorded
+// here, by name, so a backend is profiled from its first kernel; one that
+// stamps its launches with a device time says so (traits::profiles_launches)
+// and records its own.
+inline void profile_launch(const char* name) {
+  if (!traits::profiles_launches && profile::active()) profile::detail::launch(name);
+}
+inline bool ran(const char* op, bool ok) {
+  if (ok) {
+    census_ops_run++;
+    profile_launch(op);
+  }
   return ok;
 }
 }  // namespace detail
@@ -52,7 +63,8 @@ inline void census_reset() {
   struct owns_##name : std::false_type {};                                     \
   template <class B>                                                           \
   struct owns_##name<B, std::void_t<decltype(&B::name)>> : std::true_type {};  \
-  }
+  }                                                                            \
+  inline constexpr bool has_##name = detail::owns_##name<own>::value;
 
 // Every shared op launches through here.
 template <class P>
@@ -66,6 +78,7 @@ inline bool launch(kop k, std::initializer_list<arg> args, const P& params,
   }
   detail::census_counts[static_cast<size_t>(k)]++;
   detail::census_ops_run++;
+  detail::profile_launch(kop_name(k));
   return true;
 }
 
@@ -324,7 +337,7 @@ inline bool split_heads(span src, span bias, span dst, int64_t T, int64_t ld,
                         int64_t off, int64_t H, int64_t D) {
   if (T <= 0 || H <= 0 || D <= 0) return false;
   if constexpr (detail::owns_split_heads<Own>::value) {
-    return detail::ran(Own::split_heads(src, bias, dst, T, ld, off, H, D));
+    return detail::ran("split_heads", Own::split_heads(src, bias, dst, T, ld, off, H, D));
   } else {
     return false;
   }
@@ -338,7 +351,7 @@ template <class Own = own>
 inline bool argmax(span a, int64_t n, int64_t* out_idx) {
   if (!a || n <= 0 || !out_idx) return false;
   if constexpr (detail::owns_argmax<Own>::value) {
-    return detail::ran(Own::argmax(a, n, out_idx));
+    return detail::ran("argmax", Own::argmax(a, n, out_idx));
   } else {
     return false;
   }
@@ -371,7 +384,7 @@ inline bool binary_bcast_nd(kop op, span a, const int64_t* a_strides, span b,
                             const int64_t* out_shape, int rank, int64_t n,
                             float scale, float offset) {
   if constexpr (detail::owns_binary_bcast_nd<Own>::value) {
-    return detail::ran(Own::binary_bcast_nd(op, a, a_strides, b, b_strides, o, out_shape, rank, n, scale, offset));
+    return detail::ran("binary_bcast_nd", Own::binary_bcast_nd(op, a, a_strides, b, b_strides, o, out_shape, rank, n, scale, offset));
   } else {
     return false;
   }
@@ -384,7 +397,7 @@ inline bool where_nd(span cond, const int64_t* c_strides, span a,
                      const int64_t* a_strides, span b, const int64_t* b_strides,
                      span o, const int64_t* out_shape, int rank, int64_t n) {
   if constexpr (detail::owns_where_nd<Own>::value) {
-    return detail::ran(Own::where_nd(cond, c_strides, a, a_strides, b, b_strides, o, out_shape, rank, n));
+    return detail::ran("where_nd", Own::where_nd(cond, c_strides, a, a_strides, b, b_strides, o, out_shape, rank, n));
   } else {
     return false;
   }
@@ -396,7 +409,7 @@ template <class Own = own>
 inline bool copy_nd(span a, const int64_t* a_strides, span o,
                     const int64_t* out_shape, int rank, int64_t n) {
   if constexpr (detail::owns_copy_nd<Own>::value) {
-    return detail::ran(Own::copy_nd(a, a_strides, o, out_shape, rank, n));
+    return detail::ran("copy_nd", Own::copy_nd(a, a_strides, o, out_shape, rank, n));
   } else {
     return false;
   }
@@ -410,7 +423,7 @@ inline bool sum_to(span a, const int64_t* a_shape, const int64_t* a_strides,
                    const int64_t* acc, int rank, int64_t out_n,
                    int64_t reduced_n, span o) {
   if constexpr (detail::owns_sum_to<Own>::value) {
-    return detail::ran(Own::sum_to(a, a_shape, a_strides, acc, rank, out_n, reduced_n, o));
+    return detail::ran("sum_to", Own::sum_to(a, a_shape, a_strides, acc, rank, out_n, reduced_n, o));
   } else {
     return false;
   }
@@ -424,7 +437,7 @@ inline bool pad(span a, span o, const int64_t* a_shape,
                 const int64_t* out_shape, int rank, int axis, int64_t before,
                 int64_t n, int64_t out_n) {
   if constexpr (detail::owns_pad<Own>::value) {
-    return detail::ran(Own::pad(a, o, a_shape, out_shape, rank, axis, before, n, out_n));
+    return detail::ran("pad", Own::pad(a, o, a_shape, out_shape, rank, axis, before, n, out_n));
   } else {
     return false;
   }
@@ -437,7 +450,7 @@ inline bool fold(span a, span o, const int64_t* a_shape,
                  const int64_t* out_shape, int rank, int axis, int64_t step,
                  int64_t n, int64_t out_n) {
   if constexpr (detail::owns_fold<Own>::value) {
-    return detail::ran(Own::fold(a, o, a_shape, out_shape, rank, axis, step, n, out_n));
+    return detail::ran("fold", Own::fold(a, o, a_shape, out_shape, rank, axis, step, n, out_n));
   } else {
     return false;
   }
@@ -450,7 +463,7 @@ inline bool concat_part(span a, span o, const int64_t* a_shape,
                         const int64_t* out_shape, int rank, int axis,
                         int64_t before, int64_t n) {
   if constexpr (detail::owns_concat_part<Own>::value) {
-    return detail::ran(Own::concat_part(a, o, a_shape, out_shape, rank, axis, before, n));
+    return detail::ran("concat_part", Own::concat_part(a, o, a_shape, out_shape, rank, axis, before, n));
   } else {
     return false;
   }
@@ -462,7 +475,7 @@ template <class Own = own>
 inline bool index_add(span idx, span values, span o, int64_t row_size,
                       int64_t k, int64_t out_n) {
   if constexpr (detail::owns_index_add<Own>::value) {
-    return detail::ran(Own::index_add(idx, values, o, row_size, k, out_n));
+    return detail::ran("index_add", Own::index_add(idx, values, o, row_size, k, out_n));
   } else {
     return false;
   }
@@ -474,7 +487,7 @@ template <class Own = own>
 inline bool scatter_to_axis(span idx, span values, span o, int64_t n,
                             int64_t size) {
   if constexpr (detail::owns_scatter_to_axis<Own>::value) {
-    return detail::ran(Own::scatter_to_axis(idx, values, o, n, size));
+    return detail::ran("scatter_to_axis", Own::scatter_to_axis(idx, values, o, n, size));
   } else {
     return false;
   }
@@ -488,7 +501,7 @@ inline bool gemm(span a, int64_t lda, bool ta, span b, int64_t ldb, bool tb,
                  span o, int64_t m, int64_t n, int64_t k, float scale,
                  float offset) {
   if constexpr (detail::owns_gemm<Own>::value) {
-    return detail::ran(Own::gemm(a, lda, ta, b, ldb, tb, o, m, n, k, scale, offset));
+    return detail::ran("gemm", Own::gemm(a, lda, ta, b, ldb, tb, o, m, n, k, scale, offset));
   } else {
     return false;
   }
@@ -503,7 +516,7 @@ inline bool gemm_batched(span a, int64_t lda, bool ta, int64_t sa, span b,
                          int64_t n, int64_t k, int64_t batch, float scale,
                          float offset, span bias = {}) {
   if constexpr (detail::owns_gemm_batched<Own>::value) {
-    return detail::ran(Own::gemm_batched(a, lda, ta, sa, b, ldb, tb, sb, o, m, n, k, batch, scale, offset, bias));
+    return detail::ran("gemm_batched", Own::gemm_batched(a, lda, ta, sa, b, ldb, tb, sb, o, m, n, k, batch, scale, offset, bias));
   } else {
     return false;
   }
@@ -516,7 +529,7 @@ inline bool gemm_bias(span a, int64_t lda, bool ta, span b, int64_t ldb,
                       bool tb, span bias, span o, int64_t m, int64_t n,
                       int64_t k, float scale, float offset) {
   if constexpr (detail::owns_gemm_bias<Own>::value) {
-    return detail::ran(Own::gemm_bias(a, lda, ta, b, ldb, tb, bias, o, m, n, k, scale, offset));
+    return detail::ran("gemm_bias", Own::gemm_bias(a, lda, ta, b, ldb, tb, bias, o, m, n, k, scale, offset));
   } else {
     return false;
   }
@@ -529,7 +542,7 @@ template <class Own = own>
 inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
                  int64_t pos, float base, span bias = {}) {
   if constexpr (detail::owns_rope<Own>::value) {
-    return detail::ran(Own::rope(x, o, rows, T, D, pos, base, bias));
+    return detail::ran("rope", Own::rope(x, o, rows, T, D, pos, base, bias));
   } else {
     return false;
   }
@@ -543,7 +556,7 @@ inline bool layer_norm_bwd(span x, span g, span dy, span dx, span dg, span db,
                            int64_t cols, int64_t per_chunk, int64_t chunks,
                            float eps) {
   if constexpr (detail::owns_layer_norm_bwd<Own>::value) {
-    return detail::ran(Own::layer_norm_bwd(x, g, dy, dx, dg, db, stats, partials, rows, cols, per_chunk, chunks, eps));
+    return detail::ran("layer_norm_bwd", Own::layer_norm_bwd(x, g, dy, dx, dg, db, stats, partials, rows, cols, per_chunk, chunks, eps));
   } else {
     return false;
   }
@@ -556,7 +569,7 @@ TL_GPU_DETECT_OWN(gemv_f32)
 template <class Own = own>
 inline bool gemv_f32(span a, span B, span y, int64_t n, int64_t k) {
   if constexpr (detail::owns_gemv_f32<Own>::value) {
-    return detail::ran(Own::gemv_f32(a, B, y, n, k));
+    return detail::ran("gemv_f32", Own::gemv_f32(a, B, y, n, k));
   } else {
     return false;
   }
@@ -566,7 +579,7 @@ TL_GPU_DETECT_OWN(gemv_bf16)
 template <class Own = own>
 inline bool gemv_bf16(span a, span B, span y, int64_t n, int64_t k) {
   if constexpr (detail::owns_gemv_bf16<Own>::value) {
-    return detail::ran(Own::gemv_bf16(a, B, y, n, k));
+    return detail::ran("gemv_bf16", Own::gemv_bf16(a, B, y, n, k));
   } else {
     return false;
   }
@@ -578,7 +591,7 @@ template <class Own = own>
 inline bool gemm_bf16_nt(span A, span B, span C, int64_t M, int64_t N,
                          int64_t K) {
   if constexpr (detail::owns_gemm_bf16_nt<Own>::value) {
-    return detail::ran(Own::gemm_bf16_nt(A, B, C, M, N, K));
+    return detail::ran("gemm_bf16_nt", Own::gemm_bf16_nt(A, B, C, M, N, K));
   } else {
     return false;
   }
@@ -592,7 +605,7 @@ inline bool attn_decode(span q, span K, span V, span o, int64_t n_q_heads,
                         int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
                         int64_t D, float scale, bool kv_bf16 = false) {
   if constexpr (detail::owns_attn_decode<Own>::value) {
-    return detail::ran(Own::attn_decode(q, K, V, o, n_q_heads, n_kv_heads, ctx, kv_max, D, scale, kv_bf16));
+    return detail::ran("attn_decode", Own::attn_decode(q, K, V, o, n_q_heads, n_kv_heads, ctx, kv_max, D, scale, kv_bf16));
   } else {
     return false;
   }
@@ -607,7 +620,7 @@ inline bool attn_prefill(span q, span K, span V, span o, int64_t n_q_heads,
                          int64_t D, float scale, bool kv_bf16 = false,
                          int64_t pos0 = 0) {
   if constexpr (detail::owns_attn_prefill<Own>::value) {
-    return detail::ran(Own::attn_prefill(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D, scale, kv_bf16, pos0));
+    return detail::ran("attn_prefill", Own::attn_prefill(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D, scale, kv_bf16, pos0));
   } else {
     return false;
   }
@@ -620,7 +633,7 @@ inline bool attn_prefill_dq(span q, span K, span V, span dO, span O, span dq,
                             span stats, int64_t H, int64_t T, int64_t D,
                             float scale) {
   if constexpr (detail::owns_attn_prefill_dq<Own>::value) {
-    return detail::ran(Own::attn_prefill_dq(q, K, V, dO, O, dq, stats, H, T, D, scale));
+    return detail::ran("attn_prefill_dq", Own::attn_prefill_dq(q, K, V, dO, O, dq, stats, H, T, D, scale));
   } else {
     return false;
   }
@@ -632,7 +645,7 @@ inline bool attn_prefill_dkv(span q, span K, span V, span dO, span stats,
                              span dK, span dV, int64_t H, int64_t T, int64_t D,
                              float scale) {
   if constexpr (detail::owns_attn_prefill_dkv<Own>::value) {
-    return detail::ran(Own::attn_prefill_dkv(q, K, V, dO, stats, dK, dV, H, T, D, scale));
+    return detail::ran("attn_prefill_dkv", Own::attn_prefill_dkv(q, K, V, dO, stats, dK, dV, H, T, D, scale));
   } else {
     return false;
   }
@@ -646,7 +659,7 @@ template <class Own = own>
 inline bool rope_dpos(span x, span o, int64_t rows, int64_t T, int64_t D,
                       span d_pos, float base, span bias = {}) {
   if constexpr (detail::owns_rope_dpos<Own>::value) {
-    return detail::ran(Own::rope_dpos(x, o, rows, T, D, d_pos, base, bias));
+    return detail::ran("rope_dpos", Own::rope_dpos(x, o, rows, T, D, d_pos, base, bias));
   } else {
     return false;
   }
@@ -657,7 +670,7 @@ template <class Own = own>
 inline bool kv_append_dpos(span Kc, span Vc, span k_new, span v_new, span d_pos,
                            int64_t kv_max, int64_t n_kv_heads, int64_t D) {
   if constexpr (detail::owns_kv_append_dpos<Own>::value) {
-    return detail::ran(Own::kv_append_dpos(Kc, Vc, k_new, v_new, d_pos, kv_max, n_kv_heads, D));
+    return detail::ran("kv_append_dpos", Own::kv_append_dpos(Kc, Vc, k_new, v_new, d_pos, kv_max, n_kv_heads, D));
   } else {
     return false;
   }
@@ -669,7 +682,7 @@ inline bool attn_decode_dpos(span q, span K, span V, span o, int64_t n_q_heads,
                              int64_t n_kv_heads, span d_pos, int64_t kv_max,
                              int64_t D, float scale, span partials) {
   if constexpr (detail::owns_attn_decode_dpos<Own>::value) {
-    return detail::ran(Own::attn_decode_dpos(q, K, V, o, n_q_heads, n_kv_heads, d_pos, kv_max, D, scale, partials));
+    return detail::ran("attn_decode_dpos", Own::attn_decode_dpos(q, K, V, o, n_q_heads, n_kv_heads, d_pos, kv_max, D, scale, partials));
   } else {
     return false;
   }
@@ -680,7 +693,7 @@ TL_GPU_DETECT_OWN(incr_u32)
 template <class Own = own>
 inline bool incr_u32(span d_pos) {
   if constexpr (detail::owns_incr_u32<Own>::value) {
-    return detail::ran(Own::incr_u32(d_pos));
+    return detail::ran("incr_u32", Own::incr_u32(d_pos));
   } else {
     return false;
   }

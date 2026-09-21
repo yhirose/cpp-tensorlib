@@ -1045,6 +1045,10 @@ inline bool own::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
 struct traits {
   // A [rows, cols] elementwise kernel reads its cell from a flat index.
   static constexpr bool cells_2d = false;
+  // Launches are recorded under tl::profile by this backend itself, with
+  // (times_launches) a device time on each.
+  static constexpr bool profiles_launches = true;
+  static constexpr bool times_launches = true;
 };
 
 struct caps {

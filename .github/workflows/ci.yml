@@ -26,6 +26,27 @@ jobs:
       - name: Test (cpu / gpu / auto)
         run: ctest --test-dir build -C Release --output-on-failure
 
+  # The host reference backend (gpu_host.h): a "device" that is the CPU, so the
+  # shared GPU layer — gpu_ops.h, the launch policy, residency, the census — and
+  # the conformance tests run on runners with no GPU, where the plain `test` job
+  # above only ever takes the CPU fallback and never enters them. On macOS it
+  # also checks that asking for it by name wins over Metal.
+  host-backend:
+    name: host reference backend / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DTENSORLIB_HOST_GPU=ON
+      - name: Build
+        run: cmake --build build --config Release --target tensorlib_test
+      - name: Test (cpu / gpu / auto)
+        run: ctest --test-dir build -C Release --output-on-failure -R '^(cpu|gpu|auto)$'
+
   # Build verification for the CUDA toolchain. Hosted runners have no NVIDIA
   # driver, so the kernels are only compiled and linked. Running the tests here
   # doubles as coverage of the dlopen fallback on a driver-less machine, which

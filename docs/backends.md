@@ -2,7 +2,7 @@
 
 How the GPU layer is put together, how to add an op to it, and how to add a
 backend. The code is `include/gpu.h`, `gpu_abi.h`, `gpu_ops.h`, `gpu_null.h`
-and one header per backend (`metal.h`, `cuda.h`, `webgpu.h`).
+and one header per backend (`metal.h`, `cuda.h`, `webgpu.h`, `gpu_host.h`).
 
 ## Layers
 
@@ -14,8 +14,8 @@ gpu_abi.h    span, access, grid, kernel ABI,
              params structs, launch policy
 ──────────────────────────────────────────────
 device core  lifecycle, memory, dispatch,      one per backend:
-             own, traits, caps                 metal / cuda / webgpu / null
-kernels      .metal / .cu / .wgsl
+             own, traits, caps                 metal / cuda / webgpu / host / null
+kernels      .metal / .cu / .wgsl / C++ loops
 ```
 
 `tl::gpu` is a namespace holding the shared layer plus a using-directive for
@@ -180,12 +180,30 @@ a 2-D thread position or from a flat index (`traits::cells_2d`).
 
 No existing backend's file is touched.
 
+`gpu_host.h` is a backend written this way, and the proof that the steps above
+are the whole job: a "device" that is the CPU, with kernels that are plain
+loops. Its core (lifecycle, memory, `dispatch`'s switch, `traits`, `caps`) is
+about 190 lines; its kernels, about 270, cover the single-kernel ops; its `own`
+struct, about 70, holds the four backend-own ops the conformance test expects
+of every backend. `-DTENSORLIB_HOST_GPU=ON` selects it ahead of any real backend, and
+the whole suite passes on it in `--gpu` and `--auto` mode, so the shared layer
+and the conformance tests run on a machine with no GPU. Each kernel in it is
+also the plainest statement of what its id computes.
+
+What a test may ask of a backend is asked in code, not by platform macro:
+`gpu::has_<op>` (whether the selected backend runs a backend-own op),
+`gpu::caps`, `gpu::traits`. A test that needs to know whether a kernel exists
+asks; a new backend edits no test.
+
 ## What is not shared yet
 
 - The mirror table (handle to host copy, device copy, size, `residency`) and
   the buffer pool exist twice, in `cuda.h` and `webgpu.h`. The state machine
   itself is shared.
-- `tl::profile` hooks sit in each backend's launch path.
+- `tl::profile` hooks sit in each real backend's launch path, because each
+  stamps its launches with a device time its own way. A backend that records
+  none (`traits::profiles_launches = false`) gets a row per launch from the
+  shared layer, by kernel name, so it is profiled from its first kernel.
 - `kop` still lists kernel ids only one backend has (Metal's GEMM tiles and
   attention variants).
 - Launch policy inside the own ops (CUDA's split-K and tile choices, Metal's
@@ -196,7 +214,7 @@ No existing backend's file is touched.
 
 ## Verifying a change
 
-All four run on a development Mac.
+All of these run on a development Mac.
 
 | what | command |
 |------|---------|
@@ -205,6 +223,7 @@ All four run on a development Mac.
 | WebGPU | `test/wasm/build.sh && deno run --allow-all test/wasm/deno_run.js` |
 | CUDA's host side | `tools/cuda_trace/compare.sh <base-ref>` |
 | no backend | a Linux build without `TENSORLIB_CUDA`: `gpu.h` selects `gpu_null.h` |
+| the shared layer, with no GPU | `cmake -B build-host -DTENSORLIB_HOST_GPU=ON`, then `ctest` |
 
 No machine here runs CUDA kernels, and CI compiles them without running them.
 `tools/cuda_trace` puts a stand-in `libcuda.so.1` in front of the backend (it

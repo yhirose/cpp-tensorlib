@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(TENSORLIB_CUDA "Build the CUDA backend (needs CUDA Toolkit at build time only)" OFF)
+option(TENSORLIB_HOST_GPU "Select the host reference backend (gpu_host.h): runs the GPU layer and its conformance tests with no GPU" OFF)
 
 add_library(tensorlib INTERFACE)
 target_include_directories(tensorlib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -17,6 +18,10 @@ target_include_directories(tensorlib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/inclu
 if(APPLE)
   target_link_libraries(tensorlib INTERFACE
     "-framework Accelerate" "-framework Metal" "-framework Foundation")
+endif()
+
+if(TENSORLIB_HOST_GPU)
+  target_compile_definitions(tensorlib INTERFACE TENSORLIB_HOST_GPU)
 endif()
 
 if(TENSORLIB_CUDA)
