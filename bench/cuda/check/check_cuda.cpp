@@ -14,7 +14,7 @@
 #include <vector>
 
 using namespace tl::cuda;
-using kop = tl::metal::kop;
+using kop = tl::gpu::kop;
 
 static int failures = 0;
 static void check(bool ok, const char* what) {
@@ -160,7 +160,7 @@ int main() {
       }
       ref[r] = s * 0.25f + 3.0f;
     }
-    bool launched = tl::cuda::row_op(kop::row_sum, in, 0, o, 0, rows, cols, 0.25f, 3.0f);
+    bool launched = tl::gpu::row_op(kop::row_sum, {in, 0}, {o, 0}, rows, cols, 0.25f, 3.0f);
     sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t r = 0; r < rows; r++)
@@ -188,7 +188,7 @@ int main() {
       for (int64_t c = 0; c < cols; c++)
         ref[r * cols + c] = std::exp(ci[r * cols + c] - mx) / sum;
     }
-    bool launched = tl::cuda::row_op(kop::softmax, in, 0, o, 0, rows, cols, 1.0f, 0.0f);
+    bool launched = tl::gpu::row_op(kop::softmax, {in, 0}, {o, 0}, rows, cols, 1.0f, 0.0f);
     sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < rows * cols; i++)

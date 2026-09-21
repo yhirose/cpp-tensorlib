@@ -114,6 +114,43 @@ struct ew_params {  // elementwise: out[i] = f(...) * scale + offset, i < n
   uint32_t n;
   float scale, offset;
 };
+struct bcast_params {  // rank-2 broadcast binary into a contiguous [m, n]
+  uint32_t m, n;
+  uint32_t ars, acs, brs, bcs;  // each operand's row / column stride, elements
+  float scale, offset;
+};
+struct cmp_params {  // out[i] = a[i] CMP b[i * bstride] (bstride 0: a scalar)
+  uint32_t n, bstride;
+};
+struct clamp_params {
+  uint32_t n;
+  float lo, hi;
+};
+struct scalar_params {  // out[i] = (a[i] OP s) * scale + offset
+  uint32_t n;
+  float s, scale, offset;
+};
+struct reduce_params {  // a row op over the last axis of [rows, cols]
+  uint32_t rows, cols;
+  float scale, offset;
+};
+struct layer_norm_params {
+  uint32_t rows, cols;
+  float eps, scale, offset;
+};
+struct gather_params {  // index_select: rows of `row_size`, n output elements
+  uint32_t row_size, n;
+};
+struct gather_axis_params {  // out[i] = src[i * size + idx[i]], i < n
+  uint32_t size, n;
+};
+struct xent_bwd_params {
+  uint32_t cols, n;  // n = rows * cols
+};
+struct adam_params {
+  float b1, b2, eps, lr_over_bc1, inv_bc2;
+  uint32_t n;
+};
 
 // Launch policy: the shapes ops launch in, in one place. Host code shared by
 // every backend; what differs between devices will come in as traits.
@@ -123,6 +160,22 @@ namespace policy {
 inline grid flat(int64_t n, uint32_t threads = 256) {
   uint32_t groups = static_cast<uint32_t>((n + threads - 1) / threads);
   return {groups ? groups : 1, 1, 1, threads, 1, 1, 0};
+}
+
+// One group a row, its threads reducing the row between them; each thread
+// keeps `floats_per_thread` of scratch for the reduction tree.
+inline grid one_group_per_row(int64_t rows, uint32_t floats_per_thread = 1,
+                              uint32_t threads = 256) {
+  uint32_t groups = static_cast<uint32_t>(rows);
+  return {groups ? groups : 1, 1, 1, threads, 1, 1,
+          threads * floats_per_thread * static_cast<uint32_t>(sizeof(float))};
+}
+
+// A thread per cell of [rows, cols], for a kernel that reads its cell from a
+// 2-D thread position (x the column). 32x8 groups.
+inline grid cells_2d(int64_t rows, int64_t cols) {
+  return {static_cast<uint32_t>((cols + 31) / 32),
+          static_cast<uint32_t>((rows + 7) / 8), 1, 32, 8, 1, 0};
 }
 
 }  // namespace policy

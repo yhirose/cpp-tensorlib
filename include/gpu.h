@@ -5,19 +5,19 @@
 //
 //   shared    gpu_abi.h (the op vocabulary, span, the kernel ABI) and gpu_ops.h
 //             (ops written once, over the backend's `dispatch`):
-//               binary / unary / unary_ext
+//               binary / unary / unary_ext / binary_bcast / compare / clamp /
+//               scalar_binary / row_op / row_logsumexp / layer_norm /
+//               index_select / gather_from_axis / xent_bwd / adam_step
 //   backend   whatever the selected backend header declares, reached through
 //             the using-directive below. Until an op moves to gpu_ops.h, each
 //             backend header declares it with the identical signature — the
 //             contract, i.e. everything array.h/storage.h may call:
 //   lifecycle  available / pending / flush / cpu_barrier
 //   memory     alloc / release / sync_to_host / upload
-//   kernels    binary_bcast / binary_bcast_nd / where_nd / copy_nd /
-//              gemm / gemm_batched / gemm_bias / row_op / pad / fold /
-//              index_select / index_add / scatter_to_axis / gather_from_axis /
-//              sum_to / compare / clamp / scalar_binary /
-//              concat_part / rope / layer_norm / layer_norm_bwd /
-//              row_logsumexp / xent_bwd / adam_step
+//   kernels    binary_bcast_nd / where_nd / copy_nd /
+//              gemm / gemm_batched / gemm_bias / pad / fold /
+//              index_add / scatter_to_axis / sum_to /
+//              concat_part / rope / layer_norm_bwd
 //   LLM path   gemv_f32 / gemv_bf16 / gemv_q4 / attn_decode / attn_prefill /
 //              attn_prefill_dq / attn_prefill_dkv
 //   model path kv_append / kv_fill / argmax / rmsnorm / rmsnorm_res / swiglu /

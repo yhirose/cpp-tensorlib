@@ -200,6 +200,26 @@ inline const char* kernel_name_(kop op) {
     case kop::softmax: return "tl_softmax";
     case kop::row_sum: return "tl_row_sum";
     case kop::row_max: return "tl_row_max";
+    case kop::gt_: return "tl_gt";
+    case kop::lt_: return "tl_lt";
+    case kop::ge_: return "tl_ge";
+    case kop::le_: return "tl_le";
+    case kop::eq_: return "tl_eq";
+    case kop::ne_: return "tl_ne";
+    case kop::clamp_: return "tl_clamp";
+    case kop::pow_s_: return "tl_pow_s";
+    case kop::gt_s_: return "tl_gt_s";
+    case kop::lt_s_: return "tl_lt_s";
+    case kop::ge_s_: return "tl_ge_s";
+    case kop::le_s_: return "tl_le_s";
+    case kop::eq_s_: return "tl_eq_s";
+    case kop::ne_s_: return "tl_ne_s";
+    case kop::layer_norm_: return "tl_layer_norm";
+    case kop::index_select: return "tl_index_select";
+    case kop::gather_axis_: return "tl_gather_axis";
+    case kop::row_logsumexp_: return "tl_row_logsumexp";
+    case kop::xent_bwd_: return "tl_xent_bwd";
+    case kop::adam_step_: return "tl_adam_step";
     // Every f32 GEMM id is the one general kernel here (the tiled fast path
     // has its own names: sgemm_tiles below).
     case kop::sgemm32: case kop::sgemm32x64: case kop::sgemm64x32:
@@ -583,45 +603,6 @@ struct context {
     return cached_(sum_to_blocked_fn, "tl_sum_to_blocked");
   }
 
-  // Comparisons (gt/lt/ge/le/eq/ne): ReLU/LeakyReLU/Clip's backward gate
-  // and Tensor.gt/lt/... generally. Own vocabulary, not the kop table
-  // (see metal.h's cmp_op comment for why).
-  CUfunction gt_fn = nullptr, lt_fn = nullptr, ge_fn = nullptr,
-             le_fn = nullptr, eq_fn = nullptr, ne_fn = nullptr;
-  CUfunction compare_(cmp_op op) {
-    switch (op) {
-      case cmp_op::gt: return cached_(gt_fn, "tl_gt");
-      case cmp_op::lt: return cached_(lt_fn, "tl_lt");
-      case cmp_op::ge: return cached_(ge_fn, "tl_ge");
-      case cmp_op::le: return cached_(le_fn, "tl_le");
-      case cmp_op::eq: return cached_(eq_fn, "tl_eq");
-      case cmp_op::ne: return cached_(ne_fn, "tl_ne");
-      default: return nullptr;
-    }
-  }
-
-  // clamp (Clip's forward). Own getter, not the kop table (same reason as
-  // compare_ above).
-  CUfunction clamp_fn = nullptr;
-  CUfunction clamp_() { return cached_(clamp_fn, "tl_clamp"); }
-
-  // Tensor-scalar ops (pow(x, s), x > s, ...): the scalar is a kernel argument.
-  CUfunction pow_s_fn = nullptr, gt_s_fn = nullptr, lt_s_fn = nullptr,
-             ge_s_fn = nullptr, le_s_fn = nullptr, eq_s_fn = nullptr,
-             ne_s_fn = nullptr;
-  CUfunction scalar_binary_(scalar_op op) {
-    switch (op) {
-      case scalar_op::pow: return cached_(pow_s_fn, "tl_pow_s");
-      case scalar_op::gt: return cached_(gt_s_fn, "tl_gt_s");
-      case scalar_op::lt: return cached_(lt_s_fn, "tl_lt_s");
-      case scalar_op::ge: return cached_(ge_s_fn, "tl_ge_s");
-      case scalar_op::le: return cached_(le_s_fn, "tl_le_s");
-      case scalar_op::eq: return cached_(eq_s_fn, "tl_eq_s");
-      case scalar_op::ne: return cached_(ne_s_fn, "tl_ne_s");
-      default: return nullptr;
-    }
-  }
-
   // M9 batched-prefill GEMM (bf16 [N,K] weights, the decode GEMV's own layout).
   CUfunction gemm_bf16_nt_fn = nullptr, gemm_bf16_nt_s_fn = nullptr,
              gemm_bf16_nt_sk_fn = nullptr;
@@ -998,6 +979,13 @@ inline void flush() {
 // imperative decode step (no host sync / blocking copy mid-stream) is
 // capturable; embed staging + argmax happen outside the captured region.
 // What a model may ask of this backend beyond the kernel contract (gpu.h).
+// What the shared launch policy (gpu_ops.h) may assume of this backend's
+// kernels.
+struct traits {
+  // A [rows, cols] elementwise kernel reads its cell from a flat index.
+  static constexpr bool cells_2d = false;
+};
+
 struct caps {
   // Whether the model-path row is real here, or answers false: a decoder
   // runs on raw buffers only where it is true, and keeps to the array ops
@@ -1153,29 +1141,6 @@ inline bool dispatch(kop k, const gpu::arg* args, size_t n, const void* params,
   auto& c = context::get();
   if (!c.ready) return false;
   return c.dispatch_(c.fn_(k), args, n, params, params_bytes, g);
-}
-
-// Rank-2 broadcast binary (bias / row-vector / column-vector / scalar) --
-// mirrors metal.h's own kernel; ars/acs/brs/bcs are element strides (0 on a
-// broadcast axis), computed host-side by array.h's gpu_binary via the same
-// broadcast_strides() the CPU oracle uses.
-inline bool binary_bcast(kop op, void* a, int64_t ao, int64_t ars, int64_t acs,
-                         void* b, int64_t bo, int64_t brs, int64_t bcs,
-                         void* out, int64_t oo, int64_t m, int64_t n,
-                         float scale, float offset) {
-  auto& c = context::get();
-  if (!c.ready) return false;
-  c.device_read_(a);
-  c.device_read_(b);
-  c.device_write_(out);
-  float* pa = context::off_(a, ao);
-  float* pb = context::off_(b, bo);
-  float* po = context::off_(out, oo);
-  unsigned um = static_cast<unsigned>(m), un = static_cast<unsigned>(n);
-  return c.launch1d_(c.fn_(op), um * un, pa, pb, po, um, un,
-                     static_cast<unsigned>(ars), static_cast<unsigned>(acs),
-                     static_cast<unsigned>(brs), static_cast<unsigned>(bcs),
-                     scale, offset);
 }
 
 // Rank cap shared with the kernel side (tensorlib_cuda.cu's
@@ -1357,61 +1322,6 @@ inline bool sum_to(void* a_native, int64_t ao, const int64_t* a_shape,
   return c.launch1d_(f, un, pa, po, pmeta, rank, un, ured);
 }
 
-// Elementwise comparison, same shape only (array.h's gpu_compare_ gates on
-// that; ReLU/LeakyReLU/Clip's backward gate and the concrete Tensor.gt/...
-// callers never need a broadcast form). Output is a F32 mask (1.0f/0.0f),
-// matching the CPU oracle's own comparison ops.
-inline bool compare(cmp_op op, void* a_native, int64_t ao, void* b_native,
-                    int64_t bo, void* out_native, int64_t oo, int64_t n,
-                    int64_t bstride) {
-  auto& c = context::get();
-  if (!c.ready) return false;
-  CUfunction f = c.compare_(op);
-  if (!f) return false;
-  c.device_read_(a_native);
-  c.device_read_(b_native);
-  c.device_write_(out_native);
-  float* pa = context::off_(a_native, ao);
-  float* pb = context::off_(b_native, bo);
-  float* po = context::off_(out_native, oo);
-  unsigned un = static_cast<unsigned>(n);
-  unsigned ubs = static_cast<unsigned>(bstride);
-  return c.launch1d_(f, un, pa, pb, po, un, ubs);
-}
-
-// clamp(x, lo, hi): Clip's forward. No epilogue -- lo/hi occupy the role
-// scale/offset play elsewhere, and nothing composes a further affine onto
-// it today (array.h's gpu_clamp_ doesn't thread one through).
-inline bool clamp(void* a_native, int64_t ao, void* out_native, int64_t oo,
-                  int64_t n, float lo, float hi) {
-  auto& c = context::get();
-  if (!c.ready) return false;
-  CUfunction f = c.clamp_();
-  if (!f) return false;
-  c.device_read_(a_native);
-  c.device_write_(out_native);
-  float* pa = context::off_(a_native, ao);
-  float* po = context::off_(out_native, oo);
-  unsigned un = static_cast<unsigned>(n);
-  return c.launch1d_(f, un, pa, po, un, lo, hi);
-}
-
-// Tensor-scalar ops: out = f(a, s) * scale + offset (see metal.h's scalar_op).
-inline bool scalar_binary(scalar_op op, void* a_native, int64_t ao,
-                          void* out_native, int64_t oo, int64_t n, float s,
-                          float scale, float offset) {
-  auto& c = context::get();
-  if (!c.ready) return false;
-  CUfunction f = c.scalar_binary_(op);
-  if (!f) return false;
-  c.device_read_(a_native);
-  c.device_write_(out_native);
-  float* pa = context::off_(a_native, ao);
-  float* po = context::off_(out_native, oo);
-  unsigned un = static_cast<unsigned>(n);
-  return c.launch1d_(f, un, pa, po, un, s, scale, offset);
-}
-
 // Places `a` (contiguous) into a zero buffer of out_shape (array.h's
 // gpu_pad_ allocates `out` uninitialized via array::empty — this zeros the
 // device copy directly, no host round trip), shifted by `before` along
@@ -1486,26 +1396,6 @@ inline bool concat_part(void* a_native, int64_t ao, void* out_native,
   return c.launch1d_(c.pad_(), un, pa, po, pmeta, rank, ushift, un);
 }
 
-// Row gather along axis 0: out[i] = a[indices[i]] (a, indices contiguous;
-// indices float-valued, rounded on-device to match argmax's own
-// convention). One thread per output element, no write conflicts — no
-// zeroing needed (every element is written exactly once).
-inline bool index_select(void* a_native, int64_t ao, void* idx_native,
-                         int64_t idxo, void* out_native, int64_t oo,
-                         int64_t row_size, int64_t k) {
-  auto& c = context::get();
-  if (!c.ready) return false;
-  c.device_read_(a_native);
-  c.device_read_(idx_native);
-  c.device_write_(out_native);
-  float* pa = context::off_(a_native, ao);
-  float* pidx = context::off_(idx_native, idxo);
-  float* po = context::off_(out_native, oo);
-  unsigned un = static_cast<unsigned>(k * row_size);
-  unsigned urow = static_cast<unsigned>(row_size);
-  return c.launch1d_(c.index_select_(), un, pa, pidx, po, urow, un);
-}
-
 // index_select's dual: scatter-add `values` into `out` by row index.
 // Repeated indices really do collide (real write conflicts — the kernel
 // uses atomicAdd), so `out` must start zeroed, same as pad/fold above.
@@ -1546,87 +1436,6 @@ inline bool scatter_to_axis(void* idx_native, int64_t idxo,
   unsigned un = static_cast<unsigned>(n);
   unsigned usize = static_cast<unsigned>(size);
   return c.launch1d_(c.scatter_axis_(), un, pidx, pv, po, usize, un);
-}
-
-// scatter_to_axis's dual: out[i] = src[i * size + indices[i]], taking the one
-// element each position labels out of the trailing axis. One thread per
-// output, so — like index_select — no conflicts and nothing to pre-zero.
-inline bool gather_from_axis(void* src_native, int64_t so, void* idx_native,
-                             int64_t idxo, void* out_native, int64_t oo,
-                             int64_t n, int64_t size) {
-  auto& c = context::get();
-  if (!c.ready) return false;
-  c.device_read_(src_native);
-  c.device_read_(idx_native);
-  c.device_write_(out_native);
-  float* ps = context::off_(src_native, so);
-  float* pidx = context::off_(idx_native, idxo);
-  float* po = context::off_(out_native, oo);
-  unsigned un = static_cast<unsigned>(n);
-  unsigned usize = static_cast<unsigned>(size);
-  return c.launch1d_(c.gather_axis_(), un, ps, pidx, po, usize, un);
-}
-
-// Row logsumexp over the last axis: log(sum exp) per row, affine epilogue.
-// One block per row like row_op, but each thread carries a running (max, sum)
-// pair through the tree, so it takes two shared floats per thread instead of
-// one — and reads the row once where a max pass plus a sum pass reads it twice.
-inline bool row_logsumexp(void* in, int64_t io, void* out, int64_t oo,
-                          int64_t rows, int64_t cols, float scale,
-                          float offset) {
-  auto& c = context::get();
-  if (!c.ready) return false;
-  c.device_read_(in);
-  c.device_write_(out);
-  float* pin = context::off_(in, io);
-  float* po = context::off_(out, oo);
-  unsigned ur = (unsigned)rows, uc = (unsigned)cols;
-  unsigned block = 256;
-  return c.launch_(c.row_logsumexp_(), {ur ? ur : 1}, {block},
-                   2 * block * sizeof(float), pin, po, ur, uc, scale, offset);
-}
-
-// Softmax cross-entropy's pullback, from the forward's row logsumexp:
-// out[i,j] = g[i] · (exp(x[i,j] - lse[i]) - [j == targets[i]]). x and out are
-// [rows, cols]; lse, targets and g are one value per row.
-inline bool xent_bwd(void* x, int64_t xo, void* lse, int64_t lo, void* tgt,
-                     int64_t to, void* g, int64_t go, void* out, int64_t oo,
-                     int64_t rows, int64_t cols) {
-  auto& c = context::get();
-  if (!c.ready) return false;
-  c.device_read_(x);
-  c.device_read_(lse);
-  c.device_read_(tgt);
-  c.device_read_(g);
-  c.device_write_(out);
-  float* px = context::off_(x, xo);
-  float* pl = context::off_(lse, lo);
-  float* pt = context::off_(tgt, to);
-  float* pg = context::off_(g, go);
-  float* po = context::off_(out, oo);
-  unsigned un = static_cast<unsigned>(rows * cols);
-  unsigned uc = static_cast<unsigned>(cols);
-  return c.launch1d_(c.xent_bwd_(), un, px, pl, pt, pg, po, uc, un);
-}
-
-// Adam's per-parameter update in place: m and v advance, p moves by the
-// bias-corrected ratio. p, m, v and g are one shape, contiguous; the host
-// folds the bias correction into lr_over_bc1 = lr/bc1 and inv_bc2 = 1/bc2.
-inline bool adam_step(void* p, int64_t po, void* m, int64_t mo, void* v,
-                      int64_t vo, void* g, int64_t go, int64_t n, float beta1,
-                      float beta2, float eps, float lr_over_bc1,
-                      float inv_bc2) {
-  auto& c = context::get();
-  if (!c.ready || n <= 0) return false;
-  c.device_read_(g);
-  c.device_rmw_(p);  // read and written: an optimizer's state is host-born
-  c.device_rmw_(m);
-  c.device_rmw_(v);
-  unsigned un = static_cast<unsigned>(n);
-  return c.launch1d_(c.adam_step_(), un, context::off_(p, po),
-                     context::off_(m, mo), context::off_(v, vo),
-                     context::off_(g, go), beta1, beta2, eps, lr_over_bc1,
-                     inv_bc2, un);
 }
 
 // M7 decode GEMV: y(n) = a(1,k) @ B(k,n), F32 accumulate. B is either f32 or
@@ -2436,45 +2245,6 @@ inline bool gemm_bias(void* a, int64_t ao, int64_t lda, bool ta, void* b,
                       scale, offset, bias, biaso);
 }
 
-// Row op over the last axis: softmax writes rows×cols; row_sum/row_max write
-// one value per row, affine epilogue. One block per row, 256 threads.
-inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
-                   int64_t rows, int64_t cols, float scale, float offset) {
-  auto& c = context::get();
-  if (!c.ready) return false;
-  c.device_read_(in);
-  c.device_write_(out);
-  float* pin = context::off_(in, io);
-  float* po = context::off_(out, oo);
-  unsigned ur = (unsigned)rows, uc = (unsigned)cols;
-  unsigned block = 256;
-  return c.launch_(c.fn_(op), {ur ? ur : 1}, {block}, block * sizeof(float),
-                   pin, po, ur, uc, scale, offset);
-}
-
-// Layer norm over the last axis: out = (x - mu) · 1/sqrt(var + eps) · g + b per
-// row, affine epilogue; g and b are contiguous d-vectors. One block per row,
-// 256 threads, like row_op.
-inline bool layer_norm(void* x, int64_t xo, void* g, int64_t go, void* b,
-                       int64_t bo, void* out, int64_t oo, int64_t rows,
-                       int64_t cols, float eps, float scale, float offset) {
-  auto& c = context::get();
-  if (!c.ready) return false;
-  c.device_read_(x);
-  c.device_read_(g);
-  c.device_read_(b);
-  c.device_write_(out);
-  float* px = context::off_(x, xo);
-  float* pg = context::off_(g, go);
-  float* pb = context::off_(b, bo);
-  float* po = context::off_(out, oo);
-  unsigned ur = (unsigned)rows, uc = (unsigned)cols;
-  unsigned block = 256;
-  return c.launch_(c.layer_norm_(), {ur ? ur : 1}, {block},
-                   block * sizeof(float), px, pg, pb, po, ur, uc, eps, scale,
-                   offset);
-}
-
 // Layer norm's pullback: dx [rows, cols], dg and db [cols] from x and dy
 // [rows, cols] and the d-vector g, all contiguous; dx/dg/db, `stats` [2, rows]
 // and `partials` [2, chunks, cols] are fresh buffers of the caller's, the rows
@@ -2535,11 +2305,6 @@ inline bool dispatch(kop, const gpu::arg*, size_t, const void*, size_t,
 inline void flush() {}
 inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
 inline void release(void*, int64_t, float*) {}
-inline bool binary_bcast(kop, void*, int64_t, int64_t, int64_t, void*, int64_t,
-                         int64_t, int64_t, void*, int64_t, int64_t, int64_t,
-                         float, float) {
-  return false;
-}
 inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
                  void*, int64_t, int64_t, int64_t, int64_t, float, float) {
   return false;
@@ -2552,14 +2317,6 @@ inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
 inline bool gemm_bias(void*, int64_t, int64_t, bool, void*, int64_t, int64_t,
                       bool, void*, int64_t, void*, int64_t, int64_t, int64_t,
                       int64_t, float, float) {
-  return false;
-}
-inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
-                   float) {
-  return false;
-}
-inline bool layer_norm(void*, int64_t, void*, int64_t, void*, int64_t, void*,
-                       int64_t, int64_t, int64_t, float, float, float) {
   return false;
 }
 inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
@@ -2575,32 +2332,12 @@ inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,
                  const int64_t*, int, int, int64_t, int64_t, int64_t) {
   return false;
 }
-inline bool index_select(void*, int64_t, void*, int64_t, void*, int64_t,
-                         int64_t, int64_t) {
-  return false;
-}
 inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
                       int64_t, int64_t) {
   return false;
 }
 inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
                             int64_t, int64_t) {
-  return false;
-}
-inline bool gather_from_axis(void*, int64_t, void*, int64_t, void*, int64_t,
-                             int64_t, int64_t) {
-  return false;
-}
-inline bool row_logsumexp(void*, int64_t, void*, int64_t, int64_t, int64_t,
-                          float, float) {
-  return false;
-}
-inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
-                     int64_t, void*, int64_t, int64_t, int64_t) {
-  return false;
-}
-inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,
-                      int64_t, int64_t, float, float, float, float, float) {
   return false;
 }
 inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,
@@ -2619,17 +2356,6 @@ inline bool copy_nd(void*, int64_t, const int64_t*, void*, int64_t,
 }
 inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
                    const int64_t*, int, int64_t, int64_t, void*, int64_t) {
-  return false;
-}
-inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
-                    int64_t, int64_t) {
-  return false;
-}
-inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {
-  return false;
-}
-inline bool scalar_binary(scalar_op, void*, int64_t, void*, int64_t, int64_t,
-                          float, float, float) {
   return false;
 }
 inline void sync_to_host(void*, bool) {}

@@ -24,6 +24,7 @@
 #include <vector>
 
 using namespace tl::cuda;
+namespace gpu = tl::gpu;  // the shared ops; tl::gpu resolves to cuda here
 using clk = std::chrono::steady_clock;
 
 static double median(std::vector<double> v) {
@@ -94,17 +95,16 @@ int main() {
     };
 
     const double lse_ms = time_it(
-        [&] { row_logsumexp(x, 0, lse, 0, s.rows, s.cols, 1.0f, 0.0f); });
-    // Qualified because kop lives in tl::metal: an unqualified call would pull
-    // tl::metal::row_op into the overload set by ADL and be ambiguous.
+        [&] { gpu::row_logsumexp({x, 0}, {lse, 0}, s.rows, s.cols, 1.0f, 0.0f); });
     const double sm_ms = time_it([&] {
-      tl::cuda::row_op(tl::metal::kop::softmax, x, 0, probs, 0, s.rows, s.cols,
-                       1.0f, 0.0f);
+      gpu::row_op(gpu::kop::softmax, {x, 0}, {probs, 0}, s.rows, s.cols, 1.0f,
+                  0.0f);
     });
-    const double gat_ms = time_it(
-        [&] { gather_from_axis(x, 0, tgt, 0, picked, 0, s.rows, s.cols); });
+    const double gat_ms = time_it([&] {
+      gpu::gather_from_axis({x, 0}, {tgt, 0}, {picked, 0}, s.rows, s.cols);
+    });
     const double bwd_ms = time_it([&] {
-      xent_bwd(x, 0, lse, 0, tgt, 0, g, 0, dx, 0, s.rows, s.cols);
+      gpu::xent_bwd({x, 0}, {lse, 0}, {tgt, 0}, {g, 0}, {dx, 0}, s.rows, s.cols);
     });
 
     char name[32];

@@ -34,6 +34,16 @@ if [ -f "$sweep" ]; then
 fi
 for pid in "${pids[@]}"; do wait "$pid"; done  # a bare `wait` hides a failed compile
 
+# The rest of bench/cuda is CUDA-only and runs nowhere here; that it still
+# compiles against the headers is worth knowing before CI says so.
+pids=()
+for src in /tree/bench/cuda/speed/*.cpp; do
+  grep -q '#include <cu' "$src" && continue  # needs the CUDA toolkit's headers
+  g++ "${flags[@]}" -I/tree/bench/cuda -fsyntax-only "$src" &
+  pids+=($!)
+done
+for pid in "${pids[@]}"; do wait "$pid"; done
+
 # No kernel runs, so every numeric check in these programs fails; that is
 # expected and their exit status says nothing. A signal is a different matter:
 # it means the trace stops short.

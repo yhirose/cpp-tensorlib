@@ -2857,9 +2857,8 @@ struct graph {
     auto out = array::empty(n.shape);
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
-    if (!gpu::binary_bcast(*bk, a.storage_.native, a.offset_ * 4, ra[0], ra[1],
-                           b.storage_.native, b.offset_ * 4, rb[0], rb[1],
-                           out.storage_.native, out.offset_ * 4, n.shape[0],
+    if (!gpu::binary_bcast(*bk, a.device_span(), ra[0], ra[1], b.device_span(),
+                           rb[0], rb[1], out.device_span(), n.shape[0],
                            n.shape[1], n.scale, n.offset)) {
       return std::nullopt;
     }
@@ -3364,10 +3363,8 @@ struct graph {
     profile::scope ps("xent_bwd");
     auto out = array::empty(s);
     if (!out.storage_.native) return std::nullopt;
-    if (!gpu::xent_bwd(x.storage_.native, x.offset_ * 4, lse.storage_.native,
-                       lse.offset_ * 4, tgt.storage_.native, tgt.offset_ * 4,
-                       g.storage_.native, g.offset_ * 4, out.storage_.native,
-                       out.offset_ * 4, rows, cols)) {
+    if (!gpu::xent_bwd(x.device_span(), lse.device_span(), tgt.device_span(),
+                       g.device_span(), out.device_span(), rows, cols)) {
       return std::nullopt;
     }
     return out;
@@ -3547,10 +3544,9 @@ struct graph {
     const float lr_over_bc1 = lr / bc1, inv_bc2 = 1.0f / bc2;
     if (gpu_mode_(n, kernel_class::elementwise) && p.storage_.native &&
         m.storage_.native && v.storage_.native && g.storage_.native) {
-      if (gpu::adam_step(p.storage_.native, p.offset_ * 4, m.storage_.native,
-                         m.offset_ * 4, v.storage_.native, v.offset_ * 4,
-                         g.storage_.native, g.offset_ * 4, n, beta1, beta2,
-                         eps, lr_over_bc1, inv_bc2)) {
+      if (gpu::adam_step(p.device_span(), m.device_span(), v.device_span(),
+                         g.device_span(), n, beta1, beta2, eps, lr_over_bc1,
+                         inv_bc2)) {
         return true;
       }
       // No kernel for it on this backend: the host loop below. The caller
@@ -3894,10 +3890,9 @@ struct graph {
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
     int64_t d = x.shape().back();
-    if (!gpu::layer_norm(x.storage_.native, x.offset_ * 4, g.storage_.native,
-                         g.offset_ * 4, b.storage_.native, b.offset_ * 4,
-                         out.storage_.native, out.offset_ * 4, x.size() / d, d,
-                         n.arg0, n.scale, n.offset))
+    if (!gpu::layer_norm(x.device_span(), g.device_span(), b.device_span(),
+                         out.device_span(), x.size() / d, d, n.arg0, n.scale,
+                         n.offset))
       return std::nullopt;
     return out;
   }
@@ -3947,8 +3942,8 @@ struct graph {
     auto out = array::empty(out_shape);
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
-    if (!gpu::row_op(k, a.storage_.native, a.offset_ * 4, out.storage_.native,
-                       out.offset_ * 4, rows, cols, scale, offset)) {
+    if (!gpu::row_op(k, a.device_span(), out.device_span(), rows, cols, scale,
+                     offset)) {
       return std::nullopt;
     }
     return out;
@@ -4089,10 +4084,8 @@ struct graph {
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
     int64_t row_size = a.size() / a.shape()[0];
-    if (!gpu::index_select(a.storage_.native, a.offset_ * 4,
-                           indices.storage_.native, indices.offset_ * 4,
-                           out.storage_.native, out.offset_ * 4, row_size,
-                           out_shape[0])) {
+    if (!gpu::index_select(a.device_span(), indices.device_span(),
+                           out.device_span(), row_size, out_shape[0])) {
       return std::nullopt;
     }
     return out;
@@ -4193,9 +4186,8 @@ struct graph {
     auto out = array::empty(out_shape);
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
-    if (!gpu::gather_from_axis(src.storage_.native, src.offset_ * 4,
-                               indices.storage_.native, indices.offset_ * 4,
-                               out.storage_.native, out.offset_ * 4, out.size(),
+    if (!gpu::gather_from_axis(src.device_span(), indices.device_span(),
+                               out.device_span(), out.size(),
                                src.shape().back())) {
       return std::nullopt;
     }
@@ -4218,8 +4210,7 @@ struct graph {
     auto out = array::empty(out_shape);
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
-    if (!gpu::row_logsumexp(a.storage_.native, a.offset_ * 4,
-                            out.storage_.native, out.offset_ * 4, rows, cols,
+    if (!gpu::row_logsumexp(a.device_span(), out.device_span(), rows, cols,
                             scale, offset)) {
       return std::nullopt;
     }
@@ -4309,8 +4300,7 @@ struct graph {
     auto out = array::empty(a.shape());
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
-    if (!gpu::compare(c, a.storage_.native, a.offset_ * 4, b.storage_.native,
-                      b.offset_ * 4, out.storage_.native, out.offset_ * 4,
+    if (!gpu::compare(c, a.device_span(), b.device_span(), out.device_span(),
                       out.size(), bstride)) {
       return std::nullopt;
     }
@@ -4341,7 +4331,7 @@ struct graph {
   // onto it today.
   static std::optional<array> gpu_clamp_(const array& a, float lo, float hi) {
     return gpu_one_input_(a, [&](gpu::span in, gpu::span out, int64_t n) {
-      return gpu::clamp(in.buf, in.off, out.buf, out.off, n, lo, hi);
+      return gpu::clamp(in, out, n, lo, hi);
     });
   }
 
@@ -4360,8 +4350,7 @@ struct graph {
       default: return std::nullopt;
     }
     return gpu_one_input_(a, [&](gpu::span in, gpu::span out, int64_t len) {
-      return gpu::scalar_binary(k, in.buf, in.off, out.buf, out.off, len, n.arg0,
-                                n.scale, n.offset);
+      return gpu::scalar_binary(k, in, out, len, n.arg0, n.scale, n.offset);
     });
   }
 

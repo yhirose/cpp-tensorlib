@@ -61,11 +61,11 @@ EW_BINARY(pow_, pow(a[i], b[i]))
 // instead of falling back to the CPU mid-graph (each fallback costs a full
 // pipeline flush). Output is contiguous row-major [M, N].
 struct ew_bcast_params {
-  float scale;
-  float offset;
   uint M;
   uint N;
   uint ars, acs, brs, bcs;
+  float scale;
+  float offset;
 };
 
 #define EW_BCAST(name, expr)                                     \
@@ -136,8 +136,8 @@ EW_CMP(ne_, a[i] != bv)
 // clamp(x, lo, hi): Clip's forward. No epilogue -- lo/hi occupy the role
 // scale/offset play elsewhere.
 struct clamp_params {
-  float lo, hi;
   uint n;
+  float lo, hi;
 };
 
 kernel void clamp_(device const float* a [[buffer(0)]],
@@ -151,8 +151,8 @@ kernel void clamp_(device const float* a [[buffer(0)]],
 // Tensor-scalar: out = f(a, s) * scale + offset -- mirrors tensorlib_cuda.cu's
 // TL_EW_SCALAR.
 struct scalar_params {
-  float s, scale, offset;
   uint n;
+  float s, scale, offset;
 };
 
 #define EW_SCALAR(name, expr)                                  \

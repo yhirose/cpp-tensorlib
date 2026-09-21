@@ -12,7 +12,7 @@
 #include <vector>
 
 namespace cu = tl::cuda;
-using kop = tl::metal::kop;
+using kop = tl::gpu::kop;
 
 namespace {
 
@@ -35,7 +35,8 @@ void elementwise() {
     tl::gpu::binary(op, {a, kOff}, {b, 0}, {o, kOff}, n, 2.0f, 1.0f);
   }
   for (kop op : {kop::badd, kop::bsub, kop::bmul, kop::bdiv, kop::bpow}) {
-    cu::binary_bcast(op, a, kOff, 40, 1, b, 0, 0, 1, o, kOff, 25, 40, 1.0f, 0.0f);
+    tl::gpu::binary_bcast(op, {a, kOff}, 40, 1, {b, 0}, 0, 1, {o, kOff}, 25, 40,
+                          1.0f, 0.0f);
   }
   const int64_t shape[3] = {5, 8, 25}, as[3] = {200, 25, 1}, bs[3] = {0, 25, 1};
   for (kop op : {kop::badd, kop::bsub, kop::bmul, kop::bdiv, kop::bpow}) {
@@ -44,7 +45,7 @@ void elementwise() {
   using cu::cmp_op;
   for (cmp_op op : {cmp_op::gt, cmp_op::lt, cmp_op::ge, cmp_op::le, cmp_op::eq,
                     cmp_op::ne}) {
-    cu::compare(op, a, kOff, b, 0, o, kOff, n, 1);
+    tl::gpu::compare(op, {a, kOff}, {b, 0}, {o, kOff}, n, 1);
   }
 }
 

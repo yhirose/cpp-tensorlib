@@ -624,8 +624,82 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
 // operation by number. So each kernel id the shared ops may dispatch is
 // marshalled here, from its canonical params into that layout; the entry
 // point comes back, or null for an id this backend has no kernel for.
-inline const char* marshal_(kop k, const void* canonical, params& p) {
+//
+// `in_off` holds the element offsets of the views the kernel reads. A and B's
+// are placed by dispatch; a kernel that reads D or E at an offset moves it
+// into its own field and clears it here, so an offset nobody consumed is
+// caught rather than dropped.
+inline const char* marshal_(kop k, const void* canonical, uint32_t* in_off,
+                            params& p) {
   switch (k) {
+    case kop::badd: case kop::bsub: case kop::bmul: case kop::bdiv:
+    case kop::bpow: {
+      const auto& q = *static_cast<const gpu::bcast_params*>(canonical);
+      p.M = q.m;
+      p.N = q.n;
+      p.ars = q.ars;
+      p.acs = q.acs;
+      p.brs = q.brs;
+      p.bcs = q.bcs;
+      p.op = kernel_op_(k);
+      p.scale = q.scale;
+      p.offset = q.offset;
+      return "ew_bcast";
+    }
+    case kop::gt_: case kop::lt_: case kop::ge_: case kop::le_: case kop::eq_:
+    case kop::ne_: {
+      const auto& q = *static_cast<const gpu::cmp_params*>(canonical);
+      if (q.n == 0) return nullptr;
+      p.M = q.n;
+      p.ars = q.bstride;
+      p.op = static_cast<uint32_t>(k) - static_cast<uint32_t>(kop::gt_);
+      return "cmp";
+    }
+    case kop::clamp_: {  // no epilogue: scale/offset carry lo/hi
+      const auto& q = *static_cast<const gpu::clamp_params*>(canonical);
+      if (q.n == 0) return nullptr;
+      p.M = q.n;
+      p.scale = q.lo;
+      p.offset = q.hi;
+      return "clamp_";
+    }
+    case kop::pow_s_: case kop::gt_s_: case kop::lt_s_: case kop::ge_s_:
+    case kop::le_s_: case kop::eq_s_: case kop::ne_s_: {
+      const auto& q = *static_cast<const gpu::scalar_params*>(canonical);
+      if (q.n == 0) return nullptr;
+      p.M = q.n;
+      p.op = static_cast<uint32_t>(k) - static_cast<uint32_t>(kop::pow_s_);
+      p.arg = q.s;
+      p.scale = q.scale;
+      p.offset = q.offset;
+      return "ew_scalar";
+    }
+    case kop::softmax: case kop::row_sum: case kop::row_max: {
+      const auto& q = *static_cast<const gpu::reduce_params*>(canonical);
+      p.M = q.rows;
+      p.N = q.cols;
+      p.op = kernel_op_(k);
+      p.scale = q.scale;
+      p.offset = q.offset;
+      return k == kop::softmax ? "softmax" : "row_reduce";
+    }
+    case kop::layer_norm_: {  // A = x, B = g, D = b at pad3, arg = eps
+      const auto& q = *static_cast<const gpu::layer_norm_params*>(canonical);
+      p.M = q.rows;
+      p.N = q.cols;
+      p.arg = q.eps;
+      p.scale = q.scale;
+      p.offset = q.offset;
+      p.pad3 = in_off[2];
+      in_off[2] = 0;
+      return "layer_norm";
+    }
+    case kop::index_select: {
+      const auto& q = *static_cast<const gpu::gather_params*>(canonical);
+      p.M = q.n;
+      p.pad0 = q.row_size;
+      return "index_select";
+    }
     case kop::add: case kop::sub: case kop::mul: case kop::div: case kop::pow_:
     case kop::exp_: case kop::log_: case kop::sqrt_: case kop::sigmoid:
     case kop::relu: case kop::affine: case kop::tanh_: case kop::sin_:
@@ -652,11 +726,8 @@ inline bool dispatch(kop k, const gpu::arg* args, size_t n, const void* canonica
   auto& c = context::get();
   if (!c.ready) return false;
   params p = {};
-  const char* entry = marshal_(k, canonical, p);
-  if (!entry) return false;
-
   context::mirror* in[4] = {};
-  uint32_t* in_off[2] = {&p.a_off, &p.b_off};
+  uint32_t in_off[4] = {};
   context::mirror* out = nullptr;
   size_t ins = 0;
   for (size_t i = 0; i < n; i++) {
@@ -664,8 +735,8 @@ inline bool dispatch(kop k, const gpu::arg* args, size_t n, const void* canonica
     uint32_t off = 0;
     if (!m || !elem_off_(args[i].s.off, &off)) return false;  // CPU's
     if (args[i].a == gpu::access::in) {
-      if (ins == 4 || (ins >= 2 && off != 0)) return false;
-      if (ins < 2) *in_off[ins] = off;
+      if (ins == 4) return false;
+      in_off[ins] = off;
       in[ins++] = m;
     } else {
       if (out) return false;  // one writable binding
@@ -676,8 +747,12 @@ inline bool dispatch(kop k, const gpu::arg* args, size_t n, const void* canonica
   if (!out || ins == 0) return false;
   if (ins == 1) {
     in[1] = in[0];
-    p.b_off = p.a_off;
+    in_off[1] = in_off[0];
   }
+  p.a_off = in_off[0];
+  p.b_off = in_off[1];
+  const char* entry = marshal_(k, canonical, in_off, p);
+  if (!entry || in_off[2] || in_off[3]) return false;
   for (size_t i = 0; i < n; i++) {
     if (args[i].a != gpu::access::out) c.device_read_(args[i].s.buf);
     if (args[i].a != gpu::access::in) c.device_write_(args[i].s.buf);
@@ -702,39 +777,6 @@ inline bool encode_one_input_(const char* entry, void* a, int64_t ao, void* out,
   return c.encode_(entry, ma, mb, mo, p, (n + 255) / 256, 1);
 }
 
-// Rank-2 broadcast binary: out[r,c] = f(a[r*ars + c*acs], b[r*brs + c*bcs])
-// into a contiguous [m,n] output. One stride-parameterized kernel covers every
-// rank-2 broadcast, which keeps bias/gamma/beta chains on the GPU — falling
-// back mid-graph would cost a full submit-and-wait.
-inline bool binary_bcast(kop op, void* a, int64_t ao, int64_t ars, int64_t acs,
-                         void* b, int64_t bo, int64_t brs, int64_t bcs,
-                         void* out, int64_t oo, int64_t m, int64_t n,
-                         float scale, float offset) {
-  auto& c = context::get();
-  if (!c.ready || m <= 0 || n <= 0) return false;
-  // Broadcast strides are non-negative here (broadcast_strides only ever
-  // zeroes an axis); a negative one would wrap as u32 in the kernel.
-  if (ars < 0 || acs < 0 || brs < 0 || bcs < 0) return false;
-  params p = {};
-  if (!elem_off_(ao, &p.a_off) || !elem_off_(bo, &p.b_off) ||
-      !elem_off_(oo, &p.c_off)) {
-    return false;
-  }
-  context::mirror *ma, *mb, *mo;
-  if (!operands_(c, a, b, out, &ma, &mb, &mo)) return false;
-
-  p.M = (uint32_t)m;
-  p.N = (uint32_t)n;
-  p.ars = (uint32_t)ars;
-  p.acs = (uint32_t)acs;
-  p.brs = (uint32_t)brs;
-  p.bcs = (uint32_t)bcs;
-  p.op = kernel_op_(op);
-  p.scale = scale;
-  p.offset = offset;
-  return c.encode_("ew_bcast", ma, mb, mo, p, (n + 31) / 32, (m + 7) / 8);
-}
-
 // Batched GEMM in one launch: not on this backend yet — array.h's batched dot
 // loops gemm per slice when this declines (CUDA folds the batch into its grid).
 inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
@@ -742,55 +784,6 @@ inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
                          int64_t, int64_t, int64_t, int64_t, float, float,
                          void* = nullptr, int64_t = 0) {
   return false;
-}
-
-// Row-wise op over the last axis: softmax writes rows x cols; row_sum/row_max
-// write one value per row, with the affine epilogue. One workgroup per row.
-inline bool row_op(kop op, void* in, int64_t io, void* out, int64_t oo,
-                   int64_t rows, int64_t cols, float scale, float offset) {
-  auto& c = context::get();
-  if (!c.ready || rows <= 0 || cols <= 0) return false;
-  params p = {};
-  if (!elem_off_(io, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
-  context::mirror *ma, *mb, *mo;
-  if (!operands_(c, in, nullptr, out, &ma, &mb, &mo)) return false;
-
-  p.b_off = p.a_off;
-  p.M = (uint32_t)rows;
-  p.N = (uint32_t)cols;
-  p.op = kernel_op_(op);
-  p.scale = scale;
-  p.offset = offset;
-  const char* entry = op == kop::softmax ? "softmax" : "row_reduce";
-  return c.encode_(entry, ma, mb, mo, p, rows, 1);
-}
-
-// Layer norm over the last axis: out = (x - mu) · 1/sqrt(var + eps) · g + b per
-// row, affine epilogue; g and b are contiguous d-vectors. One workgroup per
-// row, like row_op. A = x, B = g, D = b (p.pad3 its element offset), p.arg =
-// eps. b's mirror is resolved before operands_ stages anything, so a decline
-// leaves no half-staged operands behind.
-inline bool layer_norm(void* x, int64_t xo, void* g, int64_t go, void* b,
-                       int64_t bo, void* out, int64_t oo, int64_t rows,
-                       int64_t cols, float eps, float scale, float offset) {
-  auto& c = context::get();
-  if (!c.ready || rows <= 0 || cols <= 0) return false;
-  params p = {};
-  if (!elem_off_(xo, &p.a_off) || !elem_off_(go, &p.b_off) ||
-      !elem_off_(bo, &p.pad3) || !elem_off_(oo, &p.c_off)) {
-    return false;
-  }
-  context::mirror* mb = c.mirror_(b);
-  if (!mb) return false;
-  context::mirror *mx, *mg, *mo;
-  if (!operands_(c, x, g, out, &mx, &mg, &mo)) return false;
-  c.device_read_(b);
-  p.M = static_cast<uint32_t>(rows);
-  p.N = static_cast<uint32_t>(cols);
-  p.arg = eps;
-  p.scale = scale;
-  p.offset = offset;
-  return c.encode_("layer_norm", mx, mg, mo, p, rows, 1, mb);
 }
 
 // A ring, not one reused buffer: queue.WriteBuffer runs ahead of whatever is
@@ -951,28 +944,6 @@ inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
   return c.encode_("fold", ma, mm, mo, p, (out_n + 255) / 256, 1);
 }
 
-// Row gather along axis 0: out[i] = a[indices[row(i)]] (a, indices
-// contiguous). A = a, B = idx, C = out; p.pad0 = row_size.
-inline bool index_select(void* a_native, int64_t ao, void* idx_native,
-                         int64_t idxo, void* out_native, int64_t oo,
-                         int64_t row_size, int64_t k) {
-  auto& c = context::get();
-  int64_t n = k * row_size;
-  if (!c.ready || n <= 0) return false;
-  params p = {};
-  if (!elem_off_(ao, &p.a_off) || !elem_off_(idxo, &p.b_off) ||
-      !elem_off_(oo, &p.c_off)) {
-    return false;
-  }
-  context::mirror *ma, *mb, *mo;
-  if (!operands_(c, a_native, idx_native, out_native, &ma, &mb, &mo)) {
-    return false;
-  }
-  p.M = static_cast<uint32_t>(n);
-  p.pad0 = static_cast<uint32_t>(row_size);
-  return c.encode_("index_select", ma, mb, mo, p, (n + 255) / 256, 1);
-}
-
 // index_select's dual, rewritten as a gather: WGSL has no float atomicAdd,
 // the same gap pad/fold above work around, so this sums over every source
 // row matching each OUTPUT row instead of scattering into a pre-zeroed
@@ -1022,33 +993,11 @@ inline bool scatter_to_axis(void* idx_native, int64_t idxo,
   return c.encode_("scatter_axis", ma, mb, mo, p, (out_n + 255) / 256, 1);
 }
 
-// Cross-entropy's three: the trailing-axis gather, the one-pass row logsumexp
-// and the pullback that reads it. CUDA-first (allowlisted); array.h composes
-// the same values here.
-inline bool gather_from_axis(void*, int64_t, void*, int64_t, void*, int64_t,
-                             int64_t, int64_t) {
-  return false;
-}
-inline bool row_logsumexp(void*, int64_t, void*, int64_t, int64_t, int64_t,
-                          float, float) {
-  return false;
-}
-inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
-                     int64_t, void*, int64_t, int64_t, int64_t) {
-  return false;
-}
 // Layer norm's pullback. CUDA-first (allowlisted); the caller composes the
 // unfused form when this declines.
 inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
                            void*, void*, void*, void*, void*, int64_t, int64_t,
                            int64_t, int64_t, float) {
-  return false;
-}
-
-// Adam's fused per-parameter update. CUDA-first (allowlisted); array.h takes
-// its host loop when this declines, a D2H and H2D round trip here.
-inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,
-                      int64_t, int64_t, float, float, float, float, float) {
   return false;
 }
 
@@ -1199,59 +1148,6 @@ inline bool sum_to(void* a_native, int64_t ao, const int64_t* a_shape,
   return c.encode_("sum_to", ma, mm, mo, p, (out_n + 255) / 256, 1);
 }
 
-// gt/lt/ge/le/eq/ne (array.h's comparison ops, ReLU/LeakyReLU/Clip's
-// backward gate): same-shape only (bstride=1) or a scalar b (bstride=0) --
-// the two shapes array.h's gpu_compare_ ever dispatches. p.ars (unused by
-// this family) carries bstride. Own entry point/op numbering, not folded
-// into ew_binary's binary_op -- it returns a bool-as-float mask rather than
-// composing with scale/offset.
-inline bool compare(cmp_op op, void* a, int64_t ao, void* b, int64_t bo,
-                    void* out, int64_t oo, int64_t n, int64_t bstride) {
-  auto& c = context::get();
-  if (!c.ready || n <= 0) return false;
-  params p = {};
-  if (!elem_off_(ao, &p.a_off) || !elem_off_(bo, &p.b_off) ||
-      !elem_off_(oo, &p.c_off)) {
-    return false;
-  }
-  context::mirror *ma, *mb, *mo;
-  if (!operands_(c, a, b, out, &ma, &mb, &mo)) return false;
-  p.M = static_cast<uint32_t>(n);
-  p.ars = static_cast<uint32_t>(bstride);
-  switch (op) {
-    case cmp_op::gt: p.op = 0; break;
-    case cmp_op::lt: p.op = 1; break;
-    case cmp_op::ge: p.op = 2; break;
-    case cmp_op::le: p.op = 3; break;
-    case cmp_op::eq: p.op = 4; break;
-    case cmp_op::ne: p.op = 5; break;
-  }
-  return c.encode_("cmp", ma, mb, mo, p, (n + 255) / 256, 1);
-}
-
-// clamp(x, lo, hi): Clip's forward. No epilogue -- p.scale/p.offset carry
-// lo/hi instead (mirrors cuda.h's/metal.h's own clamp).
-inline bool clamp(void* a, int64_t ao, void* out, int64_t oo, int64_t n,
-                  float lo, float hi) {
-  return encode_one_input_("clamp_", a, ao, out, oo, n, [&](params& p) {
-    p.scale = lo;
-    p.offset = hi;
-  });
-}
-
-// Tensor-scalar ops (metal.h's scalar_op): s rides in p.arg; p.op is
-// scalar_op's value (0 pow, then cmp_op's order).
-inline bool scalar_binary(scalar_op op, void* a, int64_t ao, void* out,
-                          int64_t oo, int64_t n, float s, float scale,
-                          float offset) {
-  return encode_one_input_("ew_scalar", a, ao, out, oo, n, [&](params& p) {
-    p.op = static_cast<uint32_t>(op);
-    p.arg = s;
-    p.scale = scale;
-    p.offset = offset;
-  });
-}
-
 // concat_part (Tensor.concat along an arbitrary axis, KV-cache append):
 // scatters `a` (this part) into `out` at a flat element shift along one
 // axis -- see kernels/tensorlib_webgpu.wgsl's own concat_part for why this
@@ -1341,11 +1237,6 @@ inline void flush() {}
 inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
 inline void release(void*, int64_t, float*) {}
 inline void sync_to_host(void*, bool) {}
-inline bool binary_bcast(kop, void*, int64_t, int64_t, int64_t, void*, int64_t,
-                         int64_t, int64_t, void*, int64_t, int64_t, int64_t,
-                         float, float) {
-  return false;
-}
 inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
                  void*, int64_t, int64_t, int64_t, int64_t, float, float) {
   return false;
@@ -1356,24 +1247,12 @@ inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
                          void* = nullptr, int64_t = 0) {
   return false;
 }
-inline bool row_op(kop, void*, int64_t, void*, int64_t, int64_t, int64_t, float,
-                   float) {
-  return false;
-}
-inline bool layer_norm(void*, int64_t, void*, int64_t, void*, int64_t, void*,
-                       int64_t, int64_t, int64_t, float, float, float) {
-  return false;
-}
 inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
                 const int64_t*, int, int, int64_t, int64_t, int64_t) {
   return false;
 }
 inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,
                  const int64_t*, int, int, int64_t, int64_t, int64_t) {
-  return false;
-}
-inline bool index_select(void*, int64_t, void*, int64_t, void*, int64_t,
-                         int64_t, int64_t) {
   return false;
 }
 inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
@@ -1384,27 +1263,11 @@ inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
                             int64_t, int64_t) {
   return false;
 }
-inline bool gather_from_axis(void*, int64_t, void*, int64_t, void*, int64_t,
-                             int64_t, int64_t) {
-  return false;
-}
-inline bool row_logsumexp(void*, int64_t, void*, int64_t, int64_t, int64_t,
-                          float, float) {
-  return false;
-}
-inline bool xent_bwd(void*, int64_t, void*, int64_t, void*, int64_t, void*,
-                     int64_t, void*, int64_t, int64_t, int64_t) {
-  return false;
-}
 // Layer norm's pullback. CUDA-first (allowlisted); the caller composes the
 // unfused form when this declines.
 inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
                            void*, void*, void*, void*, void*, int64_t, int64_t,
                            int64_t, int64_t, float) {
-  return false;
-}
-inline bool adam_step(void*, int64_t, void*, int64_t, void*, int64_t, void*,
-                      int64_t, int64_t, float, float, float, float, float) {
   return false;
 }
 inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,
@@ -1423,17 +1286,6 @@ inline bool copy_nd(void*, int64_t, const int64_t*, void*, int64_t,
 }
 inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
                    const int64_t*, int, int64_t, int64_t, void*, int64_t) {
-  return false;
-}
-inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
-                    int64_t, int64_t) {
-  return false;
-}
-inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {
-  return false;
-}
-inline bool scalar_binary(scalar_op, void*, int64_t, void*, int64_t, int64_t,
-                          float, float, float) {
   return false;
 }
 inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,
@@ -1511,6 +1363,14 @@ inline bool gemm_bf16_nt(void*, void*, void*, int64_t, int64_t, int64_t) {
 // What a model may ask of this backend beyond the kernel contract (gpu.h),
 // and the graph-capture group it names: none of it here, so each answers
 // false or does nothing and a decoder takes its host-position path.
+// What the shared launch policy (gpu_ops.h) may assume of this backend's
+// kernels.
+struct traits {
+  // A [rows, cols] elementwise kernel reads its cell from a 2-D thread
+  // position rather than a flat index.
+  static constexpr bool cells_2d = true;
+};
+
 struct caps {
   // Whether the model-path row is real here, or answers false: a decoder
   // runs on raw buffers only where it is true, and keeps to the array ops
