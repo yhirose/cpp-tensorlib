@@ -20,10 +20,10 @@
 // than on device memory — the roadmap's pre-authorized device-buffer pivot.
 // View offsets are folded host-side into the pointer passed to each kernel.
 //
-// Real implementation is gated on TENSORLIB_CUDA && !__APPLE__ (Apple uses
-// Metal; a plain build gets the stubs below). The API matches metal.h exactly
-// — available/pending/flush/alloc/release/binary/unary/gemm/row_op — so the
-// eval_one dispatch seam is backend-agnostic and carries no platform #ifdefs.
+// The whole header is gated on TENSORLIB_CUDA && !__APPLE__ (Apple uses Metal):
+// elsewhere it declares nothing, and gpu.h selects another backend (or
+// gpu_null.h). What it provides is the device core gpu.h describes, so the
+// eval seam is backend-agnostic and carries no platform #ifdefs.
 
 #include <cstdint>
 
@@ -32,18 +32,7 @@
 #include "shape.h"  // tl::contiguous_strides_into (pad/fold meta upload)
 #include "types.h"  // tl::dtype (KV cache storage width)
 
-namespace tl {
-namespace cuda {
-
-using kop = gpu::kop;
-using cmp_op = gpu::cmp_op;
-using unary_ext_op = gpu::unary_ext_op;
-using scalar_op = gpu::scalar_op;
-
 #if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
-
-}  // namespace cuda
-}  // namespace tl
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -67,6 +56,11 @@ using scalar_op = gpu::scalar_op;
 
 namespace tl {
 namespace cuda {
+
+using kop = gpu::kop;
+using cmp_op = gpu::cmp_op;
+using unary_ext_op = gpu::unary_ext_op;
+using scalar_op = gpu::scalar_op;
 
 // Dynamic-loader shim: dlopen/dlsym on Unix, LoadLibrary/GetProcAddress on
 // Windows (where the driver ships as nvcuda.dll). Symbols are cast to the
@@ -1029,7 +1023,7 @@ inline void flush() {
 // imperative decode step (no host sync / blocking copy mid-stream) is
 // capturable; embed staging + argmax happen outside the captured region.
 // What a model may ask of this backend beyond the kernel contract (gpu.h).
-#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
+
 // "No bias" is a null pointer here, which the kernel tests.
 inline bool own::split_heads(gpu::span src, gpu::span bias, gpu::span dst,
                         int64_t T, int64_t ld, int64_t off, int64_t H,
@@ -1065,7 +1059,6 @@ inline bool own::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
   *out_idx = h;
   return true;
 }
-#endif
 
 // What the shared launch policy (gpu_ops.h) may assume of this backend's
 // kernels.
@@ -2173,30 +2166,6 @@ inline bool own::layer_norm_bwd(gpu::span x, gpu::span g, gpu::span dy,
   return c.launch1d_(c.layer_norm_bwd_gb_fold_(), uc, pp, pdg, pdb, uk, uc);
 }
 
-#else  // stubs (Apple, or a build without TENSORLIB_CUDA)
-
-// Only the gpu:: facade surface is stubbed — what array.h/storage.h dispatch
-// through, so a consumer can name tl::cuda:: unconditionally and get "no device
-// here". The LLM-path entry points (gemv/attention/kv_cache/graph capture/the
-// fused decode ops) deliberately have NO stubs: they are reachable only from
-// code that is itself CUDA-gated (bench/cuda/*, which needs kv_cache and the
-// capture types anyway), so a stub could never be linked — it would just be an
-// unreachable `return false` claiming an API that isn't really there.
-
-inline bool available() { return false; }
-struct own {};
-inline bool pending() { return false; }
-inline bool dispatch(kop, const gpu::arg*, size_t, const void*, size_t,
-                     const gpu::grid&) {
-  return false;
-}
-inline void flush() {}
-inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
-inline void release(void*, int64_t, float*) {}
-inline void sync_to_host(void*, bool) {}
-
-#endif
-
 // CPU-read barrier: sync the GPU before any host read of a managed buffer.
 // Nothing to wait for before a CPU access in general: kernels write only
 // device copies, so sync_to_host waits per buffer, when that buffer's live copy
@@ -2207,3 +2176,5 @@ inline void cpu_barrier() {}
 }  // namespace cuda
 
 }  // namespace tl
+
+#endif  // TENSORLIB_CUDA && !__APPLE__

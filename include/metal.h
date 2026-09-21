@@ -16,8 +16,8 @@
 //   - Kernels JIT-compile once from the #embed'd MSL source on first GPU
 //     dispatch. Editing metal_kernels.metal requires rebuilding the host.
 //
-// On non-Apple builds everything is an inline stub returning false/null, so
-// callers carry no platform conditionals.
+// The whole header is gated on __APPLE__: elsewhere it declares nothing, and
+// gpu.h selects another backend (or gpu_null.h).
 
 #include <cstdint>
 
@@ -38,8 +38,6 @@ extern "C" void* MTLCreateSystemDefaultDevice(void);
 extern "C" void* objc_autoreleasePoolPush(void);
 extern "C" void objc_autoreleasePoolPop(void*);
 
-#endif
-
 namespace tl {
 namespace metal {
 
@@ -49,8 +47,6 @@ using kop = gpu::kop;
 using cmp_op = gpu::cmp_op;
 using unary_ext_op = gpu::unary_ext_op;
 using scalar_op = gpu::scalar_op;
-
-#ifdef __APPLE__
 
 struct mtl_size {
   unsigned long w, h, d;
@@ -1267,26 +1263,10 @@ inline bool own::attn_prefill_dkv(gpu::span q, gpu::span K, gpu::span V,
   return true;
 }
 
-#else  // !__APPLE__ — stubs so callers carry no platform conditionals
-
-inline bool available() { return false; }
-struct own {};
-inline bool pending() { return false; }
-inline void flush() {}
-inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
-inline void release(void*, int64_t, float*) {}
-inline void upload(void*, const float*, int64_t) {}
-inline bool dispatch(kop, const gpu::arg*, size_t, const void*, size_t,
-                     const gpu::grid&) {
-  return false;
-}
-
-#endif
-
 // What a model may ask of this backend beyond the kernel contract (gpu.h
 // lists every backend's). No graph capture: a Metal command buffer is cheap to
 // encode, so a decode step re-encodes each token.
-#ifdef __APPLE__
+
 // "No bias" is a flag here: a kernel cannot test a buffer for null, so an
 // absent bias binds src in its place and is never read.
 inline bool own::split_heads(gpu::span src, gpu::span bias, gpu::span dst,
@@ -1319,7 +1299,6 @@ inline bool own::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
   *out_idx = *reinterpret_cast<const int*>(c.argmax_res_contents);
   return true;
 }
-#endif
 
 // What the shared launch policy (gpu_ops.h) may assume of this backend's
 // kernels.
@@ -1369,3 +1348,5 @@ inline void sync_to_host(void*, bool) {}
 // live in gpu.h — one place, so array.h's eval seam stays #ifdef-free.
 
 }  // namespace tl
+
+#endif  // __APPLE__

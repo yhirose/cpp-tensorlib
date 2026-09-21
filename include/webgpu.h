@@ -41,18 +41,7 @@
 #include "profile.h"
 #include "types.h"
 
-namespace tl {
-namespace webgpu {
-
-using kop = gpu::kop;
-using cmp_op = gpu::cmp_op;
-using unary_ext_op = gpu::unary_ext_op;
-using scalar_op = gpu::scalar_op;
-
 #if defined(TENSORLIB_WEBGPU) && defined(__EMSCRIPTEN__)
-
-}  // namespace webgpu
-}  // namespace tl
 
 #include <emscripten/em_asm.h>
 
@@ -69,6 +58,11 @@ using scalar_op = gpu::scalar_op;
 
 namespace tl {
 namespace webgpu {
+
+using kop = gpu::kop;
+using cmp_op = gpu::cmp_op;
+using unary_ext_op = gpu::unary_ext_op;
+using scalar_op = gpu::scalar_op;
 
 inline const char* wgsl_source_() {
   static const char* src =
@@ -1233,21 +1227,6 @@ inline bool own::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
   return c.encode_("rope", ma, mb, mo, p, (n + 255) / 256, 1);
 }
 
-#else  // !(TENSORLIB_WEBGPU && __EMSCRIPTEN__) — stubs, as in metal.h
-
-inline bool available() { return false; }
-struct own {};
-inline bool pending() { return false; }
-inline bool dispatch(kop, const gpu::arg*, size_t, const void*, size_t,
-                     const gpu::grid&) {
-  return false;
-}
-inline void flush() {}
-inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
-inline void release(void*, int64_t, float*) {}
-inline void sync_to_host(void*, bool) {}
-
-#endif
 
 // What a model may ask of this backend beyond the kernel contract (gpu.h),
 // and the graph-capture group it names: none of it here, so each answers
@@ -1287,3 +1266,5 @@ inline void cpu_barrier() {
 
 }  // namespace webgpu
 }  // namespace tl
+
+#endif  // TENSORLIB_WEBGPU && __EMSCRIPTEN__

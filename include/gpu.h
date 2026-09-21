@@ -33,32 +33,37 @@
 // is false. gpu::census(kernel) counts launches, which is how a test tells a
 // kernel that ran from an op that quietly fell back.
 //
-// Each backend compiles to a null core unless its own gate holds, so including
-// all of them is free: metal.h is real only on __APPLE__, cuda.h only on
-// TENSORLIB_CUDA && !__APPLE__, webgpu.h only on TENSORLIB_WEBGPU &&
-// __EMSCRIPTEN__. The using-directive picks the one that can do real work.
-
-#include "cuda.h"
-#include "metal.h"
-#include "webgpu.h"
-
-namespace tl {
+// One backend is selected below, by the gate its header is written under:
+// webgpu.h under TENSORLIB_WEBGPU && __EMSCRIPTEN__, cuda.h under TENSORLIB_CUDA
+// && !__APPLE__, metal.h under __APPLE__, and gpu_null.h — no device, every op
+// declines — for a build none of them fits. gpu_null.h is also the template:
+// it is everything this file asks of a backend, with nothing in it. Adding a
+// backend is a header that fills that in, its kernels, and one branch here.
 
 // WebGPU is checked first: a wasm build defines neither __APPLE__ nor
 // TENSORLIB_CUDA, but a host build could define TENSORLIB_WEBGPU by accident
-// and should not silently take a backend that cannot work there — webgpu::
-// is stubs unless __EMSCRIPTEN__ too, so the order is safe either way.
+// and should not take a backend that cannot work there.
+#if defined(TENSORLIB_WEBGPU) && defined(__EMSCRIPTEN__)
+#include "webgpu.h"
+#define TL_GPU_BACKEND webgpu
+#elif defined(TENSORLIB_CUDA) && !defined(__APPLE__)
+#include "cuda.h"
+#define TL_GPU_BACKEND cuda
+#elif defined(__APPLE__)
+#include "metal.h"
+#define TL_GPU_BACKEND metal
+#else
+#include "gpu_null.h"
+#define TL_GPU_BACKEND null_gpu
+#endif
+
+namespace tl {
+
 // A using-directive rather than an alias, so tl::gpu can hold the shared layer
 // too: a name declared in tl::gpu itself (a shared op) is found first, and one
 // that is not falls through to the backend.
 namespace gpu {
-#if defined(TENSORLIB_WEBGPU) && defined(__EMSCRIPTEN__)
-using namespace webgpu;
-#elif defined(TENSORLIB_CUDA) && !defined(__APPLE__)
-using namespace cuda;
-#else
-using namespace metal;
-#endif
+using namespace TL_GPU_BACKEND;
 }  // namespace gpu
 
 inline bool gpu_available() { return gpu::available(); }
@@ -66,3 +71,5 @@ inline bool gpu_available() { return gpu::available(); }
 }  // namespace tl
 
 #include "gpu_ops.h"
+
+#undef TL_GPU_BACKEND
