@@ -46,10 +46,19 @@ Each view a kernel takes is tagged with how the kernel touches it:
 | access  | meaning | what a mirrored backend does |
 |---------|---------|------------------------------|
 | `in`    | read | upload first if the host holds the live copy |
-| `out`   | written; the host copy is dead (the kernel writes it in full, or the host never held anything worth keeping) | mark the device copy live, no upload |
-| `inout` | read, then written | upload, then mark the device copy live |
+| `out`   | written | the device copy becomes the live one; upload first only if the host had filled the buffer |
+| `inout` | read, then written | upload, then the device copy is the live one |
 
 A unified-memory backend ignores the tag. No op states residency by hand.
+
+When to copy is decided once, by `gpu::residency` (`gpu_abi.h`): a mirrored
+backend keeps one per allocation beside its two copies, asks it
+`before_kernel(access)` and `before_host(for_write)`, and does the copying. An
+allocation starts `none` (nobody has filled it) unless `alloc` was told the host
+fills it. That is what makes `out` safe on a view: a view may cover part of its
+buffer, so an output into a buffer whose live bytes are the host's has to bring
+them up or lose the rest, while an output into a fresh buffer, which is nearly
+every output, has nothing to bring.
 
 ## The kernel ABI
 
@@ -173,9 +182,9 @@ No existing backend's file is touched.
 
 ## What is not shared yet
 
-- The HOST / DEVICE / BOTH residency state machine exists twice, in `cuda.h`
-  and `webgpu.h`. `dispatch` derives the transitions from `access`, but each
-  backend still owns its mirror table.
+- The mirror table (handle to host copy, device copy, size, `residency`) and
+  the buffer pool exist twice, in `cuda.h` and `webgpu.h`. The state machine
+  itself is shared.
 - `tl::profile` hooks sit in each backend's launch path.
 - `kop` still lists kernel ids only one backend has (Metal's GEMM tiles and
   attention variants).
@@ -210,6 +219,10 @@ suite does not, so all 117 appear. `TL_CUDA_TRACE_CHECK=1 tools/cuda_trace/run.s
 CUDA branch of the headers. Whether the kernels compute the right thing is
 still a `ctest` on NVIDIA hardware.
 
-`gpu::census(kernel)` counts launches since `gpu::census_reset()`. An op that
-declines falls back to the CPU and the result is still right, so a test that
-wants to know the kernel ran has to ask.
+`gpu::census(kernel)` counts a shared op's launches and `gpu::ops_run()` every
+op that ran on the device, shared or backend-own, since `gpu::census_reset()`.
+An op that declines falls back to the CPU and the result is still right, so a
+test that wants to know the device was reached has to ask. The suite has two
+tests built on this: every op on views at non-zero offsets, inside buffers with
+sentinels on both sides, against a plain host loop; and one graph per op family
+through the evaluator in GPU mode, where the census has to move.

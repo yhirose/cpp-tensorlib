@@ -199,12 +199,11 @@ struct context {
   // Host/device mirror per allocation, keyed by the opaque handle alloc()
   // returns as `native`. Views sharing a storage share the key, so one dirty
   // state serves every view. `where` tracks which copy is live.
-  enum loc { HOST, DEVICE, BOTH };
   struct mirror {
     float* host = nullptr;   // CPU-side buffer (storage.ptr)
     wgpu::Buffer dev;        // device buffer
     size_t bytes = 0;
-    loc where = HOST;
+    gpu::residency live;  // when to copy (gpu_abi.h); the copies are made here
   };
   std::unordered_map<void*, mirror> mirrors;
 
@@ -353,25 +352,20 @@ struct context {
     return it == mirrors.end() ? nullptr : &it->second;
   }
 
-  // A kernel is about to READ this buffer: ensure the device copy is current.
+  // A kernel is about to touch this buffer as `a`: bring the host copy up if
+  // residency says so.
   //
   // WriteBuffer executes in queue order, i.e. ahead of anything still sitting
-  // in the unsubmitted encoder. That is safe precisely because a buffer in
-  // HOST state has no encoded command touching it: a pending kernel write
-  // would have set DEVICE, and a pending kernel read would have come through
-  // here and set BOTH.
-  void device_read_(void* native) {
+  // in the unsubmitted encoder. That is safe precisely because a buffer whose
+  // live bytes are the host's has no encoded command touching it: a pending
+  // kernel write would have made the device copy live, and a pending kernel
+  // read would have come through here and uploaded already.
+  void before_kernel_(void* native, gpu::access a) {
     mirror* m = mirror_(native);
-    if (m && m->where == HOST) {
-      queue.WriteBuffer(m->dev, 0, m->host, m->bytes);
-      m->where = BOTH;
-    }
+    if (m && m->live.before_kernel(a)) queue.WriteBuffer(m->dev, 0, m->host, m->bytes);
   }
-
-  // A kernel is about to WRITE this buffer: it becomes the live copy.
-  void device_write_(void* native) {
-    if (mirror* m = mirror_(native)) m->where = DEVICE;
-  }
+  void device_read_(void* native) { before_kernel_(native, gpu::access::in); }
+  void device_write_(void* native) { before_kernel_(native, gpu::access::out); }
 
   // The one place a dispatch is encoded. Every op differs only in which
   // pipeline, which params and what grid — keeping the bind group, uniform
@@ -510,7 +504,7 @@ inline void context::flush_() { flush(); }
 // anything dereferenceable; it is only ever a key back into `mirrors`.
 // `host_fill` (the host writes it first) needs nothing here: the host copy is
 // its own malloc, which kernels never write and an upload copies when queued.
-inline void* alloc(int64_t bytes, float** contents, bool /*host_fill*/ = false) {
+inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
   auto& c = context::get();
   if (!c.ready) return nullptr;
   size_t nb = bytes > 0 ? (size_t)bytes : 4;
@@ -538,7 +532,7 @@ inline void* alloc(int64_t bytes, float** contents, bool /*host_fill*/ = false) 
   // host pointer is both, and malloc will not hand out the same address twice
   // while it is live.
   void* token = host;
-  c.mirrors[token] = context::mirror{host, dev, nb, context::HOST};
+  c.mirrors[token] = context::mirror{host, dev, nb, gpu::residency(host_fill)};
   if (contents) *contents = host;
   return token;
 }
@@ -561,7 +555,7 @@ inline void sync_to_host(void* native, bool for_write) {
   context::mirror* m = c.mirror_(native);
   if (!m) return;
   if (c.pending) flush();
-  if (m->where == context::DEVICE) {
+  if (m->live.needs_download()) {
     // No CPU-visible pointer to read from: copy device -> a MapRead staging
     // buffer, map it (the second and last suspend point), memcpy out.
     wgpu::Buffer stg = c.staging_(m->bytes);
@@ -579,21 +573,21 @@ inline void sync_to_host(void* native, bool for_write) {
         ok) {
       if (const void* src = stg.GetConstMappedRange(0, m->bytes)) {
         std::memcpy(m->host, src, m->bytes);
-        m->where = context::BOTH;
+        m->live.downloaded();
       }
       stg.Unmap();
     }
-    // Only a completed memcpy makes the host copy current. Declaring BOTH on a
+    // Only a completed memcpy makes the host copy current. Declaring it so on a
     // failed readback would leave stale bytes permanently believed live, and no
     // later sync_to_host would retry — so say so loudly instead, as the WGSL
     // compile failure above does.
-    if (m->where == context::DEVICE) {
+    if (m->live.needs_download()) {
       std::fprintf(stderr, "tensorlib webgpu: readback of %zu bytes failed\n",
                    m->bytes);
     }
     c.staging_pool[m->bytes].push_back(stg);
   }
-  if (for_write) m->where = context::HOST;
+  if (for_write) m->live.host_wrote();
 }
 
 // Shared host-side prologue for every op: resolve the operand mirrors and
@@ -784,10 +778,7 @@ inline bool dispatch(kop k, const gpu::arg* args, size_t n,
   p.b_off = in_off[1];
   const char* entry = marshal_(k, canonical, in_off, p);
   if (!entry || in_off[2] || in_off[3]) return false;
-  for (size_t i = 0; i < n; i++) {
-    if (args[i].a != gpu::access::out) c.device_read_(args[i].s.buf);
-    if (args[i].a != gpu::access::in) c.device_write_(args[i].s.buf);
-  }
+  for (size_t i = 0; i < n; i++) c.before_kernel_(args[i].s.buf, args[i].a);
   return c.encode_(entry, in[0], in[1], out, p, g.gx, g.gy, in[2], in[3]);
 }
 
@@ -885,7 +876,7 @@ inline context::mirror* commit_meta_(context& c, void* ring_tok,
   // mirror never legitimately settles into a single steady HOST/DEVICE state
   // (each slot is written once, read once, never again).
   c.queue.WriteBuffer(mm->dev, word_off * 4, words, word_count * 4);
-  mm->where = context::BOTH;
+  mm->live.uploaded();
   return mm;
 }
 

@@ -291,13 +291,13 @@ struct context {
 
   // Host/device mirror per allocation, keyed by the device pointer (== the
   // `native` handle stored in storage). Views sharing a storage share the key,
-  // so one dirty state serves every view. loc tracks where the live copy is.
-  enum loc { HOST, DEVICE, BOTH };
+  // so one state serves every view. When to copy is gpu::residency's decision
+  // (gpu_abi.h); the copies are made here.
   struct mirror {
     float* host = nullptr;  // CPU-side buffer (storage.contents/ptr)
     CUdeviceptr dev = 0;    // device buffer (storage.native)
     size_t bytes = 0;
-    loc where = HOST;
+    gpu::residency live;
   };
   std::unordered_map<CUdeviceptr, mirror> mirrors;
 
@@ -312,20 +312,20 @@ struct context {
     auto it = mirrors.find(reinterpret_cast<CUdeviceptr>(native));
     return it == mirrors.end() ? nullptr : &it->second;
   }
-  // A kernel is about to READ this buffer: ensure the device copy is current.
-  // Async on the stream like the meta uploads (a blocking copy would wait out
-  // every kernel already queued and stall the pipeline mid-graph); the driver
-  // stages a pageable source during the call.
-  void device_read_(void* native) {
+  // A kernel is about to touch this buffer as `a`: bring the host copy up if
+  // residency says so. Async on the stream like the meta uploads (a blocking
+  // copy would wait out every kernel already queued and stall the pipeline
+  // mid-graph); the driver stages a pageable source during the call.
+  void before_kernel_(void* native, gpu::access a) {
     mirror* m = mirror_(native);
-    if (m && m->where == HOST) {
-      upload_(*m);
-      m->where = BOTH;
-    }
+    if (m && m->live.before_kernel(a)) upload_(*m);
   }
-  // The H2D behind device_read_ / device_rmw_: async on the stream when the
-  // driver has it. Profiled as a transfer either way (the blocking form with
-  // its wait).
+  // The three accesses by name, for the ops that state residency themselves.
+  void device_read_(void* native) { before_kernel_(native, gpu::access::in); }
+  void device_write_(void* native) { before_kernel_(native, gpu::access::out); }
+  void device_rmw_(void* native) { before_kernel_(native, gpu::access::inout); }
+  // The H2D: async on the stream when the driver has it. Profiled as a
+  // transfer either way (the blocking form with its wait).
   void upload_(const mirror& m) {
     if (d.MemcpyHtoDAsync) {
       d.MemcpyHtoDAsync(m.dev, m.host, m.bytes, stream);
@@ -334,22 +334,6 @@ struct context {
     }
     profile::detail::blocked timing{"h2d", m.bytes};
     d.MemcpyHtoD(m.dev, m.host, m.bytes);
-  }
-  // A kernel is about to WRITE every element of this buffer: it becomes the
-  // live copy, and whatever the host held is dead. A kernel that reads it
-  // first, or writes only part of it, is device_rmw_ below.
-  void device_write_(void* native) {
-    if (mirror* m = mirror_(native)) m->where = DEVICE;
-  }
-  // A kernel is about to READ and then WRITE this buffer (an in-place update):
-  // a host-born copy comes up first, then the device copy is the live one. One
-  // probe for both -- the mirror map is every CUDA buffer, and an optimizer
-  // step does this per parameter.
-  void device_rmw_(void* native) {
-    mirror* m = mirror_(native);
-    if (!m) return;
-    if (m->where == HOST) upload_(*m);
-    m->where = DEVICE;
   }
 
   static context& get() {
@@ -796,11 +780,7 @@ struct context {
     uint32_t scalars[kMaxArgs];
     void* argv[kMaxArgs];
     for (size_t i = 0; i < n; i++) {
-      switch (args[i].a) {
-        case gpu::access::in: device_read_(args[i].s.buf); break;
-        case gpu::access::out: device_write_(args[i].s.buf); break;
-        case gpu::access::inout: device_rmw_(args[i].s.buf); break;
-      }
+      before_kernel_(args[i].s.buf, args[i].a);
       ptrs[i] = off_(args[i].s.buf, args[i].s.off);
       argv[i] = &ptrs[i];
     }
@@ -1133,7 +1113,7 @@ inline void upload(void* native, const float* src, int64_t n) {
   size_t bytes = std::min((size_t)n * sizeof(float), m->bytes);
   if (src != m->host) std::memcpy(m->host, src, bytes);
   c.d.MemcpyHtoD(m->dev, m->host, bytes);
-  m->where = context::BOTH;
+  m->live.uploaded();
 }
 
 // Set a device u32 scalar (e.g. the capture pos counter) via its mirror. Raw
@@ -1145,7 +1125,7 @@ inline void upload_u32(void* native, unsigned val) {
   if (!m || m->bytes < 4) return;
   std::memcpy(m->host, &val, 4);
   c.d.MemcpyHtoD(m->dev, m->host, 4);
-  m->where = context::BOTH;
+  m->live.uploaded();
 }
 
 // Mirror allocation: a device buffer (returned as `native`) paired with a host
@@ -1154,7 +1134,7 @@ inline void upload_u32(void* native, unsigned val) {
 // keeps native != contents, like Metal (MTLBuffer handle vs .contents pointer).
 // `host_fill` (the host writes it first) needs nothing here: the host copy is
 // its own allocation, which no queued work writes.
-inline void* alloc(int64_t bytes, float** contents, bool /*host_fill*/ = false) {
+inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
   auto& c = context::get();
   if (!c.ready) return nullptr;
   size_t nb = bytes > 0 ? (size_t)bytes : 4;
@@ -1173,7 +1153,7 @@ inline void* alloc(int64_t bytes, float** contents, bool /*host_fill*/ = false) 
       return nullptr;
     }
   }
-  c.mirrors[dev] = context::mirror{host, dev, nb, context::HOST};
+  c.mirrors[dev] = context::mirror{host, dev, nb, gpu::residency(host_fill)};
   if (contents) *contents = host;
   return reinterpret_cast<void*>(dev);
 }
@@ -1202,15 +1182,11 @@ inline void sync_to_host(void* native, bool for_write) {
   if (!c.ready || !native) return;
   context::mirror* m = c.mirror_(native);
   if (!m) return;
-  if (m->where == context::DEVICE) {
+  if (m->live.before_host(for_write)) {
     if (c.pending) flush();
-    {
-      profile::detail::blocked timing{"d2h", m->bytes};
-      c.d.MemcpyDtoH(m->host, m->dev, m->bytes);
-    }
-    m->where = context::BOTH;
+    profile::detail::blocked timing{"d2h", m->bytes};
+    c.d.MemcpyDtoH(m->host, m->dev, m->bytes);
   }
-  if (for_write) m->where = context::HOST;
 }
 
 // The device core's one way to run a kernel for the shared ops (gpu_ops.h).

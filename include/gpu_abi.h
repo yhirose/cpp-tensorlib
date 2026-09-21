@@ -83,11 +83,11 @@ struct span {
   explicit operator bool() const { return buf != nullptr; }
 };
 
-// How a kernel touches a view. It drives the residency of a mirrored backend,
-// so no op says any of that by hand: an `in` is uploaded if the host holds the
-// live copy; an `out` makes the device copy the live one with no upload (the
-// kernel writes it in full, or — a KV cache's rows — the host never held
-// anything worth keeping); an `inout` is uploaded and then becomes live.
+// How a kernel touches a view. It drives the residency of a mirrored backend
+// (`residency` below), so no op says any of that by hand: an `in` is uploaded
+// if the host holds the live copy; an `out` makes the device copy the live one,
+// uploading first only if the host had filled the buffer (a view may be part
+// of it); an `inout` is uploaded and then becomes live.
 enum class access : uint8_t { in, out, inout };
 
 struct arg {
@@ -97,6 +97,52 @@ struct arg {
 inline arg in(span s) { return {s, access::in}; }
 inline arg out(span s) { return {s, access::out}; }
 inline arg inout(span s) { return {s, access::inout}; }
+
+// Where an allocation's live bytes are, for a backend whose device memory is
+// not the host's (a mirrored backend keeps one of these per allocation, next to
+// the two copies; a unified one has nothing to track). The backend does the
+// copying; when to copy is decided here, once, from how each kernel and each
+// host access touches the buffer.
+//
+// `none` is a fresh allocation nobody has filled. It matters for `out`: a view
+// may cover only part of its buffer, so a kernel's output into a buffer whose
+// live bytes are the host's has to bring them up first or lose the rest of
+// them — but an output into a fresh buffer, which is nearly every output, has
+// nothing to bring.
+struct residency {
+  enum state : uint8_t { none, host, device, both };
+  state where = none;
+
+  explicit residency(bool host_filled = false) : where(host_filled ? host : none) {}
+
+  // A kernel is about to touch the buffer as `a`. True: upload the host copy
+  // first. (A read of a `none` buffer uploads too: the host may have filled it
+  // without saying so, and an unfilled one costs a transfer of garbage that no
+  // correct program pays.)
+  bool before_kernel(access a) {
+    const bool upload = where == host || (where == none && a != access::out);
+    if (a == access::in) {
+      if (upload) where = both;
+    } else {
+      where = device;
+    }
+    return upload;
+  }
+  // The host is about to read the buffer or, with for_write, overwrite it.
+  // True: download the device copy first. (A backend whose download can fail
+  // asks needs_download(), and reports downloaded() / host_wrote() itself.)
+  bool before_host(bool for_write) {
+    const bool download = needs_download();
+    if (download) downloaded();
+    if (for_write) host_wrote();
+    return download;
+  }
+  bool needs_download() const { return where == device; }
+  void downloaded() { where = both; }
+  void host_wrote() { where = host; }
+  // The backend copied host bytes up outside a kernel (an explicit upload).
+  void uploaded() { where = both; }
+};
 
 // A launch's extent: how many groups, how many threads in each, and the bytes
 // of per-group scratch a kernel's reduction needs where the backend sizes it at

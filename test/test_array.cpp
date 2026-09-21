@@ -3,6 +3,8 @@
 #include <kv_cache.h>
 #include <tensorlib.h>
 
+#include <algorithm>
+#include <functional>
 #include <random>
 
 using tl::array;
@@ -3173,5 +3175,301 @@ TEST_CASE("shared gpu ops: views at non-zero offsets, counted by the census") {
     CHECK(gpu::census(gpu::kop::add) + gpu::census(gpu::kop::exp_) >= 1);
   }
 
+  tl::device_ = prev;
+}
+
+// The backend conformance test: every op a backend may implement, called on
+// views at non-zero byte offsets, against a plain host loop. A buffer is staged
+// with a run of sentinels before and after its values, so a kernel that drops a
+// view's offset, or writes past its end, shows in the values or in the
+// sentinels. It asks nothing of any one backend: an op the backend declines is
+// skipped, and one it accepts has to be right. `must` names the ops every
+// backend here is expected to take, so a regression that makes one decline
+// fails rather than skips.
+TEST_CASE("gpu ops on views at non-zero offsets") {
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+  tl::use_gpu();
+  namespace gpu = tl::gpu;
+  constexpr float kSentinel = -777.0f;
+  constexpr int64_t kPad = 5;  // elements of slack on each side
+
+  struct staged {
+    array buf;
+    int64_t n = 0;
+    gpu::span view() const { return buf.device_span().at(kPad * 4); }
+    array values() const { return buf.slice(0, kPad, n); }
+    bool sentinels_intact() const {
+      auto s = array::full({kPad}, kSentinel);
+      return tl::allclose(buf.slice(0, 0, kPad), s, 0.0f, 0.0f) &&
+             tl::allclose(buf.slice(0, kPad + n, kPad), s, 0.0f, 0.0f);
+    }
+  };
+  auto stage = [&](const std::vector<float>& v) {
+    std::vector<float> padded(v.size() + 2 * kPad, kSentinel);
+    std::copy(v.begin(), v.end(), padded.begin() + kPad);
+    staged s;
+    s.n = static_cast<int64_t>(v.size());
+    s.buf = array::from(std::move(padded)).clone();
+    s.buf.eval();
+    return s;
+  };
+  auto out_of = [&](int64_t n) { return stage(std::vector<float>((size_t)n, kSentinel)); };
+  auto rnd = [](int64_t n, unsigned seed, float lo = -1.0f, float hi = 1.0f) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> dist(lo, hi);
+    std::vector<float> v((size_t)n);
+    for (auto& x : v) x = dist(rng);
+    return v;
+  };
+  // Whether `ran`: a declined op leaves its output alone and is not counted.
+  auto check = [&](bool ran, bool must, staged& o, const std::vector<float>& want,
+                   float tol) {
+    if (!ran) {
+      CHECK_FALSE(must);
+      return;
+    }
+    tl::gpu::flush();
+    auto keep = tl::device_;
+    tl::use_cpu();
+    CHECK(tl::allclose(o.values(), array::from(want), tol, tol));
+    CHECK(o.sentinels_intact());
+    tl::device_ = keep;
+  };
+
+  SUBCASE("elementwise, broadcast, compare, clamp, scalar") {
+    const int64_t m = 7, n = 33;
+    auto va = rnd(m * n, 1), vb = rnd(m * n, 2), vrow = rnd(n, 3);
+    staged a = stage(va), b = stage(vb), row = stage(vrow);
+    {
+      staged o = out_of(m * n);
+      std::vector<float> want(m * n);
+      for (int64_t i = 0; i < m * n; i++) want[i] = (va[i] - vb[i]) * 3.0f + 0.5f;
+      gpu::census_reset();
+      check(gpu::binary(gpu::kop::sub, a.view(), b.view(), o.view(), m * n, 3.0f, 0.5f),
+            true, o, want, 1e-6f);
+      CHECK(gpu::census(gpu::kop::sub) == 1);
+    }
+    {
+      staged o = out_of(m * n);
+      std::vector<float> want(m * n);
+      for (int64_t r = 0; r < m; r++)
+        for (int64_t c = 0; c < n; c++) want[r * n + c] = va[r * n + c] * vrow[c] + 1.0f;
+      check(gpu::binary_bcast(gpu::kop::bmul, a.view(), n, 1, row.view(), 0, 1, o.view(),
+                              m, n, 1.0f, 1.0f),
+            true, o, want, 1e-6f);
+    }
+    {
+      staged o = out_of(m * n);
+      std::vector<float> want(m * n);
+      for (int64_t i = 0; i < m * n; i++) want[i] = va[i] > vb[i] ? 1.0f : 0.0f;
+      check(gpu::compare(gpu::cmp_op::gt, a.view(), b.view(), o.view(), m * n, 1), true,
+            o, want, 0.0f);
+    }
+    {
+      staged o = out_of(m * n);
+      std::vector<float> want(m * n);
+      for (int64_t i = 0; i < m * n; i++) want[i] = std::min(std::max(va[i], -0.25f), 0.5f);
+      check(gpu::clamp(a.view(), o.view(), m * n, -0.25f, 0.5f), true, o, want, 0.0f);
+    }
+    {
+      staged o = out_of(m * n);
+      std::vector<float> want(m * n);
+      for (int64_t i = 0; i < m * n; i++) want[i] = (va[i] < 0.1f ? 1.0f : 0.0f) * 2.0f;
+      check(gpu::scalar_binary(gpu::scalar_op::lt, a.view(), o.view(), m * n, 0.1f, 2.0f,
+                               0.0f),
+            true, o, want, 0.0f);
+    }
+    {
+      staged o = out_of(m * n);
+      std::vector<float> want(m * n);
+      for (int64_t i = 0; i < m * n; i++) want[i] = std::cos(va[i]);
+      check(gpu::unary_ext(gpu::unary_ext_op::cos_, a.view(), o.view(), m * n, 1.0f, 0.0f),
+            true, o, want, 1e-6f);
+    }
+  }
+
+  SUBCASE("row reductions, layer norm, rmsnorm, swiglu") {
+    const int64_t rows = 4, cols = 300;
+    auto vx = rnd(rows * cols, 11), vg = rnd(cols, 12), vb = rnd(cols, 13),
+         vd = rnd(rows * cols, 14);
+    staged x = stage(vx), g = stage(vg), b = stage(vb), d = stage(vd);
+    auto row_stat = [&](int64_t r, auto f) {
+      double acc = 0;
+      for (int64_t c = 0; c < cols; c++) acc += f(vx[r * cols + c]);
+      return acc;
+    };
+    {
+      staged o = out_of(rows);
+      std::vector<float> want(rows);
+      for (int64_t r = 0; r < rows; r++)
+        want[r] = (float)(row_stat(r, [](float v) { return (double)v; }) * 0.5 + 1.0);
+      check(gpu::row_op(gpu::kop::row_sum, x.view(), o.view(), rows, cols, 0.5f, 1.0f),
+            true, o, want, 1e-4f);
+    }
+    {
+      staged o = out_of(rows * cols);
+      std::vector<float> want(rows * cols);
+      for (int64_t r = 0; r < rows; r++) {
+        const double z = row_stat(r, [](float v) { return std::exp((double)v); });
+        for (int64_t c = 0; c < cols; c++)
+          want[r * cols + c] = (float)(std::exp((double)vx[r * cols + c]) / z);
+      }
+      check(gpu::row_op(gpu::kop::softmax, x.view(), o.view(), rows, cols, 1.0f, 0.0f),
+            true, o, want, 1e-6f);
+    }
+    {
+      staged o = out_of(rows);
+      std::vector<float> want(rows);
+      for (int64_t r = 0; r < rows; r++)
+        want[r] = (float)std::log(row_stat(r, [](float v) { return std::exp((double)v); }));
+      check(gpu::row_logsumexp(x.view(), o.view(), rows, cols, 1.0f, 0.0f), false, o, want,
+            1e-5f);
+    }
+    {
+      staged o = out_of(rows * cols);
+      std::vector<float> want(rows * cols);
+      for (int64_t r = 0; r < rows; r++) {
+        const double mean = row_stat(r, [](float v) { return (double)v; }) / cols;
+        const double var =
+            row_stat(r, [&](float v) { return ((double)v - mean) * ((double)v - mean); }) / cols;
+        const double inv = 1.0 / std::sqrt(var + 1e-5);
+        for (int64_t c = 0; c < cols; c++)
+          want[r * cols + c] = (float)(((double)vx[r * cols + c] - mean) * inv * vg[c] + vb[c]);
+      }
+      check(gpu::layer_norm(x.view(), g.view(), b.view(), o.view(), rows, cols, 1e-5f, 1.0f,
+                            0.0f),
+            true, o, want, 1e-5f);
+    }
+    const bool model = gpu::caps::model_path;
+    {
+      staged xo = out_of(rows * cols), ho = out_of(rows * cols);
+      std::vector<float> wx(rows * cols), wh(rows * cols);
+      for (int64_t r = 0; r < rows; r++) {
+        double ss = 0;
+        for (int64_t c = 0; c < cols; c++) {
+          wx[r * cols + c] = vx[r * cols + c] + vd[r * cols + c];
+          ss += (double)wx[r * cols + c] * wx[r * cols + c];
+        }
+        const double inv = 1.0 / std::sqrt(ss / cols + 1e-6);
+        for (int64_t c = 0; c < cols; c++)
+          wh[r * cols + c] = (float)(wx[r * cols + c] * inv * vg[c]);
+      }
+      const bool ran = gpu::rmsnorm_res(x.view(), d.view(), g.view(), xo.view(), ho.view(),
+                                        cols, 1e-6f, rows);
+      check(ran, model, xo, wx, 1e-6f);
+      check(ran, model, ho, wh, 1e-5f);
+    }
+    {
+      const int64_t ff = cols / 2;  // x as [rows, 2*ff]: gate | up
+      staged o = out_of(rows * ff);
+      std::vector<float> want(rows * ff);
+      for (int64_t r = 0; r < rows; r++)
+        for (int64_t f = 0; f < ff; f++) {
+          const double gate = vx[r * cols + f], up = vx[r * cols + ff + f];
+          want[r * ff + f] = (float)(gate / (1.0 + std::exp(-gate)) * up);
+        }
+      check(gpu::swiglu(x.view(), o.view(), ff, rows), model, o, want, 1e-6f);
+    }
+  }
+
+  SUBCASE("index family, gemm, pad: the ops backends run their own way") {
+    const int64_t table_rows = 9, row_size = 16, k = 6;
+    auto vt = rnd(table_rows * row_size, 21);
+    std::vector<float> vi = {3, 0, 8, 3, 5, 1};
+    staged t = stage(vt), idx = stage(vi);
+    {
+      staged o = out_of(k * row_size);
+      std::vector<float> want(k * row_size);
+      for (int64_t i = 0; i < k; i++)
+        for (int64_t c = 0; c < row_size; c++)
+          want[i * row_size + c] = vt[(int64_t)vi[i] * row_size + c];
+      check(gpu::index_select(t.view(), idx.view(), o.view(), row_size, k), true, o, want,
+            0.0f);
+    }
+    {
+      auto vv = rnd(k * row_size, 22);
+      staged v = stage(vv), o = out_of(table_rows * row_size);
+      std::vector<float> want(table_rows * row_size, 0.0f);
+      for (int64_t i = 0; i < k; i++)
+        for (int64_t c = 0; c < row_size; c++)
+          want[(int64_t)vi[i] * row_size + c] += vv[i * row_size + c];
+      check(gpu::index_add(idx.view(), v.view(), o.view(), row_size, k,
+                           table_rows * row_size),
+            true, o, want, 1e-6f);
+    }
+    {
+      const int64_t size = 9;  // one-hot width
+      auto vv = rnd(k, 23);
+      staged v = stage(vv), o = out_of(k * size);
+      std::vector<float> want(k * size, 0.0f);
+      for (int64_t i = 0; i < k; i++) want[i * size + (int64_t)vi[i]] = vv[i];
+      check(gpu::scatter_to_axis(idx.view(), v.view(), o.view(), k, size), true, o, want,
+            0.0f);
+    }
+    {
+      const int64_t m = 5, kk = 8, n = 12;
+      auto va = rnd(m * kk, 24), vb = rnd(kk * n, 25);
+      staged a = stage(va), b = stage(vb), o = out_of(m * n);
+      std::vector<float> want(m * n);
+      for (int64_t i = 0; i < m; i++)
+        for (int64_t j = 0; j < n; j++) {
+          double acc = 0;
+          for (int64_t q = 0; q < kk; q++) acc += (double)va[i * kk + q] * vb[q * n + j];
+          want[i * n + j] = (float)(acc * 2.0 - 1.0);
+        }
+      gpu::census_reset();
+      check(gpu::gemm(a.view(), kk, false, b.view(), n, false, o.view(), m, n, kk, 2.0f,
+                      -1.0f),
+            true, o, want, 1e-5f);
+      CHECK(gpu::ops_run() == 1);  // a backend-own op is counted too
+    }
+    {
+      const int64_t a_shape[2] = {4, 6}, out_shape[2] = {4, 10};
+      auto va = rnd(24, 26);
+      staged a = stage(va), o = out_of(40);
+      std::vector<float> want(40, 0.0f);
+      for (int64_t r = 0; r < 4; r++)
+        for (int64_t c = 0; c < 6; c++) want[r * 10 + c + 3] = va[r * 6 + c];
+      check(gpu::pad(a.view(), o.view(), a_shape, out_shape, 2, 1, 3, 24, 40), true, o,
+            want, 0.0f);
+    }
+  }
+
+  tl::device_ = prev;
+}
+
+// What the oracle comparisons cannot see: whether the evaluator's GPU mode
+// reached the device at all, or fell back op by op and was right anyway. One
+// graph a family every backend implements, and the census has to move.
+TEST_CASE("the evaluator reaches the device in gpu mode") {
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+  tl::use_gpu();
+  namespace gpu = tl::gpu;
+  array a = random_array({6, 40}, 31), b = random_array({6, 40}, 32),
+        row = random_array({40}, 33), w = random_array({40, 8}, 34);
+  struct family {
+    const char* name;
+    std::function<array()> graph;
+  };
+  const family families[] = {
+      {"elementwise", [&] { return (a + b).exp(); }},
+      {"broadcast", [&] { return a * row; }},
+      {"matmul", [&] { return a.dot(w); }},
+      {"softmax", [&] { return a.softmax(); }},
+      {"row sum", [&] { return a.sum(1); }},
+      {"compare", [&] { return a > b; }},
+      {"clamp", [&] { return a.clamp(-0.5f, 0.5f); }},
+      {"pow scalar", [&] { return tl::pow(a * a + 1.0f, 0.5f); }},
+      {"pad", [&] { return a.pad(1, 2, 3); }},
+  };
+  for (const family& f : families) {
+    CAPTURE(f.name);
+    array g = f.graph();
+    gpu::census_reset();
+    g.eval();
+    CHECK(gpu::ops_run() >= 1);
+  }
   tl::device_ = prev;
 }
