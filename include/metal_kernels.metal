@@ -2506,8 +2506,11 @@ attn_combine_<128>(device const float*, device float*,
 
 // One step's k/v ([n_kv_heads, D]) into cache row `pos`; grid (n_kv_heads),
 // D threads. KT is the cache element type.
-struct kv_params {
-  uint pos, kv_stride, T;
+struct kv_append_params {
+  uint pos, kv_stride;
+};
+struct kv_fill_params {
+  uint T, kv_stride, pos0;
 };
 
 template <typename KT>
@@ -2515,7 +2518,7 @@ kernel void kv_append_(device KT* Kc             [[buffer(0)]],
                        device KT* Vc             [[buffer(1)]],
                        device const float* k_new [[buffer(2)]],
                        device const float* v_new [[buffer(3)]],
-                       constant kv_params& p     [[buffer(4)]],
+                       constant kv_append_params& p [[buffer(4)]],
                        uint h [[threadgroup_position_in_grid]],
                        uint d [[thread_index_in_threadgroup]],
                        uint D [[threads_per_threadgroup]]) {
@@ -2526,10 +2529,10 @@ kernel void kv_append_(device KT* Kc             [[buffer(0)]],
 }
 template [[host_name("kv_append_")]] kernel void
 kv_append_<float>(device float*, device float*, device const float*,
-                  device const float*, constant kv_params&, uint, uint, uint);
+                  device const float*, constant kv_append_params&, uint, uint, uint);
 template [[host_name("kv_append_bf16_")]] kernel void
 kv_append_<ushort>(device ushort*, device ushort*, device const float*,
-                   device const float*, constant kv_params&, uint, uint, uint);
+                   device const float*, constant kv_append_params&, uint, uint, uint);
 
 // A prefill's k/v ([n_kv_heads, T, D]) into cache rows [pos, pos + T); grid
 // (n_kv_heads, T), D threads.
@@ -2538,22 +2541,22 @@ kernel void kv_fill_(device KT* Kc             [[buffer(0)]],
                      device KT* Vc             [[buffer(1)]],
                      device const float* K     [[buffer(2)]],
                      device const float* V     [[buffer(3)]],
-                     constant kv_params& p     [[buffer(4)]],
+                     constant kv_fill_params& p [[buffer(4)]],
                      uint2 g  [[threadgroup_position_in_grid]],
                      uint d   [[thread_index_in_threadgroup]],
                      uint2 nt [[threads_per_threadgroup]]) {
   const uint h = g.x, t = g.y, D = nt.x;
-  const uint dst = h * p.kv_stride + (p.pos + t) * D + d;
+  const uint dst = h * p.kv_stride + (p.pos0 + t) * D + d;
   const uint src = (h * p.T + t) * D + d;
   narrow_(Kc + dst, K[src]);
   narrow_(Vc + dst, V[src]);
 }
 template [[host_name("kv_fill_")]] kernel void
 kv_fill_<float>(device float*, device float*, device const float*,
-                device const float*, constant kv_params&, uint2, uint, uint2);
+                device const float*, constant kv_fill_params&, uint2, uint, uint2);
 template [[host_name("kv_fill_bf16_")]] kernel void
 kv_fill_<ushort>(device ushort*, device ushort*, device const float*,
-                 device const float*, constant kv_params&, uint2, uint, uint2);
+                 device const float*, constant kv_fill_params&, uint2, uint, uint2);
 
 // argmax of one length-n vector, the smallest index on ties (the host scan's
 // `v[i] > best`), so greedy decoding reads one int back instead of the logits.
@@ -2610,27 +2613,24 @@ kernel void argmax_(device const float* in      [[buffer(0)]],
 // layer's residual add folded into the norm that follows it; xout may alias
 // x). One threadgroup a row, 256 threads; 1/sqrt, as the array composition.
 struct rmsnorm_params {
-  uint n, add;
+  uint n;
   float eps;
 };
 
-kernel void rmsnorm_(device const float* x         [[buffer(0)]],
-                     device const float* delta     [[buffer(1)]],
-                     device const float* w         [[buffer(2)]],
-                     device float* xout            [[buffer(3)]],
-                     device float* hout            [[buffer(4)]],
-                     constant rmsnorm_params& p    [[buffer(5)]],
-                     uint row  [[threadgroup_position_in_grid]],
-                     uint tid  [[thread_index_in_threadgroup]],
-                     uint nt   [[threads_per_threadgroup]],
-                     uint sgid [[simdgroup_index_in_threadgroup]],
-                     uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float red[8];
+// hout = v * rsqrt(mean(v^2) + eps) * w per row, where v is x, or with ADD
+// x + delta (also stored to xout): the residual add folded into the norm that
+// follows it. Without ADD, delta and xout are never touched.
+template <bool ADD>
+static inline void rmsnorm_core_(device const float* x, device const float* delta,
+                                 device const float* w, device float* xout,
+                                 device float* hout, constant rmsnorm_params& p,
+                                 threadgroup float* red, uint row, uint tid,
+                                 uint nt, uint sgid, uint lane) {
   const uint base = row * p.n;
   float acc = 0.0f;
   for (uint i = tid; i < p.n; i += nt) {
     float v = x[base + i];
-    if (p.add) {
+    if (ADD) {
       v += delta[base + i];
       xout[base + i] = v;
     }
@@ -2642,8 +2642,36 @@ kernel void rmsnorm_(device const float* x         [[buffer(0)]],
   float ss = 0.0f;
   for (uint s = 0; s < nt / 32; s++) ss += red[s];
   const float inv = 1.0f / sqrt(ss / float(p.n) + p.eps);
-  device const float* src = p.add ? xout : x;
+  device const float* src = ADD ? xout : x;
   for (uint i = tid; i < p.n; i += nt) hout[base + i] = src[base + i] * inv * w[i];
+}
+
+kernel void rmsnorm_(device const float* x         [[buffer(0)]],
+                     device const float* w         [[buffer(1)]],
+                     device float* out             [[buffer(2)]],
+                     constant rmsnorm_params& p    [[buffer(3)]],
+                     uint row  [[threadgroup_position_in_grid]],
+                     uint tid  [[thread_index_in_threadgroup]],
+                     uint nt   [[threads_per_threadgroup]],
+                     uint sgid [[simdgroup_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float red[8];
+  rmsnorm_core_<false>(x, x, w, out, out, p, red, row, tid, nt, sgid, lane);
+}
+
+kernel void add_rmsnorm_(device const float* x         [[buffer(0)]],
+                         device const float* delta     [[buffer(1)]],
+                         device const float* w         [[buffer(2)]],
+                         device float* xout            [[buffer(3)]],
+                         device float* hout            [[buffer(4)]],
+                         constant rmsnorm_params& p    [[buffer(5)]],
+                         uint row  [[threadgroup_position_in_grid]],
+                         uint tid  [[thread_index_in_threadgroup]],
+                         uint nt   [[threads_per_threadgroup]],
+                         uint sgid [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float red[8];
+  rmsnorm_core_<true>(x, delta, w, xout, hout, p, red, row, tid, nt, sgid, lane);
 }
 
 // out[row, f] = silu(gate) · up out of the fused gate|up projection
@@ -2683,9 +2711,13 @@ kernel void split_heads_(device const float* src   [[buffer(0)]],
   dst[(h * p.T + t) * D + d] = v;
 }
 
+struct merge_heads_params {
+  uint T, H, D;
+};
+
 kernel void merge_heads_(device const float* src   [[buffer(0)]],
                          device float* dst         [[buffer(1)]],
-                         constant heads_params& p  [[buffer(2)]],
+                         constant merge_heads_params& p [[buffer(2)]],
                          uint2 g  [[threadgroup_position_in_grid]],
                          uint2 ng [[threadgroups_per_grid]],
                          uint d   [[thread_index_in_threadgroup]],

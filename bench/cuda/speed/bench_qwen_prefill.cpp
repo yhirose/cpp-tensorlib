@@ -247,8 +247,8 @@ int main(int argc, char** argv) {
   bool gemm_ok = true;
   for (const Shape& s : shapes) {
     // Warm both paths (module load, first-touch upload) outside the timing.
-    cu::gemv_bf16_row(a, s.w->native(), y1, s.N, s.K);
-    cu::gemm_bf16_nt(a, s.w->native(), y, MB, s.N, s.K);
+    tl::gpu::gemv_bf16_row({a, 0}, {s.w->native(), 0}, {y1, 0}, s.N, s.K);
+    tl::gpu::gemm_bf16_nt({a, 0}, {s.w->native(), 0}, {y, 0}, MB, s.N, s.K);
     cu::flush();
     // Correctness: GEMM row 0 must reproduce the GEMV of A's row 0.
     cu::sync_to_host(y1, false);
@@ -261,10 +261,10 @@ int main(int argc, char** argv) {
     gemm_ok &= ok;
 
     double gemv_us = 1000.0 * min_ms(3, 20, [&] {
-      cu::gemv_bf16_row(a, s.w->native(), y1, s.N, s.K);
+      tl::gpu::gemv_bf16_row({a, 0}, {s.w->native(), 0}, {y1, 0}, s.N, s.K);
     });
     double gemm_us = 1000.0 * min_ms(3, 5, [&] {
-      cu::gemm_bf16_nt(a, s.w->native(), y, MB, s.N, s.K);
+      tl::gpu::gemm_bf16_nt({a, 0}, {s.w->native(), 0}, {y, 0}, MB, s.N, s.K);
     }) / MB;  // per prompt token
     sum_gemv += gemv_us;
     sum_gemm += gemm_us;
@@ -299,14 +299,14 @@ int main(int argc, char** argv) {
     double per_tok = min_ms(3, 1, [&] {
       c.pos = 0;
       for (int64_t i = 0; i < T; i++) {
-        c.append(ks, vs);  // same row values each step; only the cost matters
-        c.attn(qs, os, qm::NH, qm::SCALE);
+        c.append({ks, 0}, {vs, 0});  // same row values each step; only the cost matters
+        c.attn({qs, 0}, {os, 0}, qm::NH, qm::SCALE);
       }
     });
     // Batched: bulk kv_fill + one causal tiled attn_prefill.
     double batched = min_ms(3, 1, [&] {
       c.pos = 0;
-      c.prefill(qs, ks, vs, os, T, qm::NH, qm::SCALE);
+      c.prefill({qs, 0}, {ks, 0}, {vs, 0}, {os, 0}, T, qm::NH, qm::SCALE);
     });
     std::printf("  %6lld  %14.3f  %14.3f  %7.1fx\n", (long long)T, per_tok,
                 batched, per_tok / batched);

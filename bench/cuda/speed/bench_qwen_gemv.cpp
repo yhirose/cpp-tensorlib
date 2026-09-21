@@ -20,7 +20,7 @@
 #ifndef TENSORLIB_CUDA
 #define TENSORLIB_CUDA
 #endif
-#include "cuda.h"
+#include "gpu.h"  // cuda.h plus the shared ops (tl::gpu resolves to cuda here)
 
 #include <algorithm>
 #include <chrono>
@@ -95,13 +95,13 @@ struct Op {
     release(a, 0, nullptr); release(B, 0, nullptr); release(y, 0, nullptr);
     release(qw, 0, nullptr); release(sc, 0, nullptr);
   }
-  void run() const { gemv_bf16(a, B, y, N, K); }
+  void run() const { tl::gpu::gemv_bf16({a, 0}, {B, 0}, {y, 0}, N, K); }
   // Warp-per-row [N,K] variant (lever A). Speed is layout-agnostic (same K*N*2
   // random bytes, same access footprint), so it reuses the same B buffer — only
   // the in-kernel interpretation differs. Compared head-to-head with split-K.
-  void run_row() const { gemv_bf16_row(a, B, y, N, K); }
+  void run_row() const { tl::gpu::gemv_bf16_row({a, 0}, {B, 0}, {y, 0}, N, K); }
   // q4 warp-per-row [N,K] (bandwidth lever): ~0.625 B/wt vs bf16's 2.
-  void run_q4() const { gemv_q4(a, qw, sc, y, N, K, G); }
+  void run_q4() const { tl::gpu::gemv_q4({a, 0}, {qw, 0}, {sc, 0}, {y, 0}, N, K, G); }
 };
 
 static const int R = 50, ROUNDS = 7;

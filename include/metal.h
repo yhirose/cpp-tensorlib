@@ -206,6 +206,7 @@ struct context {
       case kop::kv_fill_bf16_: return "kv_fill_bf16_";
       case kop::argmax_: return "argmax_";
       case kop::rmsnorm_: return "rmsnorm_";
+      case kop::add_rmsnorm_: return "add_rmsnorm_";
       case kop::swiglu_: return "swiglu_";
       case kop::split_heads_: return "split_heads_";
       case kop::merge_heads_: return "merge_heads_";
@@ -282,6 +283,75 @@ struct context {
 };
 
 inline bool available() { return context::get().device != nullptr; }
+
+// The ops this backend runs its own way: a different algorithm, several
+// kernels, or a kernel whose ABI is its own. gpu_ops.h forwards to whichever of
+// these exist (TL_GPU_DETECT_OWN) and answers false for the rest, so a backend
+// declares what it has and nothing else. Defined below, among their helpers.
+struct own {
+  static bool split_heads(gpu::span src, gpu::span bias, gpu::span dst,
+                          int64_t T, int64_t ld, int64_t off, int64_t H,
+                          int64_t D);
+  static bool argmax(gpu::span a, int64_t n, int64_t* out_idx);
+  static bool binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
+                              gpu::span b, const int64_t* b_strides,
+                              gpu::span out, const int64_t* out_shape, int rank,
+                              int64_t n, float scale, float offset);
+  static bool where_nd(gpu::span cond, const int64_t* c_strides, gpu::span a,
+                       const int64_t* a_strides, gpu::span b,
+                       const int64_t* b_strides, gpu::span out,
+                       const int64_t* out_shape, int rank, int64_t n);
+  static bool copy_nd(gpu::span a, const int64_t* a_strides, gpu::span out,
+                      const int64_t* out_shape, int rank, int64_t n);
+  static bool sum_to(gpu::span a, const int64_t* a_shape,
+                     const int64_t* a_strides, const int64_t* acc, int rank,
+                     int64_t out_n, int64_t reduced_n, gpu::span out);
+  static bool pad(gpu::span a, gpu::span out, const int64_t* a_shape,
+                  const int64_t* out_shape, int rank, int axis, int64_t before,
+                  int64_t n, int64_t out_n);
+  static bool fold(gpu::span a, gpu::span out, const int64_t* a_shape,
+                   const int64_t* out_shape, int rank, int axis, int64_t step,
+                   int64_t n, int64_t out_n);
+  static bool concat_part(gpu::span a, gpu::span out, const int64_t* a_shape,
+                          const int64_t* out_shape, int rank, int axis,
+                          int64_t before, int64_t n);
+  static bool index_add(gpu::span idx, gpu::span values, gpu::span out,
+                        int64_t row_size, int64_t k, int64_t out_n);
+  static bool scatter_to_axis(gpu::span idx, gpu::span values, gpu::span out,
+                              int64_t n, int64_t size);
+  static bool gemm(gpu::span a, int64_t lda, bool ta, gpu::span b, int64_t ldb,
+                   bool tb, gpu::span out, int64_t m, int64_t n, int64_t k,
+                   float scale, float offset);
+  static bool gemv_f32(gpu::span a, gpu::span B, gpu::span y, int64_t n,
+                       int64_t k);
+  static bool gemv_bf16(gpu::span a, gpu::span B, gpu::span y, int64_t n,
+                        int64_t k);
+  static bool attn_decode(gpu::span q, gpu::span K, gpu::span V, gpu::span out,
+                          int64_t n_q_heads, int64_t n_kv_heads, int64_t ctx,
+                          int64_t kv_max, int64_t D, float scale,
+                          bool kv_bf16 = false);
+  static bool attn_prefill(gpu::span q, gpu::span K, gpu::span V, gpu::span out,
+                           int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
+                           int64_t kv_max, int64_t D, float scale,
+                           bool kv_bf16 = false, int64_t pos0 = 0);
+  static bool attn_prefill_dq(gpu::span q, gpu::span K, gpu::span V,
+                              gpu::span dO, gpu::span O, gpu::span dq,
+                              gpu::span stats, int64_t H, int64_t T, int64_t D,
+                              float scale);
+  static bool attn_prefill_dkv(gpu::span q, gpu::span K, gpu::span V,
+                               gpu::span dO, gpu::span stats, gpu::span dK,
+                               gpu::span dV, int64_t H, int64_t T, int64_t D,
+                               float scale);
+  static bool gemm_bf16_nt(gpu::span A, gpu::span B, gpu::span C, int64_t M,
+                           int64_t N, int64_t K);
+  static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
+                   int64_t D, int64_t pos, float base, gpu::span bias = {});
+  static bool layer_norm_bwd(gpu::span x, gpu::span g, gpu::span dy,
+                             gpu::span dx, gpu::span dg, gpu::span db,
+                             gpu::span stats, gpu::span partials, int64_t rows,
+                             int64_t cols, int64_t per_chunk, int64_t chunks,
+                             float eps);
+};
 
 inline bool pending() { return context::get().pending; }
 
@@ -425,6 +495,9 @@ inline void set_buf_(objc::id enc, void* buf, int64_t off, unsigned long idx) {
   objc::send(enc, "setBuffer:offset:atIndex:", buf,
              static_cast<unsigned long>(off), idx);
 }
+inline void set_buf_(objc::id enc, gpu::span s, unsigned long idx) {
+  set_buf_(enc, s.buf, s.off, idx);
+}
 
 template <class P>
 inline void set_bytes_(objc::id enc, const P& p, unsigned long idx) {
@@ -437,9 +510,9 @@ inline void set_bytes_(objc::id enc, const P& p, unsigned long idx) {
 // C(m,n) = (A @ B) * scale + offset. lda/ldb are row strides; trans flags
 // let a transposed view be read in place. Buffers are raw MTLBuffers; byte
 // offsets fold the view offset in. Encodes without committing.
-inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b,
-                 int64_t bo, int64_t ldb, bool tb, void* out, int64_t oo,
-                 int64_t m, int64_t n, int64_t k, float scale, float offset) {
+inline bool own::gemm(gpu::span a, int64_t lda, bool ta, gpu::span b,
+                      int64_t ldb, bool tb, gpu::span out, int64_t m, int64_t n,
+                      int64_t k, float scale, float offset) {
   auto& c = context::get();
   if (!c.device) return false;
   // Dispatch ladder. STEEL (BN=64 bands) covers NN and single-transposed
@@ -480,9 +553,9 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b,
     gy = (static_cast<unsigned long>(m) + bm - 1) / bm;
   }
   c.bind_(kk_);
-  detail_::set_buf_(c.enc, a, ao, 0ul);
-  detail_::set_buf_(c.enc, b, bo, 1ul);
-  detail_::set_buf_(c.enc, out, oo, 2ul);
+  detail_::set_buf_(c.enc, a, 0ul);
+  detail_::set_buf_(c.enc, b, 1ul);
+  detail_::set_buf_(c.enc, out, 2ul);
   detail_::gemm_params p{static_cast<uint32_t>(m),   static_cast<uint32_t>(n),
                          static_cast<uint32_t>(k),   static_cast<uint32_t>(lda),
                          static_cast<uint32_t>(ldb), ta ? 1u : 0u,
@@ -493,15 +566,6 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b,
              static_cast<unsigned long>(sizeof(p)), 3ul);
   detail_::dispatch_grid_(c.enc, {gx, gy, 1}, {128, 1, 1});
   return true;
-}
-
-// Batched GEMM in one launch: not on this backend yet — array.h's batched dot
-// loops gemm per slice when this declines (CUDA folds the batch into its grid).
-inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
-                         int64_t, int64_t, bool, int64_t, void*, int64_t,
-                         int64_t, int64_t, int64_t, int64_t, float, float,
-                         void* = nullptr, int64_t = 0) {
-  return false;
 }
 
 // Rank cap for pad_/fold_'s GPU dispatch — matches cuda.h's kPadFoldMaxRank
@@ -560,11 +624,11 @@ inline bool dispatch_pad_fold_(kop op, void* a_native, int64_t ao,
 // gpu_pad_/gpu_fold_, so the metal_kernels.metal side derives a_strides from
 // a_shape rather than have them uploaded. Encodes without committing, like
 // every other dispatch above.
-inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
-                const int64_t* a_shape, const int64_t* out_shape, int rank,
-                int axis, int64_t before, int64_t n, int64_t out_n) {
+inline bool own::pad(gpu::span a, gpu::span out, const int64_t* a_shape,
+                     const int64_t* out_shape, int rank, int axis,
+                     int64_t before, int64_t n, int64_t out_n) {
   (void)n;
-  return detail_::dispatch_pad_fold_(kop::pad, a_native, ao, out_native, oo,
+  return detail_::dispatch_pad_fold_(kop::pad, a.buf, a.off, out.buf, out.off,
                                      a_shape, out_shape, rank, rank, axis,
                                      before, out_n);
 }
@@ -574,11 +638,11 @@ inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
 // (fold's own out has one fewer axis than `a`); `a`'s last dim is the
 // sliding window (size a_shape[rank-1]), and `a`'s `axis` dim is the window
 // count.
-inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
-                 const int64_t* a_shape, const int64_t* out_shape, int rank,
-                 int axis, int64_t step, int64_t n, int64_t out_n) {
+inline bool own::fold(gpu::span a, gpu::span out, const int64_t* a_shape,
+                      const int64_t* out_shape, int rank, int axis,
+                      int64_t step, int64_t n, int64_t out_n) {
   (void)n;
-  return detail_::dispatch_pad_fold_(kop::fold, a_native, ao, out_native, oo,
+  return detail_::dispatch_pad_fold_(kop::fold, a.buf, a.off, out.buf, out.off,
                                      a_shape, out_shape, rank, rank - 1, axis,
                                      step, out_n);
 }
@@ -618,16 +682,15 @@ inline bool dispatch_gather3_(kop op, void* buf0, int64_t off0, void* buf1,
 // index_select's dual as a gather (float atomics would need MSL 3): each
 // output row sums the source rows whose index matches it, in source order --
 // no zeroing needed.
-inline bool index_add(void* idx_native, int64_t idxo, void* values_native,
-                      int64_t vo, void* out_native, int64_t oo,
-                      int64_t row_size, int64_t k, int64_t out_n) {
+inline bool own::index_add(gpu::span idx, gpu::span values, gpu::span out,
+                           int64_t row_size, int64_t k, int64_t out_n) {
   auto& c = context::get();
   if (!c.device || row_size <= 0) return false;
   // A threadgroup per output row (see index_add_ in the MSL).
   c.bind_(kop::index_add);
-  detail_::set_buf_(c.enc, idx_native, idxo, 0ul);
-  detail_::set_buf_(c.enc, values_native, vo, 1ul);
-  detail_::set_buf_(c.enc, out_native, oo, 2ul);
+  detail_::set_buf_(c.enc, idx, 0ul);
+  detail_::set_buf_(c.enc, values, 1ul);
+  detail_::set_buf_(c.enc, out, 2ul);
   detail_::set_bytes_(c.enc,
                       detail_::index_add_params{static_cast<uint32_t>(row_size),
                                                 static_cast<uint32_t>(k)},
@@ -640,13 +703,12 @@ inline bool index_add(void* idx_native, int64_t idxo, void* values_native,
 // One-hot scatter into a new trailing axis, as a gather: out[pos,k] =
 // values[pos] where indices[pos] == k, else 0. Every output element reads,
 // never writes twice, so — like index_select above — no zeroing needed.
-inline bool scatter_to_axis(void* idx_native, int64_t idxo,
-                            void* values_native, int64_t vo, void* out_native,
-                            int64_t oo, int64_t n, int64_t size) {
+inline bool own::scatter_to_axis(gpu::span idx, gpu::span values, gpu::span out,
+                                 int64_t n, int64_t size) {
   detail_::scatter_axis_params p{static_cast<uint32_t>(size),
                                  static_cast<uint32_t>(n * size)};
-  return detail_::dispatch_gather3_(kop::scatter_axis, idx_native, idxo,
-                                    values_native, vo, out_native, oo, &p,
+  return detail_::dispatch_gather3_(kop::scatter_axis, idx.buf, idx.off,
+                                    values.buf, values.off, out.buf, out.off, &p,
                                     sizeof(p), p.n);
 }
 
@@ -662,11 +724,11 @@ struct layer_norm_bwd_params {
 
 // Layer norm's pullback: cuda.h's contract and its three launches -- a row
 // kernel (dx and the row stats), a column-strip kernel, a fold.
-inline bool layer_norm_bwd(void* x, int64_t xo, void* g, int64_t go, void* dy,
-                           int64_t dyo, void* dx, void* dg, void* db,
-                           void* stats, void* partials, int64_t rows,
-                           int64_t cols, int64_t per_chunk, int64_t chunks,
-                           float eps) {
+inline bool own::layer_norm_bwd(gpu::span x, gpu::span g, gpu::span dy,
+                                gpu::span dx, gpu::span dg, gpu::span db,
+                                gpu::span stats, gpu::span partials,
+                                int64_t rows, int64_t cols, int64_t per_chunk,
+                                int64_t chunks, float eps) {
   auto& c = context::get();
   if (!c.device || rows <= 0 || cols <= 0 || chunks <= 0) return false;
   detail_::layer_norm_bwd_params p{
@@ -677,26 +739,26 @@ inline bool layer_norm_bwd(void* x, int64_t xo, void* g, int64_t go, void* dy,
   const auto uk = static_cast<unsigned long>(chunks);
 
   c.bind_(kop::layer_norm_bwd_dx_);
-  detail_::set_buf_(c.enc, x, xo, 0ul);
-  detail_::set_buf_(c.enc, g, go, 1ul);
-  detail_::set_buf_(c.enc, dy, dyo, 2ul);
-  detail_::set_buf_(c.enc, dx, 0, 3ul);
-  detail_::set_buf_(c.enc, stats, 0, 4ul);
+  detail_::set_buf_(c.enc, x, 0ul);
+  detail_::set_buf_(c.enc, g, 1ul);
+  detail_::set_buf_(c.enc, dy, 2ul);
+  detail_::set_buf_(c.enc, dx, 3ul);
+  detail_::set_buf_(c.enc, stats, 4ul);
   detail_::set_bytes_(c.enc, p, 5ul);
   detail_::dispatch_grid_(c.enc, {ur, 1, 1}, {256, 1, 1});
 
   c.bind_(kop::layer_norm_bwd_gb_);
-  detail_::set_buf_(c.enc, x, xo, 0ul);
-  detail_::set_buf_(c.enc, dy, dyo, 1ul);
-  detail_::set_buf_(c.enc, stats, 0, 2ul);
-  detail_::set_buf_(c.enc, partials, 0, 3ul);
+  detail_::set_buf_(c.enc, x, 0ul);
+  detail_::set_buf_(c.enc, dy, 1ul);
+  detail_::set_buf_(c.enc, stats, 2ul);
+  detail_::set_buf_(c.enc, partials, 3ul);
   detail_::set_bytes_(c.enc, p, 4ul);
   detail_::dispatch_grid_(c.enc, {(uc + 31) / 32, uk, 1}, {32, 8, 1});
 
   c.bind_(kop::layer_norm_bwd_gb_fold_);
-  detail_::set_buf_(c.enc, partials, 0, 0ul);
-  detail_::set_buf_(c.enc, dg, 0, 1ul);
-  detail_::set_buf_(c.enc, db, 0, 2ul);
+  detail_::set_buf_(c.enc, partials, 0ul);
+  detail_::set_buf_(c.enc, dg, 1ul);
+  detail_::set_buf_(c.enc, db, 2ul);
   detail_::set_bytes_(c.enc, p, 3ul);
   detail_::dispatch_grid_(c.enc, {(uc + 255) / 256, 1, 1}, {256, 1, 1});
   return true;
@@ -752,18 +814,17 @@ inline kop to_nd_(kop op) {
 // a_strides/b_strides are the broadcast strides (0 on a broadcast axis)
 // array.h computes host-side via the same broadcast_strides() the CPU
 // oracle uses -- mirrors cuda.h's own binary_bcast_nd exactly.
-inline bool binary_bcast_nd(kop op, void* a_native, int64_t ao,
-                            const int64_t* a_strides, void* b_native,
-                            int64_t bo, const int64_t* b_strides,
-                            void* out_native, int64_t oo,
-                            const int64_t* out_shape, int rank, int64_t n,
-                            float scale, float offset) {
+inline bool own::binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
+                                 gpu::span b, const int64_t* b_strides,
+                                 gpu::span out, const int64_t* out_shape,
+                                 int rank, int64_t n, float scale,
+                                 float offset) {
   auto& c = context::get();
   if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
   c.bind_(detail_::to_nd_(op));
-  detail_::set_buf_(c.enc, a_native, ao, 0ul);
-  detail_::set_buf_(c.enc, b_native, bo, 1ul);
-  detail_::set_buf_(c.enc, out_native, oo, 2ul);
+  detail_::set_buf_(c.enc, a, 0ul);
+  detail_::set_buf_(c.enc, b, 1ul);
+  detail_::set_buf_(c.enc, out, 2ul);
   detail_::bcast_nd_params p{};
   for (int d = 0; d < rank; d++) {
     p.out_shape[d] = static_cast<uint32_t>(out_shape[d]);
@@ -784,18 +845,17 @@ inline bool binary_bcast_nd(kop op, void* a_native, int64_t ao,
 // N-D broadcast ternary select: Tensor.where's GPU dispatch. Same flat-index
 // decode as binary_bcast_nd above, one more operand -- mirrors cuda.h's own
 // where_nd exactly.
-inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
-                     void* a_native, int64_t ao, const int64_t* a_strides,
-                     void* b_native, int64_t bo, const int64_t* b_strides,
-                     void* out_native, int64_t oo, const int64_t* out_shape,
-                     int rank, int64_t n) {
+inline bool own::where_nd(gpu::span cond, const int64_t* c_strides, gpu::span a,
+                          const int64_t* a_strides, gpu::span b,
+                          const int64_t* b_strides, gpu::span out,
+                          const int64_t* out_shape, int rank, int64_t n) {
   auto& c = context::get();
   if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
   c.bind_(kop::where_nd);
-  detail_::set_buf_(c.enc, cond_native, co, 0ul);
-  detail_::set_buf_(c.enc, a_native, ao, 1ul);
-  detail_::set_buf_(c.enc, b_native, bo, 2ul);
-  detail_::set_buf_(c.enc, out_native, oo, 3ul);
+  detail_::set_buf_(c.enc, cond, 0ul);
+  detail_::set_buf_(c.enc, a, 1ul);
+  detail_::set_buf_(c.enc, b, 2ul);
+  detail_::set_buf_(c.enc, out, 3ul);
   detail_::where_nd_params p{};
   for (int d = 0; d < rank; d++) {
     p.out_shape[d] = static_cast<uint32_t>(out_shape[d]);
@@ -815,14 +875,13 @@ inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
 // clone()'s device arm for a strided view: a gather into a contiguous output,
 // where_nd's decode with one operand -- mirrors cuda.h's own copy_nd. The
 // .metal banner says why a clone must not go through the host here.
-inline bool copy_nd(void* a_native, int64_t ao, const int64_t* a_strides,
-                    void* out_native, int64_t oo, const int64_t* out_shape,
-                    int rank, int64_t n) {
+inline bool own::copy_nd(gpu::span a, const int64_t* a_strides, gpu::span out,
+                         const int64_t* out_shape, int rank, int64_t n) {
   auto& c = context::get();
   if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
   c.bind_(kop::copy_nd);
-  detail_::set_buf_(c.enc, a_native, ao, 0ul);
-  detail_::set_buf_(c.enc, out_native, oo, 1ul);
+  detail_::set_buf_(c.enc, a, 0ul);
+  detail_::set_buf_(c.enc, out, 1ul);
   detail_::copy_nd_params p{};
   for (int d = 0; d < rank; d++) {
     p.out_shape[d] = static_cast<uint32_t>(out_shape[d]);
@@ -850,17 +909,17 @@ struct sum_to_params {
 // sum_to (un-broadcast a gradient): gather, mirrors cuda.h's tl_sum_to --
 // one thread per OUTPUT element sums every `a` element that broadcasts
 // onto it, so no atomics (unlike index_add).
-inline bool sum_to(void* a, int64_t ao, const int64_t* a_shape,
-                   const int64_t* a_strides, const int64_t* acc, int rank,
-                   int64_t out_n, int64_t reduced_n, void* out, int64_t oo) {
+inline bool own::sum_to(gpu::span a, const int64_t* a_shape,
+                        const int64_t* a_strides, const int64_t* acc, int rank,
+                        int64_t out_n, int64_t reduced_n, gpu::span out) {
   auto& c = context::get();
   if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
   // A deep reduction (a bias gradient sums its column over every row) earns a
   // threadgroup per output, as on CUDA; a shallow one keeps a thread per output.
   const bool blocked = reduced_n >= 64;
   c.bind_(blocked ? kop::sum_to_blocked_ : kop::sum_to_);
-  detail_::set_buf_(c.enc, a, ao, 0ul);
-  detail_::set_buf_(c.enc, out, oo, 1ul);
+  detail_::set_buf_(c.enc, a, 0ul);
+  detail_::set_buf_(c.enc, out, 1ul);
   detail_::sum_to_params p{};
   for (int d = 0; d < rank; d++) {
     p.a_shape[d] = static_cast<uint32_t>(a_shape[d]);
@@ -897,9 +956,9 @@ struct concat_part_params {
 // over OUTPUT elements (needed for pad's zero border) rather than the much
 // smaller SOURCE (this part's own) element count concat wants, so this
 // gets its own small kernel instead of reusing pad_'s PSO.
-inline bool concat_part(void* a, int64_t ao, void* out, int64_t oo,
-                        const int64_t* a_shape, const int64_t* out_shape,
-                        int rank, int axis, int64_t before, int64_t n) {
+inline bool own::concat_part(gpu::span a, gpu::span out, const int64_t* a_shape,
+                             const int64_t* out_shape, int rank, int axis,
+                             int64_t before, int64_t n) {
   auto& c = context::get();
   if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
   int64_t out_strides[kPadFoldMaxRank];
@@ -909,8 +968,8 @@ inline bool concat_part(void* a, int64_t ao, void* out, int64_t oo,
     acc *= out_shape[d];
   }
   c.bind_(kop::concat_part_);
-  detail_::set_buf_(c.enc, a, ao, 0ul);
-  detail_::set_buf_(c.enc, out, oo, 1ul);
+  detail_::set_buf_(c.enc, a, 0ul);
+  detail_::set_buf_(c.enc, out, 1ul);
   detail_::concat_part_params p{};
   for (int d = 0; d < rank; d++) {
     p.out_strides[d] = static_cast<uint32_t>(out_strides[d]);
@@ -945,16 +1004,16 @@ struct rope_params {
 // in; array.h's gpu_rope_ never passes one). Dispatched flat over rows*(D/2)
 // (CUDA instead grids by row, blocks by D/2 -- this file's own kernels are
 // all flat-1D, same as sum_to/compare/unary_ext above).
-inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
-                 int64_t pos, float base, void* bias = nullptr) {
+inline bool own::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
+                      int64_t D, int64_t pos, float base, gpu::span bias) {
   auto& c = context::get();
   if (!c.device || D <= 0 || (D & 1)) return false;
   int64_t half = D / 2;
   int64_t n = rows * half;
   c.bind_(kop::rope_);
-  detail_::set_buf_(c.enc, x, 0, 0ul);
-  detail_::set_buf_(c.enc, out, 0, 1ul);
-  detail_::set_buf_(c.enc, bias ? bias : x, 0, 3ul);  // a slot must be bound
+  detail_::set_buf_(c.enc, x, 0ul);
+  detail_::set_buf_(c.enc, out, 1ul);
+  detail_::set_buf_(c.enc, bias ? bias : x, 3ul);  // a slot must be bound
   detail_::rope_params p{};
   p.T = static_cast<uint32_t>(T);
   p.D = static_cast<uint32_t>(D);
@@ -962,7 +1021,7 @@ inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
   p.half_ = static_cast<uint32_t>(half);
   p.base = base;
   p.n = static_cast<uint32_t>(n);
-  p.has_bias = bias ? 1u : 0u;
+  p.has_bias = bias.buf ? 1u : 0u;
   objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
              static_cast<unsigned long>(sizeof(p)), 2ul);
   unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
@@ -988,16 +1047,8 @@ struct gemv_combine_params {
   uint32_t n, parts;
 };
 
-struct gemv_row_params {
-  uint32_t n, k;
-};
-
 struct gemm_nt_params {
   uint32_t M, N, K;
-};
-
-struct gemv_q4_params {
-  uint32_t n, k, group;
 };
 
 struct attn_decode_params {
@@ -1007,27 +1058,6 @@ struct attn_decode_params {
 
 struct attn_combine_params {
   uint32_t splits;
-};
-
-struct kv_params {
-  uint32_t pos, kv_stride, T;
-};
-
-struct argmax_params {
-  uint32_t n;
-};
-
-struct rmsnorm_params {
-  uint32_t n, add;
-  float eps;
-};
-
-struct swiglu_params {
-  uint32_t ff;
-};
-
-struct heads_params {
-  uint32_t T, ld, off, has_bias;
 };
 
 // Keys per split, or 0 for the single-pass kernel: one threadgroup a head
@@ -1057,20 +1087,21 @@ inline void attn_dispatch_(objc::id enc, const attn_params& p,
 // q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D] cache read over
 // [0,pos0+T), query p at absolute position pos0+p. GQA via the head ratio.
 // D∈{64,128}; the cache is f32, or bf16 with kv_bf16.
-inline bool attn_prefill(void* q, void* K, void* V, void* out,
-                         int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
-                         int64_t kv_max, int64_t D, float scale,
-                         bool kv_bf16 = false, int64_t pos0 = 0) {
+inline bool own::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
+                              gpu::span out, int64_t n_q_heads,
+                              int64_t n_kv_heads, int64_t T, int64_t kv_max,
+                              int64_t D, float scale, bool kv_bf16,
+                              int64_t pos0) {
   auto& c = context::get();
   if (!c.device || (D != 64 && D != 128)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || T <= 0) return false;
   c.bind_(kv_bf16 ? (D == 64 ? kop::attn_prefill_bf16_64_
                              : kop::attn_prefill_bf16_128_)
                   : (D == 64 ? kop::attn_prefill_64_ : kop::attn_prefill_128_));
-  detail_::set_buf_(c.enc, q, 0, 0ul);
-  detail_::set_buf_(c.enc, K, 0, 1ul);
-  detail_::set_buf_(c.enc, V, 0, 2ul);
-  detail_::set_buf_(c.enc, out, 0, 3ul);
+  detail_::set_buf_(c.enc, q, 0ul);
+  detail_::set_buf_(c.enc, K, 1ul);
+  detail_::set_buf_(c.enc, V, 2ul);
+  detail_::set_buf_(c.enc, out, 3ul);
   detail_::attn_params p{static_cast<uint32_t>(T),
                          static_cast<uint32_t>(kv_max * D),
                          static_cast<uint32_t>(n_q_heads / n_kv_heads),
@@ -1082,7 +1113,8 @@ inline bool attn_prefill(void* q, void* K, void* V, void* out,
 // y[1,N] = a[1,K] · B[K,N] with f32 or bf16 weights, all contiguous: the
 // decode projection. A narrow layer's N/256 threadgroups leave the GPU idle,
 // so K is split across the grid's y and a combine pass sums the slices.
-inline bool gemv_(kop op, void* a, void* B, void* y, int64_t n, int64_t k) {
+inline bool gemv_(kop op, gpu::span a, gpu::span B, gpu::span y, int64_t n,
+                  int64_t k) {
   auto& c = context::get();
   if (!c.device || n <= 0 || k <= 0) return false;
   constexpr unsigned long NT = 256, kGroupsWanted = 64;
@@ -1091,23 +1123,23 @@ inline bool gemv_(kop op, void* a, void* B, void* y, int64_t n, int64_t k) {
   unsigned long chunk = (static_cast<unsigned long>(k) + parts - 1) / parts;
   chunk = (chunk + NT - 1) / NT * NT;  // whole `a` tiles
   parts = (static_cast<unsigned long>(k) + chunk - 1) / chunk;
-  void* out = y;
+  gpu::span out = y;
   if (parts > 1) {
-    out = detail_::scratch_(static_cast<int64_t>(parts) * n * 4);
+    out = {detail_::scratch_(static_cast<int64_t>(parts) * n * 4), 0};
     if (!out) parts = 1, chunk = static_cast<unsigned long>(k), out = y;
   }
   c.bind_(op);
-  detail_::set_buf_(c.enc, a, 0, 0ul);
-  detail_::set_buf_(c.enc, B, 0, 1ul);
-  detail_::set_buf_(c.enc, out, 0, 2ul);
+  detail_::set_buf_(c.enc, a, 0ul);
+  detail_::set_buf_(c.enc, B, 1ul);
+  detail_::set_buf_(c.enc, out, 2ul);
   detail_::gemv_params p{static_cast<uint32_t>(n), static_cast<uint32_t>(k),
                          static_cast<uint32_t>(chunk)};
   detail_::set_bytes_(c.enc, p, 3ul);
   detail_::dispatch_grid_(c.enc, {cols, parts, 1}, {NT, 1, 1});
   if (parts == 1) return true;
   c.bind_(kop::gemv_combine_);
-  detail_::set_buf_(c.enc, out, 0, 0ul);
-  detail_::set_buf_(c.enc, y, 0, 1ul);
+  detail_::set_buf_(c.enc, out, 0ul);
+  detail_::set_buf_(c.enc, y, 1ul);
   detail_::gemv_combine_params cp{static_cast<uint32_t>(n),
                                   static_cast<uint32_t>(parts)};
   detail_::set_bytes_(c.enc, cp, 2ul);
@@ -1115,53 +1147,28 @@ inline bool gemv_(kop op, void* a, void* B, void* y, int64_t n, int64_t k) {
   return true;
 }
 
-inline bool gemv_f32(void* a, void* B, void* y, int64_t n, int64_t k) {
+inline bool own::gemv_f32(gpu::span a, gpu::span B, gpu::span y, int64_t n,
+                          int64_t k) {
   return gemv_(kop::gemv_f32_, a, B, y, n, k);
 }
 
-inline bool gemv_bf16(void* a, void* B, void* y, int64_t n, int64_t k) {
+inline bool own::gemv_bf16(gpu::span a, gpu::span B, gpu::span y, int64_t n,
+                           int64_t k) {
   return gemv_(kop::gemv_bf16_, a, B, y, n, k);
-}
-
-// y[1,N] = a[1,K] · W[N,K]ᵀ with the weight row-major (GGML-native). One
-// threadgroup per output row, so a narrow layer parallelizes over N without
-// the [K,N] path's split-K; the threadgroup size follows cuda's own policy,
-// the smallest that still gives every thread ~one 8-wide step. Requires
-// k % 8 == 0 (host-gated; the caller keeps to the [K,N] GEMV otherwise).
-inline bool gemv_bf16_row(void* a, void* B, void* y, int64_t n, int64_t k) {
-  auto& c = context::get();
-  if (!c.device || n <= 0 || k <= 0 || (k % 8) != 0) return false;
-  unsigned long nt = 32;
-  for (unsigned long bs = 64; bs <= 256; bs += 32) {
-    if ((k + 8 * (int64_t)nt - 1) / (8 * (int64_t)nt) >
-        (k + 8 * (int64_t)bs - 1) / (8 * (int64_t)bs)) {
-      nt = bs;
-    }
-  }
-  c.bind_(kop::gemv_bf16_row_);
-  detail_::set_buf_(c.enc, a, 0, 0ul);
-  detail_::set_buf_(c.enc, B, 0, 1ul);
-  detail_::set_buf_(c.enc, y, 0, 2ul);
-  detail_::gemv_row_params p{static_cast<uint32_t>(n),
-                             static_cast<uint32_t>(k)};
-  detail_::set_bytes_(c.enc, p, 3ul);
-  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(n), 1, 1},
-                          {nt, 1, 1});
-  return true;
 }
 
 // C[M,N] = A[M,K] · B[N,K]ᵀ, B bf16: the batched prefill's projection, where
 // one weight serves a whole chunk of prompt tokens. The 32-row tile for a
 // short chunk (more M blocks to fill the GPU), the 64-row one otherwise.
-inline bool gemm_bf16_nt(void* A, void* B, void* C, int64_t M, int64_t N,
-                         int64_t K) {
+inline bool own::gemm_bf16_nt(gpu::span A, gpu::span B, gpu::span C, int64_t M,
+                              int64_t N, int64_t K) {
   auto& c = context::get();
   if (!c.device || M <= 0 || N <= 0 || K <= 0) return false;
   const unsigned long BM = M <= 64 ? 32 : 64;
   c.bind_(M <= 64 ? kop::gemm_bf16_nt32_ : kop::gemm_bf16_nt_);
-  detail_::set_buf_(c.enc, A, 0, 0ul);
-  detail_::set_buf_(c.enc, B, 0, 1ul);
-  detail_::set_buf_(c.enc, C, 0, 2ul);
+  detail_::set_buf_(c.enc, A, 0ul);
+  detail_::set_buf_(c.enc, B, 1ul);
+  detail_::set_buf_(c.enc, C, 2ul);
   detail_::gemm_nt_params p{static_cast<uint32_t>(M), static_cast<uint32_t>(N),
                             static_cast<uint32_t>(K)};
   detail_::set_bytes_(c.enc, p, 3ul);
@@ -1171,34 +1178,12 @@ inline bool gemm_bf16_nt(void* A, void* B, void* C, int64_t M, int64_t N,
   return true;
 }
 
-// int4 weights: one threadgroup per output row. `scales` is the caller's
-// pointer arithmetic on the q4 buffer (a device address on CUDA); here the two
-// name one MTLBuffer, so the difference is the scales block's byte offset.
-inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
-                    int64_t K, int64_t group) {
-  auto& c = context::get();
-  if (!c.device || N <= 0 || K <= 0 || group <= 0) return false;
-  if (K % group != 0 || group % 8 != 0) return false;
-  const unsigned long soff = static_cast<unsigned long>(
-      static_cast<char*>(scales) - static_cast<char*>(qw));
-  c.bind_(kop::gemv_q4_);
-  detail_::set_buf_(c.enc, a, 0, 0ul);
-  detail_::set_buf_(c.enc, qw, 0, 1ul);
-  detail_::set_buf_(c.enc, qw, soff, 2ul);
-  detail_::set_buf_(c.enc, y, 0, 3ul);
-  detail_::gemv_q4_params p{static_cast<uint32_t>(N), static_cast<uint32_t>(K),
-                            static_cast<uint32_t>(group)};
-  detail_::set_bytes_(c.enc, p, 4ul);
-  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(N), 1, 1},
-                          {256, 1, 1});
-  return true;
-}
-
 // One decode step: q [n_q_heads,D] against a [n_kv_heads,kv_max,D] cache read
 // over [0,ctx). GQA via the head ratio; the cache is f32, or bf16 with kv_bf16.
-inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
-                        int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
-                        int64_t D, float scale, bool kv_bf16 = false) {
+inline bool own::attn_decode(gpu::span q, gpu::span K, gpu::span V,
+                             gpu::span out, int64_t n_q_heads,
+                             int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
+                             int64_t D, float scale, bool kv_bf16) {
   auto& c = context::get();
   if (!c.device || (D != 64 && D != 128)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || ctx <= 0) return false;
@@ -1206,11 +1191,11 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
   unsigned long chunk = detail_::attn_split_chunk_(n_q_heads, ctx);
   const unsigned long splits =
       chunk ? (static_cast<unsigned long>(ctx) + chunk - 1) / chunk : 1;
-  void* dst = out;
+  gpu::span dst = out;
   if (splits > 1) {
     // pm[H*S] | pl[H*S] | pacc[H*S*D], the layout attn_combine_ reads.
     const int64_t hs = n_q_heads * static_cast<int64_t>(splits);
-    dst = detail_::scratch_((hs * 2 + hs * D) * 4);
+    dst = {detail_::scratch_((hs * 2 + hs * D) * 4), 0};
     if (!dst) chunk = 0, dst = out;
   }
   const bool split = chunk != 0;
@@ -1224,10 +1209,10 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
                            : kop::attn_decode_bf16_128_)
                     : (d64 ? kop::attn_decode_64_ : kop::attn_decode_128_));
   }
-  detail_::set_buf_(c.enc, q, 0, 0ul);
-  detail_::set_buf_(c.enc, K, 0, 1ul);
-  detail_::set_buf_(c.enc, V, 0, 2ul);
-  detail_::set_buf_(c.enc, dst, 0, 3ul);
+  detail_::set_buf_(c.enc, q, 0ul);
+  detail_::set_buf_(c.enc, K, 1ul);
+  detail_::set_buf_(c.enc, V, 2ul);
+  detail_::set_buf_(c.enc, dst, 3ul);
   detail_::attn_decode_params p{static_cast<uint32_t>(ctx),
                                 static_cast<uint32_t>(kv_max * D),
                                 static_cast<uint32_t>(n_q_heads / n_kv_heads),
@@ -1239,8 +1224,8 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
                           {static_cast<unsigned long>(D), 1, 1});
   if (!split) return true;
   c.bind_(d64 ? kop::attn_combine_64_ : kop::attn_combine_128_);
-  detail_::set_buf_(c.enc, dst, 0, 0ul);
-  detail_::set_buf_(c.enc, out, 0, 1ul);
+  detail_::set_buf_(c.enc, dst, 0ul);
+  detail_::set_buf_(c.enc, out, 1ul);
   detail_::attn_combine_params cp{static_cast<uint32_t>(splits)};
   detail_::set_bytes_(c.enc, cp, 2ul);
   detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(n_q_heads), 1, 1},
@@ -1251,171 +1236,32 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
 // ---- the KV cache's writes and the decode step's remaining kernels --------
 // cuda.h's contracts: raw device buffers, so a model's step builds no graph.
 
-// One step's k/v (each [n_kv_heads, D]) into row `pos` of the [n_kv_heads,
-// kv_max, D] cache; narrowed to bf16 when the cache is.
-inline bool kv_append(void* Kc, void* Vc, void* k_new, void* v_new, int64_t pos,
-                      int64_t kv_max, int64_t n_kv_heads, int64_t D,
-                      bool kv_bf16 = false) {
-  auto& c = context::get();
-  if (!c.device || (D != 64 && D != 128) || n_kv_heads <= 0) return false;
-  c.bind_(kv_bf16 ? kop::kv_append_bf16_ : kop::kv_append_);
-  void* bufs[] = {Kc, Vc, k_new, v_new};
-  for (unsigned long i = 0; i < 4; i++) detail_::set_buf_(c.enc, bufs[i], 0, i);
-  detail_::kv_params p{static_cast<uint32_t>(pos),
-                       static_cast<uint32_t>(kv_max * D), 1};
-  detail_::set_bytes_(c.enc, p, 4ul);
-  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(n_kv_heads), 1, 1},
-                          {static_cast<unsigned long>(D), 1, 1});
-  return true;
-}
-
-// A prefill's k/v (each [n_kv_heads, T, D]) into cache rows [pos0, pos0 + T).
-inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
-                    int64_t kv_max, int64_t n_kv_heads, int64_t D,
-                    bool kv_bf16 = false, int64_t pos0 = 0) {
-  auto& c = context::get();
-  if (!c.device || (D != 64 && D != 128) || n_kv_heads <= 0 || T <= 0) {
-    return false;
-  }
-  c.bind_(kv_bf16 ? kop::kv_fill_bf16_ : kop::kv_fill_);
-  void* bufs[] = {Kc, Vc, K, V};
-  for (unsigned long i = 0; i < 4; i++) detail_::set_buf_(c.enc, bufs[i], 0, i);
-  detail_::kv_params p{static_cast<uint32_t>(pos0),
-                       static_cast<uint32_t>(kv_max * D),
-                       static_cast<uint32_t>(T)};
-  detail_::set_bytes_(c.enc, p, 4ul);
-  detail_::dispatch_grid_(c.enc,
-                          {static_cast<unsigned long>(n_kv_heads),
-                           static_cast<unsigned long>(T), 1},
-                          {static_cast<unsigned long>(D), 1, 1});
-  return true;
-}
-
-// The argmax of a length-n vector, the smallest index on ties: greedy
-// decoding reads one int back rather than the logits. Drains the queue.
-inline bool argmax(void* in, int64_t n, int64_t* out_idx) {
-  auto& c = context::get();
-  if (!c.device || !in || n <= 0 || !out_idx) return false;
-  if (!c.argmax_res) {
-    c.argmax_res = alloc(4, &c.argmax_res_contents);
-    if (!c.argmax_res) return false;
-  }
-  c.bind_(kop::argmax_);
-  detail_::set_buf_(c.enc, in, 0, 0ul);
-  detail_::set_buf_(c.enc, c.argmax_res, 0, 1ul);
-  detail_::argmax_params p{static_cast<uint32_t>(n)};
-  detail_::set_bytes_(c.enc, p, 2ul);
-  detail_::dispatch_grid_(c.enc, {1, 1, 1}, {256, 1, 1});
-  flush();
-  *out_idx = *reinterpret_cast<const int*>(c.argmax_res_contents);
-  return true;
-}
-
-// hout = x · rsqrt(mean(x²) + eps) · w, per row of the [rows, n] buffer.
-inline bool rmsnorm(void* x, void* w, void* out, int64_t n, float eps,
-                    int64_t rows = 1) {
-  auto& c = context::get();
-  if (!c.device || n <= 0 || rows <= 0) return false;
-  c.bind_(kop::rmsnorm_);
-  void* bufs[] = {x, x, w, out, out};  // no delta: slots 1 and 3 idle
-  for (unsigned long i = 0; i < 5; i++) detail_::set_buf_(c.enc, bufs[i], 0, i);
-  detail_::rmsnorm_params p{static_cast<uint32_t>(n), 0, eps};
-  detail_::set_bytes_(c.enc, p, 5ul);
-  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(rows), 1, 1},
-                          {256, 1, 1});
-  return true;
-}
-
-// xout = x + delta and hout = rmsnorm(xout) · w: a residual add folded into
-// the norm that follows it. xout may alias x.
-inline bool rmsnorm_res(void* x, void* delta, void* w, void* xout, void* hout,
-                        int64_t n, float eps, int64_t rows = 1) {
-  auto& c = context::get();
-  if (!c.device || n <= 0 || rows <= 0) return false;
-  c.bind_(kop::rmsnorm_);
-  void* bufs[] = {x, delta, w, xout, hout};
-  for (unsigned long i = 0; i < 5; i++) detail_::set_buf_(c.enc, bufs[i], 0, i);
-  detail_::rmsnorm_params p{static_cast<uint32_t>(n), 1, eps};
-  detail_::set_bytes_(c.enc, p, 5ul);
-  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(rows), 1, 1},
-                          {256, 1, 1});
-  return true;
-}
-
-// out[rows, ff] = silu(gate) · up out of the fused gate|up buffer [rows, 2ff].
-inline bool swiglu(void* gu, void* out, int64_t ff, int64_t rows = 1) {
-  auto& c = context::get();
-  if (!c.device || ff <= 0 || rows <= 0) return false;
-  c.bind_(kop::swiglu_);
-  detail_::set_buf_(c.enc, gu, 0, 0ul);
-  detail_::set_buf_(c.enc, out, 0, 1ul);
-  detail_::swiglu_params p{static_cast<uint32_t>(ff)};
-  detail_::set_bytes_(c.enc, p, 2ul);
-  detail_::dispatch_grid_(c.enc,
-                          {(static_cast<unsigned long>(ff) + 255) / 256,
-                           static_cast<unsigned long>(rows), 1},
-                          {256, 1, 1});
-  return true;
-}
-
-// Token-major [T, ld] -> head-major [H, T, D] from column block `off`, adding
-// the optional per-head bias [H, D].
-inline bool split_heads(void* src, void* bias, void* dst, int64_t T, int64_t ld,
-                        int64_t off, int64_t H, int64_t D) {
-  auto& c = context::get();
-  if (!c.device || T <= 0 || H <= 0 || D <= 0) return false;
-  c.bind_(kop::split_heads_);
-  detail_::set_buf_(c.enc, src, 0, 0ul);
-  detail_::set_buf_(c.enc, bias ? bias : src, 0, 1ul);
-  detail_::set_buf_(c.enc, dst, 0, 2ul);
-  detail_::heads_params p{static_cast<uint32_t>(T), static_cast<uint32_t>(ld),
-                          static_cast<uint32_t>(off), bias ? 1u : 0u};
-  detail_::set_bytes_(c.enc, p, 3ul);
-  detail_::dispatch_grid_(
-      c.enc, {static_cast<unsigned long>(H), static_cast<unsigned long>(T), 1},
-      {static_cast<unsigned long>(D), 1, 1});
-  return true;
-}
-
-// Head-major [H, T, D] -> token-major [T, H·D], split_heads' inverse.
-inline bool merge_heads(void* src, void* dst, int64_t T, int64_t H, int64_t D) {
-  auto& c = context::get();
-  if (!c.device || T <= 0 || H <= 0 || D <= 0) return false;
-  c.bind_(kop::merge_heads_);
-  detail_::set_buf_(c.enc, src, 0, 0ul);
-  detail_::set_buf_(c.enc, dst, 0, 1ul);
-  detail_::heads_params p{static_cast<uint32_t>(T), 0, 0, 0};
-  detail_::set_bytes_(c.enc, p, 2ul);
-  detail_::dispatch_grid_(
-      c.enc, {static_cast<unsigned long>(H), static_cast<unsigned long>(T), 1},
-      {static_cast<unsigned long>(D), 1, 1});
-  return true;
-}
-
 // The query half of the pullback: q, K, V, dO, O and dq all [H,T,D]
 // contiguous, `stats` [2,H,T] the row logsumexp and dO·O.
-inline bool attn_prefill_dq(void* q, void* K, void* V, void* dO, void* O,
-                            void* dq, void* stats, int64_t H, int64_t T,
-                            int64_t D, float scale) {
+inline bool own::attn_prefill_dq(gpu::span q, gpu::span K, gpu::span V,
+                                 gpu::span dO, gpu::span O, gpu::span dq,
+                                 gpu::span stats, int64_t H, int64_t T,
+                                 int64_t D, float scale) {
   auto& c = context::get();
   if (!c.device || (D != 64 && D != 128) || H <= 0 || T <= 0) return false;
   c.bind_(D == 64 ? kop::attn_bwd_dq_64_ : kop::attn_bwd_dq_128_);
-  void* bufs[] = {q, K, V, dO, O, dq, stats};
-  for (unsigned long i = 0; i < 7; i++) detail_::set_buf_(c.enc, bufs[i], 0, i);
+  const gpu::span views[] = {q, K, V, dO, O, dq, stats};
+  for (unsigned long i = 0; i < 7; i++) detail_::set_buf_(c.enc, views[i], i);
   detail_::attn_params p{static_cast<uint32_t>(T), 0, 0, 0, scale};
   detail_::attn_dispatch_(c.enc, p, 7ul, H, T);
   return true;
 }
 
 // The key/value half, reading the stats the call above wrote.
-inline bool attn_prefill_dkv(void* q, void* K, void* V, void* dO, void* stats,
-                             void* dK, void* dV, int64_t H, int64_t T,
-                             int64_t D, float scale) {
+inline bool own::attn_prefill_dkv(gpu::span q, gpu::span K, gpu::span V,
+                                  gpu::span dO, gpu::span stats, gpu::span dK,
+                                  gpu::span dV, int64_t H, int64_t T, int64_t D,
+                                  float scale) {
   auto& c = context::get();
   if (!c.device || (D != 64 && D != 128) || H <= 0 || T <= 0) return false;
   c.bind_(D == 64 ? kop::attn_bwd_dkv_64_ : kop::attn_bwd_dkv_128_);
-  void* bufs[] = {q, K, V, dO, stats, dK, dV};
-  for (unsigned long i = 0; i < 7; i++) detail_::set_buf_(c.enc, bufs[i], 0, i);
+  const gpu::span views[] = {q, K, V, dO, stats, dK, dV};
+  for (unsigned long i = 0; i < 7; i++) detail_::set_buf_(c.enc, views[i], i);
   detail_::attn_params p{static_cast<uint32_t>(T), 0, 0, 0, scale};
   detail_::attn_dispatch_(c.enc, p, 7ul, H, T);
   return true;
@@ -1424,6 +1270,7 @@ inline bool attn_prefill_dkv(void* q, void* K, void* V, void* dO, void* stats,
 #else  // !__APPLE__ — stubs so callers carry no platform conditionals
 
 inline bool available() { return false; }
+struct own {};
 inline bool pending() { return false; }
 inline void flush() {}
 inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
@@ -1433,116 +1280,47 @@ inline bool dispatch(kop, const gpu::arg*, size_t, const void*, size_t,
                      const gpu::grid&) {
   return false;
 }
-inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
-                 void*, int64_t, int64_t, int64_t, int64_t, float, float) {
-  return false;
-}
-inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
-                         int64_t, int64_t, bool, int64_t, void*, int64_t,
-                         int64_t, int64_t, int64_t, int64_t, float, float,
-                         void* = nullptr, int64_t = 0) {
-  return false;
-}
-inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
-                const int64_t*, int, int, int64_t, int64_t, int64_t) {
-  return false;
-}
-inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,
-                 const int64_t*, int, int, int64_t, int64_t, int64_t) {
-  return false;
-}
-inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
-                      int64_t, int64_t) {
-  return false;
-}
-inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
-                            int64_t, int64_t) {
-  return false;
-}
-inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
-                           void*, void*, void*, void*, void*, int64_t, int64_t,
-                           int64_t, int64_t, float) {
-  return false;
-}
-inline bool attn_prefill(void*, void*, void*, void*, int64_t, int64_t, int64_t,
-                         int64_t, int64_t, float, bool = false, int64_t = 0) {
-  return false;
-}
-inline bool attn_prefill_dq(void*, void*, void*, void*, void*, void*, void*,
-                            int64_t, int64_t, int64_t, float) {
-  return false;
-}
-inline bool attn_prefill_dkv(void*, void*, void*, void*, void*, void*, void*,
-                             int64_t, int64_t, int64_t, float) {
-  return false;
-}
-inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,
-                            int64_t, const int64_t*, void*, int64_t,
-                            const int64_t*, int, int64_t, float, float) {
-  return false;
-}
-inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
-                     const int64_t*, void*, int64_t, const int64_t*, void*,
-                     int64_t, const int64_t*, int, int64_t) {
-  return false;
-}
-inline bool copy_nd(void*, int64_t, const int64_t*, void*, int64_t,
-                    const int64_t*, int, int64_t) {
-  return false;
-}
-inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
-                   const int64_t*, int, int64_t, int64_t, void*, int64_t) {
-  return false;
-}
-inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,
-                        const int64_t*, int, int, int64_t, int64_t) {
-  return false;
-}
-inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float,
-                 void* = nullptr) {
-  return false;
-}
-inline bool kv_append(void*, void*, void*, void*, int64_t, int64_t, int64_t,
-                      int64_t, bool = false) {
-  return false;
-}
-inline bool kv_fill(void*, void*, void*, void*, int64_t, int64_t, int64_t,
-                    int64_t, bool = false, int64_t = 0) {
-  return false;
-}
-inline bool argmax(void*, int64_t, int64_t*) { return false; }
-inline bool rmsnorm(void*, void*, void*, int64_t, float, int64_t = 1) {
-  return false;
-}
-inline bool rmsnorm_res(void*, void*, void*, void*, void*, int64_t, float,
-                        int64_t = 1) {
-  return false;
-}
-inline bool swiglu(void*, void*, int64_t, int64_t = 1) { return false; }
-inline bool split_heads(void*, void*, void*, int64_t, int64_t, int64_t, int64_t,
-                        int64_t) {
-  return false;
-}
-inline bool merge_heads(void*, void*, int64_t, int64_t, int64_t) { return false; }
-inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
-inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
-inline bool gemv_bf16_row(void*, void*, void*, int64_t, int64_t) { return false; }
-inline bool gemm_bf16_nt(void*, void*, void*, int64_t, int64_t, int64_t) {
-  return false;
-}
-inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
-  return false;
-}
-inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
-                        int64_t, int64_t, float, bool = false) {
-  return false;
-}
 
 #endif
 
 // What a model may ask of this backend beyond the kernel contract (gpu.h
 // lists every backend's). No graph capture: a Metal command buffer is cheap to
 // encode, so a decode step re-encodes each token.
+#ifdef __APPLE__
+// "No bias" is a flag here: a kernel cannot test a buffer for null, so an
+// absent bias binds src in its place and is never read.
+inline bool own::split_heads(gpu::span src, gpu::span bias, gpu::span dst,
+                        int64_t T, int64_t ld, int64_t off, int64_t H,
+                        int64_t D) {
+  struct {
+    uint32_t T, ld, off, has_bias;
+  } p{static_cast<uint32_t>(T), static_cast<uint32_t>(ld),
+      static_cast<uint32_t>(off), bias ? 1u : 0u};
+  const gpu::arg args[] = {gpu::in(src), gpu::in(bias ? bias : src),
+                           gpu::out(dst)};
+  return dispatch(kop::split_heads_, args, 3, &p, sizeof(p),
+                  gpu::policy::per_head(H, T, D));
+}
+
+// One int comes back through a 4-byte buffer the context keeps.
+inline bool own::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
+  auto& c = context::get();
+  if (!c.device) return false;
+  if (!c.argmax_res) {
+    c.argmax_res = alloc(4, &c.argmax_res_contents);
+    if (!c.argmax_res) return false;
+  }
+  const uint32_t p = static_cast<uint32_t>(n);
+  const gpu::arg args[] = {gpu::in(a), gpu::out({c.argmax_res, 0})};
+  if (!dispatch(kop::argmax_, args, 2, &p, sizeof(p), {1, 1, 1, 256, 1, 1, 0})) {
+    return false;
+  }
+  flush();
+  *out_idx = *reinterpret_cast<const int*>(c.argmax_res_contents);
+  return true;
+}
+#endif
+
 // What the shared launch policy (gpu_ops.h) may assume of this backend's
 // kernels.
 struct traits {
@@ -1559,11 +1337,6 @@ struct caps {
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = true;   // gemv_bf16_row: weights as [N,K]
   static constexpr bool bf16_gemm = true;  // gemm_bf16_nt: a bf16-weight GEMM
-  // `native` is an MTLBuffer handle, not an address: arithmetic on it names
-  // nothing, so a model writes each piece to its own buffer rather than
-  // slicing one kernel's output. (The generic kernels still take byte
-  // offsets — it is only a *pointer* that cannot carry one.)
-  static constexpr bool flat_addressing = false;
 };
 
 // The capture group, cuda.h's contracts: absent here, so each answers false
@@ -1576,29 +1349,7 @@ inline graph_exec capture_end() { return nullptr; }
 inline bool graph_launch(graph_exec) { return false; }
 inline void graph_destroy(graph_exec) {}
 inline void upload_u32(void*, unsigned) {}
-inline bool incr_u32(void*) { return false; }
-inline bool rope_dpos(void*, void*, int64_t, int64_t, int64_t, void*, float,
-                      void* = nullptr) {
-  return false;
-}
-inline bool kv_append_dpos(void*, void*, void*, void*, void*, int64_t, int64_t,
-                           int64_t) {
-  return false;
-}
-inline bool attn_decode_dpos(void*, void*, void*, void*, int64_t, int64_t, void*,
-                             int64_t, int64_t, float, void*) {
-  return false;
-}
 inline int64_t attn_dpos_partials_bytes(int64_t, int64_t, int64_t) { return 0; }
-
-// A gemm with its row bias added in the store: CUDA-first; the evaluator adds
-// the bias with the broadcast kernel after gemm here. Outside the #if/#else
-// like the ops below.
-inline bool gemm_bias(void*, int64_t, int64_t, bool, void*, int64_t, int64_t,
-                      bool, void*, int64_t, void*, int64_t, int64_t, int64_t,
-                      int64_t, float, float) {
-  return false;
-}
 
 // Every CPU-side buffer read funnels through array::raw()/data(), which call
 // this: one choke point makes mixed CPU/GPU graphs safe.

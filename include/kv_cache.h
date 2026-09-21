@@ -44,50 +44,51 @@ struct kv_cache {
     return K.native && V.native;  // a heap fallback has no device buffer
   }
 
-  // k_new/v_new: [n_kv_heads, D] device buffers (this step's projected k, v).
-  bool append(void* k_new, void* v_new) {
+  // k_new/v_new: [n_kv_heads, D] device views (this step's projected k, v).
+  bool append(gpu::span k_new, gpu::span v_new) {
     if (pos >= max_ctx) return false;
-    if (!gpu::kv_append(K.native, V.native, k_new, v_new, pos, max_ctx,
-                        n_kv_heads, D, kv_bf16)) {
+    if (!gpu::kv_append(K.device_span(), V.device_span(), k_new, v_new, pos,
+                        max_ctx, n_kv_heads, D, kv_bf16)) {
       return false;
     }
     pos++;
     return true;
   }
 
-  // q/out: [n_q_heads, D] device buffers. Attends over the cached prefix.
-  bool attn(void* q, void* out, int64_t n_q_heads, float scale) {
-    return gpu::attn_decode(q, K.native, V.native, out, n_q_heads, n_kv_heads,
-                            pos, max_ctx, D, scale, kv_bf16);
+  // q/out: [n_q_heads, D] device views. Attends over the cached prefix.
+  bool attn(gpu::span q, gpu::span out, int64_t n_q_heads, float scale) {
+    return gpu::attn_decode(q, K.device_span(), V.device_span(), out, n_q_heads,
+                            n_kv_heads, pos, max_ctx, D, scale, kv_bf16);
   }
 
   // T tokens at once: k_src/v_src [n_kv_heads, T, D] appended at `pos`, and
   // the causal attention of q/out [n_q_heads, T, D] over everything cached
   // before them. Leaves pos advanced by T.
-  bool prefill(void* q, void* k_src, void* v_src, void* out, int64_t T,
-               int64_t n_q_heads, float scale) {
+  bool prefill(gpu::span q, gpu::span k_src, gpu::span v_src, gpu::span out,
+               int64_t T, int64_t n_q_heads, float scale) {
     if (T <= 0 || pos + T > max_ctx) return false;
-    if (!gpu::kv_fill(K.native, V.native, k_src, v_src, T, max_ctx, n_kv_heads,
-                      D, kv_bf16, pos)) {
+    if (!gpu::kv_fill(K.device_span(), V.device_span(), k_src, v_src, T, max_ctx,
+                      n_kv_heads, D, kv_bf16, pos)) {
       return false;
     }
     const int64_t p0 = pos;
     pos += T;
-    return gpu::attn_prefill(q, K.native, V.native, out, n_q_heads, n_kv_heads,
-                             T, max_ctx, D, scale, kv_bf16, p0);
+    return gpu::attn_prefill(q, K.device_span(), V.device_span(), out,
+                             n_q_heads, n_kv_heads, T, max_ctx, D, scale, kv_bf16,
+                             p0);
   }
 
   // Graph-capture forms (f32 cache only): the position is *d_pos.
-  bool append_dpos(void* k_new, void* v_new, void* d_pos) {
-    return gpu::kv_append_dpos(K.native, V.native, k_new, v_new, d_pos, max_ctx,
-                               n_kv_heads, D);
+  bool append_dpos(gpu::span k_new, gpu::span v_new, gpu::span d_pos) {
+    return gpu::kv_append_dpos(K.device_span(), V.device_span(), k_new, v_new,
+                               d_pos, max_ctx, n_kv_heads, D);
   }
   // The split-KV partials a captured graph bakes in are this cache's own (a
   // shared scratch could be freed under a live graph), sized once from the
   // capacity on the first call.
   storage dpos_partials;
-  bool attn_dpos(void* q, void* out, int64_t n_q_heads, void* d_pos,
-                 float scale) {
+  bool attn_dpos(gpu::span q, gpu::span out, int64_t n_q_heads,
+                 gpu::span d_pos, float scale) {
     if (!dpos_partials.native) {
       const int64_t bytes =
           gpu::attn_dpos_partials_bytes(n_q_heads, max_ctx, D);
@@ -95,9 +96,9 @@ struct kv_cache {
       dpos_partials = storage::make(bytes / 4);
       if (!dpos_partials.native) return false;
     }
-    return gpu::attn_decode_dpos(q, K.native, V.native, out, n_q_heads,
-                                 n_kv_heads, d_pos, max_ctx, D, scale,
-                                 dpos_partials.native);
+    return gpu::attn_decode_dpos(q, K.device_span(), V.device_span(), out,
+                                 n_q_heads, n_kv_heads, d_pos, max_ctx, D, scale,
+                                 dpos_partials.device_span());
   }
 };
 

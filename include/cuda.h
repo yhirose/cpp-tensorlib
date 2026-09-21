@@ -220,6 +220,18 @@ inline const char* kernel_name_(kop op) {
     case kop::row_logsumexp_: return "tl_row_logsumexp";
     case kop::xent_bwd_: return "tl_xent_bwd";
     case kop::adam_step_: return "tl_adam_step";
+    case kop::rmsnorm_: return "tl_rmsnorm";
+    case kop::add_rmsnorm_: return "tl_add_rmsnorm";
+    case kop::swiglu_: return "tl_swiglu";
+    case kop::gemv_bf16_row_: return "tl_gemv_bf16_row";
+    case kop::gemv_q4_: return "tl_gemv_q4";
+    case kop::kv_append_: return "tl_kv_append";
+    case kop::kv_append_bf16_: return "tl_kv_append_bf16";
+    case kop::kv_fill_: return "tl_kv_fill";
+    case kop::kv_fill_bf16_: return "tl_kv_fill_bf16";
+    case kop::merge_heads_: return "tl_merge_heads";
+    case kop::split_heads_: return "tl_split_heads";
+    case kop::argmax_: return "tl_argmax";
     // Every f32 GEMM id is the one general kernel here (the tiled fast path
     // has its own names: sgemm_tiles below).
     case kop::sgemm32: case kop::sgemm32x64: case kop::sgemm64x32:
@@ -521,19 +533,6 @@ struct context {
   CUfunction gemv_f32_() { return cached_(gemv_f32_fn, "tl_gemv_f32"); }
   CUfunction gemv_bf16_() { return cached_(gemv_bf16_fn, "tl_gemv_bf16"); }
   CUfunction gemv_bf16v8_() { return cached_(gemv_bf16v8_fn, "tl_gemv_bf16v8"); }
-  CUfunction gemv_bf16_row_fn = nullptr;
-  CUfunction gemv_bf16_row_() {
-    return cached_(gemv_bf16_row_fn, "tl_gemv_bf16_row");
-  }
-
-  // M8 int4-weight decode GEMV.
-  CUfunction gemv_q4_fn = nullptr;
-  CUfunction gemv_q4_() { return cached_(gemv_q4_fn, "tl_gemv_q4"); }
-
-  // M9 batched-prefill layout kernels (token-major <-> head-major).
-  CUfunction split_heads_fn = nullptr, merge_heads_fn = nullptr;
-  CUfunction split_heads_() { return cached_(split_heads_fn, "tl_split_heads"); }
-  CUfunction merge_heads_() { return cached_(merge_heads_fn, "tl_merge_heads"); }
 
   // im2col's pad/fold, cached like split_heads/merge_heads.
   CUfunction pad_fn = nullptr, fold_fn = nullptr;
@@ -542,32 +541,11 @@ struct context {
 
   // Embedding-table lookup (index_select/index_add) and pooling-style
   // one-hot scatter (scatter_to_axis), cached the same way.
-  CUfunction index_select_fn = nullptr, index_add_fn = nullptr,
-             scatter_axis_fn = nullptr;
-  CUfunction index_select_() {
-    return cached_(index_select_fn, "tl_index_select");
-  }
+  CUfunction index_add_fn = nullptr, scatter_axis_fn = nullptr;
   CUfunction index_add_() { return cached_(index_add_fn, "tl_index_add"); }
   CUfunction scatter_axis_() {
     return cached_(scatter_axis_fn, "tl_scatter_axis");
   }
-
-  // Cross-entropy's three: the trailing-axis gather (scatter_axis_'s dual),
-  // the one-pass row logsumexp its forward reduces with, and the pullback
-  // that rebuilds the softmax from that logsumexp.
-  CUfunction gather_axis_fn = nullptr, row_logsumexp_fn = nullptr,
-             xent_bwd_fn = nullptr;
-  CUfunction gather_axis_() {
-    return cached_(gather_axis_fn, "tl_gather_axis");
-  }
-  CUfunction row_logsumexp_() {
-    return cached_(row_logsumexp_fn, "tl_row_logsumexp");
-  }
-  CUfunction xent_bwd_() { return cached_(xent_bwd_fn, "tl_xent_bwd"); }
-
-  // Adam's fused per-parameter update (the optimizer's whole step, one launch).
-  CUfunction adam_step_fn = nullptr;
-  CUfunction adam_step_() { return cached_(adam_step_fn, "tl_adam_step"); }
 
   // N-D broadcast binary (any rank) and N-D broadcast ternary select
   // (Tensor.where's GPU dispatch) -- new capabilities, one kernel per op
@@ -641,13 +619,6 @@ struct context {
     return cached_(attn_combine_fn, "tl_attn_combine");
   }
 
-  // M9 KV cache append (scatter one token's k,v into the persistent cache).
-  CUfunction kv_append_fn = nullptr, kv_append_bf16_fn = nullptr;
-  CUfunction kv_append_(bool bf16 = false) {
-    return bf16 ? cached_(kv_append_bf16_fn, "tl_kv_append_bf16")
-                : cached_(kv_append_fn, "tl_kv_append");
-  }
-
   // RoPE (rotary position embedding) for q/k.
   CUfunction rope_fn = nullptr;
   CUfunction rope_() { return cached_(rope_fn, "tl_rope"); }
@@ -667,26 +638,15 @@ struct context {
                    : cached_(attn_split_dpos_fn, "tl_attn_decode_split_dpos");
   }
 
-  // GPU argmax (greedy last-mile): kernel + a persistent 4-byte device result
-  // buffer so the per-token result is a 4-byte D2H, not the 608KB logits copy.
-  CUfunction argmax_fn = nullptr;
-  CUfunction argmax_() { return cached_(argmax_fn, "tl_argmax"); }
+  // GPU argmax (greedy last-mile): a persistent 4-byte device result buffer, so
+  // the per-token result is a 4-byte D2H, not the 608KB logits copy.
   CUdeviceptr argmax_res = 0;
   CUdeviceptr argmax_res_() {
     if (!argmax_res && d.MemAlloc(&argmax_res, 16) != 0) argmax_res = 0;
     return argmax_res;
   }
 
-  // Fused decode-step ops (imperative path): RMSNorm + SwiGLU.
-  CUfunction rmsnorm_fn = nullptr, swiglu_fn = nullptr;
-  CUfunction rmsnorm_() { return cached_(rmsnorm_fn, "tl_rmsnorm"); }
-  CUfunction swiglu_() { return cached_(swiglu_fn, "tl_swiglu"); }
-  CUfunction add_rmsnorm_fn = nullptr;
-  CUfunction add_rmsnorm_() { return cached_(add_rmsnorm_fn, "tl_add_rmsnorm"); }
-
-  // The graph's fused layer norm, and its pullback's three kernels.
-  CUfunction layer_norm_fn = nullptr;
-  CUfunction layer_norm_() { return cached_(layer_norm_fn, "tl_layer_norm"); }
+  // The fused layer norm's pullback: three kernels.
   CUfunction layer_norm_bwd_dx_fn = nullptr;
   CUfunction layer_norm_bwd_dx_() {
     return cached_(layer_norm_bwd_dx_fn, "tl_layer_norm_bwd_dx");
@@ -704,12 +664,7 @@ struct context {
   CUfunction fill_rows_fn = nullptr;
   CUfunction fill_rows_() { return cached_(fill_rows_fn, "tl_fill_rows"); }
 
-  // M9 prefill: bulk cache fill + causal prefill attention.
-  CUfunction kv_fill_fn = nullptr, kv_fill_bf16_fn = nullptr;
-  CUfunction kv_fill_(bool bf16 = false) {
-    return bf16 ? cached_(kv_fill_bf16_fn, "tl_kv_fill_bf16")
-                : cached_(kv_fill_fn, "tl_kv_fill");
-  }
+  // M9 prefill: causal prefill attention.
   CUfunction attn_prefill_tiled_fn = nullptr, attn_prefill_tiled_64_fn = nullptr,
              attn_prefill_tiled_bf16_fn = nullptr,
              attn_prefill_tiled_bf16_64_fn = nullptr;
@@ -872,6 +827,101 @@ struct context {
 
 inline bool available() { return context::get().ready; }
 
+inline bool dispatch(kop k, const gpu::arg* args, size_t n, const void* params,
+                     size_t params_bytes, const gpu::grid& g);
+
+// The ops this backend runs its own way: a different algorithm, several
+// kernels, or a kernel whose ABI is its own. gpu_ops.h forwards to whichever of
+// these exist (TL_GPU_DETECT_OWN) and answers false for the rest, so a backend
+// declares what it has and nothing else. Defined below, among their helpers.
+struct own {
+  static bool split_heads(gpu::span src, gpu::span bias, gpu::span dst,
+                          int64_t T, int64_t ld, int64_t off, int64_t H,
+                          int64_t D);
+  static bool argmax(gpu::span a, int64_t n, int64_t* out_idx);
+  // The graph-capture forms: the position is a device scalar, so a captured
+  // step replays against an advancing cache row.
+  static bool rope_dpos(gpu::span x, gpu::span out, int64_t rows, int64_t T,
+                        int64_t D, gpu::span d_pos, float base,
+                        gpu::span bias = {});
+  static bool kv_append_dpos(gpu::span Kc, gpu::span Vc, gpu::span k_new,
+                             gpu::span v_new, gpu::span d_pos, int64_t kv_max,
+                             int64_t n_kv_heads, int64_t D);
+  static bool attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
+                               gpu::span out, int64_t n_q_heads,
+                               int64_t n_kv_heads, gpu::span d_pos,
+                               int64_t kv_max, int64_t D, float scale,
+                               gpu::span partials);
+  static bool incr_u32(gpu::span d_pos);
+  static bool binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
+                              gpu::span b, const int64_t* b_strides,
+                              gpu::span out, const int64_t* out_shape, int rank,
+                              int64_t n, float scale, float offset);
+  static bool where_nd(gpu::span cond, const int64_t* c_strides, gpu::span a,
+                       const int64_t* a_strides, gpu::span b,
+                       const int64_t* b_strides, gpu::span out,
+                       const int64_t* out_shape, int rank, int64_t n);
+  static bool copy_nd(gpu::span a, const int64_t* a_strides, gpu::span out,
+                      const int64_t* out_shape, int rank, int64_t n);
+  static bool sum_to(gpu::span a, const int64_t* a_shape,
+                     const int64_t* a_strides, const int64_t* acc, int rank,
+                     int64_t out_n, int64_t reduced_n, gpu::span out);
+  static bool pad(gpu::span a, gpu::span out, const int64_t* a_shape,
+                  const int64_t* out_shape, int rank, int axis, int64_t before,
+                  int64_t n, int64_t out_n);
+  static bool fold(gpu::span a, gpu::span out, const int64_t* a_shape,
+                   const int64_t* out_shape, int rank, int axis, int64_t step,
+                   int64_t n, int64_t out_n);
+  static bool concat_part(gpu::span a, gpu::span out, const int64_t* a_shape,
+                          const int64_t* out_shape, int rank, int axis,
+                          int64_t before, int64_t n);
+  static bool index_add(gpu::span idx, gpu::span values, gpu::span out,
+                        int64_t row_size, int64_t k, int64_t out_n);
+  static bool scatter_to_axis(gpu::span idx, gpu::span values, gpu::span out,
+                              int64_t n, int64_t size);
+  static bool gemm(gpu::span a, int64_t lda, bool ta, gpu::span b, int64_t ldb,
+                   bool tb, gpu::span out, int64_t m, int64_t n, int64_t k,
+                   float scale, float offset);
+  static bool gemm_batched(gpu::span a, int64_t lda, bool ta, int64_t sa,
+                           gpu::span b, int64_t ldb, bool tb, int64_t sb,
+                           gpu::span out, int64_t m, int64_t n, int64_t k,
+                           int64_t batch, float scale, float offset,
+                           gpu::span bias = {});
+  static bool gemm_bias(gpu::span a, int64_t lda, bool ta, gpu::span b,
+                        int64_t ldb, bool tb, gpu::span bias, gpu::span out,
+                        int64_t m, int64_t n, int64_t k, float scale,
+                        float offset);
+  static bool gemv_f32(gpu::span a, gpu::span B, gpu::span y, int64_t n,
+                       int64_t k);
+  static bool gemv_bf16(gpu::span a, gpu::span B, gpu::span y, int64_t n,
+                        int64_t k);
+  static bool attn_decode(gpu::span q, gpu::span K, gpu::span V, gpu::span out,
+                          int64_t n_q_heads, int64_t n_kv_heads, int64_t ctx,
+                          int64_t kv_max, int64_t D, float scale,
+                          bool kv_bf16 = false);
+  static bool attn_prefill(gpu::span q, gpu::span K, gpu::span V, gpu::span out,
+                           int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
+                           int64_t kv_max, int64_t D, float scale,
+                           bool kv_bf16 = false, int64_t pos0 = 0);
+  static bool attn_prefill_dq(gpu::span q, gpu::span K, gpu::span V,
+                              gpu::span dO, gpu::span O, gpu::span dq,
+                              gpu::span stats, int64_t H, int64_t T, int64_t D,
+                              float scale);
+  static bool attn_prefill_dkv(gpu::span q, gpu::span K, gpu::span V,
+                               gpu::span dO, gpu::span stats, gpu::span dK,
+                               gpu::span dV, int64_t H, int64_t T, int64_t D,
+                               float scale);
+  static bool gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out, int64_t m,
+                           int64_t n, int64_t k);
+  static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
+                   int64_t D, int64_t pos, float base, gpu::span bias = {});
+  static bool layer_norm_bwd(gpu::span x, gpu::span g, gpu::span dy,
+                             gpu::span dx, gpu::span dg, gpu::span db,
+                             gpu::span stats, gpu::span partials, int64_t rows,
+                             int64_t cols, int64_t per_chunk, int64_t chunks,
+                             float eps);
+};
+
 // Blocks that keep the GPU busy: ~2 per SM on the 82-SM RTX 3090. The
 // threshold every tile and split-K choice below measures its grid against.
 constexpr long kFillBlocks = 164;
@@ -979,6 +1029,44 @@ inline void flush() {
 // imperative decode step (no host sync / blocking copy mid-stream) is
 // capturable; embed staging + argmax happen outside the captured region.
 // What a model may ask of this backend beyond the kernel contract (gpu.h).
+#if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
+// "No bias" is a null pointer here, which the kernel tests.
+inline bool own::split_heads(gpu::span src, gpu::span bias, gpu::span dst,
+                        int64_t T, int64_t ld, int64_t off, int64_t H,
+                        int64_t D) {
+  struct {
+    uint32_t T, ld, off, D;
+  } p{static_cast<uint32_t>(T), static_cast<uint32_t>(ld),
+      static_cast<uint32_t>(off), static_cast<uint32_t>(D)};
+  const gpu::arg args[] = {gpu::in(src), gpu::in(bias), gpu::out(dst)};
+  return dispatch(kop::split_heads_, args, 3, &p, sizeof(p),
+                  gpu::policy::per_head(H, T, D));
+}
+
+// One int comes back through a 4-byte device buffer the context keeps; the
+// reduction carries a (value, index) pair per thread.
+inline bool own::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  CUdeviceptr res = c.argmax_res_();
+  if (!res) return false;
+  const uint32_t p = static_cast<uint32_t>(n);
+  const gpu::arg args[] = {gpu::in(a),
+                           gpu::out({reinterpret_cast<void*>(res), 0})};
+  const uint32_t block = 256;
+  if (!dispatch(kop::argmax_, args, 2, &p, sizeof(p),
+                {1, 1, 1, block, 1, 1,
+                 block * uint32_t(sizeof(float) + sizeof(int))})) {
+    return false;
+  }
+  flush();  // the result index must be ready before the 4-byte D2H
+  int h = 0;
+  if (c.d.MemcpyDtoH(&h, res, sizeof(int)) != 0) return false;
+  *out_idx = h;
+  return true;
+}
+#endif
+
 // What the shared launch policy (gpu_ops.h) may assume of this backend's
 // kernels.
 struct traits {
@@ -994,9 +1082,6 @@ struct caps {
   static constexpr bool graph_capture = true;
   static constexpr bool row_gemv = true;   // gemv_bf16_row: weights as [N,K]
   static constexpr bool bf16_gemm = true;  // gemm_bf16_nt: the batched prefill
-  // A device pointer is an address, so base + n names a mid-buffer location
-  // and a fused kernel's output can be read back in slices.
-  static constexpr bool flat_addressing = true;
 };
 using graph_exec = CUgraphExec;
 
@@ -1214,26 +1299,25 @@ inline const long long* upload_bcast_meta_(
 // BatchNorm-shaped [N,D] input). `a_strides`/`b_strides` are the broadcast
 // strides (0 on a broadcast axis) array.h's gpu_binary_nd_ computes via the
 // same broadcast_strides() the CPU oracle uses.
-inline bool binary_bcast_nd(kop op, void* a_native, int64_t ao,
-                            const int64_t* a_strides, void* b_native,
-                            int64_t bo, const int64_t* b_strides,
-                            void* out_native, int64_t oo,
-                            const int64_t* out_shape, int rank, int64_t n,
-                            float scale, float offset) {
+inline bool own::binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
+                                 gpu::span b, const int64_t* b_strides,
+                                 gpu::span out, const int64_t* out_shape,
+                                 int rank, int64_t n, float scale,
+                                 float offset) {
   if (rank <= 0 || rank > kPadFoldMaxRank) return false;
   auto& c = context::get();
   if (!c.ready) return false;
   CUfunction f = c.bcast_nd_(op);
   if (!f) return false;
-  c.device_read_(a_native);
-  c.device_read_(b_native);
-  c.device_write_(out_native);
+  c.device_read_(a.buf);
+  c.device_read_(b.buf);
+  c.device_write_(out.buf);
   const long long* pmeta =
       upload_bcast_meta_(c, out_shape, rank, {a_strides, b_strides});
   if (!pmeta) return false;
-  float* pa = context::off_(a_native, ao);
-  float* pb = context::off_(b_native, bo);
-  float* po = context::off_(out_native, oo);
+  float* pa = context::off_(a.buf, a.off);
+  float* pb = context::off_(b.buf, b.off);
+  float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(n);
   return c.launch1d_(f, un, pa, pb, po, pmeta, rank, un, scale, offset);
 }
@@ -1242,25 +1326,24 @@ inline bool binary_bcast_nd(kop op, void* a_native, int64_t ao,
 // on no backend before this (eval_one's where_ case always ran the CPU
 // map_ternary). Same flat-index decode as binary_bcast_nd above, one more
 // operand -- masking (attention/padding masks) is the concrete caller.
-inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
-                     void* a_native, int64_t ao, const int64_t* a_strides,
-                     void* b_native, int64_t bo, const int64_t* b_strides,
-                     void* out_native, int64_t oo, const int64_t* out_shape,
-                     int rank, int64_t n) {
+inline bool own::where_nd(gpu::span cond, const int64_t* c_strides, gpu::span a,
+                          const int64_t* a_strides, gpu::span b,
+                          const int64_t* b_strides, gpu::span out,
+                          const int64_t* out_shape, int rank, int64_t n) {
   if (rank <= 0 || rank > kPadFoldMaxRank) return false;
   auto& c = context::get();
   if (!c.ready) return false;
-  c.device_read_(cond_native);
-  c.device_read_(a_native);
-  c.device_read_(b_native);
-  c.device_write_(out_native);
+  c.device_read_(cond.buf);
+  c.device_read_(a.buf);
+  c.device_read_(b.buf);
+  c.device_write_(out.buf);
   const long long* pmeta = upload_bcast_meta_(
       c, out_shape, rank, {c_strides, a_strides, b_strides});
   if (!pmeta) return false;
-  float* pc = context::off_(cond_native, co);
-  float* pa = context::off_(a_native, ao);
-  float* pb = context::off_(b_native, bo);
-  float* po = context::off_(out_native, oo);
+  float* pc = context::off_(cond.buf, cond.off);
+  float* pa = context::off_(a.buf, a.off);
+  float* pb = context::off_(b.buf, b.off);
+  float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(n);
   return c.launch1d_(c.where_nd_(), un, pc, pa, pb, po, pmeta, rank, un);
 }
@@ -1268,18 +1351,17 @@ inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
 // N-D strided copy: clone()'s device arm for a view the flat one-input
 // kernels cannot read (a permute, a transpose). Same flat-index decode and
 // meta upload as where_nd above, one operand.
-inline bool copy_nd(void* a_native, int64_t ao, const int64_t* a_strides,
-                    void* out_native, int64_t oo, const int64_t* out_shape,
-                    int rank, int64_t n) {
+inline bool own::copy_nd(gpu::span a, const int64_t* a_strides, gpu::span out,
+                         const int64_t* out_shape, int rank, int64_t n) {
   if (rank <= 0 || rank > kPadFoldMaxRank) return false;
   auto& c = context::get();
   if (!c.ready) return false;
-  c.device_read_(a_native);
-  c.device_write_(out_native);
+  c.device_read_(a.buf);
+  c.device_write_(out.buf);
   const long long* pmeta = upload_bcast_meta_(c, out_shape, rank, {a_strides});
   if (!pmeta) return false;
-  float* pa = context::off_(a_native, ao);
-  float* po = context::off_(out_native, oo);
+  float* pa = context::off_(a.buf, a.off);
+  float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(n);
   return c.launch1d_(c.copy_nd_(), un, pa, po, pmeta, rank, un);
 }
@@ -1291,22 +1373,21 @@ inline bool copy_nd(void* a_native, int64_t ao, const int64_t* a_strides,
 // broadcast_strides(target, out_strides, a.shape()) -- 0 on every axis
 // being summed over. `reduced_n` is the product of a_shape over exactly
 // those zero-acc axes (1 if there are none).
-inline bool sum_to(void* a_native, int64_t ao, const int64_t* a_shape,
-                   const int64_t* a_strides, const int64_t* acc, int rank,
-                   int64_t out_n, int64_t reduced_n, void* out_native,
-                   int64_t oo) {
+inline bool own::sum_to(gpu::span a, const int64_t* a_shape,
+                        const int64_t* a_strides, const int64_t* acc, int rank,
+                        int64_t out_n, int64_t reduced_n, gpu::span out) {
   if (rank <= 0 || rank > kPadFoldMaxRank) return false;
   auto& c = context::get();
   if (!c.ready) return false;
   CUfunction f = c.sum_to_();
   if (!f) return false;
-  c.device_read_(a_native);
-  c.device_write_(out_native);
+  c.device_read_(a.buf);
+  c.device_write_(out.buf);
   const long long* pmeta =
       upload_bcast_meta_(c, a_shape, rank, {a_strides, acc});
   if (!pmeta) return false;
-  float* pa = context::off_(a_native, ao);
-  float* po = context::off_(out_native, oo);
+  float* pa = context::off_(a.buf, a.off);
+  float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(out_n);
   unsigned ured = static_cast<unsigned>(reduced_n);
   // A deep reduction (a bias gradient sums its column over every row) earns a
@@ -1327,21 +1408,22 @@ inline bool sum_to(void* a_native, int64_t ao, const int64_t* a_shape,
 // device copy directly, no host round trip), shifted by `before` along
 // `axis`. No scale/offset — eval_one's shared epilogue applies those (see
 // array.h's op_t::pad_ case).
-inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
-                const int64_t* a_shape, const int64_t* out_shape, int rank,
-                int axis, int64_t before, int64_t n, int64_t out_n) {
+inline bool own::pad(gpu::span a, gpu::span out, const int64_t* a_shape,
+                     const int64_t* out_shape, int rank, int axis,
+                     int64_t before, int64_t n, int64_t out_n) {
   if (rank <= 0 || rank > kPadFoldMaxRank) return false;
   auto& c = context::get();
   if (!c.ready) return false;
-  c.device_read_(a_native);
-  c.device_write_(out_native);
-  zero_device_(reinterpret_cast<CUdeviceptr>(out_native), out_n);
+  c.device_read_(a.buf);
+  c.device_write_(out.buf);
+  zero_device_(reinterpret_cast<CUdeviceptr>(context::off_(out.buf, out.off)),
+               out_n);
   int64_t out_strides[kPadFoldMaxRank];
   const long long* pmeta =
       upload_pad_fold_meta_(c, a_shape, rank, out_shape, rank, out_strides);
   if (!pmeta) return false;
-  float* pa = context::off_(a_native, ao);
-  float* po = context::off_(out_native, oo);
+  float* pa = context::off_(a.buf, a.off);
+  float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(n);
   unsigned ushift = static_cast<unsigned>(before * out_strides[axis]);
   return c.launch1d_(c.pad_(), un, pa, po, pmeta, rank, ushift, un);
@@ -1350,21 +1432,22 @@ inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
 // unfold's inverse: scatter-add `a` (contiguous; its last dim is the sliding
 // window) into a zero buffer of out_shape (zeroed the same way as pad()
 // above) — every overlap accumulates via atomicAdd, so it must start at 0.
-inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
-                 const int64_t* a_shape, const int64_t* out_shape, int rank,
-                 int axis, int64_t step, int64_t n, int64_t out_n) {
+inline bool own::fold(gpu::span a, gpu::span out, const int64_t* a_shape,
+                      const int64_t* out_shape, int rank, int axis,
+                      int64_t step, int64_t n, int64_t out_n) {
   if (rank <= 0 || rank > kPadFoldMaxRank) return false;
   auto& c = context::get();
   if (!c.ready) return false;
-  c.device_read_(a_native);
-  c.device_write_(out_native);
-  zero_device_(reinterpret_cast<CUdeviceptr>(out_native), out_n);
+  c.device_read_(a.buf);
+  c.device_write_(out.buf);
+  zero_device_(reinterpret_cast<CUdeviceptr>(context::off_(out.buf, out.off)),
+               out_n);
   int64_t out_strides[kPadFoldMaxRank];
   const long long* pmeta = upload_pad_fold_meta_(c, a_shape, rank, out_shape,
                                                  rank - 1, out_strides);
   if (!pmeta) return false;
-  float* pa = context::off_(a_native, ao);
-  float* po = context::off_(out_native, oo);
+  float* pa = context::off_(a.buf, a.off);
+  float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(n);
   unsigned ustep = static_cast<unsigned>(step);
   return c.launch1d_(c.fold_(), un, pa, po, pmeta, rank, axis, ustep, un);
@@ -1376,21 +1459,20 @@ inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
 // padding border to zero, unlike pad() above). Reuses pad's own kernel:
 // writing a same-shape source at an axis-shifted offset is exactly what
 // tl_pad already does per source element.
-inline bool concat_part(void* a_native, int64_t ao, void* out_native,
-                        int64_t oo, const int64_t* a_shape,
-                        const int64_t* out_shape, int rank, int axis,
-                        int64_t before, int64_t n) {
+inline bool own::concat_part(gpu::span a, gpu::span out, const int64_t* a_shape,
+                             const int64_t* out_shape, int rank, int axis,
+                             int64_t before, int64_t n) {
   if (rank <= 0 || rank > kPadFoldMaxRank) return false;
   auto& c = context::get();
   if (!c.ready) return false;
-  c.device_read_(a_native);
-  c.device_write_(out_native);
+  c.device_read_(a.buf);
+  c.device_write_(out.buf);
   int64_t out_strides[kPadFoldMaxRank];
   const long long* pmeta =
       upload_pad_fold_meta_(c, a_shape, rank, out_shape, rank, out_strides);
   if (!pmeta) return false;
-  float* pa = context::off_(a_native, ao);
-  float* po = context::off_(out_native, oo);
+  float* pa = context::off_(a.buf, a.off);
+  float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(n);
   unsigned ushift = static_cast<unsigned>(before * out_strides[axis]);
   return c.launch1d_(c.pad_(), un, pa, po, pmeta, rank, ushift, un);
@@ -1399,18 +1481,18 @@ inline bool concat_part(void* a_native, int64_t ao, void* out_native,
 // index_select's dual: scatter-add `values` into `out` by row index.
 // Repeated indices really do collide (real write conflicts — the kernel
 // uses atomicAdd), so `out` must start zeroed, same as pad/fold above.
-inline bool index_add(void* idx_native, int64_t idxo, void* values_native,
-                      int64_t vo, void* out_native, int64_t oo,
-                      int64_t row_size, int64_t k, int64_t out_n) {
+inline bool own::index_add(gpu::span idx, gpu::span values, gpu::span out,
+                           int64_t row_size, int64_t k, int64_t out_n) {
   auto& c = context::get();
   if (!c.ready) return false;
-  c.device_read_(idx_native);
-  c.device_read_(values_native);
-  c.device_write_(out_native);
-  zero_device_(reinterpret_cast<CUdeviceptr>(out_native), out_n);
-  float* pidx = context::off_(idx_native, idxo);
-  float* pv = context::off_(values_native, vo);
-  float* po = context::off_(out_native, oo);
+  c.device_read_(idx.buf);
+  c.device_read_(values.buf);
+  c.device_write_(out.buf);
+  zero_device_(reinterpret_cast<CUdeviceptr>(context::off_(out.buf, out.off)),
+               out_n);
+  float* pidx = context::off_(idx.buf, idx.off);
+  float* pv = context::off_(values.buf, values.off);
+  float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(k * row_size);
   unsigned urow = static_cast<unsigned>(row_size);
   return c.launch1d_(c.index_add_(), un, pidx, pv, po, urow, un);
@@ -1421,18 +1503,18 @@ inline bool index_add(void* idx_native, int64_t idxo, void* values_native,
 // to a distinct output slot (the axis is brand new), so — unlike
 // index_add above — there is no accumulation and no atomics; `out` still
 // starts zeroed since untouched slots must read back as 0.
-inline bool scatter_to_axis(void* idx_native, int64_t idxo,
-                            void* values_native, int64_t vo, void* out_native,
-                            int64_t oo, int64_t n, int64_t size) {
+inline bool own::scatter_to_axis(gpu::span idx, gpu::span values, gpu::span out,
+                                 int64_t n, int64_t size) {
   auto& c = context::get();
   if (!c.ready) return false;
-  c.device_read_(idx_native);
-  c.device_read_(values_native);
-  c.device_write_(out_native);
-  zero_device_(reinterpret_cast<CUdeviceptr>(out_native), n * size);
-  float* pidx = context::off_(idx_native, idxo);
-  float* pv = context::off_(values_native, vo);
-  float* po = context::off_(out_native, oo);
+  c.device_read_(idx.buf);
+  c.device_read_(values.buf);
+  c.device_write_(out.buf);
+  zero_device_(reinterpret_cast<CUdeviceptr>(context::off_(out.buf, out.off)),
+               n * size);
+  float* pidx = context::off_(idx.buf, idx.off);
+  float* pv = context::off_(values.buf, values.off);
+  float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(n);
   unsigned usize = static_cast<unsigned>(size);
   return c.launch1d_(c.scatter_axis_(), un, pidx, pv, po, usize, un);
@@ -1448,8 +1530,7 @@ inline bool scatter_to_axis(void* idx_native, int64_t idxo,
 // partition K over gridDim.y, atomicAdd into a pre-zeroed y, so the kernel stays
 // bandwidth-bound rather than occupancy-bound. gridDim.y==1 stores directly.
 inline bool gemv_run_(CUfunction f, float* pa, float* pB, float* py,
-                      void* y_native, unsigned un, unsigned uk,
-                      unsigned vcols = 1) {
+                      unsigned un, unsigned uk, unsigned vcols = 1) {
   auto& c = context::get();
   unsigned per = 256u * vcols;  // output columns covered by one block
   unsigned bx = (un + per - 1) / per;
@@ -1471,35 +1552,37 @@ inline bool gemv_run_(CUfunction f, float* pa, float* pB, float* py,
     // Zero y for the split-K atomicAdd. Async on the stream (ordered before the
     // gemv on the same stream) so this stays capturable — a blocking MemsetD8
     // is illegal mid CUDA-graph capture.
-    CUdeviceptr yd = reinterpret_cast<CUdeviceptr>(y_native);
+    CUdeviceptr yd = reinterpret_cast<CUdeviceptr>(py);
     if (c.d.MemsetD8Async) c.d.MemsetD8Async(yd, 0, (size_t)un * 4, c.stream);
     else c.d.MemsetD8(yd, 0, (size_t)un * 4);
   }
   return c.launch_(f, {bx, gy}, {256}, 0, pa, pB, py, un, uk, ksplit);
 }
-inline bool gemv_f32(void* a, void* B, void* y, int64_t n, int64_t k) {
+inline bool own::gemv_f32(gpu::span a, gpu::span B, gpu::span y, int64_t n,
+                          int64_t k) {
   auto& c = context::get();
   if (!c.ready) return false;
-  c.device_read_(a);
-  c.device_read_(B);
-  c.device_write_(y);
-  return gemv_run_(c.gemv_f32_(), context::off_(a, 0), context::off_(B, 0),
-                   context::off_(y, 0), y, static_cast<unsigned>(n),
-                   static_cast<unsigned>(k));
+  c.device_read_(a.buf);
+  c.device_read_(B.buf);
+  c.device_write_(y.buf);
+  return gemv_run_(c.gemv_f32_(), context::off_(a.buf, a.off),
+                   context::off_(B.buf, B.off), context::off_(y.buf, y.off),
+                   static_cast<unsigned>(n), static_cast<unsigned>(k));
 }
-inline bool gemv_bf16(void* a, void* B, void* y, int64_t n, int64_t k) {
+inline bool own::gemv_bf16(gpu::span a, gpu::span B, gpu::span y, int64_t n,
+                           int64_t k) {
   auto& c = context::get();
   if (!c.ready) return false;
-  c.device_read_(a);
-  c.device_read_(B);  // B reinterpreted as __nv_bfloat16* in-kernel
-  c.device_write_(y);
+  c.device_read_(a.buf);
+  c.device_read_(B.buf);  // B reinterpreted as __nv_bfloat16* in-kernel
+  c.device_write_(y.buf);
   // Vectorized 8-cols/thread path when n%8==0 (all transformer dims) — 16-byte
   // bf16 loads close the bandwidth gap to f32; scalar fallback otherwise.
   bool v8 = (n % 8) == 0;
-  return gemv_run_(v8 ? c.gemv_bf16v8_() : c.gemv_bf16_(), context::off_(a, 0),
-                   context::off_(B, 0), context::off_(y, 0), y,
-                   static_cast<unsigned>(n), static_cast<unsigned>(k),
-                   v8 ? 8u : 1u);
+  return gemv_run_(v8 ? c.gemv_bf16v8_() : c.gemv_bf16_(),
+                   context::off_(a.buf, a.off), context::off_(B.buf, B.off),
+                   context::off_(y.buf, y.off), static_cast<unsigned>(n),
+                   static_cast<unsigned>(k), v8 ? 8u : 1u);
 }
 
 // Block size (32..256 threads) for the one-block-per-row GEMVs (tl_gemv_bf16_row,
@@ -1523,39 +1606,19 @@ inline unsigned gemv_row_smem(unsigned block) {
   return block > 32 ? (block >> 5) * (unsigned)sizeof(float) : 0u;
 }
 
-// Warp-per-row bf16 decode GEMV (lever A): y(N) = a(1,K) @ W[N,K], W row-major
-// (K contiguous per output row). ONE BLOCK per output row (grid.x == N), no
-// split-K — no memset, no atomic combine. The small-N floor-bound lever; see
-// tl_gemv_bf16_row. Requires K % 8 == 0 (host-gated; caller falls back to the
-// split-K [K,N] path otherwise).
-inline bool gemv_bf16_row(void* a, void* B, void* y, int64_t n, int64_t k) {
-  auto& c = context::get();
-  if (!c.ready || (k % 8) != 0) return false;
-  c.device_read_(a);
-  c.device_read_(B);  // B reinterpreted as __nv_bfloat16* [N][K] in-kernel
-  c.device_write_(y);
-  float* pa = context::off_(a, 0);
-  float* pB = context::off_(B, 0);
-  float* py = context::off_(y, 0);
-  unsigned uN = static_cast<unsigned>(n), uK = static_cast<unsigned>(k);
-  unsigned block = gemv_row_block_size(k);
-  return c.launch_(c.gemv_bf16_row_(), {uN}, {block}, gemv_row_smem(block), pa,
-                   pB, py, uN, uK);
-}
-
 // M9 batched-prefill GEMM: C(M,N) = A(M,K) @ W[N,K]^T, W the same row-major
 // bf16 weight gemv_bf16_row consumes — so a batched prompt reuses the decode
 // weights as-is. Requires K % 8 == 0. See tl_gemm_bf16_nt.
-inline bool gemm_bf16_nt(void* a, void* B, void* out, int64_t m, int64_t n,
-                         int64_t k) {
+inline bool own::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
+                              int64_t m, int64_t n, int64_t k) {
   auto& c = context::get();
   if (!c.ready || (k % 8) != 0 || m <= 0 || n <= 0) return false;
-  c.device_read_(a);
-  c.device_read_(B);  // B reinterpreted as __nv_bfloat16* [N][K] in-kernel
-  c.device_write_(out);
-  float* pa = context::off_(a, 0);
-  float* pB = context::off_(B, 0);
-  float* po = context::off_(out, 0);
+  c.device_read_(a.buf);
+  c.device_read_(B.buf);  // B reinterpreted as __nv_bfloat16* [N][K] in-kernel
+  c.device_write_(out.buf);
+  float* pa = context::off_(a.buf, a.off);
+  float* pB = context::off_(B.buf, B.off);
+  float* po = context::off_(out.buf, out.off);
   unsigned uM = (unsigned)m, uN = (unsigned)n, uK = (unsigned)k;
   // Tile choice by fill (big_tile_): a prefill chunk is only a few hundred
   // tokens, so a narrow projection (N=896, M=512) is 28 big blocks against 82
@@ -1595,60 +1658,6 @@ inline bool gemm_bf16_nt(void* a, void* B, void* out, int64_t m, int64_t n,
 
 // ---- M9 batched-prefill layout moves between token-major projections and
 // head-major attention.
-
-// [T, ld] token-major -> [H, T, D] head-major, adding an optional [H*D] bias.
-// `off` picks a column block of a fused projection output (q|k|v from one GEMM).
-inline bool split_heads(void* src, void* bias, void* dst, int64_t T, int64_t ld,
-                        int64_t off, int64_t H, int64_t D) {
-  auto& c = context::get();
-  if (!c.ready || T <= 0 || H <= 0 || D <= 0) return false;
-  c.device_read_(src);
-  if (bias) c.device_read_(bias);
-  c.device_write_(dst);
-  float* ps = context::off_(src, 0);
-  float* pb = bias ? context::off_(bias, 0) : nullptr;
-  float* pd = context::off_(dst, 0);
-  unsigned uT = (unsigned)T, uld = (unsigned)ld, uoff = (unsigned)off,
-           uD = (unsigned)D;
-  return c.launch_(c.split_heads_(), {(unsigned)H, uT}, {uD}, 0, ps, pb, pd, uT,
-                   uld, uoff, uD);
-}
-
-// [H, T, D] head-major -> [T, H*D] token-major (inverse of split_heads).
-inline bool merge_heads(void* src, void* dst, int64_t T, int64_t H, int64_t D) {
-  auto& c = context::get();
-  if (!c.ready || T <= 0 || H <= 0 || D <= 0) return false;
-  c.device_read_(src);
-  c.device_write_(dst);
-  float* ps = context::off_(src, 0);
-  float* pd = context::off_(dst, 0);
-  unsigned uT = (unsigned)T, uH = (unsigned)H, uD = (unsigned)D;
-  return c.launch_(c.merge_heads_(), {uH, uT}, {uD}, 0, ps, pd, uT, uH, uD);
-}
-
-// M8 int4-weight decode GEMV: y(N) = a(1,K) @ dequant(Wq[N,K]), F32 accumulate.
-// qw = packed int4 [N][K/8] words, scales = f32 [N][K/group]. ONE BLOCK per
-// output row (grid.x == N), K-adaptive block size — see gemv_bf16_row.
-// K % group == 0, group % 8 == 0 (host-gated); the kernel's per-thread tail
-// guard lifts the old K % 256 requirement (Qwen K=896 = 3×256+128 works).
-inline bool gemv_q4(void* a, void* qw, void* scales, void* y, int64_t N,
-                    int64_t K, int64_t group) {
-  auto& c = context::get();
-  if (!c.ready || group <= 0 || (K % group) != 0 || (group % 8) != 0)
-    return false;
-  c.device_read_(a);
-  c.device_read_(qw);
-  c.device_read_(scales);
-  c.device_write_(y);
-  float* pa = context::off_(a, 0);
-  float* pq = context::off_(qw, 0);
-  float* ps = context::off_(scales, 0);
-  float* py = context::off_(y, 0);
-  unsigned uN = (unsigned)N, uK = (unsigned)K, uG = (unsigned)group;
-  unsigned block = gemv_row_block_size(K);
-  return c.launch_(c.gemv_q4_(), {uN}, {block}, gemv_row_smem(block), pa, pq,
-                   ps, py, uN, uK, uG);
-}
 
 // Split-KV split-count heuristic: how many ctx-splits make grid = heads×S fill
 // the SMs (heads alone is ~32 blocks « 82 SMs; target ~4 blocks/SM, and each
@@ -1716,20 +1725,21 @@ struct attn_partials {
 // one pass. q [n_q_heads,D], out [n_q_heads,D]; K/V are a [n_kv_heads,kv_max,D]
 // cache read over its valid prefix [0,ctx) (kv_max==ctx is the no-cache case).
 // GQA: q head h reads kv head h/(n_q_heads/n_kv_heads). Contiguous, D∈{64,128}.
-inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
-                        int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
-                        int64_t D, float scale, bool kv_bf16 = false) {
+inline bool own::attn_decode(gpu::span q, gpu::span K, gpu::span V,
+                             gpu::span out, int64_t n_q_heads,
+                             int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
+                             int64_t D, float scale, bool kv_bf16) {
   auto& c = context::get();
   if (!c.ready || (D != 128 && D != 64)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
-  c.device_read_(q);
-  c.device_read_(K);
-  c.device_read_(V);
-  c.device_write_(out);
-  float* pq = context::off_(q, 0);
-  float* pk = context::off_(K, 0);
-  float* pv = context::off_(V, 0);
-  float* po = context::off_(out, 0);
+  c.device_read_(q.buf);
+  c.device_read_(K.buf);
+  c.device_read_(V.buf);
+  c.device_write_(out.buf);
+  float* pq = context::off_(q.buf, q.off);
+  float* pk = context::off_(K.buf, K.off);
+  float* pv = context::off_(V.buf, V.off);
+  float* po = context::off_(out.buf, out.off);
   unsigned uh = static_cast<unsigned>(n_q_heads), uctx = static_cast<unsigned>(ctx);
   unsigned kv_stride = static_cast<unsigned>(kv_max * D);
   unsigned group = static_cast<unsigned>(n_q_heads / n_kv_heads);
@@ -1763,48 +1773,49 @@ inline bool attn_decode(void* q, void* K, void* V, void* out, int64_t n_q_heads,
 // from the cache CAPACITY (max_ctx) and lets the kernel bound the work by pos.
 
 // RoPE reading pos from *d_pos (else identical to rope()).
-inline bool rope_dpos(void* x, void* out, int64_t rows, int64_t T, int64_t D,
-                      void* d_pos, float base, void* bias = nullptr) {
+inline bool own::rope_dpos(gpu::span x, gpu::span out, int64_t rows, int64_t T,
+                           int64_t D, gpu::span d_pos, float base,
+                           gpu::span bias) {
   auto& c = context::get();
   if (!c.ready || D <= 0 || (D & 1)) return false;
-  c.device_read_(x);
-  if (bias) c.device_read_(bias);
-  c.device_write_(out);
-  c.device_read_(d_pos);
-  float* px = context::off_(x, 0);
-  float* pbias = bias ? context::off_(bias, 0) : nullptr;
-  float* po = context::off_(out, 0);
-  float* pp = context::off_(d_pos, 0);
+  c.device_read_(x.buf);
+  if (bias.buf) c.device_read_(bias.buf);
+  c.device_write_(out.buf);
+  c.device_read_(d_pos.buf);
+  float* px = context::off_(x.buf, x.off);
+  float* pbias = bias.buf ? context::off_(bias.buf, bias.off) : nullptr;
+  float* po = context::off_(out.buf, out.off);
+  float* pp = context::off_(d_pos.buf, d_pos.off);
   unsigned uT = (unsigned)T, uD = (unsigned)D;
   return c.launch_(c.rope_dpos_(), {(unsigned)rows}, {(unsigned)(D / 2)}, 0, px,
                    pbias, po, uT, uD, pp, base);
 }
 
 // One-thread *d_pos += 1 (tail of a captured forward; advances the counter).
-inline bool incr_u32(void* d_pos) {
+inline bool own::incr_u32(gpu::span d_pos) {
   auto& c = context::get();
   if (!c.ready) return false;
-  c.device_write_(d_pos);
-  float* pp = context::off_(d_pos, 0);
+  c.device_write_(d_pos.buf);
+  float* pp = context::off_(d_pos.buf, d_pos.off);
   return c.launch_(c.incr_u32_(), {1}, {1}, 0, pp);
 }
 
 // KV append with write-row = *d_pos (else identical to kv_append(); f32 KV).
-inline bool kv_append_dpos(void* Kc, void* Vc, void* k_new, void* v_new,
-                           void* d_pos, int64_t kv_max, int64_t n_kv_heads,
-                           int64_t D) {
+inline bool own::kv_append_dpos(gpu::span Kc, gpu::span Vc, gpu::span k_new,
+                                gpu::span v_new, gpu::span d_pos,
+                                int64_t kv_max, int64_t n_kv_heads, int64_t D) {
   auto& c = context::get();
   if (!c.ready || (D != 128 && D != 64)) return false;
-  c.device_read_(k_new);
-  c.device_read_(v_new);
-  c.device_read_(d_pos);
-  c.device_write_(Kc);
-  c.device_write_(Vc);
-  float* pKc = context::off_(Kc, 0);
-  float* pVc = context::off_(Vc, 0);
-  float* pk = context::off_(k_new, 0);
-  float* pv = context::off_(v_new, 0);
-  float* pp = context::off_(d_pos, 0);
+  c.device_read_(k_new.buf);
+  c.device_read_(v_new.buf);
+  c.device_read_(d_pos.buf);
+  c.device_write_(Kc.buf);
+  c.device_write_(Vc.buf);
+  float* pKc = context::off_(Kc.buf, Kc.off);
+  float* pVc = context::off_(Vc.buf, Vc.off);
+  float* pk = context::off_(k_new.buf, k_new.off);
+  float* pv = context::off_(v_new.buf, v_new.off);
+  float* pp = context::off_(d_pos.buf, d_pos.off);
   unsigned kv_stride = (unsigned)(kv_max * D);
   return c.launch_(c.kv_append_dpos_(), {(unsigned)n_kv_heads}, {(unsigned)D},
                    0, pKc, pVc, pk, pv, pp, kv_stride);
@@ -1822,29 +1833,30 @@ inline bool kv_append_dpos(void* Kc, void* Vc, void* k_new, void* v_new,
 // — like d_pos, it is graph-lifetime state (a captured graph bakes its address
 // in), so it must not be a shared growable scratch; kv_cache owns one per
 // cache. f32 KV.
-inline bool attn_decode_dpos(void* q, void* K, void* V, void* out,
-                             int64_t n_q_heads, int64_t n_kv_heads, void* d_pos,
-                             int64_t kv_max, int64_t D, float scale,
-                             void* partials) {
+inline bool own::attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
+                                  gpu::span out, int64_t n_q_heads,
+                                  int64_t n_kv_heads, gpu::span d_pos,
+                                  int64_t kv_max, int64_t D, float scale,
+                                  gpu::span partials) {
   auto& c = context::get();
-  if (!c.ready || (D != 128 && D != 64) || !partials) return false;
+  if (!c.ready || (D != 128 && D != 64) || !partials.buf) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
-  c.device_read_(q);
-  c.device_read_(K);
-  c.device_read_(V);
-  c.device_read_(d_pos);
-  c.device_write_(out);
-  c.device_write_(partials);
-  float* pq = context::off_(q, 0);
-  float* pk = context::off_(K, 0);
-  float* pv = context::off_(V, 0);
-  float* po = context::off_(out, 0);
-  float* pp = context::off_(d_pos, 0);
+  c.device_read_(q.buf);
+  c.device_read_(K.buf);
+  c.device_read_(V.buf);
+  c.device_read_(d_pos.buf);
+  c.device_write_(out.buf);
+  c.device_write_(partials.buf);
+  float* pq = context::off_(q.buf, q.off);
+  float* pk = context::off_(K.buf, K.off);
+  float* pv = context::off_(V.buf, V.off);
+  float* po = context::off_(out.buf, out.off);
+  float* pp = context::off_(d_pos.buf, d_pos.off);
   unsigned uh = (unsigned)n_q_heads, uD = (unsigned)D;
   unsigned kv_stride = (unsigned)(kv_max * D);
   unsigned group = (unsigned)(n_q_heads / n_kv_heads);
   unsigned S = attn_split_count(uh, kv_max);
-  attn_partials p(context::off_(partials, 0), (size_t)uh * S);
+  attn_partials p(context::off_(partials.buf, partials.off), (size_t)uh * S);
   if (!c.launch_(c.attn_split_dpos_(D), {uh, S}, {uD}, 0, pq, pk, pv, p.pm,
                  p.pl, p.pacc, pp, kv_stride, group, scale)) {
     return false;
@@ -1852,72 +1864,28 @@ inline bool attn_decode_dpos(void* q, void* K, void* V, void* out,
   return p.combine(c, po, uh, uD, S);
 }
 
-// M9 KV cache append: scatter one decode step's k,v (each [n_kv_heads,D] device
-// buffers) into the cache (K,V each [n_kv_heads,kv_max,D]) at row `pos`.
-inline bool kv_append(void* Kc, void* Vc, void* k_new, void* v_new, int64_t pos,
-                      int64_t kv_max, int64_t n_kv_heads, int64_t D,
-                      bool kv_bf16 = false) {
-  auto& c = context::get();
-  if (!c.ready || (D != 128 && D != 64)) return false;
-  c.device_read_(k_new);
-  c.device_read_(v_new);
-  c.device_write_(Kc);
-  c.device_write_(Vc);
-  float* pKc = context::off_(Kc, 0);
-  float* pVc = context::off_(Vc, 0);
-  float* pk = context::off_(k_new, 0);
-  float* pv = context::off_(v_new, 0);
-  unsigned upos = static_cast<unsigned>(pos);
-  unsigned kv_stride = static_cast<unsigned>(kv_max * D);
-  return c.launch_(c.kv_append_(kv_bf16), {static_cast<unsigned>(n_kv_heads)},
-                   {static_cast<unsigned>(D)}, 0, pKc, pVc, pk, pv, upos,
-                   kv_stride);
-}
-
-// M9 prefill: bulk-copy a block of k,v (each [n_kv_heads,T,D] device buffers)
-// into the cache (K,V each [n_kv_heads,kv_max,D]) rows [pos0, pos0+T), so a long
-// prompt can be filled in chunks. grid=(n_kv_heads,T).
-inline bool kv_fill(void* Kc, void* Vc, void* K, void* V, int64_t T,
-                    int64_t kv_max, int64_t n_kv_heads, int64_t D,
-                    bool kv_bf16 = false, int64_t pos0 = 0) {
-  auto& c = context::get();
-  if (!c.ready || (D != 128 && D != 64)) return false;
-  c.device_read_(K);
-  c.device_read_(V);
-  c.device_write_(Kc);
-  c.device_write_(Vc);
-  float* pKc = context::off_(Kc, 0);
-  float* pVc = context::off_(Vc, 0);
-  float* pk = context::off_(K, 0);
-  float* pv = context::off_(V, 0);
-  unsigned uT = static_cast<unsigned>(T);
-  unsigned kv_stride = static_cast<unsigned>(kv_max * D);
-  unsigned up0 = static_cast<unsigned>(pos0);
-  return c.launch_(c.kv_fill_(kv_bf16), {static_cast<unsigned>(n_kv_heads), uT},
-                   {static_cast<unsigned>(D)}, 0, pKc, pVc, pk, pv, uT,
-                   kv_stride, up0);
-}
-
 // M9 causal prefill attention: q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D]
 // cache read over [0,pos0+T). Query p is at absolute position pos0+p and attends
 // keys 0..pos0+p, so a long prompt can be run in chunks (and a later turn
 // appended to a live cache). GQA via group. D∈{64,128}.
 // One block per (head, query tile); grid = (n_q_heads, ceil(T/tile)).
-inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads,
-                         int64_t n_kv_heads, int64_t T, int64_t kv_max, int64_t D,
-                         float scale, bool kv_bf16 = false, int64_t pos0 = 0) {
+inline bool own::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
+                              gpu::span out, int64_t n_q_heads,
+                              int64_t n_kv_heads, int64_t T, int64_t kv_max,
+                              int64_t D, float scale, bool kv_bf16,
+                              int64_t pos0) {
   auto& c = context::get();
   if (!c.ready || (D != 128 && D != 64)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
   if (T <= 0 || T > 65535) return false;  // one call is one prompt chunk
-  c.device_read_(q);
-  c.device_read_(K);
-  c.device_read_(V);
-  c.device_write_(out);
-  float* pq = context::off_(q, 0);
-  float* pk = context::off_(K, 0);
-  float* pv = context::off_(V, 0);
-  float* po = context::off_(out, 0);
+  c.device_read_(q.buf);
+  c.device_read_(K.buf);
+  c.device_read_(V.buf);
+  c.device_write_(out.buf);
+  float* pq = context::off_(q.buf, q.off);
+  float* pk = context::off_(K.buf, K.off);
+  float* pv = context::off_(V.buf, V.off);
+  float* po = context::off_(out.buf, out.off);
   unsigned uT = static_cast<unsigned>(T);
   unsigned kv_stride = static_cast<unsigned>(kv_max * D);
   unsigned group = static_cast<unsigned>(n_q_heads / n_kv_heads);
@@ -1938,68 +1906,70 @@ inline bool attn_prefill(void* q, void* K, void* V, void* out, int64_t n_q_heads
 // all [H,T,D] contiguous — a training shape, so no KV cache, no GQA and no
 // chunked positions — and `stats` [2,H,T] the row logsumexp and dO·O the dK/dV
 // half reads. D∈{64,128}. One block per (head, query tile).
-inline bool attn_prefill_dq(void* q, void* K, void* V, void* dO, void* O,
-                            void* dq, void* stats, int64_t H, int64_t T,
-                            int64_t D, float scale) {
+inline bool own::attn_prefill_dq(gpu::span q, gpu::span K, gpu::span V,
+                                 gpu::span dO, gpu::span O, gpu::span dq,
+                                 gpu::span stats, int64_t H, int64_t T,
+                                 int64_t D, float scale) {
   auto& c = context::get();
   if (!c.ready || (D != 128 && D != 64)) return false;
   if (H <= 0 || T <= 0 || T > 65535) return false;
-  c.device_read_(q);
-  c.device_read_(K);
-  c.device_read_(V);
-  c.device_read_(dO);
-  c.device_read_(O);
-  c.device_write_(dq);
-  c.device_write_(stats);
+  c.device_read_(q.buf);
+  c.device_read_(K.buf);
+  c.device_read_(V.buf);
+  c.device_read_(dO.buf);
+  c.device_read_(O.buf);
+  c.device_write_(dq.buf);
+  c.device_write_(stats.buf);
   unsigned uT = static_cast<unsigned>(T);
   const unsigned tile = attn_bwd_tile(D);
   return c.launch_(c.attn_bwd_dq_(D),
                    {static_cast<unsigned>(H), (uT + tile - 1) / tile},
-                   {attn_tile_threads}, 0, context::off_(q, 0),
-                   context::off_(K, 0), context::off_(V, 0),
-                   context::off_(dO, 0), context::off_(O, 0),
-                   context::off_(dq, 0), context::off_(stats, 0), uT, scale);
+                   {attn_tile_threads}, 0, context::off_(q.buf, q.off),
+                   context::off_(K.buf, K.off), context::off_(V.buf, V.off),
+                   context::off_(dO.buf, dO.off), context::off_(O.buf, O.off),
+                   context::off_(dq.buf, dq.off), context::off_(stats.buf, stats.off), uT, scale);
 }
 
 // The key/value half, reading the stats the call above wrote: q, K, V, dO, dK
 // and dV all [H,T,D] contiguous, `stats` [2,H,T]. One block per (head, key
 // tile), and the head count reaches the kernel as gridDim.x — it is what the
 // stats' plane stride is made of.
-inline bool attn_prefill_dkv(void* q, void* K, void* V, void* dO, void* stats,
-                             void* dK, void* dV, int64_t H, int64_t T,
-                             int64_t D, float scale) {
+inline bool own::attn_prefill_dkv(gpu::span q, gpu::span K, gpu::span V,
+                                  gpu::span dO, gpu::span stats, gpu::span dK,
+                                  gpu::span dV, int64_t H, int64_t T, int64_t D,
+                                  float scale) {
   auto& c = context::get();
   if (!c.ready || (D != 128 && D != 64)) return false;
   if (H <= 0 || T <= 0 || T > 65535) return false;
-  c.device_read_(q);
-  c.device_read_(K);
-  c.device_read_(V);
-  c.device_read_(dO);
-  c.device_read_(stats);
-  c.device_write_(dK);
-  c.device_write_(dV);
+  c.device_read_(q.buf);
+  c.device_read_(K.buf);
+  c.device_read_(V.buf);
+  c.device_read_(dO.buf);
+  c.device_read_(stats.buf);
+  c.device_write_(dK.buf);
+  c.device_write_(dV.buf);
   unsigned uT = static_cast<unsigned>(T);
   const unsigned tile = attn_bwd_tile(D);
   return c.launch_(c.attn_bwd_dkv_(D),
                    {static_cast<unsigned>(H), (uT + tile - 1) / tile},
-                   {attn_tile_threads}, 0, context::off_(q, 0),
-                   context::off_(K, 0), context::off_(V, 0),
-                   context::off_(dO, 0), context::off_(stats, 0),
-                   context::off_(dK, 0), context::off_(dV, 0), uT, scale);
+                   {attn_tile_threads}, 0, context::off_(q.buf, q.off),
+                   context::off_(K.buf, K.off), context::off_(V.buf, V.off),
+                   context::off_(dO.buf, dO.off), context::off_(stats.buf, stats.off),
+                   context::off_(dK.buf, dK.off), context::off_(dV.buf, dV.off), uT, scale);
 }
 
 // RoPE: rotate a contiguous [rows, D] buffer (rows = H*T). Row r's position is
 // pos + (r % T); half-split (GPT-NeoX / HF-llama) convention. D must be even.
-inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
-                 int64_t pos, float base, void* bias = nullptr) {
+inline bool own::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
+                      int64_t D, int64_t pos, float base, gpu::span bias) {
   auto& c = context::get();
   if (!c.ready || D <= 0 || (D & 1)) return false;
-  c.device_read_(x);
-  if (bias) c.device_read_(bias);
-  c.device_write_(out);
-  float* px = context::off_(x, 0);
-  float* pbias = bias ? context::off_(bias, 0) : nullptr;
-  float* po = context::off_(out, 0);
+  c.device_read_(x.buf);
+  if (bias.buf) c.device_read_(bias.buf);
+  c.device_write_(out.buf);
+  float* px = context::off_(x.buf, x.off);
+  float* pbias = bias.buf ? context::off_(bias.buf, bias.off) : nullptr;
+  float* po = context::off_(out.buf, out.off);
   unsigned uT = static_cast<unsigned>(T), uD = static_cast<unsigned>(D),
            upos = static_cast<unsigned>(pos);
   return c.launch_(c.rope_(), {static_cast<unsigned>(rows)},
@@ -2011,89 +1981,6 @@ inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
 // batched prefill chunk passes its token count. ONE kernel serves both, which is
 // what keeps the two paths from drifting numerically. Buffers are [rows, n]
 // contiguous; the weight is [n], shared by every row.
-
-// xout = x + delta; hout = rmsnorm(xout) * w, per row. xout may alias x. Folds a
-// layer's residual add into the following norm (the o-proj->norm and
-// mlp->next-input-norm seams), writing both the residual sum (the next residual
-// base) and its normalized form.
-inline bool rmsnorm_res(void* x, void* delta, void* w, void* xout, void* hout,
-                        int64_t n, float eps, int64_t rows = 1) {
-  auto& c = context::get();
-  if (!c.ready || n <= 0 || rows <= 0) return false;
-  c.device_read_(x);
-  c.device_read_(delta);
-  c.device_read_(w);
-  c.device_write_(xout);
-  c.device_write_(hout);
-  float* pa = context::off_(x, 0);
-  float* pb = context::off_(delta, 0);
-  float* pw = context::off_(w, 0);
-  float* px = context::off_(xout, 0);
-  float* ph = context::off_(hout, 0);
-  unsigned un = (unsigned)n, block = 256;
-  return c.launch_(c.add_rmsnorm_(), {(unsigned)rows}, {block},
-                   block * sizeof(float), pa, pb, pw, px, ph, un, eps);
-}
-
-// GPU argmax over a length-n device vector (contiguous, offset 0). Reduces on
-// device and D2H's only the 4-byte index — replaces the per-token 608KB logits
-// copy + host scan that greedy decoding otherwise pays. `in` is a native
-// device-buffer handle (e.g. an evaluated logits array's native()); stream
-// ordering means the prior gemv that filled it need not be host-synced first.
-// Returns the argmax index, tie-broken to the smallest index (matches the
-// host `v[i] > v[bi]` loop) so greedy output stays bit-identical.
-inline bool argmax(void* in, int64_t n, int64_t* out_idx) {
-  auto& c = context::get();
-  if (!c.ready || !in || n <= 0 || !out_idx) return false;
-  c.device_read_(in);
-  float* pin = context::off_(in, 0);
-  CUdeviceptr res = c.argmax_res_();
-  if (!res) return false;
-  int* pres = reinterpret_cast<int*>(res);
-  unsigned un = static_cast<unsigned>(n);
-  unsigned block = 256;
-  if (!c.launch_(c.argmax_(), {1}, {block},
-                 block * (sizeof(float) + sizeof(int)), pin, pres, un)) {
-    return false;
-  }
-  flush();  // the result index must be ready before the 4-byte D2H
-  int h = 0;
-  if (c.d.MemcpyDtoH(&h, res, sizeof(int)) != 0) return false;
-  *out_idx = h;
-  return true;
-}
-
-// Fused RMSNorm over one length-n row: out = x * 1/sqrt(mean(x^2)+eps) * w.
-// x/w/out are native device handles (offset 0). One block; matches the array
-// composition numerically (see tl_rmsnorm). In-place safe (out may alias x).
-inline bool rmsnorm(void* x, void* w, void* out, int64_t n, float eps,
-                    int64_t rows = 1) {
-  auto& c = context::get();
-  if (!c.ready || n <= 0 || rows <= 0) return false;
-  c.device_read_(x);
-  c.device_read_(w);
-  c.device_write_(out);
-  float* px = context::off_(x, 0);
-  float* pw = context::off_(w, 0);
-  float* po = context::off_(out, 0);
-  unsigned un = (unsigned)n, block = 256;
-  return c.launch_(c.rmsnorm_(), {(unsigned)rows}, {block},
-                   block * sizeof(float), px, pw, po, un, eps);
-}
-
-// out[rows, ff] = silu(gate) * up, read out of the FUSED gate|up buffer
-// gu[rows, 2*ff] that both paths already produce (up is gate + ff in each row).
-inline bool swiglu(void* gu, void* out, int64_t ff, int64_t rows = 1) {
-  auto& c = context::get();
-  if (!c.ready || ff <= 0 || rows <= 0) return false;
-  c.device_read_(gu);
-  c.device_write_(out);
-  float* pg = context::off_(gu, 0);
-  float* po = context::off_(out, 0);
-  unsigned uff = (unsigned)ff, block = 256;
-  unsigned gx = (uff + block - 1) / block;
-  return c.launch_(c.swiglu_(), {gx, (unsigned)rows}, {block}, 0, pg, po, uff);
-}
 
 // The KV cache itself is tl::kv_cache (kv_cache.h), written once over the
 // gpu:: facade; its graph-capture forms call kv_append_dpos / attn_decode_dpos
@@ -2152,21 +2039,21 @@ inline sgemm_splitk sgemm_splitk_(long base_blocks, unsigned k, const sgemm_tile
 // plain GEMM and keeps the one-output-per-thread fallback (tl_sgemm) for the
 // layouts the fast path declines; batch > 1 has no fallback here and returns
 // false, so the caller loops per slice.
-inline bool gemm_batched(void* a, int64_t ao, int64_t lda, bool ta, int64_t sa,
-                         void* b, int64_t bo, int64_t ldb, bool tb, int64_t sb,
-                         void* out, int64_t oo, int64_t m, int64_t n, int64_t k,
-                         int64_t batch, float scale, float offset,
-                         void* bias = nullptr, int64_t biaso = 0) {
+inline bool own::gemm_batched(gpu::span a, int64_t lda, bool ta, int64_t sa,
+                              gpu::span b, int64_t ldb, bool tb, int64_t sb,
+                              gpu::span out, int64_t m, int64_t n, int64_t k,
+                              int64_t batch, float scale, float offset,
+                              gpu::span bias) {
   auto& c = context::get();
   if (!c.ready || batch < 1) return false;
-  c.device_read_(a);
-  c.device_read_(b);
-  if (bias) c.device_read_(bias);
-  c.device_write_(out);
-  float* pa = context::off_(a, ao);
-  float* pb = context::off_(b, bo);
-  float* pbias = bias ? context::off_(bias, biaso) : nullptr;
-  float* po = context::off_(out, oo);
+  c.device_read_(a.buf);
+  c.device_read_(b.buf);
+  if (bias.buf) c.device_read_(bias.buf);
+  c.device_write_(out.buf);
+  float* pa = context::off_(a.buf, a.off);
+  float* pb = context::off_(b.buf, b.off);
+  float* pbias = bias.buf ? context::off_(bias.buf, bias.off) : nullptr;
+  float* po = context::off_(out.buf, out.off);
   unsigned um = (unsigned)m, un = (unsigned)n, uk = (unsigned)k;
 
   // Tiled fast path (tl_sgemm_cp*, one per tile per operand layout): each
@@ -2178,7 +2065,7 @@ inline bool gemm_batched(void* a, int64_t ao, int64_t lda, bool ta, int64_t sa,
   // 16B-aligned: multiples of 4 floats (C is stored per element, so only its
   // m·n stride has to fit). M and N block edges are predicated in-kernel.
   // Strided views, odd K and unaligned offsets fall to tl_sgemm.
-  bool aligned = (ao % 16 == 0) && (bo % 16 == 0) && (oo % 16 == 0);
+  bool aligned = (a.off % 16 == 0) && (b.off % 16 == 0) && (out.off % 16 == 0);
   bool a_ok = ta ? (lda == m && m % 4 == 0) : (lda == k);
   bool b_ok = tb ? (ldb == k) : (ldb == n && n % 4 == 0);
   bool batch_ok = sa % 4 == 0 && sb % 4 == 0 && sa <= (int64_t)UINT32_MAX &&
@@ -2228,50 +2115,50 @@ inline bool gemm_batched(void* a, int64_t ao, int64_t lda, bool ta, int64_t sa,
 }
 
 // C(m,n) = (A @ B) * scale + offset: the batch == 1 case of gemm_batched.
-inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
-                 int64_t ldb, bool tb, void* out, int64_t oo, int64_t m,
-                 int64_t n, int64_t k, float scale, float offset) {
-  return gemm_batched(a, ao, lda, ta, 0, b, bo, ldb, tb, 0, out, oo, m, n, k, 1,
-                      scale, offset);
+inline bool own::gemm(gpu::span a, int64_t lda, bool ta, gpu::span b,
+                      int64_t ldb, bool tb, gpu::span out, int64_t m, int64_t n,
+                      int64_t k, float scale, float offset) {
+  return gemm_batched(a, lda, ta, 0, b, ldb, tb, 0, out, m, n, k, 1, scale,
+                      offset);
 }
 
 // C(m,n) = (A @ B) * scale + offset + bias[j]: addmm's shape, the row bias
 // added in the gemm's own store rather than by a second pass over C.
-inline bool gemm_bias(void* a, int64_t ao, int64_t lda, bool ta, void* b,
-                      int64_t bo, int64_t ldb, bool tb, void* bias,
-                      int64_t biaso, void* out, int64_t oo, int64_t m,
-                      int64_t n, int64_t k, float scale, float offset) {
-  return gemm_batched(a, ao, lda, ta, 0, b, bo, ldb, tb, 0, out, oo, m, n, k, 1,
-                      scale, offset, bias, biaso);
+inline bool own::gemm_bias(gpu::span a, int64_t lda, bool ta, gpu::span b,
+                           int64_t ldb, bool tb, gpu::span bias, gpu::span out,
+                           int64_t m, int64_t n, int64_t k, float scale,
+                           float offset) {
+  return gemm_batched(a, lda, ta, 0, b, ldb, tb, 0, out, m, n, k, 1, scale,
+                      offset, bias);
 }
 
 // Layer norm's pullback: dx [rows, cols], dg and db [cols] from x and dy
 // [rows, cols] and the d-vector g, all contiguous; dx/dg/db, `stats` [2, rows]
 // and `partials` [2, chunks, cols] are fresh buffers of the caller's, the rows
 // taken `per_chunk` at a time. A row kernel, a column-strip kernel, a fold.
-inline bool layer_norm_bwd(void* x, int64_t xo, void* g, int64_t go, void* dy,
-                           int64_t dyo, void* dx, void* dg, void* db,
-                           void* stats, void* partials, int64_t rows,
-                           int64_t cols, int64_t per_chunk, int64_t chunks,
-                           float eps) {
+inline bool own::layer_norm_bwd(gpu::span x, gpu::span g, gpu::span dy,
+                                gpu::span dx, gpu::span dg, gpu::span db,
+                                gpu::span stats, gpu::span partials,
+                                int64_t rows, int64_t cols, int64_t per_chunk,
+                                int64_t chunks, float eps) {
   auto& c = context::get();
   if (!c.ready || rows <= 0 || cols <= 0 || chunks <= 0) return false;
-  c.device_read_(x);
-  c.device_read_(g);
-  c.device_read_(dy);
-  c.device_write_(dx);
-  c.device_write_(dg);
-  c.device_write_(db);
-  c.device_write_(stats);
-  c.device_write_(partials);
-  float* px = context::off_(x, xo);
-  float* pg = context::off_(g, go);
-  float* pdy = context::off_(dy, dyo);
-  float* pdx = context::off_(dx, 0);
-  float* pdg = context::off_(dg, 0);
-  float* pdb = context::off_(db, 0);
-  float* ps = context::off_(stats, 0);
-  float* pp = context::off_(partials, 0);
+  c.device_read_(x.buf);
+  c.device_read_(g.buf);
+  c.device_read_(dy.buf);
+  c.device_write_(dx.buf);
+  c.device_write_(dg.buf);
+  c.device_write_(db.buf);
+  c.device_write_(stats.buf);
+  c.device_write_(partials.buf);
+  float* px = context::off_(x.buf, x.off);
+  float* pg = context::off_(g.buf, g.off);
+  float* pdy = context::off_(dy.buf, dy.off);
+  float* pdx = context::off_(dx.buf, dx.off);
+  float* pdg = context::off_(dg.buf, dg.off);
+  float* pdb = context::off_(db.buf, db.off);
+  float* ps = context::off_(stats.buf, stats.off);
+  float* pp = context::off_(partials.buf, partials.off);
   unsigned ur = (unsigned)rows, uc = (unsigned)cols, uk = (unsigned)chunks;
   unsigned up = (unsigned)per_chunk;
   unsigned block = 256;
@@ -2297,6 +2184,7 @@ inline bool layer_norm_bwd(void* x, int64_t xo, void* g, int64_t go, void* dy,
 // unreachable `return false` claiming an API that isn't really there.
 
 inline bool available() { return false; }
+struct own {};
 inline bool pending() { return false; }
 inline bool dispatch(kop, const gpu::arg*, size_t, const void*, size_t,
                      const gpu::grid&) {
@@ -2305,59 +2193,6 @@ inline bool dispatch(kop, const gpu::arg*, size_t, const void*, size_t,
 inline void flush() {}
 inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
 inline void release(void*, int64_t, float*) {}
-inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
-                 void*, int64_t, int64_t, int64_t, int64_t, float, float) {
-  return false;
-}
-inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
-                         int64_t, int64_t, bool, int64_t, void*, int64_t,
-                         int64_t, int64_t, int64_t, int64_t, float, float) {
-  return false;
-}
-inline bool gemm_bias(void*, int64_t, int64_t, bool, void*, int64_t, int64_t,
-                      bool, void*, int64_t, void*, int64_t, int64_t, int64_t,
-                      int64_t, float, float) {
-  return false;
-}
-inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
-                           void*, void*, void*, void*, void*, int64_t, int64_t,
-                           int64_t, int64_t, float) {
-  return false;
-}
-inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
-                const int64_t*, int, int, int64_t, int64_t, int64_t) {
-  return false;
-}
-inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,
-                 const int64_t*, int, int, int64_t, int64_t, int64_t) {
-  return false;
-}
-inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
-                      int64_t, int64_t) {
-  return false;
-}
-inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
-                            int64_t, int64_t) {
-  return false;
-}
-inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,
-                            int64_t, const int64_t*, void*, int64_t,
-                            const int64_t*, int, int64_t, float, float) {
-  return false;
-}
-inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
-                     const int64_t*, void*, int64_t, const int64_t*, void*,
-                     int64_t, const int64_t*, int, int64_t) {
-  return false;
-}
-inline bool copy_nd(void*, int64_t, const int64_t*, void*, int64_t,
-                    const int64_t*, int, int64_t) {
-  return false;
-}
-inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
-                   const int64_t*, int, int64_t, int64_t, void*, int64_t) {
-  return false;
-}
 inline void sync_to_host(void*, bool) {}
 
 #endif

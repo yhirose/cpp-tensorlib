@@ -50,7 +50,7 @@ enum class kop {
   attn_decode_bf16_64_, attn_decode_bf16_128_,    // the same over a bf16 cache
   attn_decode_split_bf16_64_, attn_decode_split_bf16_128_,
   kv_append_, kv_append_bf16_, kv_fill_, kv_fill_bf16_,  // the KV cache's writes
-  argmax_, rmsnorm_, swiglu_, split_heads_, merge_heads_,  // the decode step's rest
+  argmax_, rmsnorm_, add_rmsnorm_, swiglu_, split_heads_, merge_heads_,  // decode's rest
   gemv_f32_, gemv_bf16_, gemv_q4_,   // decode GEMVs, per weight dtype
   gemv_combine_,                     // their split-K partials
   gemv_bf16_row_,                    // ... and the [N,K] weight layout's own
@@ -83,10 +83,11 @@ struct span {
   explicit operator bool() const { return buf != nullptr; }
 };
 
-// How a kernel touches a view. It drives the residency of a mirrored backend
-// (an `in` is uploaded if the host holds the live copy; an `out` that the
-// kernel writes in full makes the device copy the live one; `inout` does
-// both), so no op says any of that by hand.
+// How a kernel touches a view. It drives the residency of a mirrored backend,
+// so no op says any of that by hand: an `in` is uploaded if the host holds the
+// live copy; an `out` makes the device copy the live one with no upload (the
+// kernel writes it in full, or — a KV cache's rows — the host never held
+// anything worth keeping); an `inout` is uploaded and then becomes live.
 enum class access : uint8_t { in, out, inout };
 
 struct arg {
@@ -151,6 +152,28 @@ struct adam_params {
   float b1, b2, eps, lr_over_bc1, inv_bc2;
   uint32_t n;
 };
+struct rmsnorm_params {  // per row of n: x * rsqrt(mean(x^2) + eps) * w
+  uint32_t n;
+  float eps;
+};
+struct swiglu_params {
+  uint32_t ff;
+};
+struct gemv_row_params {  // y[n] = a[k] . W[n, k], one group an output row
+  uint32_t n, k;
+};
+struct gemv_q4_params {
+  uint32_t n, k, group;
+};
+struct kv_append_params {
+  uint32_t pos, kv_stride;  // kv_stride = kv_max * D, elements a head
+};
+struct kv_fill_params {
+  uint32_t T, kv_stride, pos0;
+};
+struct merge_heads_params {
+  uint32_t T, H, D;
+};
 
 // Launch policy: the shapes ops launch in, in one place. Host code shared by
 // every backend; what differs between devices will come in as traits.
@@ -169,6 +192,40 @@ inline grid one_group_per_row(int64_t rows, uint32_t floats_per_thread = 1,
   uint32_t groups = static_cast<uint32_t>(rows);
   return {groups ? groups : 1, 1, 1, threads, 1, 1,
           threads * floats_per_thread * static_cast<uint32_t>(sizeof(float))};
+}
+
+// One thread an element of a row of n, `rows` of them stacked on y.
+inline grid flat_rows(int64_t n, int64_t rows, uint32_t threads = 256) {
+  grid g = flat(n, threads);
+  g.gy = static_cast<uint32_t>(rows);
+  return g;
+}
+
+// One group an output row, its threads striding that row's k inputs in steps
+// of `step` elements and reducing between them: the smallest group (a
+// multiple of 32, at most 256) that leaves each thread the fewest steps, so a
+// narrow row is not spread over threads with nothing to do. Scratch is one
+// float per 32-thread lane set, needed once there is more than one.
+inline grid row_reduce(int64_t rows, int64_t k, uint32_t step = 8) {
+  uint32_t threads = 32;
+  int64_t fewest = INT64_MAX;
+  for (uint32_t t = 32; t <= 256; t += 32) {
+    const int64_t steps = (k + int64_t(step) * t - 1) / (int64_t(step) * t);
+    if (steps < fewest) {
+      fewest = steps;
+      threads = t;
+    }
+  }
+  const uint32_t groups = static_cast<uint32_t>(rows);
+  return {groups ? groups : 1, 1, 1, threads, 1, 1,
+          threads > 32 ? (threads >> 5) * static_cast<uint32_t>(sizeof(float)) : 0};
+}
+
+// One group per (head, row), a thread per head-dim element: the attention
+// and KV-cache kernels' shape.
+inline grid per_head(int64_t heads, int64_t rows, int64_t D) {
+  return {static_cast<uint32_t>(heads), static_cast<uint32_t>(rows), 1,
+          static_cast<uint32_t>(D), 1, 1, 0};
 }
 
 // A thread per cell of [rows, cols], for a kernel that reads its cell from a

@@ -16,6 +16,21 @@ g++ -std=c++17 -O1 -shared -fPIC -I"$build" /tools/fake_libcuda.cpp -o "$build/l
 echo 0x00 > "$build/tensorlib_cuda_ptx.inc"
 
 flags=(-std=c++23 -O0 -w -DTENSORLIB_CUDA -I/tree/include -I"$build")
+
+# TL_CUDA_TRACE_CHECK=1: only ask whether everything still compiles against the
+# CUDA branch of the headers (a minute, against the full trace's two).
+if [ "${TL_CUDA_TRACE_CHECK:-0}" = 1 ]; then
+  pids=()
+  for src in /tree/test/test_array.cpp /tree/bench/cuda/check/*.cpp \
+             /tree/bench/cuda/speed/*.cpp /tree/bench/models/*.cpp; do
+    grep -q '#include <cu' "$src" && continue  # needs the CUDA toolkit's headers
+    g++ "${flags[@]}" -I/tree/bench/cuda -fsyntax-only "$src" & pids+=($!)
+  done
+  status=0
+  for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+  [ "$status" -eq 0 ] && echo "cuda_trace: the CUDA branch compiles"
+  exit "$status"
+fi
 compile() {  # name, sources...
   local name=$1
   shift

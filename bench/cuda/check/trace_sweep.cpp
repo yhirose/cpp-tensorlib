@@ -40,7 +40,7 @@ void elementwise() {
   }
   const int64_t shape[3] = {5, 8, 25}, as[3] = {200, 25, 1}, bs[3] = {0, 25, 1};
   for (kop op : {kop::badd, kop::bsub, kop::bmul, kop::bdiv, kop::bpow}) {
-    cu::binary_bcast_nd(op, a, kOff, as, b, 0, bs, o, kOff, shape, 3, n, 1.0f, 0.0f);
+    tl::gpu::binary_bcast_nd(op, {a, kOff}, as, {b, 0}, bs, {o, kOff}, shape, 3, n, 1.0f, 0.0f);
   }
   using cu::cmp_op;
   for (cmp_op op : {cmp_op::gt, cmp_op::lt, cmp_op::ge, cmp_op::le, cmp_op::eq,
@@ -57,8 +57,7 @@ void gemm_bias() {
         o(s.m * s.n * 4 + kOff);
     for (int layout = 0; layout < 4; layout++) {
       const bool ta = layout & 1, tb = layout & 2;
-      cu::gemm_bias(a, kOff, ta ? s.m : s.k, ta, b, kOff, tb ? s.k : s.n, tb,
-                    bias, 0, o, kOff, s.m, s.n, s.k, 1.0f, 0.0f);
+      tl::gpu::gemm_bias({a, kOff}, ta ? s.m : s.k, ta, {b, kOff}, tb ? s.k : s.n, tb, {bias, 0}, {o, kOff}, s.m, s.n, s.k, 1.0f, 0.0f);
     }
   }
 }
@@ -67,15 +66,15 @@ void gemm_bias() {
 void zero_then_scatter() {
   const int64_t a_shape[2] = {4, 6}, out_shape[2] = {4, 10};
   buf a(24 * 4 + kOff), o(40 * 4 + kOff);
-  cu::pad(a, kOff, o, kOff, a_shape, out_shape, 2, 1, 2, 24, 40);
+  tl::gpu::pad({a, kOff}, {o, kOff}, a_shape, out_shape, 2, 1, 2, 24, 40);
 
   const int64_t w_shape[3] = {4, 4, 3}, f_shape[2] = {4, 6};
   buf w(48 * 4 + kOff), f(24 * 4 + kOff);
-  cu::fold(w, kOff, f, kOff, w_shape, f_shape, 3, 1, 1, 48, 24);
+  tl::gpu::fold({w, kOff}, {f, kOff}, w_shape, f_shape, 3, 1, 1, 48, 24);
 
   buf idx(8 * 4 + kOff), vals(8 * 16 * 4 + kOff), table(32 * 16 * 4 + kOff);
-  cu::index_add(idx, kOff, vals, kOff, table, kOff, 16, 8, 32 * 16);
-  cu::scatter_to_axis(idx, kOff, vals, kOff, table, kOff, 8, 16);
+  tl::gpu::index_add({idx, kOff}, {vals, kOff}, {table, kOff}, 16, 8, 32 * 16);
+  tl::gpu::scatter_to_axis({idx, kOff}, {vals, kOff}, {table, kOff}, 8, 16);
 }
 
 void llm() {
@@ -83,7 +82,7 @@ void llm() {
     for (int64_t n : {896, 4864}) {
       const int64_t k = 896;
       buf a(m * k * 4), B(n * k * 2), o(m * n * 4);
-      cu::gemm_bf16_nt(a, B, o, m, n, k);
+      tl::gpu::gemm_bf16_nt({a, 0}, {B, 0}, {o, 0}, m, n, k);
     }
   }
   for (int64_t D : {64, 128}) {
@@ -91,7 +90,7 @@ void llm() {
     buf q(hq * D * 4), K(hkv * kv_max * D * 2), V(hkv * kv_max * D * 2),
         o(hq * D * 4);
     for (int64_t ctx : {17, 700, 4000}) {
-      cu::attn_decode(q, K, V, o, hq, hkv, ctx, kv_max, D, 0.125f, true);
+      tl::gpu::attn_decode({q, 0}, {K, 0}, {V, 0}, {o, 0}, hq, hkv, ctx, kv_max, D, 0.125f, true);
     }
   }
 }
@@ -104,10 +103,10 @@ void capture(int64_t D) {
       partials(cu::attn_dpos_partials_bytes(hq, kv_max, D));
   cu::upload_u32(pos, 5);
   if (!cu::capture_begin()) return;
-  cu::rope_dpos(x, xo, hq, 1, D, pos, 10000.0f);
-  cu::kv_append_dpos(K, V, knew, vnew, pos, kv_max, hkv, D);
-  cu::attn_decode_dpos(xo, K, V, o, hq, hkv, pos, kv_max, D, 0.125f, partials);
-  cu::incr_u32(pos);
+  tl::gpu::rope_dpos({x, 0}, {xo, 0}, hq, 1, D, {pos, 0}, 10000.0f);
+  tl::gpu::kv_append_dpos({K, 0}, {V, 0}, {knew, 0}, {vnew, 0}, {pos, 0}, kv_max, hkv, D);
+  tl::gpu::attn_decode_dpos({xo, 0}, {K, 0}, {V, 0}, {o, 0}, hq, hkv, {pos, 0}, kv_max, D, 0.125f, {partials, 0});
+  tl::gpu::incr_u32({pos, 0});
   auto graph = cu::capture_end();
   cu::graph_launch(graph);
   cu::flush();

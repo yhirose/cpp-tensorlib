@@ -16,7 +16,7 @@
 #ifndef TENSORLIB_CUDA
 #define TENSORLIB_CUDA
 #endif
-#include "cuda.h"
+#include "gpu.h"  // cuda.h plus the shared ops (tl::gpu resolves to cuda here)
 
 #include <algorithm>
 #include <chrono>
@@ -88,8 +88,8 @@ int main() {
     }
 
     // correctness: bf16-weight result vs f32-weight result
-    gemv_f32(a, Bf, yf, N, K);
-    gemv_bf16(a, Bb, yb, N, K);
+    tl::gpu::gemv_f32({a, 0}, {Bf, 0}, {yf, 0}, N, K);
+    tl::gpu::gemv_bf16({a, 0}, {Bb, 0}, {yb, 0}, N, K);
     flush();
     sync_to_host(yf, false);
     sync_to_host(yb, false);
@@ -113,8 +113,8 @@ int main() {
       }
       return median(ms);
     };
-    double f32_ms = time_ms([&] { gemv_f32(a, Bf, yf, N, K); });
-    double bf16_ms = time_ms([&] { gemv_bf16(a, Bb, yb, N, K); });
+    double f32_ms = time_ms([&] { tl::gpu::gemv_f32({a, 0}, {Bf, 0}, {yf, 0}, N, K); });
+    double bf16_ms = time_ms([&] { tl::gpu::gemv_bf16({a, 0}, {Bb, 0}, {yb, 0}, N, K); });
     double f32_gbs = static_cast<double>(K) * N * 4 / (f32_ms * 1e6);
     double bf16_gbs = static_cast<double>(K) * N * 2 / (bf16_ms * 1e6);
     sum_f32 += f32_ms;

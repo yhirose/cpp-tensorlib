@@ -33,6 +33,10 @@ struct storage {
 
   float* data() const { return ptr; }
 
+  // The whole buffer as the GPU layer names it (gpu_abi.h): a view at offset 0,
+  // from which span::at takes a slice. Null `buf` on a heap storage.
+  gpu::span device_span() const { return {native, 0}; }
+
   // `host_fill`: the host fills it before any kernel touches it (see
   // gpu::alloc).
   static storage make(int64_t n, dtype dt = dtype::f32, bool host_fill = false) {

@@ -15,7 +15,7 @@
 #ifndef TENSORLIB_CUDA
 #define TENSORLIB_CUDA
 #endif
-#include "cuda.h"
+#include "gpu.h"  // cuda.h plus the shared ops (tl::gpu resolves to cuda here)
 #include "kv_cache.h"
 
 #include <algorithm>
@@ -80,13 +80,13 @@ int main() {
       }
       sync_to_host(kn, true);
       sync_to_host(vn, true);
-      if (!cache.append(kn, vn)) { std::printf("  append failed pos %lld\n", (long long)pos); return 1; }
+      if (!cache.append({kn, 0}, {vn, 0})) { std::printf("  append failed pos %lld\n", (long long)pos); return 1; }
 
       if (ci < sizeof(checks) / sizeof(checks[0]) && step == checks[ci]) {
         ci++;
         for (int64_t i = 0; i < HQ * D; i++) hq[i] = rnd();
         sync_to_host(q, true);
-        cache.attn(q, o, HQ, scale);
+        cache.attn({q, 0}, {o, 0}, HQ, scale);
         flush();
         sync_to_host(o, false);
         // Lockstep guard: attn_dpos (split-KV on the capacity-static grid,
@@ -94,7 +94,7 @@ int main() {
         // device attn_dpos_chunk twins the host attn_split_count/attn_split_chunk
         // heuristic, and the capacity grid's empty splits combine as exact zeros.
         upload_u32(dp, (unsigned)pos);
-        cache.attn_dpos(q, o2, HQ, dp, scale);
+        cache.attn_dpos({q, 0}, {o2, 0}, HQ, {dp, 0}, scale);
         flush();
         sync_to_host(o2, false);
         if (std::memcmp(ho, ho2, (size_t)HQ * D * 4) != 0) {
@@ -150,7 +150,7 @@ int main() {
 
     tl::kv_cache cache;
     if (!cache.init(HKV, MAXC, D)) { std::printf("  cache init failed\n"); return 1; }
-    cache.prefill(qp, ks, vs, op, T, HQ, scale);
+    cache.prefill({qp, 0}, {ks, 0}, {vs, 0}, {op, 0}, T, HQ, scale);
     flush();
     sync_to_host(op, false);
 
@@ -192,8 +192,8 @@ int main() {
     for (int64_t i = 0; i < HKV * D; i++) { hkn[i] = rnd(); hvn[i] = rnd(); }
     for (int64_t i = 0; i < HQ * D; i++) hq1[i] = rnd();
     sync_to_host(kn, true); sync_to_host(vn, true); sync_to_host(q1, true);
-    cache.append(kn, vn);
-    cache.attn(q1, o1, HQ, scale);
+    cache.append({kn, 0}, {vn, 0});
+    cache.attn({q1, 0}, {o1, 0}, HQ, scale);
     flush();
     sync_to_host(o1, false);
 

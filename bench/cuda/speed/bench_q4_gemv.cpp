@@ -9,7 +9,7 @@
 #ifndef TENSORLIB_CUDA
 #define TENSORLIB_CUDA
 #endif
-#include "cuda.h"
+#include "gpu.h"  // cuda.h plus the shared ops (tl::gpu resolves to cuda here)
 
 #include <algorithm>
 #include <chrono>
@@ -90,7 +90,7 @@ int main() {
       }
     }
 
-    gemv_q4(a, qw, sc, y, N, K, G);
+    tl::gpu::gemv_q4({a, 0}, {qw, 0}, {sc, 0}, {y, 0}, N, K, G);
     flush();
     sync_to_host(y, false);
 
@@ -117,7 +117,7 @@ int main() {
       }
       return median(ms);
     };
-    double ms = time_ms([&] { gemv_q4(a, qw, sc, y, N, K, G); });
+    double ms = time_ms([&] { tl::gpu::gemv_q4({a, 0}, {qw, 0}, {sc, 0}, {y, 0}, N, K, G); });
     double bytes = (double)N * K * 0.5 + (double)N * groups * 4;
     double gbs = bytes / (ms * 1e6);
     double bpw = bytes / ((double)N * K);

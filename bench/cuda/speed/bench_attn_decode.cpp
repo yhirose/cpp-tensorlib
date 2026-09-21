@@ -14,7 +14,7 @@
 #ifndef TENSORLIB_CUDA
 #define TENSORLIB_CUDA
 #endif
-#include "cuda.h"
+#include "gpu.h"  // cuda.h plus the shared ops (tl::gpu resolves to cuda here)
 #include "kv_cache.h"
 
 #include <algorithm>
@@ -74,12 +74,11 @@ int main() {
     }
     // Narrow the f32 K,V into the bf16 cache buffers (kv_fill: [H,ctx,D] -> cache
     // rows [0,ctx), kv_max=ctx so no padding). H_kv = H here (no GQA).
-    kv_fill(Kb, Vb, K, V, ctx, ctx, H, D, /*kv_bf16=*/true);
+    tl::gpu::kv_fill({Kb, 0}, {Vb, 0}, {K, 0}, {V, 0}, ctx, ctx, H, D, /*kv_bf16=*/true);
     flush();
 
     auto run = [&](bool bf16) {
-      attn_decode(q, bf16 ? Kb : K, bf16 ? Vb : V, o, H, H, ctx, ctx, D, scale,
-                  bf16);
+      tl::gpu::attn_decode({q, 0}, {bf16 ? Kb : K, 0}, {bf16 ? Vb : V, 0}, {o, 0}, H, H, ctx, ctx, D, scale, bf16);
     };
     run(true);
     flush();
@@ -170,11 +169,10 @@ int main() {
                        return (int32_t)st * (1.0f / 2147483648.0f); };
       for (int64_t i = 0; i < HQ * D; i++) hq[i] = rnd();
       for (int64_t i = 0; i < HKV * ctx * D; i++) { hK[i] = rnd(); hV[i] = rnd(); }
-      kv_fill(Kb, Vb, K, V, ctx, ctx, HKV, D, true);
+      tl::gpu::kv_fill({Kb, 0}, {Vb, 0}, {K, 0}, {V, 0}, ctx, ctx, HKV, D, true);
       flush();
       auto run = [&](bool bf16) {
-        attn_decode(q, bf16 ? Kb : K, bf16 ? Vb : V, o, HQ, HKV, ctx, ctx, D, sc,
-                    bf16);
+        tl::gpu::attn_decode({q, 0}, {bf16 ? Kb : K, 0}, {bf16 ? Vb : V, 0}, {o, 0}, HQ, HKV, ctx, ctx, D, sc, bf16);
       };
       auto time = [&](bool bf16) {
         run(bf16); flush();
@@ -252,7 +250,7 @@ int main() {
       }
       sync_to_host(kn, true);  // host just wrote → re-upload on next device read
       sync_to_host(vn, true);
-      if (!cache.append(kn, vn)) {
+      if (!cache.append({kn, 0}, {vn, 0})) {
         std::printf("  append failed at pos %lld\n", (long long)pos);
         return 1;
       }
@@ -261,7 +259,7 @@ int main() {
         ci++;
         for (int64_t i = 0; i < HQ * D; i++) hq[i] = rnd();
         sync_to_host(q, true);
-        cache.attn(q, o, HQ, scale);
+        cache.attn({q, 0}, {o, 0}, HQ, scale);
         flush();
         sync_to_host(o, false);
 
@@ -302,7 +300,7 @@ int main() {
     std::vector<double> ms;
     for (int r = 0; r < ROUNDS; r++) {
       auto t0 = clk::now();
-      for (int i = 0; i < R; i++) cache.attn(q, o, HQ, scale);
+      for (int i = 0; i < R; i++) cache.attn({q, 0}, {o, 0}, HQ, scale);
       flush();
       ms.push_back(
           std::chrono::duration<double, std::milli>(clk::now() - t0).count() / R);
@@ -358,7 +356,7 @@ int main() {
       std::printf("  cache init failed\n");
       return 1;
     }
-    cache.prefill(qp, ks, vs, op, T, HQ, scale);
+    cache.prefill({qp, 0}, {ks, 0}, {vs, 0}, {op, 0}, T, HQ, scale);
     flush();
     sync_to_host(op, false);
 
@@ -412,8 +410,8 @@ int main() {
     sync_to_host(kn, true);
     sync_to_host(vn, true);
     sync_to_host(q1, true);
-    cache.append(kn, vn);
-    cache.attn(q1, o1, HQ, scale);
+    cache.append({kn, 0}, {vn, 0});
+    cache.attn({q1, 0}, {o1, 0}, HQ, scale);
     flush();
     sync_to_host(o1, false);
 
@@ -457,8 +455,7 @@ int main() {
     for (int r = 0; r < ROUNDS; r++) {
       auto t0 = clk::now();
       for (int i = 0; i < R; i++)
-        attn_prefill(qp, cache.K.native, cache.V.native, op, HQ, HKV, T, MAXC, D,
-                     scale);
+        tl::gpu::attn_prefill({qp, 0}, {cache.K.native, 0}, {cache.V.native, 0}, {op, 0}, HQ, HKV, T, MAXC, D, scale);
       flush();
       ms.push_back(
           std::chrono::duration<double, std::milli>(clk::now() - t0).count() / R);

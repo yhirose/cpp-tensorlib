@@ -19,7 +19,7 @@
 #ifndef TENSORLIB_CUDA
 #define TENSORLIB_CUDA
 #endif
-#include "cuda.h"
+#include "gpu.h"  // cuda.h plus the shared ops (tl::gpu resolves to cuda here)
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -120,14 +120,13 @@ int main(int argc, char** argv) {
                   dB, (int)n, dA, (int)k, &beta, (float*)out, (int)n);
     };
     auto run_own = [&](void* out) {
-      gemm(At, 0, sh.ta ? m : k, sh.ta, Bt, 0, sh.tb ? k : n, sh.tb, out, 0, m, n, k,
-           1.0f, 0.0f);
+      tl::gpu::gemm({At, 0}, sh.ta ? m : k, sh.ta, {Bt, 0}, sh.tb ? k : n, sh.tb, {out, 0}, m, n, k, 1.0f, 0.0f);
     };
 
     // ---- correctness: own vs cuBLAS (cuBLAS is the trusted oracle here) ----
     run_own(C);        // also uploads A,B to device (unless ta/tb)
     if (sh.ta || sh.tb)  // own read At/Bt: upload A,B through a plain NN gemm
-      gemm(A, 0, k, false, B, 0, n, false, Cref, 0, m, n, k, 1.0f, 0.0f);
+      tl::gpu::gemm({A, 0}, k, false, {B, 0}, n, false, {Cref, 0}, m, n, k, 1.0f, 0.0f);
     run_cublas(Cref);  // reads the same device A,B
     cudaDeviceSynchronize();
     std::vector<float> ownv(m * n), refv(m * n);

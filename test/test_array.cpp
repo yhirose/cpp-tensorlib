@@ -2955,12 +2955,12 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
         for (int64_t t = 0; t < T; t++) {
           array k = dev(K.slice(1, t, 1).clone());  // [HKV,1,D]
           array v = dev(V.slice(1, t, 1).clone());
-          REQUIRE(cache.append(k.native(), v.native()));
+          REQUIRE(cache.append(k.device_span(), v.device_span()));
         }
         CHECK(cache.pos == T);
         array q = dev(random_array({HQ, D}, 902));
         array out = array::empty({HQ, D});
-        REQUIRE(cache.attn(q.native(), out.native(), HQ, scale));
+        REQUIRE(cache.attn(q.device_span(), out.device_span(), HQ, scale));
         // Explicit: each q head attends its kv head's T rows.
         auto Kr = kv == tl::dtype::bf16 ? K.to_bf16().to_f32() : K;
         auto Vr = kv == tl::dtype::bf16 ? V.to_bf16().to_f32() : V;
@@ -2992,18 +2992,18 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
         array qp = dev(random_array({HQ, T, D}, 903));
         array Kd = dev(K), Vd = dev(V);
         array op = array::empty({HQ, T, D});
-        REQUIRE(c2.prefill(qp.native(), Kd.native(), Vd.native(), op.native(), T,
+        REQUIRE(c2.prefill(qp.device_span(), Kd.device_span(), Vd.device_span(), op.device_span(), T,
                            HQ, scale));
         CHECK(c2.pos == T);
         array out2 = array::empty({HQ, D});
-        REQUIRE(c2.attn(q.native(), out2.native(), HQ, scale));
+        REQUIRE(c2.attn(q.device_span(), out2.device_span(), HQ, scale));
         tl::gpu::flush();
         CHECK(same(out2, out, 1e-5f));
         // Row t of the prefill output is the decode of q row t over keys 0..t.
         const int64_t t = T - 1;
         array qt = dev(qp.slice(1, t, 1).reshape({HQ, D}).clone());
         array ot = array::empty({HQ, D});
-        REQUIRE(c2.attn(qt.native(), ot.native(), HQ, scale));
+        REQUIRE(c2.attn(qt.device_span(), ot.device_span(), HQ, scale));
         tl::gpu::flush();
         CHECK(same(ot, op.slice(1, t, 1).reshape({HQ, D}), 1e-4f));
       }
@@ -3016,9 +3016,9 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
     array w = dev(random_array({n}, 912));
     array h = array::empty({rows, n}), xo = array::empty({rows, n}),
           h2 = array::empty({rows, n});
-    REQUIRE(gpu::rmsnorm(x.native(), w.native(), h.native(), n, 1e-6f, rows));
-    REQUIRE(gpu::rmsnorm_res(x.native(), d.native(), w.native(), xo.native(),
-                             h2.native(), n, 1e-6f, rows));
+    REQUIRE(gpu::rmsnorm(x.device_span(), w.device_span(), h.device_span(), n, 1e-6f, rows));
+    REQUIRE(gpu::rmsnorm_res(x.device_span(), d.device_span(), w.device_span(), xo.device_span(),
+                             h2.device_span(), n, 1e-6f, rows));
     tl::gpu::flush();
     CHECK(same(h, array::rmsnorm(x, w, 1e-6f), 1e-5f));
     CHECK(same(xo, x + d, 1e-6f));
@@ -3029,13 +3029,13 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
     // by a factor of ten rather than the last bits.
     array tiny = dev(x * 1e-4f);
     array ht = array::empty({rows, n});
-    REQUIRE(gpu::rmsnorm(tiny.native(), w.native(), ht.native(), n, 1e-6f, rows));
+    REQUIRE(gpu::rmsnorm(tiny.device_span(), w.device_span(), ht.device_span(), n, 1e-6f, rows));
     tl::gpu::flush();
     CHECK(same(ht, array::rmsnorm(tiny, w, 1e-6f), 1e-5f));
 
     array gu = dev(random_array({rows, 2 * ff}, 913));
     array o = array::empty({rows, ff});
-    REQUIRE(gpu::swiglu(gu.native(), o.native(), ff, rows));
+    REQUIRE(gpu::swiglu(gu.device_span(), o.device_span(), ff, rows));
     tl::gpu::flush();
     array gate = gu.slice(1, 0, ff), up = gu.slice(1, ff, ff);
     CHECK(same(o, array::swiglu(gate, up), 1e-5f));
@@ -3045,7 +3045,7 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
     const int64_t H = 14, D = 64;
     array x = dev(random_array({H, D}, 920)), b = dev(random_array({H, D}, 921));
     array o = array::empty({H, D});
-    REQUIRE(gpu::rope(x.native(), o.native(), H, 1, D, 37, 1e6f, b.native()));
+    REQUIRE(gpu::rope(x.device_span(), o.device_span(), H, 1, D, 37, 1e6f, b.device_span()));
     tl::gpu::flush();
     CHECK(same(o, array::rope(x + b, 37, 1e6f), 1e-5f));
   }
@@ -3056,7 +3056,7 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
     v[77778] = 5.0f;  // a tie: the smaller index wins, as the host scan does
     array a = dev(array::from(v, {(int64_t)v.size()}));
     int64_t idx = -1;
-    REQUIRE(gpu::argmax(a.native(), (int64_t)v.size(), &idx));
+    REQUIRE(gpu::argmax(a.device_span(), (int64_t)v.size(), &idx));
     CHECK(idx == 77777);
   }
 
@@ -3076,14 +3076,14 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
     if (gpu::caps::row_gemv) {
       array a = dev(random_array({1, K}, 941));
       array y = array::empty({1, N});
-      REQUIRE(gpu::gemv_bf16_row(a.native(), Wb.native(), y.native(), N, K));
+      REQUIRE(gpu::gemv_bf16_row(a.device_span(), Wb.device_span(), y.device_span(), N, K));
       tl::gpu::flush();
       CHECK(same(y, a.dot(Wt), 1e-4f));
     }
     if (gpu::caps::bf16_gemm) {
       array A = dev(random_array({M, K}, 942));
       array C = array::empty({M, N});
-      REQUIRE(gpu::gemm_bf16_nt(A.native(), Wb.native(), C.native(), M, N, K));
+      REQUIRE(gpu::gemm_bf16_nt(A.device_span(), Wb.device_span(), C.device_span(), M, N, K));
       tl::gpu::flush();
       CHECK(same(C, A.dot(Wt), 1e-4f));
       // Row m of the GEMM is the GEMV of row m — the prefill and the decode
@@ -3092,7 +3092,7 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       if (gpu::caps::row_gemv) {
         array row = dev(A.slice(0, 7, 1).clone());
         array y1 = array::empty({1, N});
-        REQUIRE(gpu::gemv_bf16_row(row.native(), Wb.native(), y1.native(), N, K));
+        REQUIRE(gpu::gemv_bf16_row(row.device_span(), Wb.device_span(), y1.device_span(), N, K));
         tl::gpu::flush();
         CHECK(same(y1, C.slice(0, 7, 1), 1e-4f));
       }
@@ -3103,9 +3103,9 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
     const int64_t T = 5, H = 18, D = 64, ld = H * D;
     array src = dev(random_array({T, ld}, 930)), bias = dev(random_array({H, D}, 931));
     array heads = array::empty({H, T, D}), back = array::empty({T, ld});
-    REQUIRE(gpu::split_heads(src.native(), bias.native(), heads.native(), T, ld, 0,
+    REQUIRE(gpu::split_heads(src.device_span(), bias.device_span(), heads.device_span(), T, ld, 0,
                              H, D));
-    REQUIRE(gpu::merge_heads(heads.native(), back.native(), T, H, D));
+    REQUIRE(gpu::merge_heads(heads.device_span(), back.device_span(), T, H, D));
     tl::gpu::flush();
     // heads[h, t, :] = src[t, h*D:(h+1)*D] + bias[h]
     CHECK(same(heads, src.reshape({T, H, D}).transpose({1, 0, 2}) +

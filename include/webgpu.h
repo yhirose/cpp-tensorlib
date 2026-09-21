@@ -450,6 +450,42 @@ struct context {
 };
 
 inline bool available() { return context::get().ready; }
+
+// The ops this backend runs its own way: a different algorithm, several
+// kernels, or a kernel whose ABI is its own. gpu_ops.h forwards to whichever of
+// these exist (TL_GPU_DETECT_OWN) and answers false for the rest, so a backend
+// declares what it has and nothing else. Defined below, among their helpers.
+struct own {
+  static bool binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
+                              gpu::span b, const int64_t* b_strides,
+                              gpu::span out, const int64_t* out_shape, int rank,
+                              int64_t n, float scale, float offset);
+  static bool where_nd(gpu::span cond, const int64_t* c_strides, gpu::span a,
+                       const int64_t* a_strides, gpu::span b,
+                       const int64_t* b_strides, gpu::span out,
+                       const int64_t* out_shape, int rank, int64_t n);
+  static bool sum_to(gpu::span a, const int64_t* a_shape,
+                     const int64_t* a_strides, const int64_t* acc, int rank,
+                     int64_t out_n, int64_t reduced_n, gpu::span out);
+  static bool pad(gpu::span a, gpu::span out, const int64_t* a_shape,
+                  const int64_t* out_shape, int rank, int axis, int64_t before,
+                  int64_t n, int64_t out_n);
+  static bool fold(gpu::span a, gpu::span out, const int64_t* a_shape,
+                   const int64_t* out_shape, int rank, int axis, int64_t step,
+                   int64_t n, int64_t out_n);
+  static bool concat_part(gpu::span a, gpu::span out, const int64_t* a_shape,
+                          const int64_t* out_shape, int rank, int axis,
+                          int64_t before, int64_t n);
+  static bool index_add(gpu::span idx, gpu::span values, gpu::span out,
+                        int64_t row_size, int64_t k, int64_t out_n);
+  static bool scatter_to_axis(gpu::span idx, gpu::span values, gpu::span out,
+                              int64_t n, int64_t size);
+  static bool gemm(gpu::span a, int64_t lda, bool ta, gpu::span b, int64_t ldb,
+                   bool tb, gpu::span out, int64_t m, int64_t n, int64_t k,
+                   float scale, float offset);
+  static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
+                   int64_t D, int64_t pos, float base, gpu::span bias = {});
+};
 inline bool pending() { return context::get().pending; }
 
 // End the batch: submit the accumulated encoder and block until the GPU
@@ -593,18 +629,18 @@ inline bool elem_off_(int64_t byte_off, uint32_t* out) {
 }
 
 // out = op(a) @ op(b) * scale + offset.
-inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
-                 int64_t ldb, bool tb, void* out, int64_t oo, int64_t m,
-                 int64_t n, int64_t k, float scale, float offset) {
+inline bool own::gemm(gpu::span a, int64_t lda, bool ta, gpu::span b,
+                      int64_t ldb, bool tb, gpu::span out, int64_t m, int64_t n,
+                      int64_t k, float scale, float offset) {
   auto& c = context::get();
   if (!c.ready || m <= 0 || n <= 0 || k <= 0) return false;
   params p = {};
-  if (!elem_off_(ao, &p.a_off) || !elem_off_(bo, &p.b_off) ||
-      !elem_off_(oo, &p.c_off)) {
+  if (!elem_off_(a.off, &p.a_off) || !elem_off_(b.off, &p.b_off) ||
+      !elem_off_(out.off, &p.c_off)) {
     return false;
   }
   context::mirror *ma, *mb, *mo;
-  if (!operands_(c, a, b, out, &ma, &mb, &mo)) return false;
+  if (!operands_(c, a.buf, b.buf, out.buf, &ma, &mb, &mo)) return false;
 
   p.M = (uint32_t)m;
   p.N = (uint32_t)n;
@@ -721,8 +757,9 @@ inline const char* marshal_(kop k, const void* canonical, uint32_t* in_off,
 // kernel writes is C and the ones it reads fill A, B, D, E in order; a
 // one-input kernel binds its input twice. Offsets ride in the uniform as
 // element counts (A, B and C only: D and E are bound whole).
-inline bool dispatch(kop k, const gpu::arg* args, size_t n, const void* canonical,
-                     size_t /*params_bytes*/, const gpu::grid& g) {
+inline bool dispatch(kop k, const gpu::arg* args, size_t n,
+                     const void* canonical, size_t /*params_bytes*/,
+                     const gpu::grid& g) {
   auto& c = context::get();
   if (!c.ready) return false;
   params p = {};
@@ -775,15 +812,6 @@ inline bool encode_one_input_(const char* entry, void* a, int64_t ao, void* out,
   p.M = static_cast<uint32_t>(n);
   fill(p);
   return c.encode_(entry, ma, mb, mo, p, (n + 255) / 256, 1);
-}
-
-// Batched GEMM in one launch: not on this backend yet — array.h's batched dot
-// loops gemm per slice when this declines (CUDA folds the batch into its grid).
-inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
-                         int64_t, int64_t, bool, int64_t, void*, int64_t,
-                         int64_t, int64_t, int64_t, int64_t, float, float,
-                         void* = nullptr, int64_t = 0) {
-  return false;
 }
 
 // A ring, not one reused buffer: queue.WriteBuffer runs ahead of whatever is
@@ -876,19 +904,19 @@ inline context::mirror* commit_meta_(context& c, void* ring_tok,
 // binding as bit-reinterpreted u32 — WGSL's fixed Params uniform (used by
 // every other kernel here) has no room for a variable-length array, and
 // WriteBuffer is a raw byte copy regardless of the binding's declared type.
-inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
-                const int64_t* a_shape, const int64_t* out_shape, int rank,
-                int axis, int64_t before, int64_t n, int64_t out_n) {
+inline bool own::pad(gpu::span a, gpu::span out, const int64_t* a_shape,
+                     const int64_t* out_shape, int rank, int axis,
+                     int64_t before, int64_t n, int64_t out_n) {
   (void)n;
   auto& c = context::get();
   if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank) return false;
   params p = {};
-  if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
-  context::mirror* ma = c.mirror_(a_native);
-  context::mirror* mo = c.mirror_(out_native);
+  if (!elem_off_(a.off, &p.a_off) || !elem_off_(out.off, &p.c_off)) return false;
+  context::mirror* ma = c.mirror_(a.buf);
+  context::mirror* mo = c.mirror_(out.buf);
   if (!ma || !mo) return false;
-  c.device_read_(a_native);
-  c.device_write_(out_native);
+  c.device_read_(a.buf);
+  c.device_write_(out.buf);
 
   uint32_t word_off, *raw;
   void* ring_tok = reserve_meta_(c, &word_off, &raw);
@@ -912,19 +940,19 @@ inline bool pad(void* a_native, int64_t ao, void* out_native, int64_t oo,
 // atomicAdd fold, needed because WGSL has no float atomicAdd. `a`'s own
 // strides aren't part of the metadata: `a` is contiguous (gpu_fold_'s
 // contract), so the kernel derives them from `a_shape` itself.
-inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
-                 const int64_t* a_shape, const int64_t* out_shape, int rank,
-                 int axis, int64_t step, int64_t n, int64_t out_n) {
+inline bool own::fold(gpu::span a, gpu::span out, const int64_t* a_shape,
+                      const int64_t* out_shape, int rank, int axis,
+                      int64_t step, int64_t n, int64_t out_n) {
   (void)n;
   auto& c = context::get();
   if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank) return false;
   params p = {};
-  if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
-  context::mirror* ma = c.mirror_(a_native);
-  context::mirror* mo = c.mirror_(out_native);
+  if (!elem_off_(a.off, &p.a_off) || !elem_off_(out.off, &p.c_off)) return false;
+  context::mirror* ma = c.mirror_(a.buf);
+  context::mirror* mo = c.mirror_(out.buf);
   if (!ma || !mo) return false;
-  c.device_read_(a_native);
-  c.device_write_(out_native);
+  c.device_read_(a.buf);
+  c.device_write_(out.buf);
 
   int out_rank = rank - 1;
   uint32_t word_off, *raw;
@@ -949,18 +977,17 @@ inline bool fold(void* a_native, int64_t ao, void* out_native, int64_t oo,
 // row matching each OUTPUT row instead of scattering into a pre-zeroed
 // buffer -- no zeroing needed. A = idx, B = values, C = out; p.pad0 =
 // row_size, p.pad1 = k (number of source rows to scan).
-inline bool index_add(void* idx_native, int64_t idxo, void* values_native,
-                      int64_t vo, void* out_native, int64_t oo,
-                      int64_t row_size, int64_t k, int64_t out_n) {
+inline bool own::index_add(gpu::span idx, gpu::span values, gpu::span out,
+                           int64_t row_size, int64_t k, int64_t out_n) {
   auto& c = context::get();
   if (!c.ready || out_n <= 0) return false;
   params p = {};
-  if (!elem_off_(idxo, &p.a_off) || !elem_off_(vo, &p.b_off) ||
-      !elem_off_(oo, &p.c_off)) {
+  if (!elem_off_(idx.off, &p.a_off) || !elem_off_(values.off, &p.b_off) ||
+      !elem_off_(out.off, &p.c_off)) {
     return false;
   }
   context::mirror *ma, *mb, *mo;
-  if (!operands_(c, idx_native, values_native, out_native, &ma, &mb, &mo)) {
+  if (!operands_(c, idx.buf, values.buf, out.buf, &ma, &mb, &mo)) {
     return false;
   }
   p.M = static_cast<uint32_t>(out_n);
@@ -973,32 +1000,23 @@ inline bool index_add(void* idx_native, int64_t idxo, void* values_native,
 // values[pos] where indices[pos] == k, else 0. Every output element reads,
 // never writes twice, so -- like index_select above -- no zeroing needed.
 // A = idx, B = values, C = out; p.pad0 = size.
-inline bool scatter_to_axis(void* idx_native, int64_t idxo,
-                            void* values_native, int64_t vo, void* out_native,
-                            int64_t oo, int64_t n, int64_t size) {
+inline bool own::scatter_to_axis(gpu::span idx, gpu::span values, gpu::span out,
+                                 int64_t n, int64_t size) {
   auto& c = context::get();
   int64_t out_n = n * size;
   if (!c.ready || out_n <= 0) return false;
   params p = {};
-  if (!elem_off_(idxo, &p.a_off) || !elem_off_(vo, &p.b_off) ||
-      !elem_off_(oo, &p.c_off)) {
+  if (!elem_off_(idx.off, &p.a_off) || !elem_off_(values.off, &p.b_off) ||
+      !elem_off_(out.off, &p.c_off)) {
     return false;
   }
   context::mirror *ma, *mb, *mo;
-  if (!operands_(c, idx_native, values_native, out_native, &ma, &mb, &mo)) {
+  if (!operands_(c, idx.buf, values.buf, out.buf, &ma, &mb, &mo)) {
     return false;
   }
   p.M = static_cast<uint32_t>(out_n);
   p.pad0 = static_cast<uint32_t>(size);
   return c.encode_("scatter_axis", ma, mb, mo, p, (out_n + 255) / 256, 1);
-}
-
-// Layer norm's pullback. CUDA-first (allowlisted); the caller composes the
-// unfused form when this declines.
-inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
-                           void*, void*, void*, void*, void*, int64_t, int64_t,
-                           int64_t, int64_t, float) {
-  return false;
 }
 
 // N-D broadcast binary: generalizes binary_bcast() above to any rank (a
@@ -1008,21 +1026,20 @@ inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
 // oracle uses. A = a, B = b, D = meta [out_shape(rank), a_strides(rank),
 // b_strides(rank)] (a and b already fill A/B, unlike pad/fold where B was
 // free for this); p.pad0 = rank, p.pad3 = meta's word offset into D.
-inline bool binary_bcast_nd(kop op, void* a_native, int64_t ao,
-                            const int64_t* a_strides, void* b_native,
-                            int64_t bo, const int64_t* b_strides,
-                            void* out_native, int64_t oo,
-                            const int64_t* out_shape, int rank, int64_t n,
-                            float scale, float offset) {
+inline bool own::binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
+                                 gpu::span b, const int64_t* b_strides,
+                                 gpu::span out, const int64_t* out_shape,
+                                 int rank, int64_t n, float scale,
+                                 float offset) {
   auto& c = context::get();
   if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank || n <= 0) return false;
   params p = {};
-  if (!elem_off_(ao, &p.a_off) || !elem_off_(bo, &p.b_off) ||
-      !elem_off_(oo, &p.c_off)) {
+  if (!elem_off_(a.off, &p.a_off) || !elem_off_(b.off, &p.b_off) ||
+      !elem_off_(out.off, &p.c_off)) {
     return false;
   }
   context::mirror *ma, *mb, *mo;
-  if (!operands_(c, a_native, b_native, out_native, &ma, &mb, &mo)) {
+  if (!operands_(c, a.buf, b.buf, out.buf, &ma, &mb, &mo)) {
     return false;
   }
 
@@ -1054,28 +1071,27 @@ inline bool binary_bcast_nd(kop op, void* a_native, int64_t ao,
 // rank, p.pad3 = b's element offset into D, p.pad4 = meta's word offset
 // into E. Bypasses operands_() (built for two real operands) since this one
 // needs three, the same way pad()/fold() above do their own mirror lookups.
-inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
-                     void* a_native, int64_t ao, const int64_t* a_strides,
-                     void* b_native, int64_t bo, const int64_t* b_strides,
-                     void* out_native, int64_t oo, const int64_t* out_shape,
-                     int rank, int64_t n) {
+inline bool own::where_nd(gpu::span cond, const int64_t* c_strides, gpu::span a,
+                          const int64_t* a_strides, gpu::span b,
+                          const int64_t* b_strides, gpu::span out,
+                          const int64_t* out_shape, int rank, int64_t n) {
   auto& c = context::get();
   if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank || n <= 0) return false;
   params p = {};
   uint32_t b_elem_off;
-  if (!elem_off_(co, &p.a_off) || !elem_off_(ao, &p.b_off) ||
-      !elem_off_(bo, &b_elem_off) || !elem_off_(oo, &p.c_off)) {
+  if (!elem_off_(cond.off, &p.a_off) || !elem_off_(a.off, &p.b_off) ||
+      !elem_off_(b.off, &b_elem_off) || !elem_off_(out.off, &p.c_off)) {
     return false;
   }
-  context::mirror* mcond = c.mirror_(cond_native);
-  context::mirror* ma = c.mirror_(a_native);
-  context::mirror* mb = c.mirror_(b_native);
-  context::mirror* mo = c.mirror_(out_native);
+  context::mirror* mcond = c.mirror_(cond.buf);
+  context::mirror* ma = c.mirror_(a.buf);
+  context::mirror* mb = c.mirror_(b.buf);
+  context::mirror* mo = c.mirror_(out.buf);
   if (!mcond || !ma || !mb || !mo) return false;
-  c.device_read_(cond_native);
-  c.device_read_(a_native);
-  c.device_read_(b_native);
-  c.device_write_(out_native);
+  c.device_read_(cond.buf);
+  c.device_read_(a.buf);
+  c.device_read_(b.buf);
+  c.device_write_(out.buf);
 
   uint32_t word_off, *raw;
   void* ring_tok = reserve_meta_(c, &word_off, &raw);
@@ -1100,31 +1116,23 @@ inline bool where_nd(void* cond_native, int64_t co, const int64_t* c_strides,
   return c.encode_("where_nd", mcond, ma, mo, p, (n + 255) / 256, 1, mb, mm);
 }
 
-// clone()'s device arm, CUDA-first: no WebGPU kernel yet, so a clone of a
-// device buffer takes array.h's host copy.
-inline bool copy_nd(void*, int64_t, const int64_t*, void*, int64_t,
-                    const int64_t*, int, int64_t) {
-  return false;
-}
-
 // sum_to (un-broadcast a gradient): gather, mirrors cuda.h's tl_sum_to and
 // metal.h's own sum_to -- one invocation per OUTPUT element sums every `a`
 // element that broadcasts onto it, so no atomics (unlike index_add). Only
 // one real tensor operand (`a`), so -- like pad/fold above -- B is free for
 // the meta ring: [a_shape(rank), a_strides(rank), acc(rank)].
-inline bool sum_to(void* a_native, int64_t ao, const int64_t* a_shape,
-                   const int64_t* a_strides, const int64_t* acc, int rank,
-                   int64_t out_n, int64_t reduced_n, void* out_native,
-                   int64_t oo) {
+inline bool own::sum_to(gpu::span a, const int64_t* a_shape,
+                        const int64_t* a_strides, const int64_t* acc, int rank,
+                        int64_t out_n, int64_t reduced_n, gpu::span out) {
   auto& c = context::get();
   if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank) return false;
   params p = {};
-  if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
-  context::mirror* ma = c.mirror_(a_native);
-  context::mirror* mo = c.mirror_(out_native);
+  if (!elem_off_(a.off, &p.a_off) || !elem_off_(out.off, &p.c_off)) return false;
+  context::mirror* ma = c.mirror_(a.buf);
+  context::mirror* mo = c.mirror_(out.buf);
   if (!ma || !mo) return false;
-  c.device_read_(a_native);
-  c.device_write_(out_native);
+  c.device_read_(a.buf);
+  c.device_write_(out.buf);
 
   uint32_t word_off, *raw;
   void* ring_tok = reserve_meta_(c, &word_off, &raw);
@@ -1157,21 +1165,20 @@ inline bool sum_to(void* a_native, int64_t ao, const int64_t* a_shape,
 // (`a`), so -- like pad/fold/sum_to above -- B is free for the meta ring:
 // [a_shape(rank), out_strides(rank)] (out_strides computed host-side,
 // mirrors cuda.h's own upload_pad_fold_meta_).
-inline bool concat_part(void* a_native, int64_t ao, void* out_native,
-                        int64_t oo, const int64_t* a_shape,
-                        const int64_t* out_shape, int rank, int axis,
-                        int64_t before, int64_t n) {
+inline bool own::concat_part(gpu::span a, gpu::span out, const int64_t* a_shape,
+                             const int64_t* out_shape, int rank, int axis,
+                             int64_t before, int64_t n) {
   auto& c = context::get();
   if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank || n <= 0) {
     return false;
   }
   params p = {};
-  if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
-  context::mirror* ma = c.mirror_(a_native);
-  context::mirror* mo = c.mirror_(out_native);
+  if (!elem_off_(a.off, &p.a_off) || !elem_off_(out.off, &p.c_off)) return false;
+  context::mirror* ma = c.mirror_(a.buf);
+  context::mirror* mo = c.mirror_(out.buf);
   if (!ma || !mo) return false;
-  c.device_read_(a_native);
-  c.device_write_(out_native);
+  c.device_read_(a.buf);
+  c.device_write_(out.buf);
 
   int64_t out_strides[kPadFoldMaxRank];
   int64_t acc = 1;
@@ -1205,16 +1212,17 @@ inline bool concat_part(void* a_native, int64_t ao, void* out_native,
 // the WGSL). x/out always view at offset 0 (array.h's gpu_rope_ requires
 // x.offset_ == 0 and hands a fresh allocation for out), so there is no
 // ao/oo in this signature to convert.
-inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
-                 int64_t pos, float base, void* bias = nullptr) {
+inline bool own::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
+                      int64_t D, int64_t pos, float base, gpu::span bias) {
   auto& c = context::get();
-  if (!c.ready || D <= 0 || (D & 1) || bias) return false;  // no fused bias
+  if (!c.ready || D <= 0 || (D & 1) || bias.buf) return false;  // no fused bias
   int64_t half = D / 2;
   int64_t n = rows * half;
   if (n <= 0) return false;
   params p = {};
+  if (!elem_off_(x.off, &p.a_off) || !elem_off_(out.off, &p.c_off)) return false;
   context::mirror *ma, *mb, *mo;
-  if (!operands_(c, x, nullptr, out, &ma, &mb, &mo)) return false;
+  if (!operands_(c, x.buf, nullptr, out.buf, &ma, &mb, &mo)) return false;
   p.b_off = p.a_off;
   p.M = static_cast<uint32_t>(n);
   p.N = static_cast<uint32_t>(T);
@@ -1228,6 +1236,7 @@ inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
 #else  // !(TENSORLIB_WEBGPU && __EMSCRIPTEN__) — stubs, as in metal.h
 
 inline bool available() { return false; }
+struct own {};
 inline bool pending() { return false; }
 inline bool dispatch(kop, const gpu::arg*, size_t, const void*, size_t,
                      const gpu::grid&) {
@@ -1237,128 +1246,8 @@ inline void flush() {}
 inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
 inline void release(void*, int64_t, float*) {}
 inline void sync_to_host(void*, bool) {}
-inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
-                 void*, int64_t, int64_t, int64_t, int64_t, float, float) {
-  return false;
-}
-inline bool gemm_batched(void*, int64_t, int64_t, bool, int64_t, void*,
-                         int64_t, int64_t, bool, int64_t, void*, int64_t,
-                         int64_t, int64_t, int64_t, int64_t, float, float,
-                         void* = nullptr, int64_t = 0) {
-  return false;
-}
-inline bool pad(void*, int64_t, void*, int64_t, const int64_t*,
-                const int64_t*, int, int, int64_t, int64_t, int64_t) {
-  return false;
-}
-inline bool fold(void*, int64_t, void*, int64_t, const int64_t*,
-                 const int64_t*, int, int, int64_t, int64_t, int64_t) {
-  return false;
-}
-inline bool index_add(void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
-                      int64_t, int64_t) {
-  return false;
-}
-inline bool scatter_to_axis(void*, int64_t, void*, int64_t, void*, int64_t,
-                            int64_t, int64_t) {
-  return false;
-}
-// Layer norm's pullback. CUDA-first (allowlisted); the caller composes the
-// unfused form when this declines.
-inline bool layer_norm_bwd(void*, int64_t, void*, int64_t, void*, int64_t,
-                           void*, void*, void*, void*, void*, int64_t, int64_t,
-                           int64_t, int64_t, float) {
-  return false;
-}
-inline bool binary_bcast_nd(kop, void*, int64_t, const int64_t*, void*,
-                            int64_t, const int64_t*, void*, int64_t,
-                            const int64_t*, int, int64_t, float, float) {
-  return false;
-}
-inline bool where_nd(void*, int64_t, const int64_t*, void*, int64_t,
-                     const int64_t*, void*, int64_t, const int64_t*, void*,
-                     int64_t, const int64_t*, int, int64_t) {
-  return false;
-}
-inline bool copy_nd(void*, int64_t, const int64_t*, void*, int64_t,
-                    const int64_t*, int, int64_t) {
-  return false;
-}
-inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
-                   const int64_t*, int, int64_t, int64_t, void*, int64_t) {
-  return false;
-}
-inline bool concat_part(void*, int64_t, void*, int64_t, const int64_t*,
-                        const int64_t*, int, int, int64_t, int64_t) {
-  return false;
-}
-inline bool rope(void*, void*, int64_t, int64_t, int64_t, int64_t, float,
-                 void* = nullptr) {
-  return false;
-}
 
 #endif
-
-// A gemm with its row bias added in the store: CUDA-first; the evaluator adds
-// the bias with the broadcast kernel after gemm here. Outside the #if/#else
-// like the ops below.
-inline bool gemm_bias(void*, int64_t, int64_t, bool, void*, int64_t, int64_t,
-                      bool, void*, int64_t, void*, int64_t, int64_t, int64_t,
-                      int64_t, float, float) {
-  return false;
-}
-
-// ---- Ops with no WGSL kernel yet (the LLM decode path). Outside the #if/#else
-// on purpose: both branches would define them identically, and returning false
-// is the whole implementation either way — it routes the op to CPU, which is
-// why each porting phase lands in a working state.
-inline bool gemv_f32(void*, void*, void*, int64_t, int64_t) { return false; }
-inline bool gemv_bf16(void*, void*, void*, int64_t, int64_t) { return false; }
-inline bool attn_decode(void*, void*, void*, void*, int64_t, int64_t, int64_t,
-                        int64_t, int64_t, float, bool = false) {
-  return false;
-}
-inline bool attn_prefill(void*, void*, void*, void*, int64_t, int64_t, int64_t,
-                         int64_t, int64_t, float, bool = false, int64_t = 0) {
-  return false;
-}
-inline bool attn_prefill_dq(void*, void*, void*, void*, void*, void*, void*,
-                            int64_t, int64_t, int64_t, float) {
-  return false;
-}
-inline bool attn_prefill_dkv(void*, void*, void*, void*, void*, void*, void*,
-                             int64_t, int64_t, int64_t, float) {
-  return false;
-}
-inline bool gemv_q4(void*, void*, void*, void*, int64_t, int64_t, int64_t) {
-  return false;
-}
-inline bool kv_append(void*, void*, void*, void*, int64_t, int64_t, int64_t,
-                      int64_t, bool = false) {
-  return false;
-}
-inline bool kv_fill(void*, void*, void*, void*, int64_t, int64_t, int64_t,
-                    int64_t, bool = false, int64_t = 0) {
-  return false;
-}
-inline bool argmax(void*, int64_t, int64_t*) { return false; }
-inline bool rmsnorm(void*, void*, void*, int64_t, float, int64_t = 1) {
-  return false;
-}
-inline bool rmsnorm_res(void*, void*, void*, void*, void*, int64_t, float,
-                        int64_t = 1) {
-  return false;
-}
-inline bool swiglu(void*, void*, int64_t, int64_t = 1) { return false; }
-inline bool split_heads(void*, void*, void*, int64_t, int64_t, int64_t, int64_t,
-                        int64_t) {
-  return false;
-}
-inline bool merge_heads(void*, void*, int64_t, int64_t, int64_t) { return false; }
-inline bool gemv_bf16_row(void*, void*, void*, int64_t, int64_t) { return false; }
-inline bool gemm_bf16_nt(void*, void*, void*, int64_t, int64_t, int64_t) {
-  return false;
-}
 
 // What a model may ask of this backend beyond the kernel contract (gpu.h),
 // and the graph-capture group it names: none of it here, so each answers
@@ -1379,7 +1268,6 @@ struct caps {
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = false;
   static constexpr bool bf16_gemm = false;
-  static constexpr bool flat_addressing = false;  // `native` is a WGPUBuffer
 };
 using graph_exec = void*;
 inline bool graph_available() { return false; }
@@ -1389,19 +1277,6 @@ inline bool graph_launch(graph_exec) { return false; }
 inline void graph_destroy(graph_exec) {}
 inline void upload(void*, const float*, int64_t) {}
 inline void upload_u32(void*, unsigned) {}
-inline bool incr_u32(void*) { return false; }
-inline bool rope_dpos(void*, void*, int64_t, int64_t, int64_t, void*, float,
-                      void* = nullptr) {
-  return false;
-}
-inline bool kv_append_dpos(void*, void*, void*, void*, void*, int64_t, int64_t,
-                           int64_t) {
-  return false;
-}
-inline bool attn_decode_dpos(void*, void*, void*, void*, int64_t, int64_t, void*,
-                             int64_t, int64_t, float, void*) {
-  return false;
-}
 inline int64_t attn_dpos_partials_bytes(int64_t, int64_t, int64_t) { return 0; }
 
 // Every CPU-side buffer read funnels through array::raw()/data(), which call

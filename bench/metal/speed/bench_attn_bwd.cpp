@@ -5,7 +5,7 @@
 // Direct metal:: API (timing via metal::flush + cpu_barrier and steady_clock),
 // so a change to one kernel can be measured without a consumer's build.
 
-#include "metal.h"
+#include "gpu.h"  // metal.h plus the shared ops (tl::gpu resolves to metal here)
 
 #include <algorithm>
 #include <chrono>
@@ -67,13 +67,13 @@ int main() {
     fill_random(hG, n, 4);
 
     auto run_fwd = [&] {
-      attn_prefill(q, K, V, out, s.H, s.H, s.T, s.T, s.D, scale);
+      tl::gpu::attn_prefill({q, 0}, {K, 0}, {V, 0}, {out, 0}, s.H, s.H, s.T, s.T, s.D, scale);
     };
     auto run_dq = [&] {
-      attn_prefill_dq(q, K, V, dO, out, dq, stats, s.H, s.T, s.D, scale);
+      tl::gpu::attn_prefill_dq({q, 0}, {K, 0}, {V, 0}, {dO, 0}, {out, 0}, {dq, 0}, {stats, 0}, s.H, s.T, s.D, scale);
     };
     auto run_dkv = [&] {
-      attn_prefill_dkv(q, K, V, dO, stats, dK, dV, s.H, s.T, s.D, scale);
+      tl::gpu::attn_prefill_dkv({q, 0}, {K, 0}, {V, 0}, {dO, 0}, {stats, 0}, {dK, 0}, {dV, 0}, s.H, s.T, s.D, scale);
     };
     auto time_it = [&](auto&& fn) {
       fn();

@@ -138,12 +138,12 @@ int main(int argc, char** argv) {
     // row P identically) — the dpos KERNELS must match the host-pos kernels.
     qm::stage_embed(M, next);
     qm::set_cache_pos(M, P);
-    qm::run_layers_(M, M.scratch.embed.native, P);
+    qm::run_layers_(M, qm::sp(M.scratch.embed), P);
     cu::sync_to_host(M.scratch.logits.native, false);
     std::vector<float> ref(M.scratch.logits.ptr, M.scratch.logits.ptr + qm::VOCAB);
     qm::set_cache_pos(M, P);
     cu::upload_u32(d_pos, (unsigned)P);
-    qm::run_layers_(M, M.scratch.embed.native, P, d_pos);
+    qm::run_layers_(M, qm::sp(M.scratch.embed), P, qm::sp(cap.d_pos));
     cu::sync_to_host(M.scratch.logits.native, false);
     const float* got = M.scratch.logits.ptr;
     int mism = 0;
@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
     double raw_min = bench([&](int64_t) { cu::graph_launch(cap.exec); });
     double ra_min = bench([&](int64_t) {
       cu::graph_launch(cap.exec);
-      cu::argmax(M.scratch.logits.native, qm::VOCAB, &di);
+      tl::gpu::argmax({M.scratch.logits.native, 0}, qm::VOCAB, &di);
     });
     double cap_min = bench([&](int64_t) { idx = cap.step(M, idx); });
     std::printf("=== correct captured decode (device-pos) ===\n");

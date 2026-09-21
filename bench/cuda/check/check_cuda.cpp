@@ -101,7 +101,7 @@ int main() {
         for (int64_t p = 0; p < k; p++) s += ca[i * k + p] * cb[p * n + j];
         ref[i * n + j] = s * 0.5f;
       }
-    bool launched = gemm(a, 0, k, false, b, 0, n, false, o, 0, m, n, k, 0.5f, 0);
+    bool launched = tl::gpu::gemm({a, 0}, k, false, {b, 0}, n, false, {o, 0}, m, n, k, 0.5f, 0);
     sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < m * n; i++)
@@ -132,7 +132,7 @@ int main() {
         ref[i * n + j] = s;
       }
     // trans_b=true, ldb=k (the col stride of the logical k×n = row stride of bt)
-    bool launched = gemm(a, 0, k, false, b, 0, k, true, o, 0, m, n, k, 1.0f, 0);
+    bool launched = tl::gpu::gemm({a, 0}, k, false, {b, 0}, k, true, {o, 0}, m, n, k, 1.0f, 0);
     sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < m * n; i++)

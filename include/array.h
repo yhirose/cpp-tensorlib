@@ -2880,11 +2880,9 @@ struct graph {
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
     std::vector<int64_t> out_shape_v(n.shape.begin(), n.shape.end());
-    if (!gpu::binary_bcast_nd(bk, a.storage_.native, a.offset_ * 4, ra.data(),
-                              b.storage_.native, b.offset_ * 4, rb.data(),
-                              out.storage_.native, out.offset_ * 4,
-                              out_shape_v.data(), rank, out.size(), n.scale,
-                              n.offset)) {
+    if (!gpu::binary_bcast_nd(bk, a.device_span(), ra.data(), b.device_span(),
+                              rb.data(), out.device_span(), out_shape_v.data(),
+                              rank, out.size(), n.scale, n.offset)) {
       return std::nullopt;
     }
     return out;
@@ -2915,10 +2913,8 @@ struct graph {
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
     std::vector<int64_t> out_shape_v(out_shape.begin(), out_shape.end());
-    if (!gpu::where_nd(cond.storage_.native, cond.offset_ * 4, rc.data(),
-                       a.storage_.native, a.offset_ * 4, ra.data(),
-                       b.storage_.native, b.offset_ * 4, rb.data(),
-                       out.storage_.native, out.offset_ * 4,
+    if (!gpu::where_nd(cond.device_span(), rc.data(), a.device_span(),
+                       ra.data(), b.device_span(), rb.data(), out.device_span(),
                        out_shape_v.data(), rank, out.size())) {
       return std::nullopt;
     }
@@ -2938,9 +2934,8 @@ struct graph {
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
     std::vector<int64_t> shape_v(a.shape().begin(), a.shape().end());
-    if (!gpu::copy_nd(a.storage_.native, a.offset_ * 4, a.strides_.data(),
-                      out.storage_.native, out.offset_ * 4, shape_v.data(),
-                      rank, out.size())) {
+    if (!gpu::copy_nd(a.device_span(), a.strides_.data(), out.device_span(),
+                      shape_v.data(), rank, out.size())) {
       return std::nullopt;
     }
     return out;
@@ -3016,19 +3011,15 @@ struct graph {
       const array bias = wrap(*n.inputs[2]);
       if (bias.storage_.dt == tl::dtype::f32 && bias.contiguous() &&
           bias.storage_.native &&
-          gpu::gemm_bias(a.storage_.native, a.offset_ * 4, la->ld, la->trans,
-                         b.storage_.native, b.offset_ * 4, lb->ld, lb->trans,
-                         bias.storage_.native, bias.offset_ * 4,
-                         out.storage_.native, out.offset_ * 4, m, nn, k, n.scale,
-                         n.offset)) {
+          gpu::gemm_bias(a.device_span(), la->ld, la->trans, b.device_span(),
+                         lb->ld, lb->trans, bias.device_span(),
+                         out.device_span(), m, nn, k, n.scale, n.offset)) {
         bias_owed = false;
         return out.reshape(n.shape);
       }
     }
-    if (!gpu::gemm(a.storage_.native, a.offset_ * 4, la->ld, la->trans,
-                     b.storage_.native, b.offset_ * 4, lb->ld, lb->trans,
-                     out.storage_.native, out.offset_ * 4, m, nn, k, n.scale,
-                     n.offset)) {
+    if (!gpu::gemm(a.device_span(), la->ld, la->trans, b.device_span(), lb->ld,
+                   lb->trans, out.device_span(), m, nn, k, n.scale, n.offset)) {
       return std::nullopt;
     }
     return out.reshape(n.shape);
@@ -3111,19 +3102,18 @@ struct graph {
     if (m == 0 || nn == 0 || batch == 0) return out;
     auto sa = batch_stride_(a), sb = batch_stride_(b);
     if (bdot_one_launch_ && sa && sb &&
-        gpu::gemm_batched(a.storage_.native, a.offset_ * 4, la->ld, la->trans,
-                          *sa, b.storage_.native, b.offset_ * 4, lb->ld,
-                          lb->trans, *sb, out.storage_.native, out.offset_ * 4,
-                          m, nn, k, batch, n.scale, n.offset)) {
+        gpu::gemm_batched(a.device_span(), la->ld, la->trans, *sa,
+                          b.device_span(), lb->ld, lb->trans, *sb,
+                          out.device_span(), m, nn, k, batch, n.scale,
+                          n.offset)) {
       return out;
     }
     batch_walk_ w(r - 2);
     for (int64_t bi = 0; bi < batch; bi++, w.step(a)) {
-      if (!gpu::gemm(a.storage_.native, (a.offset_ + w.offset(a)) * 4, la->ld,
-                     la->trans, b.storage_.native,
-                     (b.offset_ + w.offset(b)) * 4, lb->ld, lb->trans,
-                     out.storage_.native, (out.offset_ + bi * m * nn) * 4, m,
-                     nn, k, n.scale, n.offset)) {
+      if (!gpu::gemm(a.device_span().at(w.offset(a) * 4), la->ld, la->trans,
+                     b.device_span().at(w.offset(b) * 4), lb->ld, lb->trans,
+                     out.device_span().at(bi * m * nn * 4), m, nn, k, n.scale,
+                     n.offset)) {
         return std::nullopt;
       }
     }
@@ -3195,17 +3185,17 @@ struct graph {
     array out = array::empty({int64_t{1}, nn});
     if (!out.storage_.native) return std::nullopt;
     if (nn == 0) return out.reshape(n.shape);
-    bool ok = bf16 ? gpu::gemv_bf16(a->storage_.native, b.storage_.native,
-                                    out.storage_.native, nn, k)
-                   : gpu::gemv_f32(a->storage_.native, b.storage_.native,
-                                   out.storage_.native, nn, k);
+    bool ok = bf16 ? gpu::gemv_bf16(a->device_span(), b.device_span(),
+                                    out.device_span(), nn, k)
+                   : gpu::gemv_f32(a->device_span(), b.device_span(),
+                                   out.device_span(), nn, k);
     if (!ok) return std::nullopt;
     return out.reshape(n.shape);
   }
 
   // M8 int4-weight decode GEMV: a(1,K)f32 @ Wq(K,N)q4 -> (1,N)f32. Wq's logical
   // shape is [K,N]; its storage is packed [N,K] int4 + appended scales, so the
-  // scales pointer is native + N·K/2 bytes (one buffer). Gated to the decode
+  // scales are the view N·K/2 bytes into the same buffer. Gated to the decode
   // shape; non-decode / non-GPU dequantizes to F32 via the input funnel.
   static std::optional<array> gpu_gemv_q4(const node& n, const array& a_in,
                                           const array& Wq) {
@@ -3217,10 +3207,9 @@ struct graph {
     array out = array::empty({int64_t{1}, N});
     if (!out.storage_.native) return std::nullopt;
     if (N == 0) return out.reshape(n.shape);
-    void* scales = reinterpret_cast<void*>(
-        reinterpret_cast<char*>(Wq.storage_.native) + N * K / 2);
-    if (!gpu::gemv_q4(a->storage_.native, Wq.storage_.native, scales,
-                      out.storage_.native, N, K, tl::kQ4Group)) {
+    const gpu::span qw = Wq.device_span();
+    if (!gpu::gemv_q4(a->device_span(), qw, qw.at(N * K / 2), out.device_span(),
+                      N, K, tl::kQ4Group)) {
       return std::nullopt;
     }
     return out.reshape(n.shape);
@@ -3273,9 +3262,8 @@ struct graph {
     if (!out.storage_.native) return std::nullopt;
     // Array path has no persistent cache: K/V are [H,ctx,D], so n_kv_heads==H
     // (no GQA) and kv_max==ctx (kv_stride==ctx*D degenerates to whole-buffer).
-    if (!gpu::attn_decode(q.storage_.native, K.storage_.native,
-                          V.storage_.native, out.storage_.native, H, H, ctx, ctx,
-                          D, n.arg0)) {
+    if (!gpu::attn_decode(q.device_span(), K.device_span(), V.device_span(),
+                          out.device_span(), H, H, ctx, ctx, D, n.arg0)) {
       return std::nullopt;
     }
     return out;
@@ -3310,9 +3298,8 @@ struct graph {
     if (!out.storage_.native) return std::nullopt;
     // No persistent cache on the array path: K/V are [H,T,D], so n_kv_heads==H
     // (no GQA) and kv_max==T (the whole buffer is the cache, filled from 0).
-    if (!gpu::attn_prefill(q.storage_.native, K.storage_.native,
-                           V.storage_.native, out.storage_.native, H, H, T, T,
-                           D, n.arg0)) {
+    if (!gpu::attn_prefill(q.device_span(), K.device_span(), V.device_span(),
+                           out.device_span(), H, H, T, T, D, n.arg0)) {
       return std::nullopt;
     }
     return out;
@@ -3432,13 +3419,11 @@ struct graph {
         !stats.storage_.native || !partials.storage_.native) {
       return std::nullopt;
     }
-    if (!gpu::layer_norm_bwd(x.storage_.native, x.offset_ * 4,
-                             gamma.storage_.native, gamma.offset_ * 4,
-                             dout.storage_.native, dout.offset_ * 4,
-                             dx.storage_.native, dg.storage_.native,
-                             db.storage_.native, stats.storage_.native,
-                             partials.storage_.native, rows, d, per_chunk,
-                             chunks, eps)) {
+    if (!gpu::layer_norm_bwd(x.device_span(), gamma.device_span(),
+                             dout.device_span(), dx.device_span(),
+                             dg.device_span(), db.device_span(),
+                             stats.device_span(), partials.device_span(), rows,
+                             d, per_chunk, chunks, eps)) {
       return std::nullopt;
     }
     return std::array<array, 3>{dx, dg, db};
@@ -3610,10 +3595,10 @@ struct graph {
     profile::scope ps("attn_prefill_bwd_dq");
     array dq = array::empty(s), stats = array::empty({2, H, T});
     if (!dq.storage_.native || !stats.storage_.native) return std::nullopt;
-    if (!gpu::attn_prefill_dq(q.storage_.native, K.storage_.native,
-                              V.storage_.native, dout.storage_.native,
-                              out.storage_.native, dq.storage_.native,
-                              stats.storage_.native, H, T, D, scale)) {
+    if (!gpu::attn_prefill_dq(q.device_span(), K.device_span(), V.device_span(),
+                              dout.device_span(), out.device_span(),
+                              dq.device_span(), stats.device_span(), H, T, D,
+                              scale)) {
       return std::nullopt;
     }
     return std::make_pair(dq, stats);
@@ -3656,10 +3641,10 @@ struct graph {
     profile::scope ps("attn_prefill_bwd_dkv");
     array dK = array::empty(s), dV = array::empty(s);
     if (!dK.storage_.native || !dV.storage_.native) return std::nullopt;
-    if (!gpu::attn_prefill_dkv(q.storage_.native, K.storage_.native,
-                               V.storage_.native, dout.storage_.native,
-                               stats.storage_.native, dK.storage_.native,
-                               dV.storage_.native, H, T, D, scale)) {
+    if (!gpu::attn_prefill_dkv(q.device_span(), K.device_span(),
+                               V.device_span(), dout.device_span(),
+                               stats.device_span(), dK.device_span(),
+                               dV.device_span(), H, T, D, scale)) {
       return std::nullopt;
     }
     return std::make_pair(dK, dV);
@@ -3867,11 +3852,10 @@ struct graph {
     int64_t rows = x.size() / D;
     int64_t T = x.rank() == 3 ? x.shape()[1] : 1;
     if (!gpu_mode_(x.size(), kernel_class::elementwise)) return std::nullopt;
-    if (!x.contiguous() || x.offset_ != 0 || !x.storage_.native)
-      return std::nullopt;
+    if (!x.contiguous() || !x.storage_.native) return std::nullopt;
     array out = array::empty(x.shape());
     if (!out.storage_.native) return std::nullopt;
-    if (!gpu::rope(x.storage_.native, out.storage_.native, rows, T, D, n.axis,
+    if (!gpu::rope(x.device_span(), out.device_span(), rows, T, D, n.axis,
                    n.arg0))
       return std::nullopt;
     return out;
@@ -4007,14 +3991,13 @@ struct graph {
                                        int64_t before,
                                        const shape_t& out_shape) {
     return gpu_pad_fold_(a, out_shape,
-                        [&](array& out, std::vector<int64_t>& a_shape,
-                            std::vector<int64_t>& out_shape_v, int rank) {
-                          return gpu::pad(a.storage_.native, a.offset_ * 4,
-                                          out.storage_.native, out.offset_ * 4,
-                                          a_shape.data(), out_shape_v.data(),
-                                          rank, static_cast<int>(axis), before,
-                                          a.size(), out.size());
-                        });
+                         [&](array& out, std::vector<int64_t>& a_shape,
+                             std::vector<int64_t>& out_shape_v, int rank) {
+                           return gpu::pad(a.device_span(), out.device_span(),
+                                           a_shape.data(), out_shape_v.data(),
+                                           rank, static_cast<int>(axis), before,
+                                           a.size(), out.size());
+                         });
   }
 
   // unfold's inverse: scatter-add `a` back into a zero-initialized
@@ -4024,14 +4007,13 @@ struct graph {
                                         int64_t step,
                                         const shape_t& out_shape) {
     return gpu_pad_fold_(a, out_shape,
-                        [&](array& out, std::vector<int64_t>& a_shape,
-                            std::vector<int64_t>& out_shape_v, int rank) {
-                          return gpu::fold(a.storage_.native, a.offset_ * 4,
-                                           out.storage_.native, out.offset_ * 4,
-                                           a_shape.data(), out_shape_v.data(),
-                                           rank, static_cast<int>(axis), step,
-                                           a.size(), out.size());
-                        });
+                         [&](array& out, std::vector<int64_t>& a_shape,
+                             std::vector<int64_t>& out_shape_v, int rank) {
+                           return gpu::fold(a.device_span(), out.device_span(),
+                                            a_shape.data(), out_shape_v.data(),
+                                            rank, static_cast<int>(axis), step,
+                                            a.size(), out.size());
+                         });
   }
 
   // The GPU-dispatch twin of ref::concat: one gpu::concat_part() launch per
@@ -4059,10 +4041,9 @@ struct graph {
     int64_t offset = 0;
     for (auto& p : parts) {
       std::vector<int64_t> p_shape(p.shape().begin(), p.shape().end());
-      if (!gpu::concat_part(p.storage_.native, p.offset_ * 4,
-                            out.storage_.native, out.offset_ * 4,
-                            p_shape.data(), out_shape_v.data(), rank,
-                            static_cast<int>(axis), offset, p.size())) {
+      if (!gpu::concat_part(p.device_span(), out.device_span(), p_shape.data(),
+                            out_shape_v.data(), rank, static_cast<int>(axis),
+                            offset, p.size())) {
         return std::nullopt;
       }
       offset += p_shape[static_cast<size_t>(axis)];
@@ -4139,10 +4120,9 @@ struct graph {
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
     int64_t row_size = out.size() / target_shape[0];
-    if (!gpu::index_add(indices.storage_.native, indices.offset_ * 4,
-                        values.storage_.native, values.offset_ * 4,
-                        out.storage_.native, out.offset_ * 4, row_size,
-                        indices.shape()[0], out.size())) {
+    if (!gpu::index_add(indices.device_span(), values.device_span(),
+                        out.device_span(), row_size, indices.shape()[0],
+                        out.size())) {
       return std::nullopt;
     }
     return out;
@@ -4164,10 +4144,9 @@ struct graph {
     auto out = array::empty(out_shape);
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
-    if (!gpu::scatter_to_axis(indices.storage_.native, indices.offset_ * 4,
-                              values.storage_.native, values.offset_ * 4,
-                              out.storage_.native, out.offset_ * 4,
-                              values.size(), out_shape.back())) {
+    if (!gpu::scatter_to_axis(indices.device_span(), values.device_span(),
+                              out.device_span(), values.size(),
+                              out_shape.back())) {
       return std::nullopt;
     }
     return out;
@@ -4237,9 +4216,9 @@ struct graph {
     for (int d = 0; d < rank; d++) {
       if (acc[d] == 0) reduced_n *= a_shape_v[d];
     }
-    if (!gpu::sum_to(a.storage_.native, a.offset_ * 4, a_shape_v.data(),
-                     a_strides_v.data(), acc.data(), rank, out.size(),
-                     reduced_n, out.storage_.native, out.offset_ * 4)) {
+    if (!gpu::sum_to(a.device_span(), a_shape_v.data(), a_strides_v.data(),
+                     acc.data(), rank, out.size(), reduced_n,
+                     out.device_span())) {
       return std::nullopt;
     }
     return out;

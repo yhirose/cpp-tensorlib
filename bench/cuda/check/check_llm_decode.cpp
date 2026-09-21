@@ -205,9 +205,9 @@ vec gpu_step(GpuModel& m, int64_t id, int64_t pos) {
     array k = array::rope(h.dot(L.Wk).reshape({HKV, hd}), pos);
     array v = h.dot(L.Wv);  // [1, HKV*hd] == [HKV, hd] bytes
     q.eval(); k.eval(); v.eval();
-    L.cache.append(k.native(), v.native());
+    L.cache.append(k.device_span(), v.device_span());
     array a_out = array::empty({HQ, hd});
-    L.cache.attn(q.native(), a_out.native(), HQ, SCALE);
+    L.cache.attn(q.device_span(), a_out.device_span(), HQ, SCALE);
     array a = a_out.reshape({1, Dm});
     array x1 = x + a.dot(L.Wo);
     array h2 = array::rmsnorm(x1, L.n2, EPS);

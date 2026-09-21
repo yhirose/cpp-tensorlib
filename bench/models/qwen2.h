@@ -154,22 +154,13 @@ inline array load_w_T_row(const gg::model& m, const std::string& n, int64_t in,
 // (unified on Metal, the mirror on CUDA).
 inline storage scratch_f32(int64_t n) { return storage::make(n); }
 
-// Slice a device f32 buffer by element offset. The result is a mid-buffer
-// pointer: reads through it are ordered after whatever wrote the base and
-// need no host sync, since the base is already device-live.
-inline void* off_f32(void* p, int64_t nfloats) {
-  return static_cast<char*>(p) + nfloats * 4;
-}
-
-// The same slice where a pointer cannot name one: `n` floats from element
-// `from` of `src` into the start of `dst`. An affine unary carries a byte
-// offset on every backend, a pointer only where gpu::caps::flat_addressing
-// says a device pointer is an address. The model fuses its projections
-// either way — what the cap decides is whether reading the fused output back
-// costs a copy.
-inline void copy_out(void* src, int64_t from, void* dst, int64_t n) {
-  gpu::unary(gpu::kop::affine, {src, from * 4}, {dst, 0}, n, 1.0f, 0.0f);
-}
+// Device views. A storage or an array names its whole buffer; at_f32 slices a
+// view by element. The offset travels beside the handle (gpu::span), so a slice
+// is a view on every backend — no copy, and reads through it are ordered after
+// whatever wrote the base.
+inline gpu::span sp(const storage& s) { return s.device_span(); }
+inline gpu::span sp(const array& a) { return a.device_span(); }
+inline gpu::span at_f32(gpu::span s, int64_t nfloats) { return s.at(nfloats * 4); }
 
 // Make a device buffer's bytes readable on the host: drain the queue (on
 // unified memory that is all it takes) and pull the mirror back where there is
@@ -235,8 +226,6 @@ struct Scratch {
   storage h2b;          // post-attn norm out [NE]
   storage qb;           // [NH*HD] query fixture (bench_qwen_ctx's isolated-
                         // attention timing; decode reads q as a slice of qkvb)
-  storage kb, vb;       // [NKV*HD] k and v copied out of qkvb, where a
-                        // pointer cannot name that slice (see copy_out)
   storage qkvb;         // fused QKV out [(NH+2*NKV)*HD] = [1152]
   storage ab;           // attn out [NH*HD]
   storage mb;           // swiglu out [FF]
@@ -256,8 +245,6 @@ struct Scratch {
     hb = scratch_f32(NE);
     h2b = scratch_f32(NE);
     qb = scratch_f32(NH * HD);
-    kb = scratch_f32(NKV * HD);
-    vb = scratch_f32(NKV * HD);
     qkvb = scratch_f32((NH + 2 * NKV) * HD);
     ab = scratch_f32(NH * HD);
     mb = scratch_f32(FF);
@@ -280,11 +267,9 @@ struct PrefillScratch {
   storage h;       // input-norm out [cap, NE]
   storage h2;      // post-attn norm out [cap, NE]
   storage qkv;     // fused QKV out [cap, (NH+2*NKV)*HD]
-  // q|k|v head-major. Fused: ONE buffer [NH+2*NKV, cap, HD], one split_heads
-  // pass over every head, k/v mid-buffer pointers into it. Unfused: one
-  // buffer and one pass each, with that head block's own bias (bq/bk/bv
-  // rather than the concatenated bqkv).
-  storage qkvh, qh, kh, vh;
+  // q|k|v head-major in ONE buffer [NH+2*NKV, cap, HD]: one split_heads pass
+  // over every head, and k / v are views into it.
+  storage qkvh;
   storage ah;  // attn out head-major [NH, cap, HD]
   storage at;  // attn out token-major [cap, NH*HD]
   storage gu;  // fused gate|up [cap, 2*FF]
@@ -302,13 +287,7 @@ struct PrefillScratch {
     h = scratch_f32(cap * NE);
     h2 = scratch_f32(cap * NE);
     qkv = scratch_f32(cap * (NH + 2 * NKV) * HD);
-    if (gpu::caps::flat_addressing) {
-      qkvh = scratch_f32((NH + 2 * NKV) * cap * HD);
-    } else {
-      qh = scratch_f32(NH * cap * HD);
-      kh = scratch_f32(NKV * cap * HD);
-      vh = scratch_f32(NKV * cap * HD);
-    }
+    qkvh = scratch_f32((NH + 2 * NKV) * cap * HD);
     ah = scratch_f32(NH * cap * HD);
     at = scratch_f32(cap * NH * HD);
     gu = scratch_f32(cap * 2 * FF);
@@ -333,16 +312,17 @@ struct Model {
 };
 
 // Decode GEMV picking the weight-dtype kernel: y(n) = a(1,k) @ W[k,n].
-inline bool gemv_w(const array& W, void* a, void* y, int64_t n, int64_t k) {
-  return W.dt() == tl::dtype::bf16 ? gpu::gemv_bf16(a, W.native(), y, n, k)
-                                   : gpu::gemv_f32(a, W.native(), y, n, k);
+inline bool gemv_w(const array& W, gpu::span a, gpu::span y, int64_t n,
+                   int64_t k) {
+  return W.dt() == tl::dtype::bf16 ? gpu::gemv_bf16(a, sp(W), y, n, k)
+                                   : gpu::gemv_f32(a, sp(W), y, n, k);
 }
 
 // Greedy token from the logits the most recent forward left in scratch (the one
 // terminal sync of a step lives inside gpu::argmax).
 inline int64_t argmax_logits(Model& M) {
   int64_t idx = 0;
-  gpu::argmax(M.scratch.logits.native, VOCAB, &idx);
+  gpu::argmax(sp(M.scratch.logits), VOCAB, &idx);
   return idx;
 }
 
@@ -385,45 +365,33 @@ inline void prefill_chunk_(Model& M, int64_t T) {
   // same source rather than taking it as a parameter that could disagree.
   const int64_t pos0 = M.layers[0].cache.pos;
   constexpr int64_t QKVN = (NH + 2 * NKV) * HD;
-  void* x = P.emb.native;
-  gpu::rmsnorm(x, M.layers[0].an.native(), P.h.native, NE, EPS, T);
+  gpu::span x = sp(P.emb);
+  gpu::rmsnorm(x, sp(M.layers[0].an), sp(P.h), NE, EPS, T);
   for (int64_t l = 0; l < NL; l++) {
     Layer& L = M.layers[l];
-    void* ro = P.res[l & 1].native;
-    gpu::gemm_bf16_nt(P.h.native, L.wqkv.native(), P.qkv.native, T, QKVN, NE);
+    const gpu::span ro = sp(P.res[l & 1]);
+    gpu::gemm_bf16_nt(sp(P.h), sp(L.wqkv), sp(P.qkv), T, QKVN, NE);
     // split_heads turns the [T, q|k|v] output into head-major [H, T, D] and
     // adds the bias — rope's own fused-bias form only indexes correctly at
-    // T == 1, so the bias rides along here instead. Its `off` names the
-    // column block, so the unfused form is the same pass three times, each
-    // with that block's own bias.
-    void *qh, *kh, *vh;
-    if (gpu::caps::flat_addressing) {
-      gpu::split_heads(P.qkv.native, L.bqkv.native(), P.qkvh.native, T, QKVN, 0,
-                       NH + 2 * NKV, HD);
-      qh = P.qkvh.native;
-      kh = off_f32(qh, NH * T * HD);
-      vh = off_f32(qh, (NH + NKV) * T * HD);
-    } else {
-      qh = P.qh.native;
-      kh = P.kh.native;
-      vh = P.vh.native;
-      gpu::split_heads(P.qkv.native, L.bq.native(), qh, T, QKVN, 0, NH, HD);
-      gpu::split_heads(P.qkv.native, L.bk.native(), kh, T, QKVN, NH * HD, NKV, HD);
-      gpu::split_heads(P.qkv.native, L.bv.native(), vh, T, QKVN,
-                       (NH + NKV) * HD, NKV, HD);
-    }
+    // T == 1, so the bias rides along here instead. One pass over every head;
+    // k and v are views into its output.
+    gpu::split_heads(sp(P.qkv), sp(L.bqkv), sp(P.qkvh), T, QKVN, 0, NH + 2 * NKV,
+                     HD);
+    const gpu::span qh = sp(P.qkvh);
+    const gpu::span kh = at_f32(qh, NH * T * HD);
+    const gpu::span vh = at_f32(qh, (NH + NKV) * T * HD);
     // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
     gpu::rope(qh, qh, NH * T, T, HD, pos0, ROPE_BASE);
     gpu::rope(kh, kh, NKV * T, T, HD, pos0, ROPE_BASE);
-    L.cache.prefill(qh, kh, vh, P.ah.native, T, NH, SCALE);
-    gpu::merge_heads(P.ah.native, P.at.native, T, NH, HD);
-    gpu::gemm_bf16_nt(P.at.native, L.wo_row.native(), ro, T, NE, NH * HD);
-    gpu::rmsnorm_res(ro, x, L.fn.native(), ro, P.h2.native, NE, EPS, T);
-    gpu::gemm_bf16_nt(P.h2.native, L.wgu.native(), P.gu.native, T, 2 * FF, NE);
-    gpu::swiglu(P.gu.native, P.mb.native, FF, T);
-    gpu::gemm_bf16_nt(P.mb.native, L.wd_row.native(), P.md.native, T, NE, FF);
-    void* nextw = (l + 1 < NL) ? M.layers[l + 1].an.native() : M.onorm.native();
-    gpu::rmsnorm_res(ro, P.md.native, nextw, ro, P.h.native, NE, EPS, T);
+    L.cache.prefill(qh, kh, vh, sp(P.ah), T, NH, SCALE);
+    gpu::merge_heads(sp(P.ah), sp(P.at), T, NH, HD);
+    gpu::gemm_bf16_nt(sp(P.at), sp(L.wo_row), ro, T, NE, NH * HD);
+    gpu::rmsnorm_res(ro, x, sp(L.fn), ro, sp(P.h2), NE, EPS, T);
+    gpu::gemm_bf16_nt(sp(P.h2), sp(L.wgu), sp(P.gu), T, 2 * FF, NE);
+    gpu::swiglu(sp(P.gu), sp(P.mb), FF, T);
+    gpu::gemm_bf16_nt(sp(P.mb), sp(L.wd_row), sp(P.md), T, NE, FF);
+    const gpu::span nextw = sp((l + 1 < NL) ? M.layers[l + 1].an : M.onorm);
+    gpu::rmsnorm_res(ro, sp(P.md), nextw, ro, sp(P.h), NE, EPS, T);
     x = ro;
   }
   // Leaves P.h holding the final RMSNorm for every row of the chunk. Logits are
@@ -474,10 +442,9 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
     prefill_chunk_(M, last);
   }
   // Only the final row of the final chunk needs logits — one GEMV for the whole
-  // prompt rather than one per chunk. The row is copied into the decode's own
-  // norm buffer rather than pointed at in place — see copy_out.
-  copy_out(M.pscratch.h.native, (last - 1) * NE, M.scratch.hb.native, NE);
-  gemv_w(M.outwT, M.scratch.hb.native, M.scratch.logits.native, VOCAB, NE);
+  // prompt rather than one per chunk, read in place as a view of that row.
+  gemv_w(M.outwT, at_f32(sp(M.pscratch.h), (last - 1) * NE), sp(M.scratch.logits),
+         VOCAB, NE);
   return argmax_logits(M);
 }
 
@@ -626,9 +593,9 @@ inline array forward(Model& M, int64_t id, int64_t pos,
     // see the writes. Removes 3 CtxSynchronize/layer.
     q.realize(); k.realize(); v.realize();
     if (prof) { prof->qkv_eval += StepProf::now_ms() - t; t = StepProf::now_ms(); }
-    L.cache.append(k.native(), v.native());
+    L.cache.append(sp(k), sp(v));
     array a_out = array::empty({NH, HD});
-    L.cache.attn(q.native(), a_out.native(), NH, SCALE);
+    L.cache.attn(sp(q), sp(a_out), NH, SCALE);
     if (prof) { prof->cache += StepProf::now_ms() - t; t = StepProf::now_ms(); }
     array x1 = x + a_out.reshape({1, NE}).dot(L.wo);
     array h2 = array::rmsnorm(x1, L.fn, EPS);
@@ -679,7 +646,7 @@ inline int64_t step_greedy(Model& M, int64_t id, int64_t pos,
   logits.realize();
   if (prof) { prof->logits_eval += StepProf::now_ms() - t; t = StepProf::now_ms(); }
   int64_t idx = 0;
-  if (!gpu::argmax(logits.native(), VOCAB, &idx)) {
+  if (!gpu::argmax(sp(logits), VOCAB, &idx)) {
     const float* p = logits.raw();
     idx = 0;
     for (int64_t i = 1; i < VOCAB; i++)
@@ -697,12 +664,12 @@ inline int64_t argmax(const std::vector<float>& v) {
 }
 
 // q4 decode GEMV: y(N) = a(1,K) @ dequant(Wq). Wq is a q4 array (logical [K,N],
-// storage [packed [N][K/2] | scales [N][K/32]]); the scales pointer is mid-buffer
-// (rides along the base upload — same split as the array-path gpu_gemv_q4).
-inline bool gemv_q4_w(const array& Wq, void* a, void* y) {
+// storage [packed [N][K/2] | scales [N][K/32]]); the scales are a view into the
+// same buffer (they ride along the base upload — the array path's split too).
+inline bool gemv_q4_w(const array& Wq, gpu::span a, gpu::span y) {
   const int64_t K = Wq.shape()[0], N = Wq.shape()[1];
-  void* scales = static_cast<char*>(Wq.native()) + N * K / 2;
-  return gpu::gemv_q4(a, Wq.native(), scales, y, N, K, tl::kQ4Group);
+  const gpu::span qw = sp(Wq);
+  return gpu::gemv_q4(a, qw, qw.at(N * K / 2), y, N, K, tl::kQ4Group);
 }
 
 // The 24 decoder layers + final RMSNorm + lm_head gemv as direct gpu:: calls
@@ -720,10 +687,10 @@ inline bool gemv_q4_w(const array& Wq, void* a, void* y) {
 // device instead of the host `pos`, and a tl_incr_u32 at the tail advances it —
 // so the whole forward is CUDA-graph-capturable and one instantiated graph
 // replays correctly as pos grows (A-min). All caches share the one counter (every
-// layer is at the same sequence position). d_pos==nullptr = the normal host path.
-inline void run_layers_(Model& M, void* x0, int64_t pos, void* d_pos = nullptr,
-                        void* logits_out = nullptr) {
-  const bool cap = d_pos != nullptr;
+// layer is at the same sequence position). A null d_pos = the normal host path.
+inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
+                        gpu::span d_pos = {}, gpu::span logits_out = {}) {
+  const bool cap = static_cast<bool>(d_pos);
   Scratch& S = M.scratch;
   // Fused seams (kills 4 elementwise launches/layer): q/k bias folds into rope
   // (gpu::rope's bias arg); the two residual adds fold into the following RMSNorms
@@ -736,65 +703,56 @@ inline void run_layers_(Model& M, void* x0, int64_t pos, void* d_pos = nullptr,
   // layout is identical either way (contiguous [n]), so the fused-output slices
   // below are unchanged.
   const bool row = M.row;
-  auto gv = [&](const array& W, void* a, void* y, int64_t n, int64_t k) {
-    if (row) gpu::gemv_bf16_row(a, W.native(), y, n, k);
+  auto gv = [&](const array& W, gpu::span a, gpu::span y, int64_t n, int64_t k) {
+    if (row) gpu::gemv_bf16_row(a, sp(W), y, n, k);
     else gemv_w(W, a, y, n, k);
   };
-  void* x = x0;
-  gpu::rmsnorm(x, M.layers[0].an.native(), S.hb.native, NE, EPS);
+  gpu::span x = x0;
+  gpu::rmsnorm(x, sp(M.layers[0].an), sp(S.hb), NE, EPS);
   for (int64_t l = 0; l < NL; l++) {
     Layer& L = M.layers[l];
-    void* ro = S.res[l & 1].native;  // res_out (x1 then x2), ping-pong
+    const gpu::span ro = sp(S.res[l & 1]);  // res_out (x1 then x2), ping-pong
     // Fused QKV: one GEMV -> [q(NH*HD) | k(NKV*HD) | v(NKV*HD)] in S.qkvb, then
-    // slice: rope q & k in place, bias-add v. Same per-column split-K as the
-    // separate wq/wk/wv GEMVs (bx=1, chunk=32), so bit-identical per column.
-    // q is the slice at offset 0, which every backend can name; k and v are
-    // copied out where a pointer cannot (two 128-float copies a layer).
-    gv(L.wqkv, S.hb.native, S.qkvb.native, (NH + 2 * NKV) * HD, NE);
-    void* qp = S.qkvb.native;
-    void* kp = S.kb.native;
-    void* vp = S.vb.native;
-    if (gpu::caps::flat_addressing) {
-      kp = off_f32(qp, NH * HD);
-      vp = off_f32(qp, (NH + NKV) * HD);
-    } else {
-      copy_out(qp, NH * HD, kp, NKV * HD);
-      copy_out(qp, (NH + NKV) * HD, vp, NKV * HD);
-    }
+    // q, k and v are views of it: rope q & k in place, bias-add v. Same
+    // per-column split-K as the separate wq/wk/wv GEMVs (bx=1, chunk=32), so
+    // bit-identical per column.
+    gv(L.wqkv, sp(S.hb), sp(S.qkvb), (NH + 2 * NKV) * HD, NE);
+    const gpu::span qp = sp(S.qkvb);
+    const gpu::span kp = at_f32(qp, NH * HD);
+    const gpu::span vp = at_f32(qp, (NH + NKV) * HD);
     if (cap) {
-      gpu::rope_dpos(qp, qp, NH, 1, HD, d_pos, ROPE_BASE, L.bq.native());
-      gpu::rope_dpos(kp, kp, NKV, 1, HD, d_pos, ROPE_BASE, L.bk.native());
+      gpu::rope_dpos(qp, qp, NH, 1, HD, d_pos, ROPE_BASE, sp(L.bq));
+      gpu::rope_dpos(kp, kp, NKV, 1, HD, d_pos, ROPE_BASE, sp(L.bk));
     } else {
-      gpu::rope(qp, qp, NH, 1, HD, pos, ROPE_BASE, L.bq.native());
-      gpu::rope(kp, kp, NKV, 1, HD, pos, ROPE_BASE, L.bk.native());
+      gpu::rope(qp, qp, NH, 1, HD, pos, ROPE_BASE, sp(L.bq));
+      gpu::rope(kp, kp, NKV, 1, HD, pos, ROPE_BASE, sp(L.bk));
     }
-    gpu::binary(gpu::kop::add, {vp, 0}, {L.bv.native(), 0}, {vp, 0}, NKV * HD, 1,
-                0);
+    gpu::binary(gpu::kop::add, vp, sp(L.bv), vp, NKV * HD, 1, 0);
     if (cap) {
       L.cache.append_dpos(kp, vp, d_pos);
-      L.cache.attn_dpos(qp, S.ab.native, NH, d_pos, SCALE);
+      L.cache.attn_dpos(qp, sp(S.ab), NH, d_pos, SCALE);
     } else {
       L.cache.append(kp, vp);
-      L.cache.attn(qp, S.ab.native, NH, SCALE);
+      L.cache.attn(qp, sp(S.ab), NH, SCALE);
     }
-    gv(row ? L.wo_row : L.wo, S.ab.native, ro, NE, NH * HD);  // ro = attn @ wo
+    gv(row ? L.wo_row : L.wo, sp(S.ab), ro, NE, NH * HD);  // ro = attn @ wo
     // x1 = x + (attn@wo); h2 = rmsnorm(x1, fn) — fused.
-    gpu::rmsnorm_res(ro, x, L.fn.native(), ro, S.h2b.native, NE, EPS);
+    gpu::rmsnorm_res(ro, x, sp(L.fn), ro, sp(S.h2b), NE, EPS);
     // Fused gate|up: one GEMV -> [gate(FF) | up(FF)] in S.gub; swiglu reads both.
-    if (M.q4_mlp) gemv_q4_w(L.wgu_q4, S.h2b.native, S.gub.native);  // [NE, 2*FF]
-    else gv(L.wgu, S.h2b.native, S.gub.native, 2 * FF, NE);
-    gpu::swiglu(S.gub.native, S.mb.native, FF);
-    if (M.q4_mlp) gemv_q4_w(L.wd_q4, S.mb.native, S.mdb.native);  // [FF, NE]
-    else gv(row ? L.wd_row : L.wd, S.mb.native, S.mdb.native, NE, FF);
+    if (M.q4_mlp) gemv_q4_w(L.wgu_q4, sp(S.h2b), sp(S.gub));  // [NE, 2*FF]
+    else gv(L.wgu, sp(S.h2b), sp(S.gub), 2 * FF, NE);
+    gpu::swiglu(sp(S.gub), sp(S.mb), FF);
+    if (M.q4_mlp) gemv_q4_w(L.wd_q4, sp(S.mb), sp(S.mdb));  // [FF, NE]
+    else gv(row ? L.wd_row : L.wd, sp(S.mb), sp(S.mdb), NE, FF);
     // x2 = x1 + mlp; next input norm = rmsnorm(x2, next an | final onorm) — fused.
-    void* nextw = (l + 1 < NL) ? M.layers[l + 1].an.native() : M.onorm.native();
-    gpu::rmsnorm_res(ro, S.mdb.native, nextw, ro, S.hb.native, NE, EPS);
+    const gpu::span nextw = sp((l + 1 < NL) ? M.layers[l + 1].an : M.onorm);
+    gpu::rmsnorm_res(ro, sp(S.mdb), nextw, ro, sp(S.hb), NE, EPS);
     x = ro;
   }
   // hb now holds the final RMSNorm output (folded into the last layer's seam).
-  void* logits = logits_out ? logits_out : S.logits.native;
-  if (M.q4_lmhead) gemv_q4_w(M.outwT_q4, S.hb.native, logits);  // [NE, VOCAB]
-  else gemv_w(M.outwT, S.hb.native, logits, VOCAB, NE);
+  const gpu::span logits = logits_out ? logits_out : sp(S.logits);
+  if (M.q4_lmhead) gemv_q4_w(M.outwT_q4, sp(S.hb), logits);  // [NE, VOCAB]
+  else gemv_w(M.outwT, sp(S.hb), logits, VOCAB, NE);
   // Tail of the captured region: advance the shared device pos so the next
   // graph replay reads pos+1 (lm_head is pos-independent, so order vs it is free).
   if (cap) gpu::incr_u32(d_pos);
@@ -808,7 +766,7 @@ inline void run_layers_(Model& M, void* x0, int64_t pos, void* d_pos = nullptr,
 inline int64_t step_imperative(Model& M, int64_t id, int64_t pos) {
   array e = embed_row(M, id);
   e.realize();  // embed on device (native valid; uploaded on first read)
-  run_layers_(M, e.native(), pos);
+  run_layers_(M, sp(e), pos);
   return argmax_logits(M);
 }
 
@@ -818,7 +776,7 @@ inline int64_t step_imperative(Model& M, int64_t id, int64_t pos) {
 inline const float* imperative_logits(Model& M, int64_t id, int64_t pos) {
   array e = embed_row(M, id);
   e.realize();
-  run_layers_(M, e.native(), pos);
+  run_layers_(M, sp(e), pos);
   return host_read(M.scratch.logits);
 }
 
@@ -873,16 +831,16 @@ struct captured_decoder {
     if (!gpu::graph_available()) return;
     d_pos = storage::make(1);
     if (!d_pos.native) return;
-    void* dp = d_pos.native;
+    const gpu::span dp = sp(d_pos);
     stage_embed(M, first_id);
-    gpu::upload_u32(dp, (unsigned)pos);
+    gpu::upload_u32(d_pos.native, (unsigned)pos);
     // Warm run: real launches, but its logits go to the throwaway sink so a
     // prompt's logits (already in scratch when begin() batched) survive.
-    run_layers_(M, M.scratch.embed.native, pos, dp, M.scratch.logits_sink.native);
+    run_layers_(M, sp(M.scratch.embed), pos, dp, sp(M.scratch.logits_sink));
     gpu::flush();
-    gpu::upload_u32(dp, (unsigned)pos);  // reset after warm
+    gpu::upload_u32(d_pos.native, (unsigned)pos);  // reset after warm
     if (!gpu::capture_begin()) return;
-    run_layers_(M, M.scratch.embed.native, pos, dp);  // recorded, not executed
+    run_layers_(M, sp(M.scratch.embed), pos, dp);  // recorded, not executed
     exec = gpu::capture_end();
   }
 
@@ -938,7 +896,7 @@ struct captured_decoder {
     if (cur_pos >= max_ctx) return false;
     stage_embed(M, id);  // gather id's row -> S.embed (host + blocking H2D)
     if (exec) gpu::graph_launch(exec);  // replay: append@d_pos, attn, logits, incr
-    else run_layers_(M, M.scratch.embed.native, cur_pos);  // host-pos imperative
+    else run_layers_(M, sp(M.scratch.embed), cur_pos);  // host-pos imperative
     cur_pos++;
     return true;
   }

@@ -161,11 +161,16 @@ that is derived from the pool's measured wake-up on first use
 (`TL_CPU_MIN_WORK` pins it; `misc/census_pool_latency.cpp` shows the
 arithmetic); below that it runs on the calling thread.
 
-New ops sometimes land on one backend (usually CUDA) before the others catch
-up. `tools/check_backend_parity.py` reports, per op, which of CUDA/Metal/
-WebGPU actually implement it rather than falling back to the CPU oracle, and
-fails (in CI too) if an asymmetry isn't recorded in
-`tools/backend_parity_allowlist.txt` as deliberate.
+The GPU ops are written once, in `gpu_ops.h`, over views (`gpu::span`: a device
+handle and a byte offset) and a kernel ABI every backend shares (`gpu_abi.h`). A
+backend is a device core — memory, a kernel table, one `dispatch` — plus kernel
+source, and the ops it runs its own way as members of its `own` struct; an op a
+backend has no kernel for answers false and the evaluator falls back to the CPU.
+`gpu::census(kernel)` counts launches, so a test can tell the two apart. No
+machine here runs CUDA kernels, so `tools/cuda_trace` records what the CUDA
+backend asks of the driver (kernel, grid, every argument) against a stand-in
+`libcuda` in a Linux container, and `tools/cuda_trace/compare.sh <ref>` diffs
+that across a change to the backend's host side.
 
 ### Profiling
 
