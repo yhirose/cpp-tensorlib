@@ -21,6 +21,8 @@
 
 #include <cstdint>
 
+#include "gpu_abi.h"
+
 #ifdef __APPLE__
 
 #include <objc.h>
@@ -41,58 +43,12 @@ extern "C" void objc_autoreleasePoolPop(void*);
 namespace tl {
 namespace metal {
 
-enum class kop {
-  add, sub, mul, div, pow_, exp_, log_, sqrt_, sigmoid, relu, affine,
-  badd, bsub, bmul, bdiv, bpow,  // rank-2 broadcast binary (strided operands)
-  sgemm32, sgemm32x64, sgemm64x32, sgemm64,
-  steel, steel32x64, steel_ta, steel_tb, steel32x64_ta, steel32x64_tb,
-  softmax, row_sum, row_max, pad, fold,
-  index_select, index_add, scatter_axis,
-  badd_nd, bsub_nd, bmul_nd, bdiv_nd, bpow_nd,  // N-D broadcast binary
-  where_nd, copy_nd,             // N-D select / clone()'s strided gather
-  gt_, lt_, ge_, le_, eq_, ne_,  // comparisons -- cmp_op maps onto these
-  tanh_, sin_, cos_,             // unary_ext_op maps onto these
-  clamp_, sum_to_, sum_to_blocked_,  // dedicated ops, mirroring cuda.h's own
-  concat_part_, rope_,           // ditto -- Tensor.concat / RoPE's own dispatch
-  pow_s_, gt_s_, lt_s_, ge_s_, le_s_, eq_s_, ne_s_,  // scalar_op maps onto these
-  layer_norm_,                                       // the fused layer norm
-  layer_norm_bwd_dx_, layer_norm_bwd_gb_, layer_norm_bwd_gb_fold_,  // its pullback
-  attn_prefill_64_, attn_prefill_128_,  // causal prefill attention, per D
-  attn_prefill_bf16_64_, attn_prefill_bf16_128_,  // over a bf16 KV cache
-  attn_bwd_dq_64_, attn_bwd_dq_128_, attn_bwd_dkv_64_, attn_bwd_dkv_128_,
-  attn_decode_64_, attn_decode_128_,  // fused decode attention, per D
-  attn_decode_split_64_, attn_decode_split_128_,  // its split-KV pass
-  attn_combine_64_, attn_combine_128_,            // and their partials
-  attn_decode_bf16_64_, attn_decode_bf16_128_,    // the same over a bf16 cache
-  attn_decode_split_bf16_64_, attn_decode_split_bf16_128_,
-  kv_append_, kv_append_bf16_, kv_fill_, kv_fill_bf16_,  // the KV cache's writes
-  argmax_, rmsnorm_, swiglu_, split_heads_, merge_heads_,  // the decode step's rest
-  gemv_f32_, gemv_bf16_, gemv_q4_,   // decode GEMVs, per weight dtype
-  gemv_combine_,                     // their split-K partials
-  gemv_bf16_row_,                    // ... and the [N,K] weight layout's own
-  gemm_bf16_nt_, gemm_bf16_nt32_,    // the prefill's bf16 GEMM, per M tile
-  gather_axis_, row_logsumexp_, xent_bwd_, adam_step_  // cross-entropy, Adam
-};
-
-// Comparisons (gt/lt/ge/le/eq/ne) are deliberately NOT kop values: kop is
-// called unconditionally through this file's own pso_()-based binary(),
-// which throws rather than declining an enum value it has no MSL kernel
-// for -- fine for ops every backend already implements, not for a
-// CUDA-only addition landing ahead of its Metal/WebGPU kernels. compare()
-// below is its own small vocabulary so an unimplemented backend can just
-// return false, same as index_select/index_add/scatter_axis/sum_to.
-enum class cmp_op { gt, lt, ge, le, eq, ne };
-
-// tanh_/sin_/cos_: same reasoning as cmp_op above -- a CUDA-only addition,
-// so its own vocabulary rather than a new kop. clamp (2 node-specific
-// scalars, no epilogue) gets its own dedicated function below instead of
-// an enum value, same as index_select/sum_to's own dedicated functions.
-enum class unary_ext_op { tanh_, sin_, cos_ };
-
-// Tensor-scalar ops: pow(x, s) and the comparisons against a scalar, with s a
-// kernel argument instead of a rank-0 operand buffer (an allocation and an
-// upload per call). Own vocabulary, like cmp_op.
-enum class scalar_op { pow, gt, lt, ge, le, eq, ne };
+// The op vocabulary is the shared layer's (gpu_abi.h); the names stay reachable
+// as metal::kop for the code that spelled them that way.
+using kop = gpu::kop;
+using cmp_op = gpu::cmp_op;
+using unary_ext_op = gpu::unary_ext_op;
+using scalar_op = gpu::scalar_op;
 
 #ifdef __APPLE__
 
@@ -431,49 +387,26 @@ inline void dispatch_grid_(objc::id enc, mtl_size grid, mtl_size tg) {
   }
 }
 
-struct ew_params {
-  float scale;
-  float offset;
-  uint32_t n;
-};
-
-inline void dispatch_(objc::id enc, const ew_params& p,
-                      unsigned long params_index) {
-  objc::send(enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
-             static_cast<unsigned long>(sizeof(p)), params_index);
-  unsigned long groups = (p.n + 255ul) / 256ul;
-  dispatch_grid_(enc, {groups, 1, 1}, {256, 1, 1});
-}
-
 }  // namespace detail_
 
-// Contiguous elementwise dispatches; offsets in bytes. Epilogue (scale,
-// offset) applies inside the kernel. Encodes without committing.
-inline bool binary(kop op, void* a, int64_t ao, void* b, int64_t bo, void* out,
-                   int64_t oo, int64_t n, float scale, float offset) {
+// The device core's one way to run a kernel (gpu_abi.h has the contract):
+// view i goes to buffer index i at its byte offset, the params follow at index
+// n, and the grid is threadgroups x threads. Encodes without committing.
+// Unified memory, so an arg's access says nothing this backend has to act on.
+inline bool dispatch(kop k, const gpu::arg* args, size_t n, const void* params,
+                     size_t params_bytes, const gpu::grid& g) {
   auto& c = context::get();
   if (!c.device) return false;
-  c.bind_(op);
-  objc::send(c.enc, "setBuffer:offset:atIndex:", a,
-             static_cast<unsigned long>(ao), 0ul);
-  objc::send(c.enc, "setBuffer:offset:atIndex:", b,
-             static_cast<unsigned long>(bo), 1ul);
-  objc::send(c.enc, "setBuffer:offset:atIndex:", out,
-             static_cast<unsigned long>(oo), 2ul);
-  detail_::dispatch_(c.enc, {scale, offset, static_cast<uint32_t>(n)}, 3ul);
-  return true;
-}
-
-inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo,
-                  int64_t n, float scale, float offset) {
-  auto& c = context::get();
-  if (!c.device) return false;
-  c.bind_(op);
-  objc::send(c.enc, "setBuffer:offset:atIndex:", a,
-             static_cast<unsigned long>(ao), 0ul);
-  objc::send(c.enc, "setBuffer:offset:atIndex:", out,
-             static_cast<unsigned long>(oo), 1ul);
-  detail_::dispatch_(c.enc, {scale, offset, static_cast<uint32_t>(n)}, 2ul);
+  c.bind_(k);
+  for (size_t i = 0; i < n; i++) {
+    objc::send(c.enc, "setBuffer:offset:atIndex:", args[i].s.buf,
+               static_cast<unsigned long>(args[i].s.off),
+               static_cast<unsigned long>(i));
+  }
+  objc::send(c.enc, "setBytes:length:atIndex:", params,
+             static_cast<unsigned long>(params_bytes),
+             static_cast<unsigned long>(n));
+  detail_::dispatch_grid_(c.enc, {g.gx, g.gy, g.gz}, {g.tx, g.ty, g.tz});
   return true;
 }
 
@@ -1090,14 +1023,6 @@ inline kop to_cmp_(cmp_op op) {
   }
   return kop::gt_;
 }
-inline kop to_unary_ext_(unary_ext_op op) {
-  switch (op) {
-    case unary_ext_op::tanh_: return kop::tanh_;
-    case unary_ext_op::sin_: return kop::sin_;
-    case unary_ext_op::cos_: return kop::cos_;
-  }
-  return kop::tanh_;
-}
 struct cmp_params {
   uint32_t n;
   uint32_t bstride;
@@ -1153,13 +1078,6 @@ inline bool compare(cmp_op op, void* a, int64_t ao, void* b, int64_t bo,
   unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
   detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
   return true;
-}
-// tanh_/sin_/cos_ (RoPE's trig, RNN/LSTM's tanh): plain elementwise, same
-// shape as exp_/sqrt_ above -- unary() already does exactly this dispatch,
-// just keyed by a kop array.h doesn't see directly.
-inline bool unary_ext(unary_ext_op op, void* a, int64_t ao, void* out,
-                      int64_t oo, int64_t n, float scale, float offset) {
-  return unary(detail_::to_unary_ext_(op), a, ao, out, oo, n, scale, offset);
 }
 // clamp(x, lo, hi): Clip's forward. No epilogue -- lo/hi occupy the role
 // scale/offset play elsewhere (mirrors cuda.h's own clamp).
@@ -1775,16 +1693,13 @@ inline void flush() {}
 inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
 inline void release(void*, int64_t, float*) {}
 inline void upload(void*, const float*, int64_t) {}
-inline bool binary(kop, void*, int64_t, void*, int64_t, void*, int64_t,
-                   int64_t, float, float) {
+inline bool dispatch(kop, const gpu::arg*, size_t, const void*, size_t,
+                     const gpu::grid&) {
   return false;
 }
 inline bool binary_bcast(kop, void*, int64_t, int64_t, int64_t, void*, int64_t,
                          int64_t, int64_t, void*, int64_t, int64_t, int64_t,
                          float, float) {
-  return false;
-}
-inline bool unary(kop, void*, int64_t, void*, int64_t, int64_t, float, float) {
   return false;
 }
 inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
@@ -1878,10 +1793,6 @@ inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
 }
 inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
                     int64_t, int64_t) {
-  return false;
-}
-inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
-                      float, float) {
   return false;
 }
 inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {

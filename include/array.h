@@ -391,6 +391,9 @@ class array {
   // buffer to an imperative cuda:: kernel (e.g. the kv_cache decode loop) —
   // eval() first, then pass native() as the q/k/v pointer. Contiguous, offset 0.
   void* native() const { return storage_.native; }
+  // This view as the GPU layer names it: the storage's device handle and the
+  // view's byte offset (gpu_abi.h). Null `buf` when the storage is heap.
+  gpu::span device_span() const { return {storage_.native, offset_ * 4}; }
 
   // Views (zero-copy on the materialized result) and copies. View
   // construction realizes the source without a sync — pending GPU kernels
@@ -2832,9 +2835,8 @@ struct graph {
       auto out = array::empty(n.shape);
       if (out.size() == 0) return out;
       if (!out.storage_.native) return std::nullopt;
-      if (!gpu::binary(*k, a.storage_.native, a.offset_ * 4,
-                         b.storage_.native, b.offset_ * 4, out.storage_.native,
-                         out.offset_ * 4, out.size(), n.scale, n.offset)) {
+      if (!gpu::binary(*k, a.device_span(), b.device_span(), out.device_span(),
+                       out.size(), n.scale, n.offset)) {
         return std::nullopt;
       }
       return out;
@@ -3953,7 +3955,7 @@ struct graph {
   }
 
   // The one-input elementwise GPU dispatches share this gate and output:
-  // `call(a_native, a_off, out_native, out_off, n)` is the backend call.
+  // `call(a, out, n)` is the backend call, on the two views.
   template <typename Call>
   static std::optional<array> gpu_one_input_(const array& a, Call&& call) {
     if (!gpu_mode_(a.size(), kernel_class::elementwise) || !a.contiguous()) {
@@ -3963,8 +3965,7 @@ struct graph {
     auto out = array::empty(a.shape());
     if (out.size() == 0) return out;
     if (!out.storage_.native) return std::nullopt;
-    if (!call(a.storage_.native, a.offset_ * 4, out.storage_.native,
-              out.offset_ * 4, out.size())) {
+    if (!call(a.device_span(), out.device_span(), out.size())) {
       return std::nullopt;
     }
     return out;
@@ -3974,8 +3975,8 @@ struct graph {
                                         const array& a, float scale,
                                         float offset) {
     if (!k) return std::nullopt;  // no kernel for this op on this backend
-    return gpu_one_input_(a, [&](void* an, int64_t ao, void* on, int64_t oo, int64_t n) {
-      return gpu::unary(*k, an, ao, on, oo, n, scale, offset);
+    return gpu_one_input_(a, [&](gpu::span in, gpu::span out, int64_t n) {
+      return gpu::unary(*k, in, out, n, scale, offset);
     });
   }
 
@@ -4329,8 +4330,8 @@ struct graph {
       case op_t::cos_: u = gpu::unary_ext_op::cos_; break;
       default: return std::nullopt;
     }
-    return gpu_one_input_(a, [&](void* an, int64_t ao, void* on, int64_t oo, int64_t n) {
-      return gpu::unary_ext(u, an, ao, on, oo, n, scale, offset);
+    return gpu_one_input_(a, [&](gpu::span in, gpu::span out, int64_t n) {
+      return gpu::unary_ext(u, in, out, n, scale, offset);
     });
   }
 
@@ -4339,8 +4340,8 @@ struct graph {
   // role scale/offset play elsewhere, and nothing composes a further affine
   // onto it today.
   static std::optional<array> gpu_clamp_(const array& a, float lo, float hi) {
-    return gpu_one_input_(a, [&](void* an, int64_t ao, void* on, int64_t oo, int64_t n) {
-      return gpu::clamp(an, ao, on, oo, n, lo, hi);
+    return gpu_one_input_(a, [&](gpu::span in, gpu::span out, int64_t n) {
+      return gpu::clamp(in.buf, in.off, out.buf, out.off, n, lo, hi);
     });
   }
 
@@ -4358,8 +4359,9 @@ struct graph {
       case op_t::ne_s: k = gpu::scalar_op::ne; break;
       default: return std::nullopt;
     }
-    return gpu_one_input_(a, [&](void* an, int64_t ao, void* on, int64_t oo, int64_t len) {
-      return gpu::scalar_binary(k, an, ao, on, oo, len, n.arg0, n.scale, n.offset);
+    return gpu_one_input_(a, [&](gpu::span in, gpu::span out, int64_t len) {
+      return gpu::scalar_binary(k, in.buf, in.off, out.buf, out.off, len, n.arg0,
+                                n.scale, n.offset);
     });
   }
 

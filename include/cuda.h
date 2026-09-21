@@ -27,7 +27,7 @@
 
 #include <cstdint>
 
-#include "metal.h"  // reuse tl::metal::kop (platform-independent op enum)
+#include "gpu_abi.h"  // the op vocabulary and the launch contract
 #include "profile.h"  // tl::profile (per-launch attribution and timing)
 #include "shape.h"  // tl::contiguous_strides_into (pad/fold meta upload)
 #include "types.h"  // tl::dtype (KV cache storage width)
@@ -35,10 +35,10 @@
 namespace tl {
 namespace cuda {
 
-using kop = tl::metal::kop;
-using cmp_op = tl::metal::cmp_op;
-using unary_ext_op = tl::metal::unary_ext_op;
-using scalar_op = tl::metal::scalar_op;
+using kop = gpu::kop;
+using cmp_op = gpu::cmp_op;
+using unary_ext_op = gpu::unary_ext_op;
+using scalar_op = gpu::scalar_op;
 
 #if defined(TENSORLIB_CUDA) && !defined(__APPLE__)
 
@@ -194,10 +194,20 @@ inline const char* kernel_name_(kop op) {
     case kop::sigmoid: return "tl_sigmoid";
     case kop::relu: return "tl_relu";
     case kop::affine: return "tl_affine";
+    case kop::tanh_: return "tl_tanh";
+    case kop::sin_: return "tl_sin";
+    case kop::cos_: return "tl_cos";
     case kop::softmax: return "tl_softmax";
     case kop::row_sum: return "tl_row_sum";
     case kop::row_max: return "tl_row_max";
-    default: return "tl_sgemm";  // sgemm* / steel* all route to tl_sgemm
+    // Every f32 GEMM id is the one general kernel here (the tiled fast path
+    // has its own names: sgemm_tiles below).
+    case kop::sgemm32: case kop::sgemm32x64: case kop::sgemm64x32:
+    case kop::sgemm64: case kop::steel: case kop::steel32x64:
+    case kop::steel_ta: case kop::steel_tb: case kop::steel32x64_ta:
+    case kop::steel32x64_tb:
+      return "tl_sgemm";
+    default: return nullptr;  // no kernel here: dispatch declines
   }
 }
 
@@ -427,7 +437,8 @@ struct context {
     int key = static_cast<int>(op);
     auto it = fns.find(key);
     if (it != fns.end()) return it->second;
-    CUfunction f = load_(kernel_name_(op));
+    const char* name = kernel_name_(op);
+    CUfunction f = name ? load_(name) : nullptr;
     fns[key] = f;
     return f;
   }
@@ -589,19 +600,9 @@ struct context {
     }
   }
 
-  // tanh_/sin_/cos_ (RoPE's trig, RNN/LSTM's tanh) and clamp (Clip's
-  // forward). Own vocabulary, not the kop table (same reason as compare_
-  // above).
-  CUfunction tanh_fn = nullptr, sin_fn = nullptr, cos_fn = nullptr,
-             clamp_fn = nullptr;
-  CUfunction unary_ext_(unary_ext_op op) {
-    switch (op) {
-      case unary_ext_op::tanh_: return cached_(tanh_fn, "tl_tanh");
-      case unary_ext_op::sin_: return cached_(sin_fn, "tl_sin");
-      case unary_ext_op::cos_: return cached_(cos_fn, "tl_cos");
-      default: return nullptr;
-    }
-  }
+  // clamp (Clip's forward). Own getter, not the kop table (same reason as
+  // compare_ above).
+  CUfunction clamp_fn = nullptr;
   CUfunction clamp_() { return cached_(clamp_fn, "tl_clamp"); }
 
   // Tensor-scalar ops (pow(x, s), x > s, ...): the scalar is a kernel argument.
@@ -819,8 +820,14 @@ struct context {
                   "kernel arg must be a pointer or a 4-byte scalar: an 8-byte "
                   "one (int64_t/size_t/double/nullptr) shifts every arg after "
                   "it. Cast to unsigned/float at the call site.");
-    if (!f) return false;
     void* argv[] = {&args...};
+    return launch_argv_(f, grid, block, smem, argv);
+  }
+
+  // The launch itself, once argv is built (by launch_ above, or by dispatch_).
+  bool launch_argv_(CUfunction f, dims grid, dims block, unsigned smem,
+                    void** argv) {
+    if (!f) return false;
     pending = true;
     // Profiling: the launch under the open scope, and — outside a graph
     // capture, where an event record would become a graph node — an event on
@@ -841,6 +848,36 @@ struct context {
       timed.push_back({pr, begin, end});
     }
     return ok;
+  }
+
+  // The shared layer's launch (gpu_abi.h): residency from each view's access,
+  // then argv as the views' device addresses followed by the params' 4-byte
+  // fields. It is launch_'s contract read the other way round — every kernel
+  // takes its pointers first and 4-byte scalars after — so a params struct
+  // laid out in the kernel's argument order expands with no per-kernel code.
+  bool dispatch_(CUfunction f, const gpu::arg* args, size_t n,
+                 const void* params, size_t params_bytes, const gpu::grid& g) {
+    constexpr size_t kMaxArgs = 32;
+    const size_t words = params_bytes / 4;
+    if (!f || params_bytes % 4 || n + words == 0 || n + words > kMaxArgs) {
+      return false;
+    }
+    void* ptrs[kMaxArgs];
+    uint32_t scalars[kMaxArgs];
+    void* argv[kMaxArgs];
+    for (size_t i = 0; i < n; i++) {
+      switch (args[i].a) {
+        case gpu::access::in: device_read_(args[i].s.buf); break;
+        case gpu::access::out: device_write_(args[i].s.buf); break;
+        case gpu::access::inout: device_rmw_(args[i].s.buf); break;
+      }
+      ptrs[i] = off_(args[i].s.buf, args[i].s.off);
+      argv[i] = &ptrs[i];
+    }
+    std::memcpy(scalars, params, params_bytes);
+    for (size_t j = 0; j < words; j++) argv[n + j] = &scalars[j];
+    return launch_argv_(f, {g.gx, g.gy, g.gz}, {g.tx, g.ty, g.tz},
+                        g.scratch_bytes, argv);
   }
 
   // The 1-D elementwise shape: 256-thread blocks covering n elements.
@@ -1110,19 +1147,12 @@ inline void sync_to_host(void* native, bool for_write) {
   if (for_write) m->where = context::HOST;
 }
 
-// out = (a OP b) * scale + offset, contiguous; offsets in bytes.
-inline bool binary(kop op, void* a, int64_t ao, void* b, int64_t bo, void* out,
-                   int64_t oo, int64_t n, float scale, float offset) {
+// The device core's one way to run a kernel for the shared ops (gpu_ops.h).
+inline bool dispatch(kop k, const gpu::arg* args, size_t n, const void* params,
+                     size_t params_bytes, const gpu::grid& g) {
   auto& c = context::get();
   if (!c.ready) return false;
-  c.device_read_(a);
-  c.device_read_(b);
-  c.device_write_(out);
-  float* pa = context::off_(a, ao);
-  float* pb = context::off_(b, bo);
-  float* po = context::off_(out, oo);
-  unsigned un = static_cast<unsigned>(n);
-  return c.launch1d_(c.fn_(op), un, pa, pb, po, un, scale, offset);
+  return c.dispatch_(c.fn_(k), args, n, params, params_bytes, g);
 }
 
 // Rank-2 broadcast binary (bias / row-vector / column-vector / scalar) --
@@ -1146,18 +1176,6 @@ inline bool binary_bcast(kop op, void* a, int64_t ao, int64_t ars, int64_t acs,
                      static_cast<unsigned>(ars), static_cast<unsigned>(acs),
                      static_cast<unsigned>(brs), static_cast<unsigned>(bcs),
                      scale, offset);
-}
-
-inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo, int64_t n,
-                  float scale, float offset) {
-  auto& c = context::get();
-  if (!c.ready) return false;
-  c.device_read_(a);
-  c.device_write_(out);
-  float* pa = context::off_(a, ao);
-  float* po = context::off_(out, oo);
-  unsigned un = static_cast<unsigned>(n);
-  return c.launch1d_(c.fn_(op), un, pa, po, un, scale, offset);
 }
 
 // Rank cap shared with the kernel side (tensorlib_cuda.cu's
@@ -1359,23 +1377,6 @@ inline bool compare(cmp_op op, void* a_native, int64_t ao, void* b_native,
   unsigned un = static_cast<unsigned>(n);
   unsigned ubs = static_cast<unsigned>(bstride);
   return c.launch1d_(f, un, pa, pb, po, un, ubs);
-}
-
-// tanh_/sin_/cos_: plain elementwise, same shape as tl_exp/tl_sqrt (scale/
-// offset epilogue included, same reason those have it).
-inline bool unary_ext(unary_ext_op op, void* a_native, int64_t ao,
-                      void* out_native, int64_t oo, int64_t n, float scale,
-                      float offset) {
-  auto& c = context::get();
-  if (!c.ready) return false;
-  CUfunction f = c.unary_ext_(op);
-  if (!f) return false;
-  c.device_read_(a_native);
-  c.device_write_(out_native);
-  float* pa = context::off_(a_native, ao);
-  float* po = context::off_(out_native, oo);
-  unsigned un = static_cast<unsigned>(n);
-  return c.launch1d_(f, un, pa, po, un, scale, offset);
 }
 
 // clamp(x, lo, hi): Clip's forward. No epilogue -- lo/hi occupy the role
@@ -2527,19 +2528,16 @@ inline bool layer_norm_bwd(void* x, int64_t xo, void* g, int64_t go, void* dy,
 
 inline bool available() { return false; }
 inline bool pending() { return false; }
+inline bool dispatch(kop, const gpu::arg*, size_t, const void*, size_t,
+                     const gpu::grid&) {
+  return false;
+}
 inline void flush() {}
 inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
 inline void release(void*, int64_t, float*) {}
-inline bool binary(kop, void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
-                   float, float) {
-  return false;
-}
 inline bool binary_bcast(kop, void*, int64_t, int64_t, int64_t, void*, int64_t,
                          int64_t, int64_t, void*, int64_t, int64_t, int64_t,
                          float, float) {
-  return false;
-}
-inline bool unary(kop, void*, int64_t, void*, int64_t, int64_t, float, float) {
   return false;
 }
 inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
@@ -2625,10 +2623,6 @@ inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
 }
 inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
                     int64_t, int64_t) {
-  return false;
-}
-inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
-                      float, float) {
   return false;
 }
 inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {

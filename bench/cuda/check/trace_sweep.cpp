@@ -6,7 +6,7 @@
 #ifndef TENSORLIB_CUDA
 #define TENSORLIB_CUDA
 #endif
-#include "cuda.h"
+#include "gpu.h"  // the shared ops (tl::gpu) resolve to cuda here
 
 #include <cstdio>
 #include <vector>
@@ -32,7 +32,7 @@ void elementwise() {
   const int64_t n = 1000;
   buf a(n * 4 + kOff), b(n * 4 + kOff), o(n * 4 + kOff);
   for (kop op : {kop::add, kop::sub, kop::mul, kop::div, kop::pow_}) {
-    cu::binary(op, a, kOff, b, 0, o, kOff, n, 2.0f, 1.0f);
+    tl::gpu::binary(op, {a, kOff}, {b, 0}, {o, kOff}, n, 2.0f, 1.0f);
   }
   for (kop op : {kop::badd, kop::bsub, kop::bmul, kop::bdiv, kop::bpow}) {
     cu::binary_bcast(op, a, kOff, 40, 1, b, 0, 0, 1, o, kOff, 25, 40, 1.0f, 0.0f);

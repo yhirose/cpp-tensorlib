@@ -168,7 +168,7 @@ inline void* off_f32(void* p, int64_t nfloats) {
 // either way — what the cap decides is whether reading the fused output back
 // costs a copy.
 inline void copy_out(void* src, int64_t from, void* dst, int64_t n) {
-  gpu::unary(gpu::kop::affine, src, from * 4, dst, 0, n, 1.0f, 0.0f);
+  gpu::unary(gpu::kop::affine, {src, from * 4}, {dst, 0}, n, 1.0f, 0.0f);
 }
 
 // Make a device buffer's bytes readable on the host: drain the queue (on
@@ -768,7 +768,8 @@ inline void run_layers_(Model& M, void* x0, int64_t pos, void* d_pos = nullptr,
       gpu::rope(qp, qp, NH, 1, HD, pos, ROPE_BASE, L.bq.native());
       gpu::rope(kp, kp, NKV, 1, HD, pos, ROPE_BASE, L.bk.native());
     }
-    gpu::binary(gpu::kop::add, vp, 0, L.bv.native(), 0, vp, 0, NKV * HD, 1, 0);
+    gpu::binary(gpu::kop::add, {vp, 0}, {L.bv.native(), 0}, {vp, 0}, NKV * HD, 1,
+                0);
     if (cap) {
       L.cache.append_dpos(kp, vp, d_pos);
       L.cache.attn_dpos(qp, S.ab.native, NH, d_pos, SCALE);

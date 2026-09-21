@@ -11,10 +11,13 @@
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
+// Params structs follow the shared kernel ABI (gpu_abi.h): 4-byte fields in
+// the order gpu_ops.h declares them, which is the order the CUDA kernel of the
+// same name takes its scalars.
 struct ew_params {
+  uint n;
   float scale;
   float offset;
-  uint n;
 };
 
 // bf16 is the top 16 bits of the f32 pattern: widen by a shift, narrow with

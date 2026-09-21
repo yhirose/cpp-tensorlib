@@ -37,17 +37,17 @@
 
 #include <cstdint>
 
-#include "metal.h"  // reuse tl::metal::kop (platform-independent op enum)
+#include "gpu_abi.h"  // the op vocabulary and the launch contract
 #include "profile.h"
 #include "types.h"
 
 namespace tl {
 namespace webgpu {
 
-using kop = tl::metal::kop;
-using cmp_op = tl::metal::cmp_op;
-using unary_ext_op = tl::metal::unary_ext_op;
-using scalar_op = tl::metal::scalar_op;
+using kop = gpu::kop;
+using cmp_op = gpu::cmp_op;
+using unary_ext_op = gpu::unary_ext_op;
+using scalar_op = gpu::scalar_op;
 
 #if defined(TENSORLIB_WEBGPU) && defined(__EMSCRIPTEN__)
 
@@ -619,24 +619,70 @@ inline bool gemm(void* a, int64_t ao, int64_t lda, bool ta, void* b, int64_t bo,
   return c.encode_("sgemm", ma, mb, mo, p, (n + 63) / 64, (m + 63) / 64);
 }
 
-// Contiguous elementwise binary over n elements.
-inline bool binary(kop op, void* a, int64_t ao, void* b, int64_t bo, void* out,
-                   int64_t oo, int64_t n, float scale, float offset) {
-  auto& c = context::get();
-  if (!c.ready || n <= 0) return false;
-  params p = {};
-  if (!elem_off_(ao, &p.a_off) || !elem_off_(bo, &p.b_off) ||
-      !elem_off_(oo, &p.c_off)) {
-    return false;
+// This backend's kernels predate the shared kernel ABI (gpu_abi.h): every WGSL
+// entry point reads the one `params` layout above, and a family picks its
+// operation by number. So each kernel id the shared ops may dispatch is
+// marshalled here, from its canonical params into that layout; the entry
+// point comes back, or null for an id this backend has no kernel for.
+inline const char* marshal_(kop k, const void* canonical, params& p) {
+  switch (k) {
+    case kop::add: case kop::sub: case kop::mul: case kop::div: case kop::pow_:
+    case kop::exp_: case kop::log_: case kop::sqrt_: case kop::sigmoid:
+    case kop::relu: case kop::affine: case kop::tanh_: case kop::sin_:
+    case kop::cos_: {
+      const auto& q = *static_cast<const gpu::ew_params*>(canonical);
+      if (q.n == 0) return nullptr;
+      p.M = q.n;
+      p.op = kernel_op_(k);
+      p.scale = q.scale;
+      p.offset = q.offset;
+      return k <= kop::pow_ ? "ew_binary" : "ew_unary";
+    }
+    default: return nullptr;
   }
-  context::mirror *ma, *mb, *mo;
-  if (!operands_(c, a, b, out, &ma, &mb, &mo)) return false;
+}
 
-  p.M = (uint32_t)n;
-  p.op = kernel_op_(op);
-  p.scale = scale;
-  p.offset = offset;
-  return c.encode_("ew_binary", ma, mb, mo, p, (n + 255) / 256, 1);
+// The device core's one way to run a kernel for the shared ops. The bind
+// group is fixed — A and B read, C written, D and E read — so the view a
+// kernel writes is C and the ones it reads fill A, B, D, E in order; a
+// one-input kernel binds its input twice. Offsets ride in the uniform as
+// element counts (A, B and C only: D and E are bound whole).
+inline bool dispatch(kop k, const gpu::arg* args, size_t n, const void* canonical,
+                     size_t /*params_bytes*/, const gpu::grid& g) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  params p = {};
+  const char* entry = marshal_(k, canonical, p);
+  if (!entry) return false;
+
+  context::mirror* in[4] = {};
+  uint32_t* in_off[2] = {&p.a_off, &p.b_off};
+  context::mirror* out = nullptr;
+  size_t ins = 0;
+  for (size_t i = 0; i < n; i++) {
+    context::mirror* m = c.mirror_(args[i].s.buf);
+    uint32_t off = 0;
+    if (!m || !elem_off_(args[i].s.off, &off)) return false;  // CPU's
+    if (args[i].a == gpu::access::in) {
+      if (ins == 4 || (ins >= 2 && off != 0)) return false;
+      if (ins < 2) *in_off[ins] = off;
+      in[ins++] = m;
+    } else {
+      if (out) return false;  // one writable binding
+      out = m;
+      p.c_off = off;
+    }
+  }
+  if (!out || ins == 0) return false;
+  if (ins == 1) {
+    in[1] = in[0];
+    p.b_off = p.a_off;
+  }
+  for (size_t i = 0; i < n; i++) {
+    if (args[i].a != gpu::access::out) c.device_read_(args[i].s.buf);
+    if (args[i].a != gpu::access::in) c.device_write_(args[i].s.buf);
+  }
+  return c.encode_(entry, in[0], in[1], out, p, g.gx, g.gy, in[2], in[3]);
 }
 
 // A one-input elementwise dispatch over n elements: the kernel binds its one
@@ -654,15 +700,6 @@ inline bool encode_one_input_(const char* entry, void* a, int64_t ao, void* out,
   p.M = static_cast<uint32_t>(n);
   fill(p);
   return c.encode_(entry, ma, mb, mo, p, (n + 255) / 256, 1);
-}
-
-inline bool unary(kop op, void* a, int64_t ao, void* out, int64_t oo, int64_t n,
-                  float scale, float offset) {
-  return encode_one_input_("ew_unary", a, ao, out, oo, n, [&](params& p) {
-    p.op = kernel_op_(op);
-    p.scale = scale;
-    p.offset = offset;
-  });
 }
 
 // Rank-2 broadcast binary: out[r,c] = f(a[r*ars + c*acs], b[r*brs + c*bcs])
@@ -1192,23 +1229,6 @@ inline bool compare(cmp_op op, void* a, int64_t ao, void* b, int64_t bo,
   return c.encode_("cmp", ma, mb, mo, p, (n + 255) / 256, 1);
 }
 
-// tanh_/sin_/cos_ (RoPE's trig, RNN/LSTM's tanh): plain elementwise, same
-// shape as exp_/sqrt_ -- unary() above already does exactly this dispatch
-// through ew_unary, just keyed by a kop array.h doesn't see directly.
-inline bool unary_ext(unary_ext_op op, void* a, int64_t ao, void* out,
-                      int64_t oo, int64_t n, float scale, float offset) {
-  kop k;
-  switch (op) {
-    case unary_ext_op::tanh_: k = kop::tanh_; break;
-    case unary_ext_op::sin_: k = kop::sin_; break;
-    case unary_ext_op::cos_: k = kop::cos_; break;
-  }
-  // Qualified: unqualified unary(...) is ambiguous here -- kop is really
-  // tl::metal::kop, so ADL pulls in metal.h's non-Apple unary() stub
-  // alongside this namespace's own.
-  return tl::webgpu::unary(k, a, ao, out, oo, n, scale, offset);
-}
-
 // clamp(x, lo, hi): Clip's forward. No epilogue -- p.scale/p.offset carry
 // lo/hi instead (mirrors cuda.h's/metal.h's own clamp).
 inline bool clamp(void* a, int64_t ao, void* out, int64_t oo, int64_t n,
@@ -1313,20 +1333,17 @@ inline bool rope(void* x, void* out, int64_t rows, int64_t T, int64_t D,
 
 inline bool available() { return false; }
 inline bool pending() { return false; }
+inline bool dispatch(kop, const gpu::arg*, size_t, const void*, size_t,
+                     const gpu::grid&) {
+  return false;
+}
 inline void flush() {}
 inline void* alloc(int64_t, float**, bool = false) { return nullptr; }
 inline void release(void*, int64_t, float*) {}
 inline void sync_to_host(void*, bool) {}
-inline bool binary(kop, void*, int64_t, void*, int64_t, void*, int64_t, int64_t,
-                   float, float) {
-  return false;
-}
 inline bool binary_bcast(kop, void*, int64_t, int64_t, int64_t, void*, int64_t,
                          int64_t, int64_t, void*, int64_t, int64_t, int64_t,
                          float, float) {
-  return false;
-}
-inline bool unary(kop, void*, int64_t, void*, int64_t, int64_t, float, float) {
   return false;
 }
 inline bool gemm(void*, int64_t, int64_t, bool, void*, int64_t, int64_t, bool,
@@ -1410,10 +1427,6 @@ inline bool sum_to(void*, int64_t, const int64_t*, const int64_t*,
 }
 inline bool compare(cmp_op, void*, int64_t, void*, int64_t, void*, int64_t,
                     int64_t, int64_t) {
-  return false;
-}
-inline bool unary_ext(unary_ext_op, void*, int64_t, void*, int64_t, int64_t,
-                      float, float) {
   return false;
 }
 inline bool clamp(void*, int64_t, void*, int64_t, int64_t, float, float) {

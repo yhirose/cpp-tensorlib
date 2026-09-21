@@ -6,7 +6,7 @@
 #ifndef TENSORLIB_CUDA
 #define TENSORLIB_CUDA  // standalone build; the CMake build passes it as a flag
 #endif
-#include "cuda.h"
+#include "gpu.h"  // the shared ops (tl::gpu) resolve to cuda here
 
 #include <cmath>
 #include <cstdio>
@@ -49,7 +49,8 @@ int main() {
       cb[i] = d(g);
       ref[i] = (ca[i] + cb[i]) * 2.0f + 1.0f;
     }
-    bool launched = tl::cuda::binary(kop::add, a, 0, b, 0, o, 0, n, 2.0f, 1.0f);
+    bool launched =
+        tl::gpu::binary(kop::add, {a, 0}, {b, 0}, {o, 0}, n, 2.0f, 1.0f);
     sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < n; i++)
@@ -72,7 +73,7 @@ int main() {
       ca[i] = d(g) * 4.0f;
       ref[i] = 1.0f / (1.0f + std::exp(-ca[i]));
     }
-    bool launched = tl::cuda::unary(kop::sigmoid, a, 0, o, 0, n, 1.0f, 0.0f);
+    bool launched = tl::gpu::unary(kop::sigmoid, {a, 0}, {o, 0}, n, 1.0f, 0.0f);
     sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < n; i++)

@@ -3115,3 +3115,63 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
 
   tl::device_ = prev;
 }
+
+// The shared ops (gpu_ops.h) take views: a device handle and a byte offset.
+// Each one here runs on views at distinct non-zero offsets into larger
+// buffers and is checked against the same arithmetic on the host; the census
+// says the kernel ran on the device rather than the evaluator falling back,
+// which the suite's oracle comparisons cannot tell apart.
+TEST_CASE("shared gpu ops: views at non-zero offsets, counted by the census") {
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+  tl::use_gpu();
+  namespace gpu = tl::gpu;
+  auto dev = [](const array& a) {
+    array c = a.clone();
+    c.eval();
+    return c;
+  };
+  auto same = [](const array& got, const array& want, float tol) {
+    return tl::allclose(got, want, tol, tol);
+  };
+  const int64_t n = 1000, pa = 3, pb = 7, po = 11;  // elements of slack in front
+  array A = dev(random_array({n + pa}, 940)), B = dev(random_array({n + pb}, 941));
+  array a = A.slice(0, pa, n), b = B.slice(0, pb, n);
+
+  SUBCASE("binary") {
+    array O = dev(array::zeros({n + po}));
+    gpu::census_reset();
+    REQUIRE(gpu::binary(gpu::kop::add, a.device_span(), b.device_span(),
+                        O.slice(0, po, n).device_span(), n, 2.0f, 1.0f));
+    tl::gpu::flush();
+    CHECK(gpu::census(gpu::kop::add) == 1);
+    tl::use_cpu();
+    CHECK(same(O.slice(0, po, n), (a + b) * 2.0f + 1.0f, 1e-6f));
+    CHECK(same(O.slice(0, 0, po), array::zeros({po}), 0.0f));  // slack untouched
+  }
+
+  SUBCASE("unary and unary_ext") {
+    array O = dev(array::zeros({n + po})), P = dev(array::zeros({n + po}));
+    gpu::census_reset();
+    REQUIRE(gpu::unary(gpu::kop::sigmoid, a.device_span(),
+                       O.slice(0, po, n).device_span(), n, 1.0f, 0.0f));
+    REQUIRE(gpu::unary_ext(gpu::unary_ext_op::tanh_, b.device_span(),
+                           P.slice(0, po, n).device_span(), n, 3.0f, -1.0f));
+    tl::gpu::flush();
+    CHECK(gpu::census(gpu::kop::sigmoid) == 1);
+    CHECK(gpu::census(gpu::kop::tanh_) == 1);
+    tl::use_cpu();
+    CHECK(same(O.slice(0, po, n), a.sigmoid(), 1e-6f));
+    CHECK(same(P.slice(0, po, n), b.tanh() * 3.0f - 1.0f, 1e-5f));
+    CHECK(same(P.slice(0, 0, po), array::zeros({po}), 0.0f));
+  }
+
+  SUBCASE("the evaluator's elementwise graph reaches the device") {
+    gpu::census_reset();
+    array y = (a.clone() + b.clone()).exp();
+    y.eval();
+    CHECK(gpu::census(gpu::kop::add) + gpu::census(gpu::kop::exp_) >= 1);
+  }
+
+  tl::device_ = prev;
+}

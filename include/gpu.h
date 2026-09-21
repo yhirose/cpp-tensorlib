@@ -1,15 +1,21 @@
 #pragma once
 
-// The GPU-backend facade: array.h and storage.h dispatch through tl::gpu, so
-// the eval seam carries no platform #ifdefs. Every backend header exposes the
-// identical API and shares tl::metal::kop, which makes the alias below a
-// drop-in. The contract, i.e. everything array.h/storage.h may call:
+// The GPU facade: array.h and storage.h dispatch through tl::gpu, so the eval
+// seam carries no platform #ifdefs. tl::gpu is two things laid over each other:
+//
+//   shared    gpu_abi.h (the op vocabulary, span, the kernel ABI) and gpu_ops.h
+//             (ops written once, over the backend's `dispatch`):
+//               binary / unary / unary_ext
+//   backend   whatever the selected backend header declares, reached through
+//             the using-directive below. Until an op moves to gpu_ops.h, each
+//             backend header declares it with the identical signature — the
+//             contract, i.e. everything array.h/storage.h may call:
 //   lifecycle  available / pending / flush / cpu_barrier
 //   memory     alloc / release / sync_to_host / upload
-//   kernels    binary / binary_bcast / binary_bcast_nd / where_nd / copy_nd / unary /
+//   kernels    binary_bcast / binary_bcast_nd / where_nd / copy_nd /
 //              gemm / gemm_batched / gemm_bias / row_op / pad / fold /
 //              index_select / index_add / scatter_to_axis / gather_from_axis /
-//              sum_to / compare / unary_ext / clamp / scalar_binary /
+//              sum_to / compare / clamp / scalar_binary /
 //              concat_part / rope / layer_norm / layer_norm_bwd /
 //              row_logsumexp / xent_bwd / adam_step
 //   LLM path   gemv_f32 / gemv_bf16 / gemv_q4 / attn_decode / attn_prefill /
@@ -53,14 +59,21 @@ namespace tl {
 // TENSORLIB_CUDA, but a host build could define TENSORLIB_WEBGPU by accident
 // and should not silently take a backend that cannot work there — webgpu::
 // is stubs unless __EMSCRIPTEN__ too, so the order is safe either way.
+// A using-directive rather than an alias, so tl::gpu can hold the shared layer
+// too: a name declared in tl::gpu itself (a shared op) is found first, and one
+// that is not falls through to the backend.
+namespace gpu {
 #if defined(TENSORLIB_WEBGPU) && defined(__EMSCRIPTEN__)
-namespace gpu = webgpu;
+using namespace webgpu;
 #elif defined(TENSORLIB_CUDA) && !defined(__APPLE__)
-namespace gpu = cuda;
+using namespace cuda;
 #else
-namespace gpu = metal;
+using namespace metal;
 #endif
+}  // namespace gpu
 
 inline bool gpu_available() { return gpu::available(); }
 
 }  // namespace tl
+
+#include "gpu_ops.h"
