@@ -171,6 +171,8 @@ machine here runs CUDA kernels, so `tools/cuda_trace` records what the CUDA
 backend asks of the driver (kernel, grid, every argument) against a stand-in
 `libcuda` in a Linux container, and `tools/cuda_trace/compare.sh <ref>` diffs
 that across a change to the backend's host side.
+[docs/backends.md](docs/backends.md) covers the layers, the kernel ABI, and how
+to add an op or a backend.
 
 ### Profiling
 
