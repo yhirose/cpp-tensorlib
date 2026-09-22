@@ -940,11 +940,16 @@ inline bool big_tile_(int64_t m, int64_t n, int64_t k, int64_t batch = 1) {
 // 256×768×256:nt 5.1k → 5.6k and 256×512×256:nt 3.9k → 4.5k.
 constexpr unsigned kWaveMinK = 192;
 inline unsigned sgemm_wave_chunk_(long tiles, unsigned k, const sgemm_tile& t) {
-  if (tiles >= traits::fill_groups) return k;
+  // fill_groups is int64_t, tiles/slabs long — the same width everywhere this
+  // library builds except Windows (LLP64, long is 32-bit), where std::min/max
+  // over the two otherwise deduce to no common type. One cast here keeps the
+  // rest of the function in `long`, as it was before the trait.
+  const long fill = static_cast<long>(traits::fill_groups);
+  if (tiles >= fill) return k;
   const long slabs = k / t.bk, min_slabs = kWaveMinK / t.bk;
-  const long full = std::max<long>(1, std::min(traits::fill_groups / tiles, slabs / min_slabs));
+  const long full = std::max<long>(1, std::min<long>(fill / tiles, slabs / min_slabs));
   long chunk_slabs = (slabs + full - 1) / full;
-  if (const long spare = traits::fill_groups - full * tiles; spare > 0) {
+  if (const long spare = fill - full * tiles; spare > 0) {
     const long rounds = (tiles + spare - 1) / spare;
     const long parts = full * rounds + 1;  // a full layer is `rounds` tails
     if (slabs >= min_slabs * parts) chunk_slabs = (slabs * rounds + parts - 1) / parts;
