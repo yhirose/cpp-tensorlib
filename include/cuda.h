@@ -282,29 +282,19 @@ struct context {
   std::vector<timed_launch> timed;
   std::vector<CUevent> spare_events;
 
-  // Host/device mirror per allocation, keyed by the device pointer (== the
-  // `native` handle stored in storage). Views sharing a storage share the key,
-  // so one state serves every view. When to copy is gpu::residency's decision
-  // (gpu_abi.h); the copies are made here.
-  struct mirror {
-    float* host = nullptr;  // CPU-side buffer (storage.contents/ptr)
-    CUdeviceptr dev = 0;    // device buffer (storage.native)
-    size_t bytes = 0;
-    gpu::residency live;
-  };
-  std::unordered_map<CUdeviceptr, mirror> mirrors;
+  // Host/device mirror per allocation and its size-keyed free list (shared
+  // shape with webgpu.h; `gpu::mirror_table`, gpu_abi.h). Keyed by the device
+  // pointer, reinterpreted as the `native` handle stored in storage. Views
+  // sharing a storage share the key, so one state serves every view. When to
+  // copy is gpu::residency's decision; the copies are made here. Released
+  // buffers are recycled, not cuMemFree'd — repeated large alloc/free
+  // otherwise fragments the driver allocator (decode benches, training that
+  // churns activations); they persist until the (leaked) context tears down.
+  using mirror = gpu::mirror_table<CUdeviceptr>::entry;
+  gpu::mirror_table<CUdeviceptr> mt;
 
-  // Size-keyed free list (like Metal's MTLBuffer pool). Released buffers are
-  // recycled, not cuMemFree'd — repeated large alloc/free otherwise fragments
-  // the driver allocator (decode benches, training that churns activations).
-  // Buffers persist until the (leaked) context tears down. Keyed by exact byte
-  // size; the workloads that churn reuse identical shapes.
-  std::unordered_map<size_t, std::vector<std::pair<CUdeviceptr, float*>>> pool;
+  mirror* mirror_(void* native) { return mt.find(native); }
 
-  mirror* mirror_(void* native) {
-    auto it = mirrors.find(reinterpret_cast<CUdeviceptr>(native));
-    return it == mirrors.end() ? nullptr : &it->second;
-  }
   // A kernel is about to touch this buffer as `a`: bring the host copy up if
   // residency says so. Async on the stream like the meta uploads (a blocking
   // copy would wait out every kernel already queued and stall the pipeline
@@ -1141,12 +1131,7 @@ inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
   size_t nb = bytes > 0 ? (size_t)bytes : 4;
   CUdeviceptr dev = 0;
   float* host = nullptr;
-  auto it = c.pool.find(nb);  // reuse a recycled buffer of this exact size
-  if (it != c.pool.end() && !it->second.empty()) {
-    dev = it->second.back().first;
-    host = it->second.back().second;
-    it->second.pop_back();
-  } else {
+  if (!c.mt.take(nb, dev, host)) {  // no recycled buffer of this exact size
     if (c.d.MemAlloc(&dev, nb) != 0) return nullptr;
     host = static_cast<float*>(std::malloc(nb));
     if (!host) {
@@ -1154,22 +1139,18 @@ inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
       return nullptr;
     }
   }
-  c.mirrors[dev] = context::mirror{host, dev, nb, gpu::residency(host_fill)};
+  void* native = reinterpret_cast<void*>(dev);
+  c.mt.insert(native, dev, host, nb, host_fill);
   if (contents) *contents = host;
-  return reinterpret_cast<void*>(dev);
+  return native;
 }
 
 inline void release(void* buf, int64_t, float*) {
   auto& c = context::get();
   if (!c.ready || !buf) return;
-  CUdeviceptr dev = reinterpret_cast<CUdeviceptr>(buf);
-  auto it = c.mirrors.find(dev);
-  if (it == c.mirrors.end()) {
-    c.d.MemFree(dev);  // untracked (shouldn't happen); free outright
-    return;
+  if (!c.mt.release(buf)) {
+    c.d.MemFree(reinterpret_cast<CUdeviceptr>(buf));  // untracked (shouldn't happen); free outright
   }
-  c.pool[it->second.bytes].push_back({dev, it->second.host});  // recycle
-  c.mirrors.erase(it);
 }
 
 // Reconcile a buffer for a CPU access: when the device holds the live copy,
