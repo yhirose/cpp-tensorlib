@@ -144,23 +144,27 @@ differ, not to avoid reordering a params struct.
 
 The ops fall in two tiers. Tier 0 — elementwise, broadcast, reduction, GEMM,
 copy and index — closes the array surface: a backend with those kernels runs
-every graph. Tier 1 is the fused ops of the model path — `rmsnorm`, `swiglu`,
+every graph. Tier 1 is the fused ops — the model path's `rmsnorm`, `swiglu`,
 the decode GEMV, the cache writes, `rope`, the attention, `split_heads` /
-`merge_heads`, `argmax` — each a kernel a backend *may* have. Under each of
-them `gpu_ops.h` holds one generic composition out of tier 0 (`gpu::generic`),
-and the op takes it when the shared launch declines or `own` has no member:
-several launches and a scratch buffer or two where the kernel is one launch,
-so a backend that cares for the decode loop writes the kernel, and a backend
-that has only tier 0 still runs the whole model path. The compositions are
-f32: an operand the tier has no reader for — a bf16 cache or weight, int4
-weights — still declines, and a model keeps to the array ops there
+`merge_heads`, `argmax`, plus two training ops off that path, `xent_bwd` and
+`adam_step` — each a kernel a backend *may* have. Under each of them
+`gpu_ops.h` holds one generic composition out of tier 0 (`gpu::generic`), and
+the op
+takes it when the shared launch declines or `own` has no member: several
+launches and a scratch buffer or two where the kernel is one launch, so a
+backend that cares writes the kernel, and a backend that has only tier 0
+still runs the whole model path — and, for `adam_step`, still updates its
+state on the device rather than a host round trip. The compositions are f32:
+an operand the tier has no reader for — a bf16 cache or weight, int4 weights
+— still declines, and a model keeps to the array ops there
 (`caps::row_gemv`, `caps::bf16_gemm`). A composition names no backend and no
 array: spans, tier-0 ops, and the device core's `alloc` / `release` /
 `cpu_barrier` / `sync_to_host`.
 
-Two tests hold the two routes together: the model-path test checks the op,
-however it ran, against the array oracle, and a second runs each composition
-beside the backend's kernel and requires the same numbers.
+Two tests hold the two routes together: the model-path test (and, for the two
+training ops off that path, their own eager tests) checks the op, however it
+ran, against the array oracle, and a second runs each composition beside the
+backend's kernel and requires the same numbers.
 
 ## Launch policy
 

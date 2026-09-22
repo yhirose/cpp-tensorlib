@@ -3534,10 +3534,13 @@ struct graph {
                          inv_bc2)) {
         return true;
       }
-      // No kernel for it on this backend: the host loop below. The caller
-      // updates in place and cannot compose its way out, so this has to be
-      // total -- and Metal's unified memory makes the round trip a flush and a
-      // memcpy, the same bargain its other CPU fallbacks make.
+      // gpu::adam_step already falls to its tier-0 composition when the
+      // backend has no fused kernel, so this is the device itself declining
+      // -- a scratch it could not allocate, or a tier-0 launch it refused:
+      // the host loop below. The caller updates in place and cannot compose
+      // its way out, so this has to be total -- and Metal's unified memory
+      // makes the round trip a flush and a memcpy, the same bargain its
+      // other CPU fallbacks make.
     }
     // data() brings any device copy home first, the same as every other host
     // path. A CUDA build hands every buffer a mirror key, so "has a native

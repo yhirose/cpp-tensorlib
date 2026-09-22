@@ -202,30 +202,6 @@ inline bool gather_from_axis(span src, span idx, span o, int64_t n,
                 policy::flat(n));
 }
 
-// Softmax cross-entropy's pullback from the forward's row logsumexp:
-// out[i,j] = g[i] * (exp(x[i,j] - lse[i]) - [j == tgt[i]]). x and out are
-// [rows, cols]; lse, tgt and g hold one value a row.
-inline bool xent_bwd(span x, span lse, span tgt, span g, span o, int64_t rows,
-                     int64_t cols) {
-  const int64_t n = rows * cols;
-  if (n <= 0) return false;
-  return launch(kop::xent_bwd_, {in(x), in(lse), in(tgt), in(g), out(o)},
-                xent_bwd_params{static_cast<uint32_t>(cols),
-                                static_cast<uint32_t>(n)},
-                policy::flat(n));
-}
-
-// Adam's update in place over n contiguous elements: m and v advance, p moves
-// by the bias-corrected ratio the host folded into lr_over_bc1 and inv_bc2.
-inline bool adam_step(span p, span m, span v, span g, int64_t n, float beta1,
-                      float beta2, float eps, float lr_over_bc1, float inv_bc2) {
-  if (n <= 0) return false;
-  return launch(kop::adam_step_, {inout(p), inout(m), inout(v), in(g)},
-                adam_params{beta1, beta2, eps, lr_over_bc1, inv_bc2,
-                            static_cast<uint32_t>(n)},
-                policy::flat(n));
-}
-
 // tanh / sin / cos: unary's shape under their own vocabulary (gpu_abi.h).
 inline bool unary_ext(unary_ext_op op, span a, span o, int64_t n, float scale,
                       float offset) {
@@ -671,6 +647,45 @@ inline bool argmax(span a, int64_t n, int64_t* out_idx) {
   return true;
 }
 
+// Softmax cross-entropy's pullback: exp(x - lse) row-broadcast, a one-hot
+// scatter of the targets subtracted, g row-broadcast into the result.
+inline bool xent_bwd(span x, span lse, span tgt, span g, span o, int64_t rows,
+                     int64_t cols) {
+  const int64_t n = rows * cols;
+  scratch diff(n), p(n), onehot(n), ones(rows, true);
+  if (!diff || !p || !onehot || !ones) return false;
+  for (int64_t i = 0; i < rows; i++) ones.contents[i] = 1.0f;
+  return binary_bcast(kop::bsub, x, cols, 1, lse, 1, 0, diff, rows, cols, 1.0f,
+                      0.0f) &&
+         unary(kop::exp_, diff, p, n, 1.0f, 0.0f) &&
+         scatter_to_axis(tgt, ones, onehot, rows, cols) &&
+         binary(kop::sub, p, onehot, diff, n, 1.0f, 0.0f) &&
+         binary_bcast(kop::bmul, diff, cols, 1, g, 1, 0, o, rows, cols, 1.0f,
+                      0.0f);
+}
+
+// Adam's update: m and v each a sum of two affines of their old value and g,
+// p moved by their ratio through a scratch of its own (p is read only before
+// it is ever the write side, so the update never aliases a launch's input).
+inline bool adam_step(span p, span m, span v, span g, int64_t n, float beta1,
+                      float beta2, float eps, float lr_over_bc1,
+                      float inv_bc2) {
+  scratch a(n), b(n), c(n);
+  if (!a || !b || !c) return false;
+  return unary(kop::affine, m, a, n, beta1, 0.0f) &&
+         unary(kop::affine, g, b, n, 1.0f - beta1, 0.0f) &&
+         binary(kop::add, a, b, m, n, 1.0f, 0.0f) &&
+         binary(kop::mul, g, g, c, n, 1.0f - beta2, 0.0f) &&
+         unary(kop::affine, v, b, n, beta2, 0.0f) &&
+         binary(kop::add, b, c, v, n, 1.0f, 0.0f) &&
+         unary(kop::affine, v, a, n, inv_bc2, 0.0f) &&
+         unary(kop::sqrt_, a, c, n, 1.0f, eps) &&
+         unary(kop::affine, m, a, n, lr_over_bc1, 0.0f) &&
+         binary(kop::div, a, c, b, n, 1.0f, 0.0f) &&
+         binary(kop::sub, p, b, a, n, 1.0f, 0.0f) &&
+         unary(kop::affine, a, p, n, 1.0f, 0.0f);
+}
+
 }  // namespace generic
 
 // ---- the model path: what a decoder runs on raw device buffers between its
@@ -906,6 +921,36 @@ inline bool attn_prefill_dkv(span q, span K, span V, span dO, span stats,
   } else {
     return false;
   }
+}
+
+// ---- the training ops: eager, off the decode path, each the backend's fused
+// kernel where it has one and the tier-0 composition where it does not.
+
+// Softmax cross-entropy's pullback from the forward's row logsumexp:
+// out[i,j] = g[i] * (exp(x[i,j] - lse[i]) - [j == tgt[i]]). x and out are
+// [rows, cols]; lse, tgt and g hold one value a row.
+inline bool xent_bwd(span x, span lse, span tgt, span g, span o, int64_t rows,
+                     int64_t cols) {
+  const int64_t n = rows * cols;
+  if (n <= 0) return false;
+  return launch(kop::xent_bwd_, {in(x), in(lse), in(tgt), in(g), out(o)},
+                xent_bwd_params{static_cast<uint32_t>(cols),
+                                static_cast<uint32_t>(n)},
+                policy::flat(n)) ||
+         generic::xent_bwd(x, lse, tgt, g, o, rows, cols);
+}
+
+// Adam's update in place over n contiguous elements: m and v advance, p moves
+// by the bias-corrected ratio the host folded into lr_over_bc1 and inv_bc2.
+inline bool adam_step(span p, span m, span v, span g, int64_t n, float beta1,
+                      float beta2, float eps, float lr_over_bc1, float inv_bc2) {
+  if (n <= 0) return false;
+  return launch(kop::adam_step_, {inout(p), inout(m), inout(v), in(g)},
+                adam_params{beta1, beta2, eps, lr_over_bc1, inv_bc2,
+                            static_cast<uint32_t>(n)},
+                policy::flat(n)) ||
+         generic::adam_step(p, m, v, g, n, beta1, beta2, eps, lr_over_bc1,
+                            inv_bc2);
 }
 
 // ---- the graph-capture forms (caps::graph_capture): a decode step whose
