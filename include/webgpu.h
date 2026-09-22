@@ -1231,6 +1231,9 @@ struct traits {
   // A launch's tl::profile row is counted, not timed: WebGPU has no per-launch
   // device time to stamp it with.
   static constexpr bool times_launches = false;
+  // Workgroups that keep the device busy. Untuned: the browser hides the
+  // device, and no op here splits against it yet.
+  static constexpr int64_t fill_groups = 64;
 };
 
 struct caps {

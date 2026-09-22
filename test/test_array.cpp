@@ -2896,6 +2896,47 @@ TEST_CASE("profile: an eager op that declines on its operands leaves no row") {
   }
 }
 
+// The shared split policy, at the rules the backends state. The CUDA numbers
+// are the ones its decode attention's device twin (attn_dpos_chunk) reproduces
+// and its launch trace records, so they are pinned here as such.
+TEST_CASE("policy: a split measures its groups against the device's fill") {
+  using tl::gpu::policy::split_chunk;
+  using tl::gpu::policy::split_parts;
+  using tl::gpu::policy::split_rule;
+
+  // CUDA's decode GEMV: 164 blocks fill, no split under K=512, 32-wide steps.
+  constexpr split_rule gemv{164, 512, 0, 32};
+  CHECK(split_parts(4, 896, gemv) == 41);  // 896 = Qwen's NE, 4 column blocks
+  CHECK(split_chunk(896, 41, gemv) == 32);  // 22 rounded up to the step
+  CHECK(split_parts(594, 4096, gemv) == 1);  // the vocab projection fills
+  CHECK(split_parts(4, 511, gemv) == 1);     // too short a K
+  CHECK(split_parts(0, 4096, gemv) == 1);
+
+  // CUDA's decode attention: twice the fill, 256 keys to split, 128 a part,
+  // parts in whole warps of 4.
+  constexpr split_rule attn{328, 256, 128, 4};
+  CHECK(split_parts(14, 1000, attn) == 7);   // 24 wanted, 1000 / 128 allow 7
+  CHECK(split_chunk(1000, 7, attn) == 144);  // 143 rounded up
+  CHECK((1000 + 144 - 1) / 144 == 7);
+  CHECK(split_parts(14, 255, attn) == 1);
+  CHECK(split_parts(400, 4096, attn) == 1);
+  CHECK(split_parts(14, 4096, attn) == 24);
+  // parts never fall as k grows: the captured graph's grid is sized at max_ctx
+  for (int64_t ctx = 1; ctx < 4096; ctx++) {
+    CHECK(split_parts(14, ctx, attn) <= split_parts(14, ctx + 1, attn));
+  }
+
+  // CUDA's bf16 GEMM: four times the fill, slices at least 448 deep in
+  // 16-deep slabs.
+  constexpr split_rule gemm{656, 0, 448, 16};
+  CHECK(split_parts(12, 4864, gemm) == 10);  // 55 wanted, 4864 / 448 allow 10
+  CHECK(split_chunk(4864, 10, gemm) == 496);
+  CHECK(split_parts(700, 4864, gemm) == 1);
+
+  // A part is never zero: the shortest k still rounds up to one granule.
+  CHECK(split_chunk(1, 1, gemv) == 32);
+}
+
 // A buffer released while the device still has work queued against it goes
 // straight back to the pool for device work, but not for the host to fill.
 // Here the logsumexp is encoded but not run when its temporary dies (xent_bwd

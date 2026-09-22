@@ -280,6 +280,19 @@ struct context {
 
 inline bool available() { return context::get().device != nullptr; }
 
+// What the shared launch policy (gpu_abi.h) may assume of this backend's
+// kernels.
+struct traits {
+  // A [rows, cols] elementwise kernel reads its cell from a 2-D thread
+  // position rather than a flat index.
+  static constexpr bool cells_2d = true;
+  // Each launch's tl::profile row carries a device time.
+  static constexpr bool times_launches = true;
+  // Threadgroups that keep the GPU busy: ~4 per core of a 16-core Apple GPU,
+  // the target the GEMV and attention splits below measure their grid against.
+  static constexpr int64_t fill_groups = 64;
+};
+
 // The ops this backend runs its own way: a different algorithm, several
 // kernels, or a kernel whose ABI is its own. gpu_ops.h forwards to whichever of
 // these exist (TL_GPU_DETECT_OWN) and answers false for the rest, so a backend
@@ -1059,16 +1072,14 @@ struct attn_combine_params {
 };
 
 // Keys per split, or 0 for the single-pass kernel: one threadgroup a head
-// leaves most of a 16-core GPU idle when a model has few heads, so cut the
-// keys until there are enough threadgroups (cuda's attn_split_count).
+// leaves most of the GPU idle when a model has few heads, so cut the keys
+// until there are enough threadgroups. The kernel's rule: no split under 256
+// keys, a split at least 128 keys and a multiple of 4.
 inline unsigned long attn_split_chunk_(int64_t heads, int64_t ctx) {
-  constexpr long kWantGroups = 64, kMinKeys = 128;
-  if (heads <= 0 || heads >= kWantGroups || ctx < 2 * kMinKeys) return 0;
-  long want = (kWantGroups + heads - 1) / heads;
-  const long most = ctx / kMinKeys;
-  if (want > most) want = most;
-  if (want <= 1) return 0;
-  return static_cast<unsigned long>((ctx + want - 1) / want);
+  constexpr gpu::policy::split_rule rule{traits::fill_groups, 256, 128, 4};
+  const int64_t parts = gpu::policy::split_parts(heads, ctx, rule);
+  if (parts <= 1) return 0;
+  return static_cast<unsigned long>(gpu::policy::split_chunk(ctx, parts, rule));
 }
 
 inline void attn_dispatch_(objc::id enc, const attn_params& p,
@@ -1110,17 +1121,18 @@ inline bool own::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
 
 // y[1,N] = a[1,K] · B[K,N] with f32 or bf16 weights, all contiguous: the
 // decode projection. A narrow layer's N/256 threadgroups leave the GPU idle,
-// so K is split across the grid's y and a combine pass sums the slices.
+// so K is split across the grid's y and a combine pass sums the slices. The
+// kernel's rule: a slice is whole 256-wide `a` tiles.
 inline bool gemv_(kop op, gpu::span a, gpu::span B, gpu::span y, int64_t n,
                   int64_t k) {
   auto& c = context::get();
   if (!c.device || n <= 0 || k <= 0) return false;
-  constexpr unsigned long NT = 256, kGroupsWanted = 64;
+  constexpr unsigned long NT = 256;
+  constexpr gpu::policy::split_rule rule{traits::fill_groups, 0, 0, NT};
   const unsigned long cols = (static_cast<unsigned long>(n) + NT - 1) / NT;
-  unsigned long parts = cols >= kGroupsWanted ? 1 : kGroupsWanted / cols;
-  unsigned long chunk = (static_cast<unsigned long>(k) + parts - 1) / parts;
-  chunk = (chunk + NT - 1) / NT * NT;  // whole `a` tiles
-  parts = (static_cast<unsigned long>(k) + chunk - 1) / chunk;
+  unsigned long chunk = static_cast<unsigned long>(gpu::policy::split_chunk(
+      k, gpu::policy::split_parts(cols, k, rule), rule));
+  unsigned long parts = (static_cast<unsigned long>(k) + chunk - 1) / chunk;
   gpu::span out = y;
   if (parts > 1) {
     out = {detail_::scratch_(static_cast<int64_t>(parts) * n * 4), 0};
@@ -1301,16 +1313,6 @@ inline bool own::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
   *out_idx = *reinterpret_cast<const int*>(c.argmax_res_contents);
   return true;
 }
-
-// What the shared launch policy (gpu_ops.h) may assume of this backend's
-// kernels.
-struct traits {
-  // A [rows, cols] elementwise kernel reads its cell from a 2-D thread
-  // position rather than a flat index.
-  static constexpr bool cells_2d = true;
-  // Each launch's tl::profile row carries a device time.
-  static constexpr bool times_launches = true;
-};
 
 struct caps {
   // Whether the model-path row is real here, or answers false: a decoder

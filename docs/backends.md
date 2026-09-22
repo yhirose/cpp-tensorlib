@@ -150,8 +150,26 @@ Metal and WGSL size theirs in the kernel).
 
 What differs between backends' kernels comes in through the backend's `traits`:
 whether a rank-2 elementwise kernel reads its cell from a 2-D thread position
-or from a flat index (`traits::cells_2d`), and whether a launch's profile row
-carries a device time (`traits::times_launches`).
+or from a flat index (`traits::cells_2d`), whether a launch's profile row
+carries a device time (`traits::times_launches`), and how many groups keep
+the device busy (`traits::fill_groups`: 164 on CUDA, two per SM of an RTX
+3090; 64 on Metal).
+
+A reduction that leaves the device short of that many groups is split over
+more of them and combined after: a decode GEMV's K, decode attention's keys,
+a bf16 GEMM tile's K. Every such split is `policy::split_parts` and
+`policy::split_chunk` (`gpu_abi.h`) under a `split_rule` — the kernel's side
+of the decision: the target (the fill, or a multiple of it for a kernel with
+small groups), the shortest k worth splitting, the shortest part, and what a
+part must be a multiple of. A backend states its rule next to its kernel and
+launches the count the rule gives; it does not do the arithmetic itself. The
+CUDA decode attention's device twin (`attn_dpos_chunk` in
+`tensorlib_cuda.cu`) reproduces its rule for the captured-graph path, which is
+why CUDA's fill is a constant rather than a device query.
+
+Which of its kernels a backend launches — CUDA's f32 tile and its wave plan,
+Metal's STEEL bands — stays with the backend: a tile is that kernel family's
+ABI. What such a choice measures its grid against is the same `fill_groups`.
 
 ## Profiling
 
@@ -215,8 +233,9 @@ asks; a new backend edits no test.
   itself is shared.
 - `kop` still lists kernel ids only one backend has (Metal's GEMM tiles and
   attention variants).
-- Launch policy inside the own ops (CUDA's split-K and tile choices, Metal's
-  GEMM ladder) is still the backend's.
+- CUDA's f32 GEMM wave plan (`sgemm_wave_chunk_`: layers, spare slots and
+  rounds over a two-blocks-per-SM wave) is a split policy of its own, written
+  against `traits::fill_groups` but not yet a shared function.
 - There is no generic composition under the fused ops, so a backend without the
   model-path kernels reports `caps::model_path = false` rather than running them
   slowly. WebGPU is in that position.

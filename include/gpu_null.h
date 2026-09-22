@@ -51,6 +51,9 @@ struct traits {
   // Whether a launch's tl::profile row (gpu::launched, called from the
   // backend's launch primitive) carries a device time.
   static constexpr bool times_launches = false;
+  // Groups that keep the device busy: the target a split (policy::split_parts)
+  // measures its grid against.
+  static constexpr int64_t fill_groups = 1;
 };
 
 // ---- what a model may assume, and the graph-capture plumbing behind

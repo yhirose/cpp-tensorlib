@@ -895,9 +895,19 @@ struct own {
                              float eps);
 };
 
-// Blocks that keep the GPU busy: ~2 per SM on the 82-SM RTX 3090. The
-// threshold every tile and split-K choice below measures its grid against.
-constexpr long kFillBlocks = 164;
+// What the shared launch policy (gpu_abi.h) may assume of this backend's
+// kernels.
+struct traits {
+  // A [rows, cols] elementwise kernel reads its cell from a flat index.
+  static constexpr bool cells_2d = false;
+  // Each launch's tl::profile row carries a device time.
+  static constexpr bool times_launches = true;
+  // Blocks that keep the GPU busy: ~2 per SM on the 82-SM RTX 3090. The
+  // target every tile and split choice below measures its grid against. A
+  // constant rather than a device query because the decode attention's
+  // device twin (attn_dpos_chunk in tensorlib_cuda.cu) bakes it in.
+  static constexpr int64_t fill_groups = 164;
+};
 
 // The bf16 gemm's tile choice: the 128² tile is the more arithmetically
 // efficient, but a few-hundred-row activation against a projection (256×768:
@@ -910,11 +920,11 @@ inline long blocks128_(int64_t m, int64_t n, int64_t batch) {
   return (long)((n + 127) / 128) * ((m + 127) / 128) * batch;
 }
 inline bool big_tile_(int64_t m, int64_t n, int64_t k, int64_t batch = 1) {
-  return blocks128_(m, n, batch) >= kFillBlocks || k % 16 != 0;
+  return blocks128_(m, n, batch) >= traits::fill_groups || k % 16 != 0;
 }
 
 // The wave plan. A launch places one block per SM up to kWaveSingles blocks
-// and two per SM past that, so a wave is kFillBlocks slots; a block takes time
+// and two per SM past that, so a wave is the fill's slots; a block takes time
 // in proportion to its slabs, and a launch lasts as long as its busiest slot.
 // So split K into `full` equal layers that fit the wave, each at least
 // kWaveMinK deep (a block's fixed cost is some twenty 128² slabs), and when
@@ -930,11 +940,11 @@ inline bool big_tile_(int64_t m, int64_t n, int64_t k, int64_t batch = 1) {
 // 256×768×256:nt 5.1k → 5.6k and 256×512×256:nt 3.9k → 4.5k.
 constexpr unsigned kWaveMinK = 192;
 inline unsigned sgemm_wave_chunk_(long tiles, unsigned k, const sgemm_tile& t) {
-  if (tiles >= kFillBlocks) return k;
+  if (tiles >= traits::fill_groups) return k;
   const long slabs = k / t.bk, min_slabs = kWaveMinK / t.bk;
-  const long full = std::max<long>(1, std::min(kFillBlocks / tiles, slabs / min_slabs));
+  const long full = std::max<long>(1, std::min(traits::fill_groups / tiles, slabs / min_slabs));
   long chunk_slabs = (slabs + full - 1) / full;
-  if (const long spare = kFillBlocks - full * tiles; spare > 0) {
+  if (const long spare = traits::fill_groups - full * tiles; spare > 0) {
     const long rounds = (tiles + spare - 1) / spare;
     const long parts = full * rounds + 1;  // a full layer is `rounds` tails
     if (slabs >= min_slabs * parts) chunk_slabs = (slabs * rounds + parts - 1) / parts;
@@ -1038,15 +1048,6 @@ inline bool own::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
   *out_idx = h;
   return true;
 }
-
-// What the shared launch policy (gpu_ops.h) may assume of this backend's
-// kernels.
-struct traits {
-  // A [rows, cols] elementwise kernel reads its cell from a flat index.
-  static constexpr bool cells_2d = false;
-  // Each launch's tl::profile row carries a device time.
-  static constexpr bool times_launches = true;
-};
 
 struct caps {
   // Whether the model-path row is real here, or answers false: a decoder
@@ -1499,6 +1500,8 @@ inline bool own::scatter_to_axis(gpu::span idx, gpu::span values, gpu::span out,
 // Split-K when the N/256 column-blocks alone underfill the SMs (small-N layers):
 // partition K over gridDim.y, atomicAdd into a pre-zeroed y, so the kernel stays
 // bandwidth-bound rather than occupancy-bound. gridDim.y==1 stores directly.
+// The kernel's rule: no split under K=512, and a part is a multiple of its
+// 32-wide K step.
 inline bool gemv_run_(CUfunction f, float* pa, float* pB, float* py,
                       unsigned un, unsigned uk, unsigned vcols = 1) {
   auto& c = context::get();
@@ -1506,17 +1509,12 @@ inline bool gemv_run_(CUfunction f, float* pa, float* pB, float* py,
   unsigned bx = (un + per - 1) / per;
   if (bx == 0) bx = 1;
   unsigned gy = 1, ksplit = uk;
-  const long target = kFillBlocks;
-  if (!c.no_splitk && static_cast<long>(bx) < target && uk >= 512) {
-    unsigned g = static_cast<unsigned>((target + bx - 1) / bx);
-    unsigned chunk = (uk + g - 1) / g;
-    chunk = (chunk + 31u) & ~31u;
-    if (chunk == 0) chunk = 32;
-    unsigned s = (uk + chunk - 1) / chunk;
-    if (s > 1) {
-      gy = s;
-      ksplit = chunk;
-    }
+  constexpr gpu::policy::split_rule rule{traits::fill_groups, 512, 0, 32};
+  const int64_t parts =
+      c.no_splitk ? 1 : gpu::policy::split_parts(bx, uk, rule);
+  if (parts > 1) {
+    ksplit = static_cast<unsigned>(gpu::policy::split_chunk(uk, parts, rule));
+    gy = (uk + ksplit - 1) / ksplit;
   }
   if (gy > 1) {
     // Zero y for the split-K atomicAdd. Async on the stream (ordered before the
@@ -1604,17 +1602,15 @@ inline bool own::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
   // (>= 448 K-elements), and stop once the grid is comfortably several waves
   // (~8 blocks/SM). Measured at M=512: wd 506 -> 312 us, wo 92 -> 75, while a
   // grid that already fills (gateup, 1216 blocks) correctly declines to split.
+  // As a rule: four times the fill, slices in the 64 tile's 16-deep slabs.
+  constexpr gpu::policy::split_rule rule{4 * traits::fill_groups, 0, 448, 16};
   unsigned z = 1;
   if (blocks < 128 && c.d.MemsetD8Async) {
-    unsigned by_k = (unsigned)(k / 448);
-    unsigned by_fill = (656 + blocks - 1) / blocks;
-    z = by_k < by_fill ? by_k : by_fill;
-    if (z < 1) z = 1;
+    z = (unsigned)gpu::policy::split_parts(blocks, k, rule);
   }
   if (z > 1) {
-    constexpr unsigned BK = 16;  // the 64 tile's K slab
-    unsigned ksplit = ((uK + z - 1) / z + BK - 1) / BK * BK;
-    z = (uK + ksplit - 1) / ksplit;  // recompute after rounding
+    unsigned ksplit = (unsigned)gpu::policy::split_chunk(k, z, rule);
+    z = (uK + ksplit - 1) / ksplit;  // recount after rounding
     // atomicAdd combine needs a zeroed C; async on the stream, so it is ordered
     // before the launch without a host sync (and stays capturable).
     c.d.MemsetD8Async(reinterpret_cast<CUdeviceptr>(po), 0,
@@ -1634,13 +1630,14 @@ inline bool own::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
 // split needs >=128 keys to amortize its fixed cost). Shared by attn_decode
 // (evaluated at the live ctx) and attn_decode_dpos (evaluated at max_ctx, so
 // the CUDA-graph grid is pos-independent).
+// The kernel's rule: 128-thread blocks, so twice the fill (~4 per SM); no
+// split under 256 keys, a split at least 128 keys and a multiple of its 4
+// warps.
+inline constexpr gpu::policy::split_rule attn_split_rule{
+    2 * traits::fill_groups, 256, 128, 4};
 inline unsigned attn_split_count(unsigned n_heads, int64_t ctx) {
-  const long target = 2 * kFillBlocks;  // ~4 blocks per SM
-  if (n_heads == 0 || (long)n_heads >= target || ctx < 256) return 1;
-  unsigned want = static_cast<unsigned>((target + n_heads - 1) / n_heads);
-  unsigned max_s = static_cast<unsigned>(ctx / 128);  // >=128 keys/split
-  if (want > max_s) want = max_s;
-  return want > 1 ? want : 1;
+  return static_cast<unsigned>(
+      gpu::policy::split_parts(n_heads, ctx, attn_split_rule));
 }
 
 // Launch shape of the tiled prefill attention — the ONE place it lives. It is
@@ -1669,10 +1666,8 @@ inline constexpr unsigned attn_bwd_tile(int64_t D) {
 // stay in lockstep — the host/dpos bit-identity rests on it. Guarded by the
 // attn64 ctest's host-vs-dpos bit-equality sweep.
 inline unsigned attn_split_chunk(unsigned n_heads, int64_t ctx) {
-  unsigned S = attn_split_count(n_heads, ctx);
-  unsigned chunk = (static_cast<unsigned>(ctx) + S - 1) / S;
-  chunk = (chunk + 3u) & ~3u;
-  return chunk ? chunk : 4u;
+  return static_cast<unsigned>(gpu::policy::split_chunk(
+      ctx, attn_split_count(n_heads, ctx), attn_split_rule));
 }
 
 // Split-KV partials scratch: ONE buffer laid out pm[H*S] | pl[H*S] | pacc[H*S*D]

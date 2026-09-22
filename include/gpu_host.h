@@ -517,6 +517,7 @@ struct own {
 struct traits {
   static constexpr bool cells_2d = false;  // a cell is read from a flat index
   static constexpr bool times_launches = false;  // a row is counted, not timed
+  static constexpr int64_t fill_groups = 1;  // a loop: a split is only more passes
 };
 struct caps {
   // The decoder's single-kernel ops are here, but not attention, rope or the

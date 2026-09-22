@@ -325,6 +325,38 @@ inline grid cells_2d(int64_t rows, int64_t cols) {
           static_cast<uint32_t>((rows + 7) / 8), 1, 32, 8, 1, 0};
 }
 
+// Splitting a reduction over more groups. `groups` groups each walk k units
+// (a GEMV's k, attention's keys, a GEMM tile's k); when they alone leave the
+// device short of busy groups, each is cut into parts that run as extra groups
+// and are combined after. The rule is the kernel's side of it — what its part
+// must be a multiple of, and how short a part or a k is still worth the
+// combine — and the target is the device's (traits::fill_groups, or a multiple
+// of it for a kernel whose groups are small). A backend keeps to this shape
+// of decision rather than its own arithmetic, so the split every backend's
+// GEMV and attention make is one function of the device.
+struct split_rule {
+  int64_t target;    // groups that keep the device busy
+  int64_t min_k;     // a k shorter than this is not split at all
+  int64_t min_part;  // a part is at least this many units
+  int64_t granule;   // and a multiple of this (the kernel's step)
+};
+
+// The parts the k units are cut into; 1 when not split. Monotone in k.
+inline int64_t split_parts(int64_t groups, int64_t k, const split_rule& r) {
+  if (groups <= 0 || groups >= r.target || k < r.min_k) return 1;
+  int64_t parts = (r.target + groups - 1) / groups;
+  if (r.min_part > 0 && parts > k / r.min_part) parts = k / r.min_part;
+  return parts > 1 ? parts : 1;
+}
+
+// The units each of `parts` parts takes, rounded up to the granule. Rounding
+// can leave fewer parts than asked, so the count to launch is (k + chunk - 1)
+// / chunk.
+inline int64_t split_chunk(int64_t k, int64_t parts, const split_rule& r) {
+  const int64_t chunk = ((k + parts - 1) / parts + r.granule - 1) / r.granule * r.granule;
+  return chunk > 0 ? chunk : r.granule;
+}
+
 }  // namespace policy
 
 }  // namespace gpu
