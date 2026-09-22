@@ -417,7 +417,7 @@ struct context {
 
     pending = true;
     dispatch_counts[entry]++;
-    if (profile::active()) profile::detail::launch(entry);  // counted, untimed
+    gpu::launched(entry);  // counted, untimed
     return true;
   }
 
@@ -1228,9 +1228,8 @@ struct traits {
   // A [rows, cols] elementwise kernel reads its cell from a 2-D thread
   // position rather than a flat index.
   static constexpr bool cells_2d = true;
-  // Launches are recorded under tl::profile by this backend itself, with
-  // (times_launches) a device time on each.
-  static constexpr bool profiles_launches = true;
+  // A launch's tl::profile row is counted, not timed: WebGPU has no per-launch
+  // device time to stamp it with.
   static constexpr bool times_launches = false;
 };
 

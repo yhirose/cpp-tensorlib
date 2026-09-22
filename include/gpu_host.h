@@ -355,10 +355,9 @@ inline bool merge_heads(const gpu::arg* v, const void* params) {
 
 // ---- launch: the kernel table and the kernels in one switch. An id with no
 // case declines, and the op above falls back to the CPU.
-inline bool dispatch(kop k, const gpu::arg* v, size_t /*n*/, const void* params,
-                     size_t /*params_bytes*/, const gpu::grid& g) {
+inline bool kernel_(kop k, const gpu::arg* v, const void* params,
+                    const gpu::grid& g) {
   namespace d = detail_;
-  d::pending_ = true;  // declining leaves it set too: a flush then waits on nothing
   switch (k) {
     case kop::add: return d::binary(v, params, [](float a, float b) { return a + b; });
     case kop::sub: return d::binary(v, params, [](float a, float b) { return a - b; });
@@ -430,6 +429,15 @@ inline bool dispatch(kop k, const gpu::arg* v, size_t /*n*/, const void* params,
   }
 }
 
+// A kernel that ran is a row under tl::profile, as on any backend.
+inline bool dispatch(kop k, const gpu::arg* v, size_t /*n*/, const void* params,
+                     size_t /*params_bytes*/, const gpu::grid& g) {
+  detail_::pending_ = true;  // declining leaves it set too: a flush then waits on nothing
+  if (!kernel_(k, v, params, g)) return false;
+  gpu::launched(kop_name(k));
+  return true;
+}
+
 // ---- the ops this backend runs its own way: the ones with no single-kernel
 // form in gpu_ops.h that the conformance test expects of every backend. Each
 // is the definition of its op, as a loop.
@@ -451,6 +459,7 @@ struct own {
         C[i * n + j] = static_cast<float>(acc) * scale + offset;
       }
     }
+    gpu::launched("gemm");
     return true;
   }
 
@@ -468,6 +477,7 @@ struct own {
       const int64_t outer = i / (a_axis * inner), rest = i % (a_axis * inner);
       O[outer * o_axis * inner + before * inner + rest] = A[i];
     }
+    gpu::launched("pad");
     return true;
   }
 
@@ -481,6 +491,7 @@ struct own {
       const int64_t row = static_cast<int64_t>(I[i] + 0.5f);
       for (int64_t c = 0; c < row_size; c++) O[row * row_size + c] += V[i * row_size + c];
     }
+    gpu::launched("index_add");
     return true;
   }
 
@@ -491,6 +502,7 @@ struct own {
     float* O = view<float>(out);
     std::fill(O, O + n * size, 0.0f);
     for (int64_t i = 0; i < n; i++) O[i * size + static_cast<int64_t>(I[i] + 0.5f)] = V[i];
+    gpu::launched("scatter_to_axis");
     return true;
   }
 
@@ -504,10 +516,7 @@ struct own {
 // ---- what the shared layer may assume.
 struct traits {
   static constexpr bool cells_2d = false;  // a cell is read from a flat index
-  // Whether this backend records its own launches under tl::profile (else the
-  // shared layer does), and whether each carries a device time.
-  static constexpr bool profiles_launches = false;
-  static constexpr bool times_launches = false;
+  static constexpr bool times_launches = false;  // a row is counted, not timed
 };
 struct caps {
   // The decoder's single-kernel ops are here, but not attention, rope or the

@@ -18,6 +18,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
+
+#include "profile.h"
 
 namespace tl {
 namespace gpu {
@@ -249,6 +252,18 @@ struct kv_fill_params {
 struct merge_heads_params {
   uint32_t T, H, D;
 };
+
+// The launch record. Every kernel launch on every backend is one row under
+// tl::profile, made here from the kernel's name: a backend's launch primitive
+// (the one place its launches funnel through, shared ops and own alike) calls
+// this once per launch and stamps the row with a device time where it has one
+// (profile::detail::device_time). Under TL_PROFILE=1 the first launch also
+// starts the profile — a decoder on the model path never reaches the
+// evaluator, so this is where its profile begins.
+inline profile::row* launched(std::string_view kernel) {
+  profile::detail::env_autostart();
+  return profile::active() ? profile::detail::launch(kernel) : nullptr;
+}
 
 // Launch policy: the shapes ops launch in, in one place. Host code shared by
 // every backend; what differs between devices will come in as traits.

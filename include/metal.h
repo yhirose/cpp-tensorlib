@@ -446,9 +446,11 @@ inline void dispatch_grid_(objc::id enc, mtl_size grid, mtl_size tg) {
   reinterpret_cast<fn>(objc_msgSend)(
       enc, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"),
       grid, tg);
-  if (profile::active()) {
-    auto& c = context::get();
-    c.commit_(profile::detail::launch(c.bound ? c.bound : "?"));
+  // Under a profile the launch is its own command buffer, owed the row's
+  // GPU time at the flush.
+  auto& c = context::get();
+  if (profile::row* r = gpu::launched(c.bound ? c.bound : "?")) {
+    c.commit_(r);
     profile::detail::drain_hook = &flush;
   }
 }
@@ -1306,9 +1308,7 @@ struct traits {
   // A [rows, cols] elementwise kernel reads its cell from a 2-D thread
   // position rather than a flat index.
   static constexpr bool cells_2d = true;
-  // Launches are recorded under tl::profile by this backend itself, with
-  // (times_launches) a device time on each.
-  static constexpr bool profiles_launches = true;
+  // Each launch's tl::profile row carries a device time.
   static constexpr bool times_launches = true;
 };
 

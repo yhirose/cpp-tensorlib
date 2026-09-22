@@ -148,9 +148,22 @@ A `grid` is groups x threads-per-group plus the bytes of per-group scratch a
 reduction needs where the backend sizes it at launch (CUDA's shared memory;
 Metal and WGSL size theirs in the kernel).
 
-What differs between backends' kernels comes in through the backend's `traits`.
-Today that is one fact: whether a rank-2 elementwise kernel reads its cell from
-a 2-D thread position or from a flat index (`traits::cells_2d`).
+What differs between backends' kernels comes in through the backend's `traits`:
+whether a rank-2 elementwise kernel reads its cell from a 2-D thread position
+or from a flat index (`traits::cells_2d`), and whether a launch's profile row
+carries a device time (`traits::times_launches`).
+
+## Profiling
+
+Every kernel launch on every backend is one row under `tl::profile`, made in
+one place: `gpu::launched(kernel name)` (`gpu_abi.h`), which a backend's launch
+primitive — the one place its launches funnel through, shared ops and own ops
+alike — calls once per launch. What the backend adds is the device time, where
+it has one: CUDA brackets the launch with events and stamps the row when the
+stream drains, Metal commits the launch as its own command buffer and stamps
+the row at the flush, WebGPU and the host backend count. `TL_PROFILE=1` starts
+at the first evaluation or the first launch, so a decoder on the model path,
+which never reaches the evaluator, is profiled from its first kernel.
 
 ## Adding an op
 
@@ -200,10 +213,6 @@ asks; a new backend edits no test.
 - The mirror table (handle to host copy, device copy, size, `residency`) and
   the buffer pool exist twice, in `cuda.h` and `webgpu.h`. The state machine
   itself is shared.
-- `tl::profile` hooks sit in each real backend's launch path, because each
-  stamps its launches with a device time its own way. A backend that records
-  none (`traits::profiles_launches = false`) gets a row per launch from the
-  shared layer, by kernel name, so it is profiled from its first kernel.
 - `kop` still lists kernel ids only one backend has (Metal's GEMM tiles and
   attention variants).
 - Launch policy inside the own ops (CUDA's split-K and tile choices, Metal's

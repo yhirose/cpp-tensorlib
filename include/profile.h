@@ -317,10 +317,11 @@ inline void report(FILE* out) {
 }
 
 namespace detail {
-// TL_PROFILE=1: profile the whole process from the first evaluation and
-// print the table to stderr at exit. Called by the evaluator; the first call
-// does the work (the exit handler reads the calling thread's state, which is
-// the evaluating one in every consumer).
+// TL_PROFILE=1: profile the whole process from the first evaluation or kernel
+// launch (gpu::launched — a decoder on the model path never reaches the
+// evaluator) and print the table to stderr at exit. The first call does the
+// work (the exit handler reads the calling thread's state, which is the
+// evaluating one in every consumer).
 inline void env_autostart() {
   static bool once = false;
   if (once) return;

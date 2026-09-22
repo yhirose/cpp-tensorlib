@@ -743,11 +743,10 @@ struct context {
                     void** argv) {
     if (!f) return false;
     pending = true;
-    // Profiling: the launch under the open scope, and — outside a graph
-    // capture, where an event record would become a graph node — an event on
-    // each side of it for the elapsed time.
-    profile::row* pr =
-        profile::active() ? profile::detail::launch(name_(f)) : nullptr;
+    // Profiling: the launch's row, and — outside a graph capture, where an
+    // event record would become a graph node — an event on each side of it
+    // for the elapsed time.
+    profile::row* pr = gpu::launched(name_(f));
     CUevent begin = nullptr;
     if (pr && d.timing_ok() && !stream) {  // null = the default stream
       begin = event_();
@@ -1045,9 +1044,7 @@ inline bool own::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
 struct traits {
   // A [rows, cols] elementwise kernel reads its cell from a flat index.
   static constexpr bool cells_2d = false;
-  // Launches are recorded under tl::profile by this backend itself, with
-  // (times_launches) a device time on each.
-  static constexpr bool profiles_launches = true;
+  // Each launch's tl::profile row carries a device time.
   static constexpr bool times_launches = true;
 };
 

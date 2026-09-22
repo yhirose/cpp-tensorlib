@@ -34,7 +34,8 @@ inline void upload(void*, const float*, int64_t) {}     // stage host floats in
 // ---- launch: the one way a shared op (gpu_ops.h) runs a kernel. View i is the
 // kernel's i-th buffer at its byte offset, `params` a block of 4-byte fields
 // in the kernel's argument order (gpu_abi.h). False for a kernel id this
-// backend has no kernel for.
+// backend has no kernel for. Every launch a backend makes, here or in an own
+// op, is one gpu::launched(kernel name) call: its row under tl::profile.
 inline bool dispatch(gpu::kop, const gpu::arg*, size_t, const void* /*params*/,
                      size_t /*params_bytes*/, const gpu::grid&) {
   return false;
@@ -47,9 +48,8 @@ struct own {};
 // ---- what the shared launch policy may assume of this backend's kernels.
 struct traits {
   static constexpr bool cells_2d = false;
-  // Whether this backend records its own launches under tl::profile (else the
-  // shared layer does), and whether each carries a device time.
-  static constexpr bool profiles_launches = false;
+  // Whether a launch's tl::profile row (gpu::launched, called from the
+  // backend's launch primitive) carries a device time.
   static constexpr bool times_launches = false;
 };
 
