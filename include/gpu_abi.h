@@ -25,14 +25,13 @@
 namespace tl {
 namespace gpu {
 
-// Kernel ids. The shared ops name the ones every backend may implement; the
-// rest are one backend's own (Metal's GEMM tiles, its attention variants),
-// kept here only until that backend keys them privately.
+// Kernel ids. The shared ops name the ones every backend may implement.
+// Metal's own kernels -- the GEMM tiles and the attention variants, neither
+// touched by another backend's dispatch -- are keyed privately in metal.h's
+// own `gtile` and `attn_op` instead, not here.
 enum class kop {
   add, sub, mul, div, pow_, exp_, log_, sqrt_, sigmoid, relu, affine,
   badd, bsub, bmul, bdiv, bpow,  // rank-2 broadcast binary (strided operands)
-  sgemm32, sgemm32x64, sgemm64x32, sgemm64,
-  steel, steel32x64, steel_ta, steel_tb, steel32x64_ta, steel32x64_tb,
   softmax, row_sum, row_max, pad, fold,
   index_select, index_add, scatter_axis,
   badd_nd, bsub_nd, bmul_nd, bdiv_nd, bpow_nd,  // N-D broadcast binary
@@ -44,14 +43,6 @@ enum class kop {
   pow_s_, gt_s_, lt_s_, ge_s_, le_s_, eq_s_, ne_s_,  // scalar_op maps onto these
   layer_norm_,                                       // the fused layer norm
   layer_norm_bwd_dx_, layer_norm_bwd_gb_, layer_norm_bwd_gb_fold_,  // its pullback
-  attn_prefill_64_, attn_prefill_128_,  // causal prefill attention, per D
-  attn_prefill_bf16_64_, attn_prefill_bf16_128_,  // over a bf16 KV cache
-  attn_bwd_dq_64_, attn_bwd_dq_128_, attn_bwd_dkv_64_, attn_bwd_dkv_128_,
-  attn_decode_64_, attn_decode_128_,  // fused decode attention, per D
-  attn_decode_split_64_, attn_decode_split_128_,  // its split-KV pass
-  attn_combine_64_, attn_combine_128_,            // and their partials
-  attn_decode_bf16_64_, attn_decode_bf16_128_,    // the same over a bf16 cache
-  attn_decode_split_bf16_64_, attn_decode_split_bf16_128_,
   kv_append_, kv_append_bf16_, kv_fill_, kv_fill_bf16_,  // the KV cache's writes
   argmax_, rmsnorm_, add_rmsnorm_, swiglu_, split_heads_, merge_heads_,  // decode's rest
   gemv_f32_, gemv_bf16_, gemv_q4_,   // decode GEMVs, per weight dtype
@@ -65,22 +56,15 @@ inline constexpr size_t kKopCount = static_cast<size_t>(kop::adam_step_) + 1;
 // The ids' names, for what reports by kernel (the census, tl::profile).
 inline constexpr const char* kKopNames[] = {
     "add", "sub", "mul", "div", "pow_", "exp_", "log_", "sqrt_", "sigmoid",
-    "relu", "affine", "badd", "bsub", "bmul", "bdiv", "bpow", "sgemm32",
-    "sgemm32x64", "sgemm64x32", "sgemm64", "steel", "steel32x64", "steel_ta",
-    "steel_tb", "steel32x64_ta", "steel32x64_tb", "softmax", "row_sum",
-    "row_max", "pad", "fold", "index_select", "index_add", "scatter_axis",
+    "relu", "affine", "badd", "bsub", "bmul", "bdiv", "bpow", "softmax",
+    "row_sum", "row_max", "pad", "fold", "index_select", "index_add",
+    "scatter_axis",
     "badd_nd", "bsub_nd", "bmul_nd", "bdiv_nd", "bpow_nd", "where_nd",
     "copy_nd", "gt_", "lt_", "ge_", "le_", "eq_", "ne_", "tanh_", "sin_",
     "cos_", "clamp_", "sum_to_", "sum_to_blocked_", "concat_part_", "rope_",
     "pow_s_", "gt_s_", "lt_s_", "ge_s_", "le_s_", "eq_s_", "ne_s_",
     "layer_norm_", "layer_norm_bwd_dx_", "layer_norm_bwd_gb_",
-    "layer_norm_bwd_gb_fold_", "attn_prefill_64_", "attn_prefill_128_",
-    "attn_prefill_bf16_64_", "attn_prefill_bf16_128_", "attn_bwd_dq_64_",
-    "attn_bwd_dq_128_", "attn_bwd_dkv_64_", "attn_bwd_dkv_128_",
-    "attn_decode_64_", "attn_decode_128_", "attn_decode_split_64_",
-    "attn_decode_split_128_", "attn_combine_64_", "attn_combine_128_",
-    "attn_decode_bf16_64_", "attn_decode_bf16_128_",
-    "attn_decode_split_bf16_64_", "attn_decode_split_bf16_128_", "kv_append_",
+    "layer_norm_bwd_gb_fold_", "kv_append_",
     "kv_append_bf16_", "kv_fill_", "kv_fill_bf16_", "argmax_", "rmsnorm_",
     "add_rmsnorm_", "swiglu_", "split_heads_", "merge_heads_", "gemv_f32_",
     "gemv_bf16_", "gemv_q4_", "gemv_combine_", "gemv_bf16_row_",

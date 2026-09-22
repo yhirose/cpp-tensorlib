@@ -196,6 +196,11 @@ why CUDA's fill is a constant rather than a device query.
 Which of its kernels a backend launches — CUDA's f32 tile and its wave plan,
 Metal's STEEL bands — stays with the backend: a tile is that kernel family's
 ABI. What such a choice measures its grid against is the same `fill_groups`.
+The wave plan itself (`sgemm_wave_chunk_`) has no Metal counterpart to share
+it with (Metal's GEMM dispatch only ever picks a tile, never splits K), and
+its own two-stage layering — a floor'd fill share, then spare slots folded
+into a shorter tail — doesn't fit `gpu::policy::split_rule`'s single ceil
+formula either, so it stays a CUDA-only function.
 
 ## Profiling
 
@@ -257,11 +262,8 @@ asks; a new backend edits no test.
 - The mirror table (handle to host copy, device copy, size, `residency`) and
   the buffer pool exist twice, in `cuda.h` and `webgpu.h`. The state machine
   itself is shared.
-- `kop` still lists kernel ids only one backend has (Metal's GEMM tiles and
-  attention variants).
-- CUDA's f32 GEMM wave plan (`sgemm_wave_chunk_`: layers, spare slots and
-  rounds over a two-blocks-per-SM wave) is a split policy of its own, written
-  against `traits::fill_groups` but not yet a shared function.
+- WebGPU's kernels still predate the canonical ABI and go through `marshal_`
+  (see above).
 
 ## Verifying a change
 

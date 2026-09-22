@@ -48,6 +48,68 @@ using cmp_op = gpu::cmp_op;
 using unary_ext_op = gpu::unary_ext_op;
 using scalar_op = gpu::scalar_op;
 
+// The f32 GEMM's kernel choice: no other backend has these names, so they
+// stay out of the shared kop vocabulary. context::pso_id_ caches these
+// alongside a kop's pipelines, keyed negative (gtile_key_) so the two id
+// spaces never collide.
+enum class gtile {
+  sgemm32, sgemm32x64, sgemm64x32, sgemm64,
+  steel, steel32x64, steel_ta, steel_tb, steel32x64_ta, steel32x64_tb,
+};
+constexpr int gtile_key_(gtile t) { return -1 - static_cast<int>(t); }
+inline const char* gtile_name_(gtile t) {
+  switch (t) {
+    case gtile::sgemm32: return "sgemm_32_";
+    case gtile::sgemm32x64: return "sgemm_32x64_";
+    case gtile::sgemm64x32: return "sgemm_64x32_";
+    case gtile::sgemm64: return "sgemm_64_";
+    case gtile::steel: return "sgemm_steel_";
+    case gtile::steel32x64: return "sgemm_steel_32x64_";
+    case gtile::steel_ta: return "sgemm_steel_ta_";
+    case gtile::steel_tb: return "sgemm_steel_tb_";
+    case gtile::steel32x64_ta: return "sgemm_steel_32x64_ta_";
+    case gtile::steel32x64_tb: return "sgemm_steel_32x64_tb_";
+  }
+  return "";
+}
+
+// The attention kernels' variant, by D and whether the KV cache is bf16: also
+// no other backend's, so also kept out of kop. Offset far enough past
+// gtile_key_'s range that the two never collide either.
+enum class attn_op {
+  prefill_64, prefill_128, prefill_bf16_64, prefill_bf16_128,
+  bwd_dq_64, bwd_dq_128, bwd_dkv_64, bwd_dkv_128,
+  decode_64, decode_128, decode_split_64, decode_split_128,
+  combine_64, combine_128, decode_bf16_64, decode_bf16_128,
+  decode_split_bf16_64, decode_split_bf16_128,
+};
+constexpr int attn_op_key_(attn_op t) { return -101 - static_cast<int>(t); }
+inline const char* attn_op_name_(attn_op t) {
+  switch (t) {
+    case attn_op::prefill_64: return "attn_prefill_64_";
+    case attn_op::prefill_128: return "attn_prefill_128_";
+    case attn_op::prefill_bf16_64: return "attn_prefill_bf16_64_";
+    case attn_op::prefill_bf16_128: return "attn_prefill_bf16_128_";
+    case attn_op::bwd_dq_64: return "attn_bwd_dq_64_";
+    case attn_op::bwd_dq_128: return "attn_bwd_dq_128_";
+    case attn_op::bwd_dkv_64: return "attn_bwd_dkv_64_";
+    case attn_op::bwd_dkv_128: return "attn_bwd_dkv_128_";
+    case attn_op::decode_64: return "attn_decode_64_";
+    case attn_op::decode_128: return "attn_decode_128_";
+    case attn_op::decode_split_64: return "attn_decode_split_64_";
+    case attn_op::decode_split_128: return "attn_decode_split_128_";
+    case attn_op::combine_64: return "attn_combine_64_";
+    case attn_op::combine_128: return "attn_combine_128_";
+    case attn_op::decode_bf16_64: return "attn_decode_bf16_64_";
+    case attn_op::decode_bf16_128: return "attn_decode_bf16_128_";
+    case attn_op::decode_split_bf16_64: return "attn_decode_split_bf16_64_";
+    case attn_op::decode_split_bf16_128: return "attn_decode_split_bf16_128_";
+  }
+  return "";
+}
+static_assert(gtile_key_(gtile::steel32x64_tb) > attn_op_key_(attn_op::prefill_64),
+              "gtile and attn_op pipeline keys must stay in disjoint ranges");
+
 struct mtl_size {
   unsigned long w, h, d;
 };
@@ -128,16 +190,6 @@ struct context {
       case kop::sigmoid: return "sigmoid_";
       case kop::relu: return "relu_";
       case kop::affine: return "affine_";
-      case kop::sgemm32: return "sgemm_32_";
-      case kop::sgemm32x64: return "sgemm_32x64_";
-      case kop::sgemm64x32: return "sgemm_64x32_";
-      case kop::sgemm64: return "sgemm_64_";
-      case kop::steel: return "sgemm_steel_";
-      case kop::steel32x64: return "sgemm_steel_32x64_";
-      case kop::steel_ta: return "sgemm_steel_ta_";
-      case kop::steel_tb: return "sgemm_steel_tb_";
-      case kop::steel32x64_ta: return "sgemm_steel_32x64_ta_";
-      case kop::steel32x64_tb: return "sgemm_steel_32x64_tb_";
       case kop::softmax: return "softmax_";
       case kop::row_sum: return "row_sum_";
       case kop::row_max: return "row_max_";
@@ -178,24 +230,6 @@ struct context {
       case kop::layer_norm_bwd_dx_: return "layer_norm_bwd_dx_";
       case kop::layer_norm_bwd_gb_: return "layer_norm_bwd_gb_";
       case kop::layer_norm_bwd_gb_fold_: return "layer_norm_bwd_gb_fold_";
-      case kop::attn_prefill_64_: return "attn_prefill_64_";
-      case kop::attn_prefill_128_: return "attn_prefill_128_";
-      case kop::attn_prefill_bf16_64_: return "attn_prefill_bf16_64_";
-      case kop::attn_prefill_bf16_128_: return "attn_prefill_bf16_128_";
-      case kop::attn_bwd_dq_64_: return "attn_bwd_dq_64_";
-      case kop::attn_bwd_dq_128_: return "attn_bwd_dq_128_";
-      case kop::attn_bwd_dkv_64_: return "attn_bwd_dkv_64_";
-      case kop::attn_bwd_dkv_128_: return "attn_bwd_dkv_128_";
-      case kop::attn_decode_64_: return "attn_decode_64_";
-      case kop::attn_decode_128_: return "attn_decode_128_";
-      case kop::attn_decode_split_64_: return "attn_decode_split_64_";
-      case kop::attn_decode_split_128_: return "attn_decode_split_128_";
-      case kop::attn_combine_64_: return "attn_combine_64_";
-      case kop::attn_combine_128_: return "attn_combine_128_";
-      case kop::attn_decode_bf16_64_: return "attn_decode_bf16_64_";
-      case kop::attn_decode_bf16_128_: return "attn_decode_bf16_128_";
-      case kop::attn_decode_split_bf16_64_: return "attn_decode_split_bf16_64_";
-      case kop::attn_decode_split_bf16_128_: return "attn_decode_split_bf16_128_";
       case kop::kv_append_: return "kv_append_";
       case kop::kv_append_bf16_: return "kv_append_bf16_";
       case kop::kv_fill_: return "kv_fill_";
@@ -223,16 +257,24 @@ struct context {
 
   // Every op binds its pipeline through here: the pipeline for `op` on the
   // pending encoder, opened if there is none.
-  void bind_(kop op) {
-    objc::id pso = pso_(op);
+  void bind_(kop op) { bind_id_(static_cast<int>(op), kernel_name_(op)); }
+  void bind_(gtile t) { bind_id_(gtile_key_(t), gtile_name_(t)); }
+  void bind_(attn_op t) { bind_id_(attn_op_key_(t), attn_op_name_(t)); }
+
+  void bind_id_(int id, const char* name) {
+    objc::id pso = pso_id_(id, name);
     if (cb && profile::active()) commit_(nullptr);  // untimed dispatches
     ensure_encoder_();
     objc::send(enc, "setComputePipelineState:", pso);
-    bound = kernel_name_(op);
+    bound = name;
   }
 
-  objc::id pso_(kop op) {
-    auto it = psos.find(static_cast<int>(op));
+  // psos is one cache for all three: a kop's id is never negative, gtile's
+  // (gtile_key_) counts down from -1, attn_op's (attn_op_key_) from -101 --
+  // a gap wide enough that neither range reaches the other (the static_assert
+  // above checks it).
+  objc::id pso_id_(int id, const char* name) {
+    auto it = psos.find(id);
     if (it != psos.end()) return it->second;
     if (!library) {
       objc::id err = nullptr;
@@ -245,18 +287,17 @@ struct context {
                                  objc::error_str(err));
       }
     }
-    auto name = objc::send(objc::cls("NSString"), "stringWithUTF8String:",
-                           kernel_name_(op));
-    auto fn = objc::send(library, "newFunctionWithName:", name);
+    auto oname = objc::send(objc::cls("NSString"), "stringWithUTF8String:",
+                            name);
+    auto fn = objc::send(library, "newFunctionWithName:", oname);
     objc::id err = nullptr;
     auto pso = objc::send(device, "newComputePipelineStateWithFunction:error:",
                           fn, &err);
     if (!pso) {
       throw std::runtime_error("tl::metal: PSO creation failed for " +
-                               std::string(kernel_name_(op)) + ": " +
-                               objc::error_str(err));
+                               std::string(name) + ": " + objc::error_str(err));
     }
-    psos[static_cast<int>(op)] = pso;
+    psos[id] = pso;
     return pso;
   }
 
@@ -532,15 +573,15 @@ inline bool own::gemm(gpu::span a, int64_t lda, bool ta, gpu::span b,
   // shapes take the simple-tile family, which reads transposed views in
   // place. Gates are provisional pending a full census vs PyTorch-MPS.
   bool steel = !(ta && tb) && m >= 16 && n >= 48 && k >= 16;
-  kop kk_;
+  gtile kk_;
   unsigned long bm, bn;
   uint32_t fast_a, fast_b;  // STEEL reuses the a_fast slot for swizzle_log
   unsigned long gx, gy;
   if (steel) {
     bool band32 = m < 97;
-    kk_ = band32 ? (ta ? kop::steel32x64_ta
-                       : tb ? kop::steel32x64_tb : kop::steel32x64)
-                 : (ta ? kop::steel_ta : tb ? kop::steel_tb : kop::steel);
+    kk_ = band32 ? (ta ? gtile::steel32x64_ta
+                       : tb ? gtile::steel32x64_tb : gtile::steel32x64)
+                 : (ta ? gtile::steel_ta : tb ? gtile::steel_tb : gtile::steel);
     bm = band32 ? 32 : 64;
     bn = 64;
     unsigned long tiles_n = (static_cast<unsigned long>(n) + bn - 1) / bn;
@@ -553,7 +594,7 @@ inline bool own::gemm(gpu::span a, int64_t lda, bool ta, gpu::span b,
     gx = tiles_n << swizzle_log;
     gy = (tiles_m + ((1ul << swizzle_log) - 1)) >> swizzle_log;
   } else {
-    kk_ = m >= 64 ? kop::sgemm64x32 : kop::sgemm32;
+    kk_ = m >= 64 ? gtile::sgemm64x32 : gtile::sgemm32;
     bm = m >= 64 ? 64 : 32;
     bn = 32;
     // float4 loader eligibility: row-major operand only (Apple GPUs handle
@@ -807,7 +848,7 @@ struct copy_nd_params {
 // shared with binary_bcast() above -- array.h's gpu_binary_bcast_nd_ passes
 // the same `bk` either kernel would take); map it to its own PSO/kernel name
 // here rather than caching the N-D kernel under the rank-2 op's slot in
-// context::psos, which pso_() keys by this same enum value.
+// context::psos, which pso_id_ keys by this same enum value.
 inline kop to_nd_(kop op) {
   switch (op) {
     case kop::badd: return kop::badd_nd;
@@ -1104,9 +1145,9 @@ inline bool own::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
   auto& c = context::get();
   if (!c.device || (D != 64 && D != 128)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || T <= 0) return false;
-  c.bind_(kv_bf16 ? (D == 64 ? kop::attn_prefill_bf16_64_
-                             : kop::attn_prefill_bf16_128_)
-                  : (D == 64 ? kop::attn_prefill_64_ : kop::attn_prefill_128_));
+  c.bind_(kv_bf16 ? (D == 64 ? attn_op::prefill_bf16_64
+                             : attn_op::prefill_bf16_128)
+                  : (D == 64 ? attn_op::prefill_64 : attn_op::prefill_128));
   detail_::set_buf_(c.enc, q, 0ul);
   detail_::set_buf_(c.enc, K, 1ul);
   detail_::set_buf_(c.enc, V, 2ul);
@@ -1210,14 +1251,14 @@ inline bool own::attn_decode(gpu::span q, gpu::span K, gpu::span V,
   }
   const bool split = chunk != 0;
   if (split) {
-    c.bind_(kv_bf16 ? (d64 ? kop::attn_decode_split_bf16_64_
-                           : kop::attn_decode_split_bf16_128_)
-                    : (d64 ? kop::attn_decode_split_64_
-                           : kop::attn_decode_split_128_));
+    c.bind_(kv_bf16 ? (d64 ? attn_op::decode_split_bf16_64
+                           : attn_op::decode_split_bf16_128)
+                    : (d64 ? attn_op::decode_split_64
+                           : attn_op::decode_split_128));
   } else {
-    c.bind_(kv_bf16 ? (d64 ? kop::attn_decode_bf16_64_
-                           : kop::attn_decode_bf16_128_)
-                    : (d64 ? kop::attn_decode_64_ : kop::attn_decode_128_));
+    c.bind_(kv_bf16 ? (d64 ? attn_op::decode_bf16_64
+                           : attn_op::decode_bf16_128)
+                    : (d64 ? attn_op::decode_64 : attn_op::decode_128));
   }
   detail_::set_buf_(c.enc, q, 0ul);
   detail_::set_buf_(c.enc, K, 1ul);
@@ -1233,7 +1274,7 @@ inline bool own::attn_decode(gpu::span q, gpu::span K, gpu::span V,
                            split ? splits : 1ul, 1},
                           {static_cast<unsigned long>(D), 1, 1});
   if (!split) return true;
-  c.bind_(d64 ? kop::attn_combine_64_ : kop::attn_combine_128_);
+  c.bind_(d64 ? attn_op::combine_64 : attn_op::combine_128);
   detail_::set_buf_(c.enc, dst, 0ul);
   detail_::set_buf_(c.enc, out, 1ul);
   detail_::attn_combine_params cp{static_cast<uint32_t>(splits)};
@@ -1254,7 +1295,7 @@ inline bool own::attn_prefill_dq(gpu::span q, gpu::span K, gpu::span V,
                                  int64_t D, float scale) {
   auto& c = context::get();
   if (!c.device || (D != 64 && D != 128) || H <= 0 || T <= 0) return false;
-  c.bind_(D == 64 ? kop::attn_bwd_dq_64_ : kop::attn_bwd_dq_128_);
+  c.bind_(D == 64 ? attn_op::bwd_dq_64 : attn_op::bwd_dq_128);
   const gpu::span views[] = {q, K, V, dO, O, dq, stats};
   for (unsigned long i = 0; i < 7; i++) detail_::set_buf_(c.enc, views[i], i);
   detail_::attn_params p{static_cast<uint32_t>(T), 0, 0, 0, scale};
@@ -1269,7 +1310,7 @@ inline bool own::attn_prefill_dkv(gpu::span q, gpu::span K, gpu::span V,
                                   float scale) {
   auto& c = context::get();
   if (!c.device || (D != 64 && D != 128) || H <= 0 || T <= 0) return false;
-  c.bind_(D == 64 ? kop::attn_bwd_dkv_64_ : kop::attn_bwd_dkv_128_);
+  c.bind_(D == 64 ? attn_op::bwd_dkv_64 : attn_op::bwd_dkv_128);
   const gpu::span views[] = {q, K, V, dO, stats, dK, dV};
   for (unsigned long i = 0; i < 7; i++) detail_::set_buf_(c.enc, views[i], i);
   detail_::attn_params p{static_cast<uint32_t>(T), 0, 0, 0, scale};

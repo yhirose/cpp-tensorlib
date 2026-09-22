@@ -226,13 +226,6 @@ inline const char* kernel_name_(kop op) {
     case kop::merge_heads_: return "tl_merge_heads";
     case kop::split_heads_: return "tl_split_heads";
     case kop::argmax_: return "tl_argmax";
-    // Every f32 GEMM id is the one general kernel here (the tiled fast path
-    // has its own names: sgemm_tiles below).
-    case kop::sgemm32: case kop::sgemm32x64: case kop::sgemm64x32:
-    case kop::sgemm64: case kop::steel: case kop::steel32x64:
-    case kop::steel_ta: case kop::steel_tb: case kop::steel32x64_ta:
-    case kop::steel32x64_tb:
-      return "tl_sgemm";
     default: return nullptr;  // no kernel here: dispatch declines
   }
 }
@@ -516,6 +509,11 @@ struct context {
   CUfunction pad_fn = nullptr, fold_fn = nullptr;
   CUfunction pad_() { return cached_(pad_fn, "tl_pad"); }
   CUfunction fold_() { return cached_(fold_fn, "tl_fold"); }
+
+  // The f32 gemm's general fallback (the tiled fast path above, sgemm_(), has
+  // its own names).
+  CUfunction sgemm_fallback_fn = nullptr;
+  CUfunction sgemm_fallback_() { return cached_(sgemm_fallback_fn, "tl_sgemm"); }
 
   // Embedding-table lookup (index_select/index_add) and pooling-style
   // one-hot scatter (scatter_to_axis), cached the same way.
@@ -2075,8 +2073,7 @@ inline bool own::gemm_batched(gpu::span a, int64_t lda, bool ta, int64_t sa,
   unsigned gx = (un + bx - 1) / bx, gy = (um + by - 1) / by;
   if (gx == 0) gx = 1;
   if (gy == 0) gy = 1;
-  // kop::sgemm32 is routed to tl_sgemm by kernel_name_.
-  return c.launch_(c.fn_(kop::sgemm32), {gx, gy}, {bx, by}, 0, pa, pb, po,
+  return c.launch_(c.sgemm_fallback_(), {gx, gy}, {bx, by}, 0, pa, pb, po,
                    pbias, um, un, uk, ula, ulb, uta, utb, scale, offset);
 }
 
