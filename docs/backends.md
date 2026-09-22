@@ -60,6 +60,15 @@ buffer, so an output into a buffer whose live bytes are the host's has to bring
 them up or lose the rest, while an output into a fresh buffer, which is nearly
 every output, has nothing to bring.
 
+The table that holds those copies — host pointer, device handle, size,
+`residency` — and the size-keyed free list `alloc`/`release` recycle buffers
+through are `gpu::mirror_table<Handle>` (`gpu_abi.h`), one instantiation per
+mirrored backend (`mirror_table<CUdeviceptr>` in `cuda.h`,
+`mirror_table<wgpu::Buffer>` in `webgpu.h`). Only `Handle` — the backend's own
+device buffer type — varies; the map, the pool and the copying policy do not.
+A backend still does the actual copy (`before_kernel_`, `sync_to_host`) since
+that call differs by driver.
+
 ## The kernel ABI
 
 An op hands the backend a kernel id, an ordered list of views, a params
@@ -259,9 +268,6 @@ asks; a new backend edits no test.
 
 ## What is not shared yet
 
-- The mirror table (handle to host copy, device copy, size, `residency`) and
-  the buffer pool exist twice, in `cuda.h` and `webgpu.h`. The state machine
-  itself is shared.
 - WebGPU's kernels still predate the canonical ABI and go through `marshal_`
   (see above).
 

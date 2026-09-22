@@ -196,21 +196,16 @@ struct context {
   void* meta_ring_(float** host_out);
   uint32_t meta_reserve_slot_();
 
-  // Host/device mirror per allocation, keyed by the opaque handle alloc()
-  // returns as `native`. Views sharing a storage share the key, so one dirty
-  // state serves every view. `where` tracks which copy is live.
-  struct mirror {
-    float* host = nullptr;   // CPU-side buffer (storage.ptr)
-    wgpu::Buffer dev;        // device buffer
-    size_t bytes = 0;
-    gpu::residency live;  // when to copy (gpu_abi.h); the copies are made here
-  };
-  std::unordered_map<void*, mirror> mirrors;
+  // Host/device mirror per allocation and its size-keyed free list (shared
+  // shape with cuda.h; `gpu::mirror_table`, gpu_abi.h), keyed by the opaque
+  // handle alloc() returns as `native`. Views sharing a storage share the
+  // key, so one dirty state serves every view.
+  using mirror = gpu::mirror_table<wgpu::Buffer>::entry;
+  gpu::mirror_table<wgpu::Buffer> mt;
 
-  // Size-keyed free lists (like Metal's MTLBuffer pool and CUDA's). Repeated
-  // alloc/free of identical shapes is the common case, and per-dispatch
-  // allocation would compound the fixed dispatch floor.
-  std::unordered_map<size_t, std::vector<std::pair<wgpu::Buffer, float*>>> pool;
+  // Mapped-for-readback staging buffers (sync_to_host's D2H), a distinct pool
+  // from the mirror table's device buffers: these are never bound as a
+  // kernel operand, only mapped.
   std::unordered_map<size_t, std::vector<wgpu::Buffer>> staging_pool;
 
   // Compute pipelines, keyed by WGSL entry point. Every one is built in the
@@ -347,10 +342,7 @@ struct context {
     return instance.WaitAny(f, UINT64_MAX) == wgpu::WaitStatus::Success;
   }
 
-  mirror* mirror_(void* native) {
-    auto it = mirrors.find(native);
-    return it == mirrors.end() ? nullptr : &it->second;
-  }
+  mirror* mirror_(void* native) { return mt.find(native); }
 
   // A kernel is about to touch this buffer as `a`: bring the host copy up if
   // residency says so.
@@ -512,12 +504,7 @@ inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
 
   wgpu::Buffer dev;
   float* host = nullptr;
-  auto it = c.pool.find(nb);  // reuse a recycled buffer of this exact size
-  if (it != c.pool.end() && !it->second.empty()) {
-    dev = it->second.back().first;
-    host = it->second.back().second;
-    it->second.pop_back();
-  } else {
+  if (!c.mt.take(nb, dev, host)) {  // no recycled buffer of this exact size
     wgpu::BufferDescriptor d = {};
     d.size = nb;
     d.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst |
@@ -532,7 +519,7 @@ inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
   // host pointer is both, and malloc will not hand out the same address twice
   // while it is live.
   void* token = host;
-  c.mirrors[token] = context::mirror{host, dev, nb, gpu::residency(host_fill)};
+  c.mt.insert(token, dev, host, nb, host_fill);
   if (contents) *contents = host;
   return token;
 }
@@ -540,10 +527,7 @@ inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
 inline void release(void* buf, int64_t, float*) {
   auto& c = context::get();
   if (!c.ready || !buf) return;
-  auto it = c.mirrors.find(buf);
-  if (it == c.mirrors.end()) return;
-  c.pool[it->second.bytes].push_back({it->second.dev, it->second.host});
-  c.mirrors.erase(it);
+  c.mt.release(buf);
 }
 
 // Reconcile a buffer for a CPU access: flush pending kernels, then D2H if the

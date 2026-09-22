@@ -19,6 +19,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "profile.h"
 
@@ -158,6 +161,54 @@ struct residency {
   void host_wrote() { where = host; }
   // The backend copied host bytes up outside a kernel (an explicit upload).
   void uploaded() { where = both; }
+};
+
+// The host/device mirror and size-keyed buffer pool a mirrored backend (CUDA,
+// WebGPU) keeps per allocation. `Handle` is the backend's own device buffer
+// type (`CUdeviceptr`, `wgpu::Buffer`); the map, the pool and the entry shape
+// are otherwise identical between them, so only `Handle` varies. A backend
+// still does its own copying (`before_kernel_`, `sync_to_host`) and still
+// keys lookups by whatever `void*` it hands out as `native`; this only owns
+// where the state lives.
+template <class Handle>
+struct mirror_table {
+  struct entry {
+    float* host = nullptr;
+    Handle dev{};
+    size_t bytes = 0;
+    residency live;
+  };
+  std::unordered_map<void*, entry> mirrors;
+  std::unordered_map<size_t, std::vector<std::pair<Handle, float*>>> pool;
+
+  entry* find(void* native) {
+    auto it = mirrors.find(native);
+    return it == mirrors.end() ? nullptr : &it->second;
+  }
+
+  // A released buffer of this exact size, if the pool has one.
+  bool take(size_t bytes, Handle& dev, float*& host) {
+    auto it = pool.find(bytes);
+    if (it == pool.end() || it->second.empty()) return false;
+    dev = it->second.back().first;
+    host = it->second.back().second;
+    it->second.pop_back();
+    return true;
+  }
+
+  void insert(void* key, Handle dev, float* host, size_t bytes, bool host_fill) {
+    mirrors[key] = entry{host, std::move(dev), bytes, residency(host_fill)};
+  }
+
+  // Moves `native`'s entry into the free list, keyed by its size. False if
+  // `native` is not tracked (nothing to release).
+  bool release(void* native) {
+    auto it = mirrors.find(native);
+    if (it == mirrors.end()) return false;
+    pool[it->second.bytes].push_back({it->second.dev, it->second.host});
+    mirrors.erase(it);
+    return true;
+  }
 };
 
 // A launch's extent: how many groups, how many threads in each, and the bytes
