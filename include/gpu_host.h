@@ -520,9 +520,6 @@ struct traits {
   static constexpr int64_t fill_groups = 1;  // a loop: a split is only more passes
 };
 struct caps {
-  // The decoder's single-kernel ops are here, but not attention, rope or the
-  // GEMVs a model also needs, so a model keeps to the array ops.
-  static constexpr bool model_path = false;
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = true;
   static constexpr bool bf16_gemm = false;

@@ -123,22 +123,44 @@ template <class Own = own>
 inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
                  int64_t pos, float base, span bias = {}) {
   if constexpr (detail::owns_rope<Own>::value) {
-    return Own::rope(x, o, rows, T, D, pos, base, bias);
-  } else {
-    return false;
+    if (Own::rope(x, o, rows, T, D, pos, base, bias)) return true;
   }
+  return generic::rope(x, o, rows, T, D, pos, base, bias);
 }
 
 // metal.h — declared in `struct own`, defined among its helpers
 inline bool own::rope(gpu::span x, gpu::span out, ...) { ... }
 ```
 
-`gpu_ops.h` detects the member and forwards to it, or answers false. A backend
-declares what it has and nothing else: there are no stubs. A member whose
-signature drifts from the shared one is a compile error, not a silent fallback.
+`gpu_ops.h` detects the member and forwards to it, or takes the generic
+composition (below). A backend declares what it has and nothing else: there
+are no stubs. A member whose signature drifts from the shared one is a compile
+error, not a silent fallback.
 
 Prefer the single-kernel form. Reach for `own` when the kernels genuinely
 differ, not to avoid reordering a params struct.
+
+## Tiers
+
+The ops fall in two tiers. Tier 0 — elementwise, broadcast, reduction, GEMM,
+copy and index — closes the array surface: a backend with those kernels runs
+every graph. Tier 1 is the fused ops of the model path — `rmsnorm`, `swiglu`,
+the decode GEMV, the cache writes, `rope`, the attention, `split_heads` /
+`merge_heads`, `argmax` — each a kernel a backend *may* have. Under each of
+them `gpu_ops.h` holds one generic composition out of tier 0 (`gpu::generic`),
+and the op takes it when the shared launch declines or `own` has no member:
+several launches and a scratch buffer or two where the kernel is one launch,
+so a backend that cares for the decode loop writes the kernel, and a backend
+that has only tier 0 still runs the whole model path. The compositions are
+f32: an operand the tier has no reader for — a bf16 cache or weight, int4
+weights — still declines, and a model keeps to the array ops there
+(`caps::row_gemv`, `caps::bf16_gemm`). A composition names no backend and no
+array: spans, tier-0 ops, and the device core's `alloc` / `release` /
+`cpu_barrier` / `sync_to_host`.
+
+Two tests hold the two routes together: the model-path test checks the op,
+however it ran, against the array oracle, and a second runs each composition
+beside the backend's kernel and requires the same numbers.
 
 ## Launch policy
 
@@ -236,9 +258,6 @@ asks; a new backend edits no test.
 - CUDA's f32 GEMM wave plan (`sgemm_wave_chunk_`: layers, spare slots and
   rounds over a two-blocks-per-SM wave) is a split policy of its own, written
   against `traits::fill_groups` but not yet a shared function.
-- There is no generic composition under the fused ops, so a backend without the
-  model-path kernels reports `caps::model_path = false` rather than running them
-  slowly. WebGPU is in that position.
 
 ## Verifying a change
 

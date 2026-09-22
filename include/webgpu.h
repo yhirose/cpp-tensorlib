@@ -1237,10 +1237,6 @@ struct traits {
 };
 
 struct caps {
-  // Whether the model-path row is real here, or answers false: a decoder
-  // runs on raw buffers only where it is true, and keeps to the array ops
-  // otherwise (there is no CPU fallback under that row).
-  static constexpr bool model_path = false;
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = false;
   static constexpr bool bf16_gemm = false;

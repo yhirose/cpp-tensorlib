@@ -97,11 +97,12 @@ int main(int argc, char** argv) {
 
   // The same sequence again, on the imperative path: the fused model-path
   // kernels (rmsnorm/rmsnorm_res/swiglu, the decode GEMVs, kv_append,
-  // attn_decode, argmax) instead of the array compositions the checkpoints
-  // above validated. They are meant to compute the same thing, so at F32 the
-  // greedy sequence must be identical — which makes every one of them gated
-  // against the numpy reference too, without a second oracle.
-  if (tl::gpu::caps::model_path) {
+  // attn_decode, argmax), or their generic compositions on a backend without
+  // them, instead of the array compositions the checkpoints above validated.
+  // They are meant to compute the same thing, so at F32 the greedy sequence
+  // must be identical — which makes every one of them gated against the numpy
+  // reference too, without a second oracle.
+  {
     qm::reset_cache(M);
     int64_t p = 0, tok = 0;
     for (int64_t i = 0; i < NP; i++) tok = qm::step_imperative(M, qwenoracle::prompt_ids[i], p++);
@@ -112,8 +113,6 @@ int main(int argc, char** argv) {
       tok = qm::step_imperative(M, tok, p++);
     }
     std::printf("\n  greedy %s\n", imp_ok ? "MATCH" : "DIVERGE");
-  } else {
-    std::printf("\nimperative path: backend has no model path — skipped\n");
   }
 
   ok_f32 = emb_mr < 1e-3 && l0_mr < 5e-3 && fn_mr < 5e-3 && logit_mr < 5e-3 &&

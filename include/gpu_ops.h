@@ -9,6 +9,7 @@
 // Included by gpu.h, after the backend is selected.
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <initializer_list>
 #include <type_traits>
@@ -225,126 +226,6 @@ inline bool adam_step(span p, span m, span v, span g, int64_t n, float beta1,
                 policy::flat(n));
 }
 
-// ---- the model path: what a decoder runs on raw device buffers between its
-// GEMVs and attention. No CPU fallback sits under these, so a model checks the
-// return and keeps to the array ops where it is false.
-
-// out = x * rsqrt(mean(x^2) + eps) * w per row of [rows, n]. out may alias x.
-inline bool rmsnorm(span x, span w, span o, int64_t n, float eps,
-                    int64_t rows = 1) {
-  if (n <= 0 || rows <= 0) return false;
-  return launch(kop::rmsnorm_, {in(x), in(w), out(o)},
-                rmsnorm_params{static_cast<uint32_t>(n), eps},
-                policy::one_group_per_row(rows));
-}
-
-// xout = x + delta and hout = rmsnorm(xout) * w: a residual add folded into
-// the norm that follows it. xout may alias x.
-inline bool rmsnorm_res(span x, span delta, span w, span xout, span hout,
-                        int64_t n, float eps, int64_t rows = 1) {
-  if (n <= 0 || rows <= 0) return false;
-  return launch(kop::add_rmsnorm_,
-                {in(x), in(delta), in(w), out(xout), out(hout)},
-                rmsnorm_params{static_cast<uint32_t>(n), eps},
-                policy::one_group_per_row(rows));
-}
-
-// out[rows, ff] = silu(gate) * up out of the fused gate|up buffer [rows, 2ff].
-inline bool swiglu(span gu, span o, int64_t ff, int64_t rows = 1) {
-  if (ff <= 0 || rows <= 0) return false;
-  return launch(kop::swiglu_, {in(gu), out(o)},
-                swiglu_params{static_cast<uint32_t>(ff)},
-                policy::flat_rows(ff, rows));
-}
-
-// y[1,N] = a[1,K] . W[N,K]^T with the bf16 weight row-major (GGML-native): one
-// group an output row. Requires k % 8 == 0.
-inline bool gemv_bf16_row(span a, span W, span y, int64_t n, int64_t k) {
-  if (n <= 0 || k <= 0 || k % 8 != 0) return false;
-  return launch(kop::gemv_bf16_row_, {in(a), in(W), out(y)},
-                gemv_row_params{static_cast<uint32_t>(n), static_cast<uint32_t>(k)},
-                policy::row_reduce(n, k));
-}
-
-// The same over int4 weights: qw is [N][K/8] packed words and scales
-// [N][K/group] floats, two views that may share a buffer. K % group == 0 and
-// group % 8 == 0.
-inline bool gemv_q4(span a, span qw, span scales, span y, int64_t N, int64_t K,
-                    int64_t group) {
-  if (N <= 0 || K <= 0 || group <= 0 || K % group != 0 || group % 8 != 0) {
-    return false;
-  }
-  return launch(kop::gemv_q4_, {in(a), in(qw), in(scales), out(y)},
-                gemv_q4_params{static_cast<uint32_t>(N), static_cast<uint32_t>(K),
-                               static_cast<uint32_t>(group)},
-                policy::row_reduce(N, K));
-}
-
-// One decode step's k, v (each [n_kv_heads, D]) into row `pos` of a
-// [n_kv_heads, kv_max, D] cache, f32 or bf16.
-inline bool kv_append(span Kc, span Vc, span k_new, span v_new, int64_t pos,
-                      int64_t kv_max, int64_t n_kv_heads, int64_t D,
-                      bool kv_bf16 = false) {
-  if ((D != 64 && D != 128) || n_kv_heads <= 0) return false;
-  return launch(kv_bf16 ? kop::kv_append_bf16_ : kop::kv_append_,
-                {out(Kc), out(Vc), in(k_new), in(v_new)},
-                kv_append_params{static_cast<uint32_t>(pos),
-                                 static_cast<uint32_t>(kv_max * D)},
-                policy::per_head(n_kv_heads, 1, D));
-}
-
-// A prefill's k, v (each [n_kv_heads, T, D]) into cache rows [pos0, pos0 + T).
-inline bool kv_fill(span Kc, span Vc, span K, span V, int64_t T, int64_t kv_max,
-                    int64_t n_kv_heads, int64_t D, bool kv_bf16 = false,
-                    int64_t pos0 = 0) {
-  if ((D != 64 && D != 128) || n_kv_heads <= 0 || T <= 0) return false;
-  return launch(kv_bf16 ? kop::kv_fill_bf16_ : kop::kv_fill_,
-                {out(Kc), out(Vc), in(K), in(V)},
-                kv_fill_params{static_cast<uint32_t>(T),
-                               static_cast<uint32_t>(kv_max * D),
-                               static_cast<uint32_t>(pos0)},
-                policy::per_head(n_kv_heads, T, D));
-}
-
-// Head-major [H, T, D] -> token-major [T, H*D]: split_heads' inverse.
-inline bool merge_heads(span src, span dst, int64_t T, int64_t H, int64_t D) {
-  if (T <= 0 || H <= 0 || D <= 0) return false;
-  return launch(kop::merge_heads_, {in(src), out(dst)},
-                merge_heads_params{static_cast<uint32_t>(T),
-                                   static_cast<uint32_t>(H),
-                                   static_cast<uint32_t>(D)},
-                policy::per_head(H, T, D));
-}
-
-// Token-major [T, ld] -> head-major [H, T, D] from column block `off`, adding
-// the optional per-head bias [H, D] (a null view: none). Backend-own: the
-// kernels disagree on how "no bias" is said.
-TL_GPU_DETECT_OWN(split_heads)
-template <class Own = own>
-inline bool split_heads(span src, span bias, span dst, int64_t T, int64_t ld,
-                        int64_t off, int64_t H, int64_t D) {
-  if (T <= 0 || H <= 0 || D <= 0) return false;
-  if constexpr (detail::owns_split_heads<Own>::value) {
-    return detail::ran(Own::split_heads(src, bias, dst, T, ld, off, H, D));
-  } else {
-    return false;
-  }
-}
-
-// The argmax of a length-n vector, the smallest index on ties: greedy decoding
-// reads one int back rather than the logits. Drains the queue. Backend-own:
-// the result's staging buffer and its read-back are the backend's.
-TL_GPU_DETECT_OWN(argmax)
-template <class Own = own>
-inline bool argmax(span a, int64_t n, int64_t* out_idx) {
-  if (!a || n <= 0 || !out_idx) return false;
-  if constexpr (detail::owns_argmax<Own>::value) {
-    return detail::ran(Own::argmax(a, n, out_idx));
-  } else {
-    return false;
-  }
-}
-
 // tanh / sin / cos: unary's shape under their own vocabulary (gpu_abi.h).
 inline bool unary_ext(unary_ext_op op, span a, span o, int64_t n, float scale,
                       float offset) {
@@ -523,19 +404,6 @@ inline bool gemm_bias(span a, int64_t lda, bool ta, span b, int64_t ldb,
   }
 }
 
-// Rotary embedding over [rows, T, D] at position `pos`, adding the optional
-// per-row bias first.
-TL_GPU_DETECT_OWN(rope)
-template <class Own = own>
-inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
-                 int64_t pos, float base, span bias = {}) {
-  if constexpr (detail::owns_rope<Own>::value) {
-    return detail::ran(Own::rope(x, o, rows, T, D, pos, base, bias));
-  } else {
-    return false;
-  }
-}
-
 // Layer norm's pullback: dx, and dg / db reduced over rows in chunks.
 TL_GPU_DETECT_OWN(layer_norm_bwd)
 template <class Own = own>
@@ -550,6 +418,404 @@ inline bool layer_norm_bwd(span x, span g, span dy, span dx, span dg, span db,
   }
 }
 
+// ---- tier 1 by composition. Each fused op below is a kernel a backend may
+// have; where it does not — the shared launch declines, or `own` has no such
+// member — the same result comes from the tier-0 ops above, written once here.
+// Several launches and a scratch buffer or two rather than one kernel, so a
+// backend that cares for the decode loop writes the kernel; a new backend has
+// the whole model path from its tier 0 alone. f32 only: a bf16 or int4 operand
+// needs a reader the tier does not have, so those ops still decline. Nothing
+// here names a backend or the array layer: spans, tier-0 ops, and the device
+// core's alloc / release / cpu_barrier / sync_to_host.
+namespace generic {
+
+// A device buffer for the extent of one composition. With host_fill the host
+// writes `contents` before the first kernel reads it (a table, a mask), and
+// the backend uploads it where memory is not unified.
+struct scratch {
+  void* buf = nullptr;
+  float* contents = nullptr;
+  int64_t bytes = 0;
+  explicit scratch(int64_t floats, bool host_fill = false) : bytes(floats * 4) {
+    buf = alloc(bytes, &contents, host_fill);
+  }
+  ~scratch() {
+    if (buf) release(buf, bytes, contents);
+  }
+  scratch(const scratch&) = delete;
+  scratch& operator=(const scratch&) = delete;
+  explicit operator bool() const { return buf != nullptr; }
+  operator span() const { return {buf, 0}; }
+};
+
+// A strided rank-2 view copied into a contiguous [m, n]: the broadcast add of
+// a zero, which `zero` holds (one float the host filled).
+inline bool copy_2d(span a, int64_t ars, int64_t acs, span zero, span o,
+                    int64_t m, int64_t n) {
+  return binary_bcast(kop::badd, a, ars, acs, zero, 0, 0, o, m, n, 1.0f, 0.0f);
+}
+
+inline bool rmsnorm(span x, span w, span o, int64_t n, float eps,
+                    int64_t rows) {
+  scratch sq(rows * n), ms(rows), r(rows);
+  if (!sq || !ms || !r) return false;
+  // mean(x^2) + eps in the reduction's epilogue, then its inverse root, then
+  // two broadcasts: by the row's scale and by w. (No launch here writes a
+  // buffer it reads — a backend may forbid that — and o, which may alias x,
+  // is written last, after x's last read.)
+  return binary(kop::mul, x, x, sq, rows * n, 1.0f, 0.0f) &&
+         row_op(kop::row_sum, sq, ms, rows, n, 1.0f / static_cast<float>(n), eps) &&
+         scalar_binary(scalar_op::pow, ms, r, rows, -0.5f, 1.0f, 0.0f) &&
+         binary_bcast(kop::bmul, x, n, 1, r, 1, 0, sq, rows, n, 1.0f, 0.0f) &&
+         binary_bcast(kop::bmul, sq, n, 1, w, 0, 1, o, rows, n, 1.0f, 0.0f);
+}
+
+inline bool rmsnorm_res(span x, span delta, span w, span xout, span hout,
+                        int64_t n, float eps, int64_t rows) {
+  if (xout.buf != x.buf) {
+    return binary(kop::add, x, delta, xout, rows * n, 1.0f, 0.0f) &&
+           rmsnorm(xout, w, hout, n, eps, rows);
+  }
+  // xout aliases x: the sum goes through a buffer of this layer's own.
+  scratch sum(rows * n);
+  return sum && binary(kop::add, x, delta, sum, rows * n, 1.0f, 0.0f) &&
+         unary(kop::affine, sum, xout, rows * n, 1.0f, 0.0f) &&
+         rmsnorm(sum, w, hout, n, eps, rows);
+}
+
+inline bool swiglu(span gu, span o, int64_t ff, int64_t rows) {
+  scratch zero(1, true), g(rows * ff), s(rows * ff), silu(rows * ff);
+  if (!zero || !g || !s || !silu) return false;
+  zero.contents[0] = 0.0f;
+  // gate out of the fused [rows, 2ff] buffer, silu(gate) = gate * sigmoid(gate),
+  // times up read in place.
+  return copy_2d(gu, 2 * ff, 1, zero, g, rows, ff) &&
+         unary(kop::sigmoid, g, s, rows * ff, 1.0f, 0.0f) &&
+         binary(kop::mul, g, s, silu, rows * ff, 1.0f, 0.0f) &&
+         binary_bcast(kop::bmul, silu, ff, 1, gu.at(ff * 4), 2 * ff, 1, o, rows,
+                      ff, 1.0f, 0.0f);
+}
+
+// A GEMV is a GEMM with one row.
+inline bool gemv_f32(span a, span B, span y, int64_t n, int64_t k) {
+  return gemm(a, k, false, B, n, false, y, 1, n, k, 1.0f, 0.0f);
+}
+
+// A row into the cache is a contiguous copy per head.
+inline bool kv_append(span Kc, span Vc, span k_new, span v_new, int64_t pos,
+                      int64_t kv_max, int64_t n_kv_heads, int64_t D) {
+  for (int64_t h = 0; h < n_kv_heads; h++) {
+    const int64_t at = (h * kv_max + pos) * D * 4, from = h * D * 4;
+    if (!unary(kop::affine, k_new.at(from), Kc.at(at), D, 1.0f, 0.0f) ||
+        !unary(kop::affine, v_new.at(from), Vc.at(at), D, 1.0f, 0.0f)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool kv_fill(span Kc, span Vc, span K, span V, int64_t T, int64_t kv_max,
+                    int64_t n_kv_heads, int64_t D, int64_t pos0) {
+  for (int64_t h = 0; h < n_kv_heads; h++) {
+    const int64_t at = (h * kv_max + pos0) * D * 4, from = h * T * D * 4;
+    if (!unary(kop::affine, K.at(from), Kc.at(at), T * D, 1.0f, 0.0f) ||
+        !unary(kop::affine, V.at(from), Vc.at(at), T * D, 1.0f, 0.0f)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// [H, T, D] -> [T, H*D]: token t's row is the [H, D] gather of the heads'
+// row t, one strided copy a token.
+inline bool merge_heads(span src, span dst, int64_t T, int64_t H, int64_t D) {
+  scratch zero(1, true);
+  if (!zero) return false;
+  zero.contents[0] = 0.0f;
+  for (int64_t t = 0; t < T; t++) {
+    if (!copy_2d(src.at(t * D * 4), T * D, 1, zero, dst.at(t * H * D * 4), H, D)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// [T, ld] -> [H, T, D] from column block `off`, plus the head's bias row: one
+// broadcast add a head (of zero, when there is no bias).
+inline bool split_heads(span src, span bias, span dst, int64_t T, int64_t ld,
+                        int64_t off, int64_t H, int64_t D) {
+  scratch zero(1, true);
+  if (!zero) return false;
+  zero.contents[0] = 0.0f;
+  for (int64_t h = 0; h < H; h++) {
+    const span b = bias ? bias.at(h * D * 4) : span(zero);
+    if (!binary_bcast(kop::badd, src.at((off + h * D) * 4), ld, 1, b, 0,
+                      bias ? 1 : 0, dst.at(h * T * D * 4), T, D, 1.0f, 0.0f)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Rotary embedding over [rows, D], rows = H*T, row r at position pos + r % T:
+// out = x * C + swap(x) * S, with C and S the [T, D] tables of cos and of
+// (-sin | +sin) over the two halves, and swap(x) the halves exchanged (a row
+// gather of x seen as [2T, D/2]). Four launches a head over shared tables.
+inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
+                 int64_t pos, float base, span bias) {
+  if (rows <= 0 || T <= 0 || D <= 0 || D % 2 || rows % T) return false;
+  const int64_t half = D / 2, H = rows / T;
+  scratch C(T * D, true), S(T * D, true), idx(2 * T, true),
+      xb(bias ? rows * D : 1), sw(T * D), xc(T * D), xs(T * D);
+  if (!C || !S || !idx || (bias && !xb) || !sw || !xc || !xs) return false;
+  for (int64_t t = 0; t < T; t++) {
+    const double position = static_cast<double>(pos + t);
+    for (int64_t j = 0; j < half; j++) {
+      const double ang = position * std::pow(static_cast<double>(base),
+                                             -2.0 * static_cast<double>(j) / D);
+      const float c = static_cast<float>(std::cos(ang)),
+                  s = static_cast<float>(std::sin(ang));
+      C.contents[t * D + j] = C.contents[t * D + j + half] = c;
+      S.contents[t * D + j] = -s;
+      S.contents[t * D + j + half] = s;
+    }
+    idx.contents[2 * t] = static_cast<float>(2 * t + 1);
+    idx.contents[2 * t + 1] = static_cast<float>(2 * t);
+  }
+  span src = x;
+  if (bias) {
+    if (!binary(kop::add, x, bias, xb, rows * D, 1.0f, 0.0f)) return false;
+    src = xb;
+  }
+  for (int64_t h = 0; h < H; h++) {
+    const span xh = src.at(h * T * D * 4), oh = o.at(h * T * D * 4);
+    if (!index_select(xh, idx, sw, half, 2 * T) ||
+        !binary(kop::mul, xh, C, xc, T * D, 1.0f, 0.0f) ||
+        !binary(kop::mul, sw, S, xs, T * D, 1.0f, 0.0f) ||
+        !binary(kop::add, xc, xs, oh, T * D, 1.0f, 0.0f)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// One decode step, a head at a time: scores = q . K^T over the cached
+// prefix, softmax, times V. An f32 cache only.
+inline bool attn_decode(span q, span K, span V, span o, int64_t n_q_heads,
+                        int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
+                        int64_t D, float scale, bool kv_bf16) {
+  if (kv_bf16 || n_kv_heads <= 0 || n_q_heads % n_kv_heads || ctx <= 0 ||
+      D <= 0) {
+    return false;
+  }
+  scratch s(ctx), p(ctx);
+  if (!s || !p) return false;
+  const int64_t group = n_q_heads / n_kv_heads;
+  for (int64_t h = 0; h < n_q_heads; h++) {
+    const int64_t kv = (h / group) * kv_max * D * 4;
+    if (!gemm(q.at(h * D * 4), D, false, K.at(kv), D, true, s, 1, ctx, D, scale,
+              0.0f) ||
+        !row_op(kop::softmax, s, p, 1, ctx, 1.0f, 0.0f) ||
+        !gemm(p, ctx, false, V.at(kv), D, false, o.at(h * D * 4), 1, D, ctx,
+              1.0f, 0.0f)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The causal prefill, a head at a time: scores [T, ctx] over the cache rows
+// [0, pos0 + T), a mask that closes the keys past each query's position,
+// softmax by row, times V.
+inline bool attn_prefill(span q, span K, span V, span o, int64_t n_q_heads,
+                         int64_t n_kv_heads, int64_t T, int64_t kv_max,
+                         int64_t D, float scale, bool kv_bf16, int64_t pos0) {
+  if (kv_bf16 || n_kv_heads <= 0 || n_q_heads % n_kv_heads || T <= 0 ||
+      D <= 0 || pos0 < 0 || pos0 + T > kv_max) {
+    return false;
+  }
+  const int64_t ctx = pos0 + T;
+  scratch mask(T * ctx, true), s(T * ctx), p(T * ctx);
+  if (!mask || !s || !p) return false;
+  for (int64_t t = 0; t < T; t++) {
+    for (int64_t j = 0; j < ctx; j++) {
+      mask.contents[t * ctx + j] = j <= pos0 + t ? 0.0f : -1e30f;
+    }
+  }
+  const int64_t group = n_q_heads / n_kv_heads;
+  for (int64_t h = 0; h < n_q_heads; h++) {
+    const int64_t kv = (h / group) * kv_max * D * 4, qh = h * T * D * 4;
+    if (!gemm(q.at(qh), D, false, K.at(kv), D, true, s, T, ctx, D, scale, 0.0f) ||
+        !binary(kop::add, s, mask, p, T * ctx, 1.0f, 0.0f) ||
+        !row_op(kop::softmax, p, s, T, ctx, 1.0f, 0.0f) ||
+        !gemm(s, ctx, false, V.at(kv), D, false, o.at(qh), T, D, ctx, 1.0f,
+              0.0f)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The vector copied into a buffer of this layer's own, brought to the host
+// and scanned: the one host round trip the model path makes.
+inline bool argmax(span a, int64_t n, int64_t* out_idx) {
+  scratch c(n);
+  if (!c || !unary(kop::affine, a, c, n, 1.0f, 0.0f)) return false;
+  cpu_barrier();
+  sync_to_host(c.buf, false);
+  int64_t best = 0;
+  for (int64_t i = 1; i < n; i++) {
+    if (c.contents[i] > c.contents[best]) best = i;
+  }
+  *out_idx = best;
+  return true;
+}
+
+}  // namespace generic
+
+// ---- the model path: what a decoder runs on raw device buffers between its
+// GEMVs and attention. Each is the backend's kernel where it has one and the
+// generic composition where it does not, so every backend has the f32 model
+// path; an op still answers false for an operand its backend cannot read (a
+// bf16 cache or weight, int4 weights), and a model keeps to the array ops
+// there.
+
+// out = x * rsqrt(mean(x^2) + eps) * w per row of [rows, n]. out may alias x.
+inline bool rmsnorm(span x, span w, span o, int64_t n, float eps,
+                    int64_t rows = 1) {
+  if (n <= 0 || rows <= 0) return false;
+  return launch(kop::rmsnorm_, {in(x), in(w), out(o)},
+                rmsnorm_params{static_cast<uint32_t>(n), eps},
+                policy::one_group_per_row(rows)) ||
+         generic::rmsnorm(x, w, o, n, eps, rows);
+}
+
+// xout = x + delta and hout = rmsnorm(xout) * w: a residual add folded into
+// the norm that follows it. xout may alias x.
+inline bool rmsnorm_res(span x, span delta, span w, span xout, span hout,
+                        int64_t n, float eps, int64_t rows = 1) {
+  if (n <= 0 || rows <= 0) return false;
+  return launch(kop::add_rmsnorm_,
+                {in(x), in(delta), in(w), out(xout), out(hout)},
+                rmsnorm_params{static_cast<uint32_t>(n), eps},
+                policy::one_group_per_row(rows)) ||
+         generic::rmsnorm_res(x, delta, w, xout, hout, n, eps, rows);
+}
+
+// out[rows, ff] = silu(gate) * up out of the fused gate|up buffer [rows, 2ff].
+inline bool swiglu(span gu, span o, int64_t ff, int64_t rows = 1) {
+  if (ff <= 0 || rows <= 0) return false;
+  return launch(kop::swiglu_, {in(gu), out(o)},
+                swiglu_params{static_cast<uint32_t>(ff)},
+                policy::flat_rows(ff, rows)) ||
+         generic::swiglu(gu, o, ff, rows);
+}
+
+// y[1,N] = a[1,K] . W[N,K]^T with the bf16 weight row-major (GGML-native): one
+// group an output row. Requires k % 8 == 0.
+inline bool gemv_bf16_row(span a, span W, span y, int64_t n, int64_t k) {
+  if (n <= 0 || k <= 0 || k % 8 != 0) return false;
+  return launch(kop::gemv_bf16_row_, {in(a), in(W), out(y)},
+                gemv_row_params{static_cast<uint32_t>(n), static_cast<uint32_t>(k)},
+                policy::row_reduce(n, k));
+}
+
+// The same over int4 weights: qw is [N][K/8] packed words and scales
+// [N][K/group] floats, two views that may share a buffer. K % group == 0 and
+// group % 8 == 0.
+inline bool gemv_q4(span a, span qw, span scales, span y, int64_t N, int64_t K,
+                    int64_t group) {
+  if (N <= 0 || K <= 0 || group <= 0 || K % group != 0 || group % 8 != 0) {
+    return false;
+  }
+  return launch(kop::gemv_q4_, {in(a), in(qw), in(scales), out(y)},
+                gemv_q4_params{static_cast<uint32_t>(N), static_cast<uint32_t>(K),
+                               static_cast<uint32_t>(group)},
+                policy::row_reduce(N, K));
+}
+
+// One decode step's k, v (each [n_kv_heads, D]) into row `pos` of a
+// [n_kv_heads, kv_max, D] cache, f32 or bf16.
+inline bool kv_append(span Kc, span Vc, span k_new, span v_new, int64_t pos,
+                      int64_t kv_max, int64_t n_kv_heads, int64_t D,
+                      bool kv_bf16 = false) {
+  if ((D != 64 && D != 128) || n_kv_heads <= 0) return false;
+  return launch(kv_bf16 ? kop::kv_append_bf16_ : kop::kv_append_,
+                {out(Kc), out(Vc), in(k_new), in(v_new)},
+                kv_append_params{static_cast<uint32_t>(pos),
+                                 static_cast<uint32_t>(kv_max * D)},
+                policy::per_head(n_kv_heads, 1, D)) ||
+         (!kv_bf16 &&
+          generic::kv_append(Kc, Vc, k_new, v_new, pos, kv_max, n_kv_heads, D));
+}
+
+// A prefill's k, v (each [n_kv_heads, T, D]) into cache rows [pos0, pos0 + T).
+inline bool kv_fill(span Kc, span Vc, span K, span V, int64_t T, int64_t kv_max,
+                    int64_t n_kv_heads, int64_t D, bool kv_bf16 = false,
+                    int64_t pos0 = 0) {
+  if ((D != 64 && D != 128) || n_kv_heads <= 0 || T <= 0) return false;
+  return launch(kv_bf16 ? kop::kv_fill_bf16_ : kop::kv_fill_,
+                {out(Kc), out(Vc), in(K), in(V)},
+                kv_fill_params{static_cast<uint32_t>(T),
+                               static_cast<uint32_t>(kv_max * D),
+                               static_cast<uint32_t>(pos0)},
+                policy::per_head(n_kv_heads, T, D)) ||
+         (!kv_bf16 &&
+          generic::kv_fill(Kc, Vc, K, V, T, kv_max, n_kv_heads, D, pos0));
+}
+
+// Head-major [H, T, D] -> token-major [T, H*D]: split_heads' inverse.
+inline bool merge_heads(span src, span dst, int64_t T, int64_t H, int64_t D) {
+  if (T <= 0 || H <= 0 || D <= 0) return false;
+  return launch(kop::merge_heads_, {in(src), out(dst)},
+                merge_heads_params{static_cast<uint32_t>(T),
+                                   static_cast<uint32_t>(H),
+                                   static_cast<uint32_t>(D)},
+                policy::per_head(H, T, D)) ||
+         generic::merge_heads(src, dst, T, H, D);
+}
+
+// Token-major [T, ld] -> head-major [H, T, D] from column block `off`, adding
+// the optional per-head bias [H, D] (a null view: none). Backend-own: the
+// kernels disagree on how "no bias" is said.
+TL_GPU_DETECT_OWN(split_heads)
+template <class Own = own>
+inline bool split_heads(span src, span bias, span dst, int64_t T, int64_t ld,
+                        int64_t off, int64_t H, int64_t D) {
+  if (T <= 0 || H <= 0 || D <= 0) return false;
+  if constexpr (detail::owns_split_heads<Own>::value) {
+    if (detail::ran(Own::split_heads(src, bias, dst, T, ld, off, H, D))) {
+      return true;
+    }
+  }
+  return generic::split_heads(src, bias, dst, T, ld, off, H, D);
+}
+
+// The argmax of a length-n vector, the smallest index on ties: greedy decoding
+// reads one int back rather than the logits. Drains the queue. Backend-own:
+// the result's staging buffer and its read-back are the backend's.
+TL_GPU_DETECT_OWN(argmax)
+template <class Own = own>
+inline bool argmax(span a, int64_t n, int64_t* out_idx) {
+  if (!a || n <= 0 || !out_idx) return false;
+  if constexpr (detail::owns_argmax<Own>::value) {
+    if (detail::ran(Own::argmax(a, n, out_idx))) return true;
+  }
+  return generic::argmax(a, n, out_idx);
+}
+
+// Rotary embedding over [rows, T, D] at position `pos`, adding the optional
+// per-row bias first.
+TL_GPU_DETECT_OWN(rope)
+template <class Own = own>
+inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
+                 int64_t pos, float base, span bias = {}) {
+  if constexpr (detail::owns_rope<Own>::value) {
+    if (detail::ran(Own::rope(x, o, rows, T, D, pos, base, bias))) return true;
+  }
+  return generic::rope(x, o, rows, T, D, pos, base, bias);
+}
+
 // ---- the LLM path.
 
 // y[1,n] = a[1,k] . B[k,n], the weight column-major, f32 or bf16.
@@ -557,10 +823,9 @@ TL_GPU_DETECT_OWN(gemv_f32)
 template <class Own = own>
 inline bool gemv_f32(span a, span B, span y, int64_t n, int64_t k) {
   if constexpr (detail::owns_gemv_f32<Own>::value) {
-    return detail::ran(Own::gemv_f32(a, B, y, n, k));
-  } else {
-    return false;
+    if (detail::ran(Own::gemv_f32(a, B, y, n, k))) return true;
   }
+  return generic::gemv_f32(a, B, y, n, k);
 }
 
 TL_GPU_DETECT_OWN(gemv_bf16)
@@ -593,10 +858,12 @@ inline bool attn_decode(span q, span K, span V, span o, int64_t n_q_heads,
                         int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
                         int64_t D, float scale, bool kv_bf16 = false) {
   if constexpr (detail::owns_attn_decode<Own>::value) {
-    return detail::ran(Own::attn_decode(q, K, V, o, n_q_heads, n_kv_heads, ctx, kv_max, D, scale, kv_bf16));
-  } else {
-    return false;
+    if (detail::ran(Own::attn_decode(q, K, V, o, n_q_heads, n_kv_heads, ctx, kv_max, D, scale, kv_bf16))) {
+      return true;
+    }
   }
+  return generic::attn_decode(q, K, V, o, n_q_heads, n_kv_heads, ctx, kv_max, D,
+                              scale, kv_bf16);
 }
 
 // Causal prefill: q, out [n_q_heads, T, D] against the cache rows
@@ -608,10 +875,12 @@ inline bool attn_prefill(span q, span K, span V, span o, int64_t n_q_heads,
                          int64_t D, float scale, bool kv_bf16 = false,
                          int64_t pos0 = 0) {
   if constexpr (detail::owns_attn_prefill<Own>::value) {
-    return detail::ran(Own::attn_prefill(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D, scale, kv_bf16, pos0));
-  } else {
-    return false;
+    if (detail::ran(Own::attn_prefill(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D, scale, kv_bf16, pos0))) {
+      return true;
+    }
   }
+  return generic::attn_prefill(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D,
+                               scale, kv_bf16, pos0);
 }
 
 // The causal prefill's pullback, query half then key/value half.

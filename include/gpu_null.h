@@ -59,7 +59,6 @@ struct traits {
 // ---- what a model may assume, and the graph-capture plumbing behind
 // caps::graph_capture.
 struct caps {
-  static constexpr bool model_path = false;
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = false;
   static constexpr bool bf16_gemm = false;

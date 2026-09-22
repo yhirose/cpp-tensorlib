@@ -1315,10 +1315,6 @@ inline bool own::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
 }
 
 struct caps {
-  // Whether the model-path row is real here, or answers false: a decoder
-  // runs on raw buffers only where it is true, and keeps to the array ops
-  // otherwise (there is no CPU fallback under that row).
-  static constexpr bool model_path = true;
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = true;   // gemv_bf16_row: weights as [N,K]
   static constexpr bool bf16_gemm = true;  // gemm_bf16_nt: a bf16-weight GEMM

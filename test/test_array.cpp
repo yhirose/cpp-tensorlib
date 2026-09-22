@@ -2937,6 +2937,157 @@ TEST_CASE("policy: a split measures its groups against the device's fill") {
   CHECK(split_chunk(1, 1, gemv) == 32);
 }
 
+// The generic compositions (gpu_ops.h, tier 1 out of tier 0) against the op
+// as the backend runs it. Where the backend has the fused kernel the two are
+// different programs that must agree; where it does not, the op is the
+// composition and this is the composition against itself, and the model-path
+// test above holds it to the array oracle.
+TEST_CASE("generic compositions agree with the fused kernels") {
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+  tl::use_gpu();
+  namespace gpu = tl::gpu;
+  namespace gen = tl::gpu::generic;
+  auto dev = [](const array& a) {
+    array c = a.clone();
+    c.eval();
+    return c;
+  };
+  auto same = [](const array& got, const array& want, float tol) {
+    return tl::allclose(got, want, tol, tol);
+  };
+
+  SUBCASE("rmsnorm, rmsnorm_res and swiglu") {
+    const int64_t rows = 3, n = 896, ff = 512;
+    array x = dev(random_array({rows, n}, 950)), d = dev(random_array({rows, n}, 951));
+    array w = dev(random_array({n}, 952));
+    array a = array::empty({rows, n}), b = array::empty({rows, n});
+    REQUIRE(gpu::rmsnorm(x.device_span(), w.device_span(), a.device_span(), n, 1e-6f, rows));
+    REQUIRE(gen::rmsnorm(x.device_span(), w.device_span(), b.device_span(), n, 1e-6f, rows));
+    tl::gpu::flush();
+    CHECK(same(a, b, 1e-5f));
+    // Rows small enough that eps carries the reciprocal (mean(x^2) ~ 1e-8
+    // against eps 1e-6): a composition that dropped eps would be off tenfold.
+    array tiny = dev(x * 1e-4f);
+    REQUIRE(gpu::rmsnorm(tiny.device_span(), w.device_span(), a.device_span(), n, 1e-6f, rows));
+    REQUIRE(gen::rmsnorm(tiny.device_span(), w.device_span(), b.device_span(), n, 1e-6f, rows));
+    tl::gpu::flush();
+    CHECK(same(a, b, 1e-5f));
+
+    array xa = array::empty({rows, n}), ha = array::empty({rows, n});
+    array xb = array::empty({rows, n}), hb = array::empty({rows, n});
+    REQUIRE(gpu::rmsnorm_res(x.device_span(), d.device_span(), w.device_span(), xa.device_span(),
+                             ha.device_span(), n, 1e-6f, rows));
+    REQUIRE(gen::rmsnorm_res(x.device_span(), d.device_span(), w.device_span(), xb.device_span(),
+                             hb.device_span(), n, 1e-6f, rows));
+    tl::gpu::flush();
+    CHECK(same(xa, xb, 0.0f));
+    CHECK(same(ha, hb, 1e-5f));
+
+    array gu = dev(random_array({rows, 2 * ff}, 953));
+    array oa = array::empty({rows, ff}), ob = array::empty({rows, ff});
+    REQUIRE(gpu::swiglu(gu.device_span(), oa.device_span(), ff, rows));
+    REQUIRE(gen::swiglu(gu.device_span(), ob.device_span(), ff, rows));
+    tl::gpu::flush();
+    CHECK(same(oa, ob, 1e-5f));
+  }
+
+  SUBCASE("the f32 decode GEMV") {
+    const int64_t K = 896, N = 1152;
+    array a = dev(random_array({1, K}, 954)), B = dev(random_array({K, N}, 955));
+    array ya = array::empty({1, N}), yb = array::empty({1, N});
+    REQUIRE(gpu::gemv_f32(a.device_span(), B.device_span(), ya.device_span(), N, K));
+    REQUIRE(gen::gemv_f32(a.device_span(), B.device_span(), yb.device_span(), N, K));
+    tl::gpu::flush();
+    CHECK(same(ya, yb, 1e-3f));
+  }
+
+  SUBCASE("the cache: fill, append, decode and prefill attention") {
+    const int64_t D = 64, HKV = 2, HQ = 14, MAXC = 64, T = 20, T2 = 7;
+    const float scale = 1.0f / std::sqrt((float)D);
+    array K = dev(random_array({HKV, T, D}, 960)), V = dev(random_array({HKV, T, D}, 961));
+    array Ka = dev(array::zeros({HKV, MAXC, D})), Va = dev(array::zeros({HKV, MAXC, D}));
+    array Kb = dev(array::zeros({HKV, MAXC, D})), Vb = dev(array::zeros({HKV, MAXC, D}));
+    REQUIRE(gpu::kv_fill(Ka.device_span(), Va.device_span(), K.device_span(), V.device_span(), T,
+                         MAXC, HKV, D));
+    REQUIRE(gen::kv_fill(Kb.device_span(), Vb.device_span(), K.device_span(), V.device_span(), T,
+                         MAXC, HKV, D, 0));
+    array k1 = dev(random_array({HKV, D}, 962)), v1 = dev(random_array({HKV, D}, 963));
+    REQUIRE(gpu::kv_append(Ka.device_span(), Va.device_span(), k1.device_span(), v1.device_span(),
+                           T, MAXC, HKV, D));
+    REQUIRE(gen::kv_append(Kb.device_span(), Vb.device_span(), k1.device_span(), v1.device_span(),
+                           T, MAXC, HKV, D));
+    tl::gpu::flush();
+    CHECK(same(Ka, Kb, 0.0f));
+    CHECK(same(Va, Vb, 0.0f));
+
+    // A decode step over the T + 1 cached rows, by both routes.
+    array q = dev(random_array({HQ, D}, 964));
+    array oa = array::empty({HQ, D}), ob = array::empty({HQ, D});
+    REQUIRE(gpu::attn_decode(q.device_span(), Ka.device_span(), Va.device_span(), oa.device_span(),
+                             HQ, HKV, T + 1, MAXC, D, scale));
+    REQUIRE(gen::attn_decode(q.device_span(), Ka.device_span(), Va.device_span(), ob.device_span(),
+                             HQ, HKV, T + 1, MAXC, D, scale, false));
+    tl::gpu::flush();
+    CHECK(same(oa, ob, 1e-4f));
+
+    // A prefill of T2 more rows after them: the mask has to open the T + 1
+    // rows already cached and close the keys past each query.
+    array K2 = dev(random_array({HKV, T2, D}, 965)), V2 = dev(random_array({HKV, T2, D}, 966));
+    REQUIRE(gpu::kv_fill(Ka.device_span(), Va.device_span(), K2.device_span(), V2.device_span(),
+                         T2, MAXC, HKV, D, false, T + 1));
+    array qp = dev(random_array({HQ, T2, D}, 967));
+    array pa = array::empty({HQ, T2, D}), pb = array::empty({HQ, T2, D});
+    REQUIRE(gpu::attn_prefill(qp.device_span(), Ka.device_span(), Va.device_span(),
+                              pa.device_span(), HQ, HKV, T2, MAXC, D, scale, false, T + 1));
+    REQUIRE(gen::attn_prefill(qp.device_span(), Ka.device_span(), Va.device_span(),
+                              pb.device_span(), HQ, HKV, T2, MAXC, D, scale, false, T + 1));
+    tl::gpu::flush();
+    CHECK(same(pa, pb, 1e-4f));
+  }
+
+  SUBCASE("rope, split_heads, merge_heads and argmax") {
+    const int64_t H = 14, T = 5, D = 64, ld = H * D;
+    array x = dev(random_array({H * T, D}, 970)), b = dev(random_array({H * T, D}, 971));
+    array ra = array::empty({H * T, D}), rb = array::empty({H * T, D});
+    REQUIRE(gpu::rope(x.device_span(), ra.device_span(), H * T, T, D, 37, 1e6f, b.device_span()));
+    REQUIRE(gen::rope(x.device_span(), rb.device_span(), H * T, T, D, 37, 1e6f, b.device_span()));
+    tl::gpu::flush();
+    CHECK(same(ra, rb, 1e-4f));
+    REQUIRE(gpu::rope(x.device_span(), ra.device_span(), H * T, T, D, 37, 1e6f));
+    REQUIRE(gen::rope(x.device_span(), rb.device_span(), H * T, T, D, 37, 1e6f, {}));
+    tl::gpu::flush();
+    CHECK(same(ra, rb, 1e-4f));
+
+    array src = dev(random_array({T, ld}, 972)), bias = dev(random_array({H, D}, 973));
+    array sa = array::empty({H, T, D}), sb = array::empty({H, T, D});
+    REQUIRE(gpu::split_heads(src.device_span(), bias.device_span(), sa.device_span(), T, ld, 0, H, D));
+    REQUIRE(gen::split_heads(src.device_span(), bias.device_span(), sb.device_span(), T, ld, 0, H, D));
+    tl::gpu::flush();
+    CHECK(same(sa, sb, 0.0f));
+    REQUIRE(gpu::split_heads(src.device_span(), {}, sa.device_span(), T, ld, 0, H, D));
+    REQUIRE(gen::split_heads(src.device_span(), {}, sb.device_span(), T, ld, 0, H, D));
+    array ma = array::empty({T, ld}), mb = array::empty({T, ld});
+    REQUIRE(gpu::merge_heads(sa.device_span(), ma.device_span(), T, H, D));
+    REQUIRE(gen::merge_heads(sa.device_span(), mb.device_span(), T, H, D));
+    tl::gpu::flush();
+    CHECK(same(sa, sb, 0.0f));
+    CHECK(same(ma, mb, 0.0f));
+    CHECK(same(ma, src, 0.0f));
+
+    std::vector<float> v(10000, -1.0f);
+    v[4321] = v[4322] = 5.0f;
+    array a = dev(array::from(v, {(int64_t)v.size()}));
+    int64_t ia = -1, ib = -1;
+    REQUIRE(gpu::argmax(a.device_span(), (int64_t)v.size(), &ia));
+    REQUIRE(gen::argmax(a.device_span(), (int64_t)v.size(), &ib));
+    CHECK(ia == 4321);
+    CHECK(ib == 4321);
+  }
+
+  tl::device_ = prev;
+}
+
 // A buffer released while the device still has work queued against it goes
 // straight back to the pool for device work, but not for the host to fill.
 // Here the logsumexp is encoded but not run when its temporary dies (xent_bwd
@@ -2962,9 +3113,9 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
   // graph; each kernel here is checked against the array composition that
   // defines it. Shapes are Qwen2's head geometry (D=64, 14 q heads over 2 kv
   // heads) at a context past the split-KV cutoff, plus the D=128
-  // instantiation. Nothing to compare where the backend answers false for the
-  // whole row (gpu::caps::model_path) or has no device at all.
-  if (!tl::gpu_available() || !tl::gpu::caps::model_path) return;
+  // instantiation. A backend without a kernel takes the generic composition,
+  // which has to agree too; a bf16 cache needs the backend's own attention.
+  if (!tl::gpu_available()) return;
   auto prev = tl::device_;
   tl::use_gpu();
   namespace gpu = tl::gpu;
@@ -2982,6 +3133,7 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
   SUBCASE("kv_cache: append + attn, prefill, in f32 and bf16") {
     for (int64_t D : {64, 128}) {
       for (tl::dtype kv : {tl::dtype::f32, tl::dtype::bf16}) {
+        if (kv == tl::dtype::bf16 && !gpu::has_attn_decode) continue;
         const int64_t HQ = 14, HKV = 2, MAXC = 300, T = 260;
         const float scale = 1.0f / std::sqrt((float)D);
         tl::kv_cache cache;
@@ -3375,7 +3527,7 @@ TEST_CASE("gpu ops on views at non-zero offsets") {
                             0.0f),
             true, o, want, 1e-5f);
     }
-    const bool model = gpu::caps::model_path;
+    // Every backend has these: the kernel, or the generic composition.
     {
       staged xo = out_of(rows * cols), ho = out_of(rows * cols);
       std::vector<float> wx(rows * cols), wh(rows * cols);
@@ -3391,8 +3543,8 @@ TEST_CASE("gpu ops on views at non-zero offsets") {
       }
       const bool ran = gpu::rmsnorm_res(x.view(), d.view(), g.view(), xo.view(), ho.view(),
                                         cols, 1e-6f, rows);
-      check(ran, model, xo, wx, 1e-6f);
-      check(ran, model, ho, wh, 1e-5f);
+      check(ran, true, xo, wx, 1e-6f);
+      check(ran, true, ho, wh, 1e-5f);
     }
     {
       const int64_t ff = cols / 2;  // x as [rows, 2*ff]: gate | up
@@ -3403,7 +3555,7 @@ TEST_CASE("gpu ops on views at non-zero offsets") {
           const double gate = vx[r * cols + f], up = vx[r * cols + ff + f];
           want[r * ff + f] = (float)(gate / (1.0 + std::exp(-gate)) * up);
         }
-      check(gpu::swiglu(x.view(), o.view(), ff, rows), model, o, want, 1e-6f);
+      check(gpu::swiglu(x.view(), o.view(), ff, rows), true, o, want, 1e-6f);
     }
   }
 

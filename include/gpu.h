@@ -20,18 +20,20 @@
 //                          gpu_ops.h forwards to the ones that exist; an op a
 //                          backend does not declare has no stub to keep in step
 //               traits     what the launch policy may assume of its kernels
-//               caps       what a model may assume (model_path, graph_capture,
-//                          row_gemv, bf16_gemm), plus the graph-capture plumbing
+//               caps       what a model may assume (graph_capture, row_gemv,
+//                          bf16_gemm), plus the graph-capture plumbing
 //                          — graph_available / capture_begin / capture_end /
 //                          graph_launch / graph_destroy / upload_u32 /
 //                          attn_dpos_partials_bytes — as no-ops where absent
 //
 // An op answers false when the backend has no kernel for it, and the evaluator
 // falls back to the CPU. The model path (what a decoder runs on raw device
-// buffers between its GEMVs and attention: kv_cache.h, bench/models) has no CPU
-// fallback, so a model checks the return and keeps to the array ops where it
-// is false. gpu::census(kernel) counts launches, which is how a test tells a
-// kernel that ran from an op that quietly fell back.
+// buffers between its GEMVs and attention: kv_cache.h, bench/models) falls
+// back instead to gpu_ops.h's generic compositions of the tier-0 ops, so it
+// runs on every backend in f32; an op there still answers false for an
+// operand its backend cannot read (bf16, int4), and a model keeps to the
+// array ops where it does. gpu::census(kernel) counts launches, which is how
+// a test tells a kernel that ran from an op that quietly fell back.
 //
 // One backend is selected below, by the gate its header is written under:
 // webgpu.h under TENSORLIB_WEBGPU && __EMSCRIPTEN__, cuda.h under TENSORLIB_CUDA
