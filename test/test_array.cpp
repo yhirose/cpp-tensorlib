@@ -3085,6 +3085,40 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     CHECK(ib == 4321);
   }
 
+  SUBCASE("xent_bwd and adam_step") {
+    const int64_t rows = 5, cols = 37;
+    array x = dev(random_array({rows, cols}, 980));
+    array lse = dev(random_array({rows}, 981));
+    array tgt = dev(array::from({3, 0, 36, 17, 9}, {rows}));
+    array g = dev(random_array({rows}, 982));
+    array oa = array::empty({rows, cols}), ob = array::empty({rows, cols});
+    REQUIRE(gpu::xent_bwd(x.device_span(), lse.device_span(), tgt.device_span(),
+                          g.device_span(), oa.device_span(), rows, cols));
+    REQUIRE(gen::xent_bwd(x.device_span(), lse.device_span(), tgt.device_span(),
+                          g.device_span(), ob.device_span(), rows, cols));
+    tl::gpu::flush();
+    CHECK(same(oa, ob, 1e-5f));
+
+    const int64_t n = 200;
+    auto p0 = random_array({n}, 983), m0 = random_array({n}, 984);
+    auto v0 = tl::pow(random_array({n}, 985), 2.0f).eval();  // v is a square
+    array grad = dev(random_array({n}, 986));
+    array pa = dev(p0), ma = dev(m0), va = dev(v0);
+    array pb = dev(p0), mb = dev(m0), vb = dev(v0);
+    const float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f, lr_over_bc1 = 0.01f,
+                inv_bc2 = 1.05f;
+    REQUIRE(gpu::adam_step(pa.device_span(), ma.device_span(), va.device_span(),
+                           grad.device_span(), n, beta1, beta2, eps,
+                           lr_over_bc1, inv_bc2));
+    REQUIRE(gen::adam_step(pb.device_span(), mb.device_span(), vb.device_span(),
+                           grad.device_span(), n, beta1, beta2, eps,
+                           lr_over_bc1, inv_bc2));
+    tl::gpu::flush();
+    CHECK(same(pa, pb, 1e-4f));
+    CHECK(same(ma, mb, 1e-5f));
+    CHECK(same(va, vb, 1e-4f));
+  }
+
   tl::device_ = prev;
 }
 
