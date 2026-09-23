@@ -14,7 +14,8 @@
 // order the kernel takes its scalars. That is what lets each backend realize a
 // launch generically — Metal binds view i at buffer index i and the params
 // after them; CUDA builds cuLaunchKernel's argv as the view addresses followed
-// by the params' fields, four bytes apiece.
+// by the params' fields, four bytes apiece; WebGPU binds view i at binding i
+// and a uniform after them holding the views' offsets and then the params.
 
 #include <cstddef>
 #include <cstdint>
