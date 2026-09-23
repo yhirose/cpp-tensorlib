@@ -39,6 +39,7 @@
 
 #include "gpu_abi.h"  // the op vocabulary and the launch contract
 #include "profile.h"
+#include "shape.h"  // tl::contiguous_strides_into (concat_part's meta)
 #include "types.h"
 
 #if defined(TENSORLIB_WEBGPU) && defined(__EMSCRIPTEN__)
@@ -49,9 +50,11 @@
 // not in emscripten/html5_webgpu.h (that is the old built-in binding's home).
 #include <webgpu/webgpu_cpp.h>
 
+#include <array>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -71,70 +74,87 @@ inline const char* wgsl_source_() {
   return src;
 }
 
-// Uniform params, laid out to match the WGSL Params struct. One struct serves
-// every kernel family (see the comment on Params in the .wgsl): unused fields
-// cost a few bytes of a 256-byte slot, and it keeps one uniform ring and one
-// bind group layout for the whole backend.
-struct params {
-  uint32_t M, N, K;
-  uint32_t lda, ldb, ldc;
-  uint32_t a_off, b_off, c_off;
-  uint32_t ta, tb;
-  uint32_t ars, acs, brs, bcs;
-  uint32_t op;
-  float scale, offset;
-  uint32_t pad0, pad1, pad2, pad3, pad4;
-  float arg;  // a scalar operand (ew_scalar's s)
+// The kernel table: a kernel id's WGSL entry point and the OP its family
+// selects the operation by (-1: the entry point has no OP), or no entry for an
+// id this backend has no kernel for. The counterpart of metal.h's and cuda.h's
+// kernel_name_; the OP values are the case labels of the family's switch in
+// the .wgsl.
+struct kernel {
+  const char* entry = nullptr;
+  int op = -1;
 };
+inline kernel kernel_(kop k) {
+  switch (k) {
+    case kop::add: return {"ew_binary", 0};
+    case kop::sub: return {"ew_binary", 1};
+    case kop::mul: return {"ew_binary", 2};
+    case kop::div: return {"ew_binary", 3};
+    case kop::pow_: return {"ew_binary", 4};
 
-// WGSL gives a uniform-address-space struct align 16, so Params is 96 bytes
-// there. This must agree: the bind group's minBindingSize comes from sizeof
-// here, and a short one fails validation on every dispatch.
-static_assert(sizeof(params) == 96, "params must match the WGSL Params size");
+    case kop::exp_: return {"ew_unary", 0};
+    case kop::log_: return {"ew_unary", 1};
+    case kop::sqrt_: return {"ew_unary", 2};
+    case kop::sigmoid: return {"ew_unary", 3};
+    case kop::relu: return {"ew_unary", 4};
+    case kop::affine: return {"ew_unary", 5};
+    case kop::tanh_: return {"ew_unary", 6};
+    case kop::sin_: return {"ew_unary", 7};
+    case kop::cos_: return {"ew_unary", 8};
 
-// Which operation within a family, matching the OP_* constants in the WGSL.
-// Families have separate numbering, so this is only meaningful alongside the
-// entry point it is passed to.
-inline uint32_t kernel_op_(kop op) {
-  switch (op) {
-    case kop::add: case kop::badd: return 0;
-    case kop::sub: case kop::bsub: return 1;
-    case kop::mul: case kop::bmul: return 2;
-    case kop::div: case kop::bdiv: return 3;
-    case kop::pow_: case kop::bpow: return 4;
+    case kop::badd: return {"ew_bcast", 0};
+    case kop::bsub: return {"ew_bcast", 1};
+    case kop::bmul: return {"ew_bcast", 2};
+    case kop::bdiv: return {"ew_bcast", 3};
+    case kop::bpow: return {"ew_bcast", 4};
 
-    case kop::exp_: return 0;
-    case kop::log_: return 1;
-    case kop::sqrt_: return 2;
-    case kop::sigmoid: return 3;
-    case kop::relu: return 4;
-    case kop::affine: return 5;
-    case kop::tanh_: return 6;
-    case kop::sin_: return 7;
-    case kop::cos_: return 8;
+    case kop::gt_: return {"cmp", 0};
+    case kop::lt_: return {"cmp", 1};
+    case kop::ge_: return {"cmp", 2};
+    case kop::le_: return {"cmp", 3};
+    case kop::eq_: return {"cmp", 4};
+    case kop::ne_: return {"cmp", 5};
 
-    case kop::row_sum: return 0;
-    case kop::row_max: return 1;
-    default: return 0;
+    case kop::pow_s_: return {"ew_scalar", 0};
+    case kop::gt_s_: return {"ew_scalar", 1};
+    case kop::lt_s_: return {"ew_scalar", 2};
+    case kop::ge_s_: return {"ew_scalar", 3};
+    case kop::le_s_: return {"ew_scalar", 4};
+    case kop::eq_s_: return {"ew_scalar", 5};
+    case kop::ne_s_: return {"ew_scalar", 6};
+
+    case kop::row_sum: return {"row_reduce", 0};
+    case kop::row_max: return {"row_reduce", 1};
+    case kop::softmax: return {"softmax", -1};
+    case kop::clamp_: return {"clamp_", -1};
+    case kop::layer_norm_: return {"layer_norm", -1};
+    case kop::index_select: return {"index_select", -1};
+    default: return {};
   }
 }
+
+// The uniform a kernel reads (tensorlib_webgpu.wgsl's header): its views'
+// element offsets, one slot a view, then its params struct.
+constexpr size_t kMaxViews = 8;
+constexpr size_t kViewsBytes = kMaxViews * sizeof(uint32_t);
 
 // WebGPU guarantees maxComputeWorkgroupsPerDimension >= 65535. Anything past
 // that returns false and falls to CPU rather than silently truncating.
 constexpr int64_t kMaxWorkgroups = 65535;
 
-// Dynamic uniform offsets must be a multiple of the adapter's
+// A uniform binding's offset must be a multiple of the adapter's
 // minUniformBufferOffsetAlignment; 256 is the spec's guaranteed-safe maximum.
 constexpr uint64_t kUniformSlotBytes = 256;
-// One flush can batch this many dispatches; past it, encode_ forces a blocking
-// flush mid-graph. At 96 bytes of payload per 256-byte slot the ring is pure
-// device memory (1 MB here) with no binding-size implication, so it is sized to
-// put that forced stall well beyond any graph the backend is aimed at.
+// One flush can batch this many launches; past it, launch_ forces a blocking
+// flush mid-graph. The ring is pure device memory (1 MB here) with no
+// binding-size implication, so it is sized to put that forced stall well
+// beyond any graph the backend is aimed at.
 constexpr uint32_t kUniformSlotCount = 4096;
 
-// Every WGSL entry point. The context prebuilds a pipeline for each and the
-// browser harness asserts each one dispatched — both need the same list, and a
-// new kernel missing from either loses a guarantee silently.
+// Every WGSL entry point. The context prebuilds a pipeline for each (with its
+// OP at the default; the family's other operations are the same code under
+// another constant, built on first use) and the browser harness asserts each
+// one dispatched — both need the same list, and a new kernel missing from
+// either loses a guarantee silently.
 inline constexpr const char* kEntryPoints[] = {
     "sgemm",        "ew_binary",   "ew_unary",     "ew_bcast",
     "softmax",      "row_reduce",  "pad",          "fold",
@@ -161,12 +181,19 @@ inline bool has_preinitialized_device_() {
   return EM_ASM_INT({ return Module["preinitializedWebGPUDevice"] ? 1 : 0; }) != 0;
 }
 
+// Byte offsets must be 4-aligned to convert to the element offsets the
+// kernels index with. They always are for f32 views; anything else falls to
+// the CPU rather than silently truncating.
+inline bool elem_off_(int64_t byte_off, uint32_t* out) {
+  if (byte_off % 4) return false;
+  *out = (uint32_t)(byte_off / 4);
+  return true;
+}
+
 struct context {
   wgpu::Instance instance;
   wgpu::Device device;
   wgpu::Queue queue;
-  wgpu::BindGroupLayout bgl;
-  wgpu::PipelineLayout play;
   wgpu::ShaderModule mod;
   wgpu::Buffer uniforms;  // ring of kUniformSlots x kUniformSlot bytes
   bool ready = false;
@@ -182,7 +209,7 @@ struct context {
   wgpu::ComputePassEncoder pass;
   uint32_t slot = 0;  // next free uniform ring slot
 
-  // pad_/fold_'s per-call shape metadata ring — same idea as the uniform
+  // The N-D kernels' per-call shape metadata ring — same idea as the uniform
   // ring above (queue.WriteBuffer runs ahead of whatever is still sitting in
   // the unsubmitted encoder, so two calls sharing one buffer before a flush
   // would have the second's write stomp the first dispatch's not-yet-
@@ -208,10 +235,19 @@ struct context {
   // kernel operand, only mapped.
   std::unordered_map<size_t, std::vector<wgpu::Buffer>> staging_pool;
 
-  // Compute pipelines, keyed by WGSL entry point. Every one is built in the
-  // constructor and they all share a layout, so by the time encode_ runs this
-  // is a pure lookup and pipeline_'s create branch is unreachable.
-  std::unordered_map<std::string, wgpu::ComputePipeline> pipelines;
+  // Compute pipelines, keyed by WGSL entry point and OP, each with the bind
+  // group layout it took from its entry point (an auto layout: the WGSL's
+  // declarations are the kernel's side of the ABI).
+  struct pipeline {
+    wgpu::ComputePipeline pipe;
+    wgpu::BindGroupLayout layout;
+    const char* entry;  // for the census and the profile row
+  };
+  std::unordered_map<std::string, pipeline> pipelines;
+  // Each kernel id's pipeline once dispatch has resolved it, so a shared op's
+  // launch indexes an array where the map lookup would build a key.
+  // unordered_map never moves its values, so the pointers stay good.
+  std::array<const pipeline*, gpu::kKopCount> kop_pipelines{};
   // Per-entry-point dispatch census. Unlike the native backends, this one has
   // no test runner that fails when it is absent: the browser suite passes
   // whether or not the GPU engages, because every unported op falls back to
@@ -274,41 +310,6 @@ struct context {
     }
     if (!compiled) return;
 
-    // Explicit layout rather than GetBindGroupLayout(0): the auto-generated
-    // one has no dynamic offset on the uniform binding, which the ring needs.
-    // Bindings 4 (D) and 5 (E) are a third and fourth read-only operand —
-    // binary_bcast_nd and where_nd need more real buffers (operands + N-D
-    // shape/stride meta) than A/B/C alone can hold; see tensorlib_webgpu.wgsl's
-    // comment on D/E for which kernel binds what there.
-    wgpu::BindGroupLayoutEntry be[6] = {};
-    for (int i = 0; i < 3; ++i) {
-      be[i].binding = i;
-      be[i].visibility = wgpu::ShaderStage::Compute;
-      be[i].buffer.type = i == 2 ? wgpu::BufferBindingType::Storage
-                                 : wgpu::BufferBindingType::ReadOnlyStorage;
-    }
-    be[3].binding = 3;
-    be[3].visibility = wgpu::ShaderStage::Compute;
-    be[3].buffer.type = wgpu::BufferBindingType::Uniform;
-    be[3].buffer.hasDynamicOffset = true;
-    be[3].buffer.minBindingSize = sizeof(params);
-    for (int i = 4; i < 6; ++i) {
-      be[i].binding = i;
-      be[i].visibility = wgpu::ShaderStage::Compute;
-      be[i].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
-    }
-    wgpu::BindGroupLayoutDescriptor bgld = {};
-    bgld.entryCount = 6;
-    bgld.entries = be;
-    bgl = device.CreateBindGroupLayout(&bgld);
-    if (!bgl) return;
-
-    wgpu::PipelineLayoutDescriptor pld = {};
-    pld.bindGroupLayoutCount = 1;
-    pld.bindGroupLayouts = &bgl;
-    play = device.CreatePipelineLayout(&pld);
-    if (!play) return;
-
     wgpu::BufferDescriptor ud = {};
     ud.size = kUniformSlotBytes * kUniformSlotCount;
     ud.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
@@ -319,22 +320,34 @@ struct context {
     // error would surface as an op quietly falling back to CPU forever; here
     // it makes available() false, which the harness reports.
     for (const char* ep : kEntryPoints) {
-      if (!pipeline_(ep)) return;
+      if (!pipeline_(ep, -1)) return;
     }
 
     ready = true;
   }
 
-  wgpu::ComputePipeline pipeline_(const char* entry) {
-    auto it = pipelines.find(entry);
-    if (it != pipelines.end()) return it->second;
+  // `entry` with OP set to `op`. 0 is OP's default in the WGSL, so it and -1
+  // (no OP) name the one pipeline the constructor prebuilt. No layout is
+  // given, so the pipeline takes the auto layout of what its entry point
+  // declares.
+  const pipeline* pipeline_(const char* entry, int op) {
+    std::string key = entry;
+    if (op > 0) key += '#' + std::to_string(op);
+    auto it = pipelines.find(key);
+    if (it != pipelines.end()) return &it->second;
+    wgpu::ConstantEntry constant = {};
+    constant.key = "OP";
+    constant.value = op;
     wgpu::ComputePipelineDescriptor pd = {};
-    pd.layout = play;
     pd.compute.module = mod;
     pd.compute.entryPoint = entry;
+    if (op > 0) {
+      pd.compute.constantCount = 1;
+      pd.compute.constants = &constant;
+    }
     wgpu::ComputePipeline p = device.CreateComputePipeline(&pd);
-    if (p) pipelines[entry] = p;
-    return p;
+    if (!p) return nullptr;
+    return &(pipelines[key] = pipeline{p, p.GetBindGroupLayout(0), entry});
   }
 
   // Blocking wait on a single future — the one place anything suspends.
@@ -352,50 +365,60 @@ struct context {
   // live bytes are the host's has no encoded command touching it: a pending
   // kernel write would have made the device copy live, and a pending kernel
   // read would have come through here and uploaded already.
-  void before_kernel_(void* native, gpu::access a) {
-    mirror* m = mirror_(native);
-    if (m && m->live.before_kernel(a)) queue.WriteBuffer(m->dev, 0, m->host, m->bytes);
+  void before_kernel_(mirror& m, gpu::access a) {
+    if (m.live.before_kernel(a)) queue.WriteBuffer(m.dev, 0, m.host, m.bytes);
   }
-  void device_read_(void* native) { before_kernel_(native, gpu::access::in); }
-  void device_write_(void* native) { before_kernel_(native, gpu::access::out); }
 
-  // The one place a dispatch is encoded. Every op differs only in which
-  // pipeline, which params and what grid — keeping the bind group, uniform
-  // ring and encoder bookkeeping in a single copy is the same discipline
-  // metal_kernels.metal applies to its kernel bodies.
+  // The one place a kernel is launched, the shared ops' and this backend's own
+  // alike: view i bound whole at binding i, then the uniform — the views'
+  // element offsets and the params — at binding n (tensorlib_webgpu.wgsl's
+  // header). Nothing here knows a kernel. Declines, so the op falls back to
+  // the CPU, for a view with no device buffer or an offset that is not a
+  // whole float.
   //
-  // `b` may be the same mirror as `a` (a unary or reduce kernel binds its one
-  // input twice): two read-only bindings may alias. `out` is always a fresh
-  // allocation from the evaluator, so a writable binding never does. `d`/`e`
-  // are the optional third/fourth read-only operand (binary_bcast_nd/
-  // where_nd's extra tensor operand and/or N-D shape/stride meta); every
-  // other kernel leaves them null, which binds them to `a` -- unused by that
-  // kernel's WGSL, but bind group validation requires every declared binding
-  // be present regardless of which ones the active entry point reads.
-  bool encode_(const char* entry, mirror* a, mirror* b, mirror* out,
-               const params& p, int64_t gx, int64_t gy, mirror* d = nullptr,
-               mirror* e = nullptr) {
-    if (gx <= 0 || gy <= 0) return false;
-    if (gx > kMaxWorkgroups || gy > kMaxWorkgroups) return false;
-    wgpu::ComputePipeline pipe = pipeline_(entry);
-    if (!pipe) return false;
+  // Two inputs may be the same buffer: read-only bindings may alias. A buffer
+  // bound as an output may not be bound again in the same launch — WebGPU
+  // invalidates the whole encoder for it, and with it every launch batched
+  // since the last flush — so no caller hands one over twice.
+  bool launch_(const pipeline* p, const gpu::arg* args, size_t n,
+               const void* params, size_t params_bytes, uint32_t gx,
+               uint32_t gy) {
+    if (!p || n == 0 || n > kMaxViews ||
+        kViewsBytes + params_bytes > kUniformSlotBytes) {
+      return false;
+    }
+    if (gx == 0 || gy == 0 || gx > kMaxWorkgroups || gy > kMaxWorkgroups) {
+      return false;
+    }
+    mirror* views[kMaxViews];
+    uint32_t offs[kMaxViews] = {};
+    for (size_t i = 0; i < n; i++) {
+      views[i] = mirror_(args[i].s.buf);
+      if (!views[i] || !elem_off_(args[i].s.off, &offs[i])) return false;
+    }
+
     if (slot >= kUniformSlotCount) flush_();  // ring exhausted; new batch
+    for (size_t i = 0; i < n; i++) before_kernel_(*views[i], args[i].a);
 
     const uint32_t off = slot++ * (uint32_t)kUniformSlotBytes;
-    queue.WriteBuffer(uniforms, off, &p, sizeof(p));
+    unsigned char u[kUniformSlotBytes];
+    std::memcpy(u, offs, kViewsBytes);
+    std::memcpy(u + kViewsBytes, params, params_bytes);
+    queue.WriteBuffer(uniforms, off, u, kViewsBytes + params_bytes);
 
-    mirror* md = d ? d : a;
-    mirror* me = e ? e : a;
-    wgpu::BindGroupEntry bge[6] = {};
-    bge[0].binding = 0; bge[0].buffer = a->dev;    bge[0].size = a->bytes;
-    bge[1].binding = 1; bge[1].buffer = b->dev;    bge[1].size = b->bytes;
-    bge[2].binding = 2; bge[2].buffer = out->dev;  bge[2].size = out->bytes;
-    bge[3].binding = 3; bge[3].buffer = uniforms;  bge[3].size = sizeof(params);
-    bge[4].binding = 4; bge[4].buffer = md->dev;   bge[4].size = md->bytes;
-    bge[5].binding = 5; bge[5].buffer = me->dev;   bge[5].size = me->bytes;
+    wgpu::BindGroupEntry bge[kMaxViews + 1] = {};
+    for (size_t i = 0; i < n; i++) {
+      bge[i].binding = static_cast<uint32_t>(i);
+      bge[i].buffer = views[i]->dev;
+      bge[i].size = views[i]->bytes;
+    }
+    bge[n].binding = static_cast<uint32_t>(n);
+    bge[n].buffer = uniforms;
+    bge[n].offset = off;
+    bge[n].size = kUniformSlotBytes;
     wgpu::BindGroupDescriptor bgd = {};
-    bgd.layout = bgl;
-    bgd.entryCount = 6;
+    bgd.layout = p->layout;
+    bgd.entryCount = n + 1;
     bgd.entries = bge;
     wgpu::BindGroup bg = device.CreateBindGroup(&bgd);
 
@@ -403,13 +426,13 @@ struct context {
       enc = device.CreateCommandEncoder();
       pass = enc.BeginComputePass();
     }
-    pass.SetPipeline(pipe);
-    pass.SetBindGroup(0, bg, 1, &off);
-    pass.DispatchWorkgroups((uint32_t)gx, (uint32_t)gy, 1);
+    pass.SetPipeline(p->pipe);
+    pass.SetBindGroup(0, bg);
+    pass.DispatchWorkgroups(gx, gy, 1);
 
     pending = true;
-    dispatch_counts[entry]++;
-    gpu::launched(entry);  // counted, untimed
+    dispatch_counts[p->entry]++;
+    gpu::launched(p->entry);  // counted, untimed
     return true;
   }
 
@@ -574,243 +597,102 @@ inline void sync_to_host(void* native, bool for_write) {
   if (for_write) m->live.host_wrote();
 }
 
-// Shared host-side prologue for every op: resolve the operand mirrors and
-// stage the lazy copies. Returns false when any operand is untracked — that
-// means a heap storage with no device buffer, so the op belongs on the CPU.
-// `b` may be null for one-input kernels, which then bind `a` twice.
-inline bool operands_(context& c, void* a, void* b, void* out,
-                      context::mirror** ma, context::mirror** mb,
-                      context::mirror** mo) {
-  *ma = c.mirror_(a);
-  *mb = b ? c.mirror_(b) : *ma;
-  *mo = c.mirror_(out);
-  if (!*ma || !*mb || !*mo) return false;
-  c.device_read_(a);
-  if (b) c.device_read_(b);
-  c.device_write_(out);
-  return true;
+// The device core's one way to run a kernel for the shared ops: the id's
+// entry point and OP from the kernel table, and the rest as the shared op
+// handed it — views, params, grid — with no per-kernel code.
+inline bool dispatch(kop k, const gpu::arg* args, size_t n, const void* params,
+                     size_t params_bytes, const gpu::grid& g) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  const context::pipeline*& p = c.kop_pipelines[static_cast<size_t>(k)];
+  if (!p) {
+    const kernel kn = kernel_(k);
+    if (!kn.entry) return false;
+    p = c.pipeline_(kn.entry, kn.op);
+  }
+  return c.launch_(p, args, n, params, params_bytes, g.gx, g.gy);
 }
 
-// Byte offsets must be 4-aligned to convert to the element offsets the
-// kernels index with. They always are for f32 views; anything else falls to
-// the CPU rather than silently truncating.
-inline bool elem_off_(int64_t byte_off, uint32_t* out) {
-  if (byte_off % 4) return false;
-  *out = (uint32_t)(byte_off / 4);
-  return true;
+namespace detail_ {
+
+// This backend's own kernels' params: 4-byte fields, which
+// tensorlib_webgpu.wgsl declares in the same order after the views' offsets.
+struct gemm_params {
+  uint32_t m, n, k, lda, ldb, ldc, ta, tb;
+  float scale, offset;
+};
+struct pad_params { uint32_t n, rank, axis, before; };
+struct fold_params { uint32_t n, rank, axis, step; };
+struct sum_to_params { uint32_t n, rank, reduced_n; };
+struct concat_params { uint32_t n, rank, shift; };
+struct bcast_nd_params {
+  uint32_t n, rank;
+  float scale, offset;
+};
+struct where_nd_params { uint32_t n, rank; };
+struct index_add_params { uint32_t n, row_size, k; };
+struct scatter_axis_params { uint32_t n, size; };
+struct rope_params {
+  uint32_t n, t, d, pos, half;
+  float base;
+};
+
+inline uint32_t u32(int64_t v) { return static_cast<uint32_t>(v); }
+
+// An own op's launch, through the same launch_ as the shared ops.
+template <class P>
+inline bool launch_own_(const char* entry, int op,
+                        std::initializer_list<gpu::arg> args, const P& p,
+                        const gpu::grid& g) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  return c.launch_(c.pipeline_(entry, op), args.begin(), args.size(), &p,
+                   sizeof(P), g.gx, g.gy);
 }
+
+}  // namespace detail_
 
 // out = op(a) @ op(b) * scale + offset.
 inline bool own::gemm(gpu::span a, int64_t lda, bool ta, gpu::span b,
                       int64_t ldb, bool tb, gpu::span out, int64_t m, int64_t n,
                       int64_t k, float scale, float offset) {
-  auto& c = context::get();
-  if (!c.ready || m <= 0 || n <= 0 || k <= 0) return false;
-  params p = {};
-  if (!elem_off_(a.off, &p.a_off) || !elem_off_(b.off, &p.b_off) ||
-      !elem_off_(out.off, &p.c_off)) {
-    return false;
-  }
-  context::mirror *ma, *mb, *mo;
-  if (!operands_(c, a.buf, b.buf, out.buf, &ma, &mb, &mo)) return false;
-
-  p.M = (uint32_t)m;
-  p.N = (uint32_t)n;
-  p.K = (uint32_t)k;
-  p.lda = (uint32_t)lda;
-  p.ldb = (uint32_t)ldb;
-  p.ldc = (uint32_t)n;  // the eval seam always hands us a contiguous output
-  p.ta = ta ? 1u : 0u;
-  p.tb = tb ? 1u : 0u;
-  p.scale = scale;
-  p.offset = offset;
-  return c.encode_("sgemm", ma, mb, mo, p, (n + 63) / 64, (m + 63) / 64);
-}
-
-// This backend's kernels predate the shared kernel ABI (gpu_abi.h): every WGSL
-// entry point reads the one `params` layout above, and a family picks its
-// operation by number. So each kernel id the shared ops may dispatch is
-// marshalled here, from its canonical params into that layout; the entry
-// point comes back, or null for an id this backend has no kernel for.
-//
-// `in_off` holds the element offsets of the views the kernel reads. A and B's
-// are placed by dispatch; a kernel that reads D or E at an offset moves it
-// into its own field and clears it here, so an offset nobody consumed is
-// caught rather than dropped.
-inline const char* marshal_(kop k, const void* canonical, uint32_t* in_off,
-                            params& p) {
-  switch (k) {
-    case kop::badd: case kop::bsub: case kop::bmul: case kop::bdiv:
-    case kop::bpow: {
-      const auto& q = *static_cast<const gpu::bcast_params*>(canonical);
-      p.M = q.m;
-      p.N = q.n;
-      p.ars = q.ars;
-      p.acs = q.acs;
-      p.brs = q.brs;
-      p.bcs = q.bcs;
-      p.op = kernel_op_(k);
-      p.scale = q.scale;
-      p.offset = q.offset;
-      return "ew_bcast";
-    }
-    case kop::gt_: case kop::lt_: case kop::ge_: case kop::le_: case kop::eq_:
-    case kop::ne_: {
-      const auto& q = *static_cast<const gpu::cmp_params*>(canonical);
-      if (q.n == 0) return nullptr;
-      p.M = q.n;
-      p.ars = q.bstride;
-      p.op = static_cast<uint32_t>(k) - static_cast<uint32_t>(kop::gt_);
-      return "cmp";
-    }
-    case kop::clamp_: {  // no epilogue: scale/offset carry lo/hi
-      const auto& q = *static_cast<const gpu::clamp_params*>(canonical);
-      if (q.n == 0) return nullptr;
-      p.M = q.n;
-      p.scale = q.lo;
-      p.offset = q.hi;
-      return "clamp_";
-    }
-    case kop::pow_s_: case kop::gt_s_: case kop::lt_s_: case kop::ge_s_:
-    case kop::le_s_: case kop::eq_s_: case kop::ne_s_: {
-      const auto& q = *static_cast<const gpu::scalar_params*>(canonical);
-      if (q.n == 0) return nullptr;
-      p.M = q.n;
-      p.op = static_cast<uint32_t>(k) - static_cast<uint32_t>(kop::pow_s_);
-      p.arg = q.s;
-      p.scale = q.scale;
-      p.offset = q.offset;
-      return "ew_scalar";
-    }
-    case kop::softmax: case kop::row_sum: case kop::row_max: {
-      const auto& q = *static_cast<const gpu::reduce_params*>(canonical);
-      p.M = q.rows;
-      p.N = q.cols;
-      p.op = kernel_op_(k);
-      p.scale = q.scale;
-      p.offset = q.offset;
-      return k == kop::softmax ? "softmax" : "row_reduce";
-    }
-    case kop::layer_norm_: {  // A = x, B = g, D = b at pad3, arg = eps
-      const auto& q = *static_cast<const gpu::layer_norm_params*>(canonical);
-      p.M = q.rows;
-      p.N = q.cols;
-      p.arg = q.eps;
-      p.scale = q.scale;
-      p.offset = q.offset;
-      p.pad3 = in_off[2];
-      in_off[2] = 0;
-      return "layer_norm";
-    }
-    case kop::index_select: {
-      const auto& q = *static_cast<const gpu::gather_params*>(canonical);
-      p.M = q.n;
-      p.pad0 = q.row_size;
-      return "index_select";
-    }
-    case kop::add: case kop::sub: case kop::mul: case kop::div: case kop::pow_:
-    case kop::exp_: case kop::log_: case kop::sqrt_: case kop::sigmoid:
-    case kop::relu: case kop::affine: case kop::tanh_: case kop::sin_:
-    case kop::cos_: {
-      const auto& q = *static_cast<const gpu::ew_params*>(canonical);
-      if (q.n == 0) return nullptr;
-      p.M = q.n;
-      p.op = kernel_op_(k);
-      p.scale = q.scale;
-      p.offset = q.offset;
-      return k <= kop::pow_ ? "ew_binary" : "ew_unary";
-    }
-    default: return nullptr;
-  }
-}
-
-// The device core's one way to run a kernel for the shared ops. The bind
-// group is fixed — A and B read, C written, D and E read — so the view a
-// kernel writes is C and the ones it reads fill A, B, D, E in order; a
-// one-input kernel binds its input twice. Offsets ride in the uniform as
-// element counts (A, B and C only: D and E are bound whole).
-inline bool dispatch(kop k, const gpu::arg* args, size_t n,
-                     const void* canonical, size_t /*params_bytes*/,
-                     const gpu::grid& g) {
-  auto& c = context::get();
-  if (!c.ready) return false;
-  params p = {};
-  context::mirror* in[4] = {};
-  uint32_t in_off[4] = {};
-  context::mirror* out = nullptr;
-  size_t ins = 0;
-  for (size_t i = 0; i < n; i++) {
-    context::mirror* m = c.mirror_(args[i].s.buf);
-    uint32_t off = 0;
-    if (!m || !elem_off_(args[i].s.off, &off)) return false;  // CPU's
-    if (args[i].a == gpu::access::in) {
-      if (ins == 4) return false;
-      in_off[ins] = off;
-      in[ins++] = m;
-    } else {
-      if (out) return false;  // one writable binding
-      out = m;
-      p.c_off = off;
-    }
-  }
-  if (!out || ins == 0) return false;
-  if (ins == 1) {
-    in[1] = in[0];
-    in_off[1] = in_off[0];
-  }
-  p.a_off = in_off[0];
-  p.b_off = in_off[1];
-  const char* entry = marshal_(k, canonical, in_off, p);
-  if (!entry || in_off[2] || in_off[3]) return false;
-  for (size_t i = 0; i < n; i++) c.before_kernel_(args[i].s.buf, args[i].a);
-  return c.encode_(entry, in[0], in[1], out, p, g.gx, g.gy, in[2], in[3]);
-}
-
-// A one-input elementwise dispatch over n elements: the kernel binds its one
-// input twice, and `fill` sets the family's own fields.
-template <typename Fill>
-inline bool encode_one_input_(const char* entry, void* a, int64_t ao, void* out,
-                              int64_t oo, int64_t n, Fill&& fill) {
-  auto& c = context::get();
-  if (!c.ready || n <= 0) return false;
-  params p = {};
-  if (!elem_off_(ao, &p.a_off) || !elem_off_(oo, &p.c_off)) return false;
-  context::mirror *ma, *mb, *mo;
-  if (!operands_(c, a, nullptr, out, &ma, &mb, &mo)) return false;
-  p.b_off = p.a_off;
-  p.M = static_cast<uint32_t>(n);
-  fill(p);
-  return c.encode_(entry, ma, mb, mo, p, (n + 255) / 256, 1);
+  using detail_::u32;
+  if (m <= 0 || n <= 0 || k <= 0) return false;
+  // ldc = n: the eval seam always hands us a contiguous output.
+  detail_::gemm_params p{u32(m), u32(n), u32(k), u32(lda), u32(ldb), u32(n),
+                         ta ? 1u : 0u, tb ? 1u : 0u, scale, offset};
+  return detail_::launch_own_("sgemm", -1,
+                              {gpu::in(a), gpu::in(b), gpu::out(out)}, p,
+                              gpu::grid{u32((n + 63) / 64), u32((m + 63) / 64)});
 }
 
 // A ring, not one reused buffer: queue.WriteBuffer runs ahead of whatever is
-// still sitting in the unsubmitted encoder (see device_read_'s comment
-// above), so two pad/fold calls batched into the same unflushed pass would
-// have the second call's metadata write stomp the first dispatch's
-// not-yet-executed read of the same buffer — the exact hazard the uniform
-// ring above (kUniformSlotCount) already exists to avoid for Params, just for
-// a second resource. One slot comfortably covers the rank-8 cap (pad needs
-// 2*rank <= 16 words, fold (rank-1)+rank <= 15, binary_bcast_nd 3*rank <= 24,
-// where_nd's own [out_shape, cond_strides, a_strides, b_strides] 4*rank <=
-// 32 -- the largest of the four, which is what sizes this), which is why
-// this state lives on `context` (meta_ring_tok/meta_ring_host/meta_slot)
-// right beside `slot` instead of as a second, independent ring: flush()
-// resets both counters together, the way it already resets `slot`.
+// still sitting in the unsubmitted encoder (see before_kernel_'s comment
+// above), so two N-D calls batched into the same unflushed pass would have
+// the second call's metadata write stomp the first launch's not-yet-executed
+// read of the same buffer — the exact hazard the uniform ring above
+// (kUniformSlotCount) already exists to avoid, just for a second resource.
+// One slot comfortably covers the rank-8 cap (pad needs 2*rank <= 16 words,
+// fold (rank-1)+rank <= 15, binary_bcast_nd 3*rank <= 24, where_nd's own
+// [out_shape, cond_strides, a_strides, b_strides] 4*rank <= 32 -- the largest,
+// which is what sizes this), which is why this state lives on `context`
+// (meta_ring_tok/meta_ring_host/meta_slot) right beside `slot` instead of as
+// a second, independent ring: flush() resets both counters together, the way
+// it already resets `slot`.
 inline constexpr size_t kMetaSlotWords = 32;
 inline constexpr size_t kMetaSlotCount = 4096;
 
-// Rank cap for pad_/fold_'s GPU dispatch — matches cuda.h's own
-// kPadFoldMaxRank (not unified with it: the two backends derive their caps
-// from different physical constraints, kMetaSlotWords here vs a fixed-size
-// on-stack index array there) and kernels/tensorlib_webgpu.wgsl's
-// kPadFoldMaxRank, which the WGSL side needs as its own `const` since a
-// shader can't see a host-side C++ constant.
+// Rank cap for the N-D kernels — matches cuda.h's own kPadFoldMaxRank (not
+// unified with it: the two backends derive their caps from different physical
+// constraints, kMetaSlotWords here vs a fixed-size on-stack index array
+// there) and kernels/tensorlib_webgpu.wgsl's kPadFoldMaxRank, which the WGSL
+// side needs as its own `const` since a shader can't see a host-side C++
+// constant.
 inline constexpr int kPadFoldMaxRank = 8;
 
 // Allocated once, sized for the whole ring — through the same alloc() pool
-// every tensor buffer uses (by the time pad()/fold() below can run, alloc()
-// is already defined above). The token is opaque to eval_one's storage
-// layer, so nothing else could mistake it for a live array.
+// every tensor buffer uses. The token is opaque to eval_one's storage layer,
+// so nothing else could mistake it for a live array.
 inline void* context::meta_ring_(float** host_out) {
   if (!meta_ring_tok) {
     meta_ring_tok = alloc(
@@ -823,45 +705,49 @@ inline void* context::meta_ring_(float** host_out) {
 }
 
 // This call's word offset into the ring, advancing like the uniform ring's
-// `slot` and forcing the same flush-then-reset on wraparound.
+// `slot`. A full ring — either ring: the launch this slot is for comes next,
+// and were launch_ to flush between them, later calls in the new batch would
+// be handed this slot again and rewrite it before the launch had read it —
+// flushes first, so a slot and its launch always share a batch.
 inline uint32_t context::meta_reserve_slot_() {
-  if (meta_slot >= kMetaSlotCount) {
+  if (meta_slot >= kMetaSlotCount || slot >= kUniformSlotCount) {
     flush();
     meta_slot = 0;
   }
   return (meta_slot++) * static_cast<uint32_t>(kMetaSlotWords);
 }
 
-// Reserve one meta-ring slot: returns the u32 write pointer for this call's
-// slot (already offset into the ring) via `host_words`, and this slot's word
-// offset via `word_off_out`; the return value is the ring's own opaque
-// token, or null if the ring couldn't be allocated. Shared by pad()/fold()/
-// binary_bcast_nd()/where_nd() below, which differ only in how many words
-// they fill in and with what.
-inline void* reserve_meta_(context& c, uint32_t* word_off_out,
-                           uint32_t** host_words) {
+// A run of `len` shape or stride values, one u32 word each in a meta slot.
+struct meta_run {
+  const int64_t* p;
+  int len;
+};
+
+// `runs`, back to back, in a fresh slot of the meta ring, as a view an N-D
+// kernel reads like any other input; a null span when they overflow a slot
+// or the ring could not be allocated.
+inline gpu::span meta_(std::initializer_list<meta_run> runs) {
+  uint32_t words[kMetaSlotWords];
+  size_t count = 0;
+  for (const meta_run& r : runs) {
+    if (r.len < 0 || count + r.len > kMetaSlotWords) return {};
+    for (int d = 0; d < r.len; d++) words[count++] = detail_::u32(r.p[d]);
+  }
+  auto& c = context::get();
   float* ring_host = nullptr;
   void* ring_tok = c.meta_ring_(&ring_host);
-  if (!ring_tok) return nullptr;
-  *word_off_out = c.meta_reserve_slot_();
-  *host_words = reinterpret_cast<uint32_t*>(ring_host) + *word_off_out;
-  return ring_tok;
-}
-
-// Upload a filled meta-ring slot and mark it live -- the other half of
-// reserve_meta_ above, split from it so the caller can fill `host_words` (the
-// pointer reserve_meta_ handed back) in between.
-inline context::mirror* commit_meta_(context& c, void* ring_tok,
-                                     uint32_t word_off, const uint32_t* words,
-                                     size_t word_count) {
+  if (!ring_tok) return {};
+  const uint32_t word_off = c.meta_reserve_slot_();
+  std::memcpy(reinterpret_cast<uint32_t*>(ring_host) + word_off, words,
+              count * 4);
+  // This slot only, at its own byte offset, and unconditionally: the ring's
+  // residency never settles into one live copy (each slot is written once,
+  // read once, never again), so the host and device copies are both live
+  // after it rather than one or the other.
   context::mirror* mm = c.mirror_(ring_tok);
-  // This call's slot only, at its own byte offset — an unconditional
-  // WriteBuffer, not device_read_'s dirty-flag check, since the ring's
-  // mirror never legitimately settles into a single steady HOST/DEVICE state
-  // (each slot is written once, read once, never again).
-  c.queue.WriteBuffer(mm->dev, word_off * 4, words, word_count * 4);
+  c.queue.WriteBuffer(mm->dev, word_off * 4, words, count * 4);
   mm->live.uploaded();
-  return mm;
+  return {ring_tok, static_cast<int64_t>(word_off) * 4};
 }
 
 // Gather-style pad/fold (M11): unlike CUDA's scatter+atomicAdd, WGSL has no
@@ -869,38 +755,19 @@ inline context::mirror* commit_meta_(context& c, void* ring_tok,
 // have it read (pad) or sum (fold) whatever cells of `a` map to it — no
 // output cell is ever written by two invocations, so unlike cuda.h's pad/fold
 // neither needs a pre-zeroed buffer. `a_shape`/`out_shape` (length `rank`,
-// `rank-1` for fold's `out_shape`) ride the otherwise-unused second storage
-// binding as bit-reinterpreted u32 — WGSL's fixed Params uniform (used by
-// every other kernel here) has no room for a variable-length array, and
-// WriteBuffer is a raw byte copy regardless of the binding's declared type.
+// `rank-1` for fold's `out_shape`) ride the meta ring.
 inline bool own::pad(gpu::span a, gpu::span out, const int64_t* a_shape,
                      const int64_t* out_shape, int rank, int axis,
                      int64_t before, int64_t n, int64_t out_n) {
+  using detail_::u32;
   (void)n;
-  auto& c = context::get();
-  if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank) return false;
-  params p = {};
-  if (!elem_off_(a.off, &p.a_off) || !elem_off_(out.off, &p.c_off)) return false;
-  context::mirror* ma = c.mirror_(a.buf);
-  context::mirror* mo = c.mirror_(out.buf);
-  if (!ma || !mo) return false;
-  c.device_read_(a.buf);
-  c.device_write_(out.buf);
-
-  uint32_t word_off, *raw;
-  void* ring_tok = reserve_meta_(c, &word_off, &raw);
-  if (!ring_tok) return false;
-  for (int d = 0; d < rank; d++) raw[d] = static_cast<uint32_t>(out_shape[d]);
-  for (int d = 0; d < rank; d++) raw[rank + d] = static_cast<uint32_t>(a_shape[d]);
-  context::mirror* mm =
-      commit_meta_(c, ring_tok, word_off, raw, 2 * static_cast<size_t>(rank));
-
-  p.M = static_cast<uint32_t>(out_n);
-  p.b_off = word_off;
-  p.pad0 = static_cast<uint32_t>(rank);
-  p.pad1 = static_cast<uint32_t>(axis);
-  p.pad2 = static_cast<uint32_t>(before);
-  return c.encode_("pad", ma, mm, mo, p, (out_n + 255) / 256, 1);
+  if (rank <= 0 || rank > kPadFoldMaxRank || out_n <= 0) return false;
+  gpu::span meta = meta_({{out_shape, rank}, {a_shape, rank}});
+  if (!meta) return false;
+  return detail_::launch_own_(
+      "pad", -1, {gpu::in(a), gpu::in(meta), gpu::out(out)},
+      detail_::pad_params{u32(out_n), u32(rank), u32(axis), u32(before)},
+      gpu::policy::flat(out_n));
 }
 
 // unfold's inverse. Each output element sums over the bounded range of
@@ -912,217 +779,101 @@ inline bool own::pad(gpu::span a, gpu::span out, const int64_t* a_shape,
 inline bool own::fold(gpu::span a, gpu::span out, const int64_t* a_shape,
                       const int64_t* out_shape, int rank, int axis,
                       int64_t step, int64_t n, int64_t out_n) {
+  using detail_::u32;
   (void)n;
-  auto& c = context::get();
-  if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank) return false;
-  params p = {};
-  if (!elem_off_(a.off, &p.a_off) || !elem_off_(out.off, &p.c_off)) return false;
-  context::mirror* ma = c.mirror_(a.buf);
-  context::mirror* mo = c.mirror_(out.buf);
-  if (!ma || !mo) return false;
-  c.device_read_(a.buf);
-  c.device_write_(out.buf);
-
-  int out_rank = rank - 1;
-  uint32_t word_off, *raw;
-  void* ring_tok = reserve_meta_(c, &word_off, &raw);
-  if (!ring_tok) return false;
-  for (int d = 0; d < out_rank; d++) raw[d] = static_cast<uint32_t>(out_shape[d]);
-  for (int d = 0; d < rank; d++) raw[out_rank + d] = static_cast<uint32_t>(a_shape[d]);
-  context::mirror* mm =
-      commit_meta_(c, ring_tok, word_off, raw,
-                   static_cast<size_t>(out_rank) + static_cast<size_t>(rank));
-
-  p.M = static_cast<uint32_t>(out_n);
-  p.b_off = word_off;
-  p.pad0 = static_cast<uint32_t>(rank);
-  p.pad1 = static_cast<uint32_t>(axis);
-  p.pad2 = static_cast<uint32_t>(step);
-  return c.encode_("fold", ma, mm, mo, p, (out_n + 255) / 256, 1);
+  if (rank <= 0 || rank > kPadFoldMaxRank || out_n <= 0) return false;
+  const int out_rank = rank - 1;
+  gpu::span meta = meta_({{out_shape, out_rank}, {a_shape, rank}});
+  if (!meta) return false;
+  return detail_::launch_own_(
+      "fold", -1, {gpu::in(a), gpu::in(meta), gpu::out(out)},
+      detail_::fold_params{u32(out_n), u32(rank), u32(axis), u32(step)},
+      gpu::policy::flat(out_n));
 }
 
 // index_select's dual, rewritten as a gather: WGSL has no float atomicAdd,
 // the same gap pad/fold above work around, so this sums over every source
 // row matching each OUTPUT row instead of scattering into a pre-zeroed
-// buffer -- no zeroing needed. A = idx, B = values, C = out; p.pad0 =
-// row_size, p.pad1 = k (number of source rows to scan).
+// buffer -- no zeroing needed.
 inline bool own::index_add(gpu::span idx, gpu::span values, gpu::span out,
                            int64_t row_size, int64_t k, int64_t out_n) {
-  auto& c = context::get();
-  if (!c.ready || out_n <= 0) return false;
-  params p = {};
-  if (!elem_off_(idx.off, &p.a_off) || !elem_off_(values.off, &p.b_off) ||
-      !elem_off_(out.off, &p.c_off)) {
-    return false;
-  }
-  context::mirror *ma, *mb, *mo;
-  if (!operands_(c, idx.buf, values.buf, out.buf, &ma, &mb, &mo)) {
-    return false;
-  }
-  p.M = static_cast<uint32_t>(out_n);
-  p.pad0 = static_cast<uint32_t>(row_size);
-  p.pad1 = static_cast<uint32_t>(k);
-  return c.encode_("index_add", ma, mb, mo, p, (out_n + 255) / 256, 1);
+  using detail_::u32;
+  if (out_n <= 0) return false;
+  return detail_::launch_own_(
+      "index_add", -1, {gpu::in(idx), gpu::in(values), gpu::out(out)},
+      detail_::index_add_params{u32(out_n), u32(row_size), u32(k)},
+      gpu::policy::flat(out_n));
 }
 
 // One-hot scatter into a new trailing axis, as a gather: out[pos,k] =
 // values[pos] where indices[pos] == k, else 0. Every output element reads,
-// never writes twice, so -- like index_select above -- no zeroing needed.
-// A = idx, B = values, C = out; p.pad0 = size.
+// never writes twice, so -- like index_select -- no zeroing needed.
 inline bool own::scatter_to_axis(gpu::span idx, gpu::span values, gpu::span out,
                                  int64_t n, int64_t size) {
-  auto& c = context::get();
-  int64_t out_n = n * size;
-  if (!c.ready || out_n <= 0) return false;
-  params p = {};
-  if (!elem_off_(idx.off, &p.a_off) || !elem_off_(values.off, &p.b_off) ||
-      !elem_off_(out.off, &p.c_off)) {
-    return false;
-  }
-  context::mirror *ma, *mb, *mo;
-  if (!operands_(c, idx.buf, values.buf, out.buf, &ma, &mb, &mo)) {
-    return false;
-  }
-  p.M = static_cast<uint32_t>(out_n);
-  p.pad0 = static_cast<uint32_t>(size);
-  return c.encode_("scatter_axis", ma, mb, mo, p, (out_n + 255) / 256, 1);
+  using detail_::u32;
+  const int64_t out_n = n * size;
+  if (out_n <= 0) return false;
+  return detail_::launch_own_(
+      "scatter_axis", -1, {gpu::in(idx), gpu::in(values), gpu::out(out)},
+      detail_::scatter_axis_params{u32(out_n), u32(size)},
+      gpu::policy::flat(out_n));
 }
 
-// N-D broadcast binary: generalizes binary_bcast() above to any rank (a
+// N-D broadcast binary: generalizes binary_bcast() to any rank (a
 // Transformer's [N,S,D] LayerNorm broadcasting a [N,S,1] mean, rank 3).
 // a_strides/b_strides are the broadcast strides (0 on a broadcast axis)
-// array.h computes host-side via the same broadcast_strides() the CPU
-// oracle uses. A = a, B = b, D = meta [out_shape(rank), a_strides(rank),
-// b_strides(rank)] (a and b already fill A/B, unlike pad/fold where B was
-// free for this); p.pad0 = rank, p.pad3 = meta's word offset into D.
+// array.h computes host-side via the same broadcast_strides() the CPU oracle
+// uses. `op` is the rank-2 broadcast id (badd..bpow), whose OP this kernel
+// shares.
 inline bool own::binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
                                  gpu::span b, const int64_t* b_strides,
                                  gpu::span out, const int64_t* out_shape,
                                  int rank, int64_t n, float scale,
                                  float offset) {
-  auto& c = context::get();
-  if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank || n <= 0) return false;
-  params p = {};
-  if (!elem_off_(a.off, &p.a_off) || !elem_off_(b.off, &p.b_off) ||
-      !elem_off_(out.off, &p.c_off)) {
-    return false;
-  }
-  context::mirror *ma, *mb, *mo;
-  if (!operands_(c, a.buf, b.buf, out.buf, &ma, &mb, &mo)) {
-    return false;
-  }
-
-  uint32_t word_off, *raw;
-  void* ring_tok = reserve_meta_(c, &word_off, &raw);
-  if (!ring_tok) return false;
-  for (int d = 0; d < rank; d++) raw[d] = static_cast<uint32_t>(out_shape[d]);
-  for (int d = 0; d < rank; d++) {
-    raw[rank + d] = static_cast<uint32_t>(a_strides[d]);
-  }
-  for (int d = 0; d < rank; d++) {
-    raw[2 * rank + d] = static_cast<uint32_t>(b_strides[d]);
-  }
-  context::mirror* mm =
-      commit_meta_(c, ring_tok, word_off, raw, 3 * static_cast<size_t>(rank));
-
-  p.M = static_cast<uint32_t>(n);
-  p.op = kernel_op_(op);
-  p.pad0 = static_cast<uint32_t>(rank);
-  p.pad3 = word_off;
-  p.scale = scale;
-  p.offset = offset;
-  return c.encode_("ew_bcast_nd", ma, mb, mo, p, (n + 255) / 256, 1, mm);
+  using detail_::u32;
+  if (op < kop::badd || op > kop::bpow) return false;
+  if (rank <= 0 || rank > kPadFoldMaxRank || n <= 0) return false;
+  gpu::span meta =
+      meta_({{out_shape, rank}, {a_strides, rank}, {b_strides, rank}});
+  if (!meta) return false;
+  return detail_::launch_own_(
+      "ew_bcast_nd", kernel_(op).op,
+      {gpu::in(a), gpu::in(b), gpu::in(meta), gpu::out(out)},
+      detail_::bcast_nd_params{u32(n), u32(rank), scale, offset},
+      gpu::policy::flat(n));
 }
 
-// N-D broadcast ternary select: Tensor.where's GPU dispatch. A = cond, B = a,
-// D = b, E = meta [out_shape(rank), cond_strides(rank), a_strides(rank),
-// b_strides(rank)] (cond/a/b fill A/B/D, leaving E free for meta); p.pad0 =
-// rank, p.pad3 = b's element offset into D, p.pad4 = meta's word offset
-// into E. Bypasses operands_() (built for two real operands) since this one
-// needs three, the same way pad()/fold() above do their own mirror lookups.
+// N-D broadcast ternary select: Tensor.where's GPU dispatch, each operand
+// through its own broadcast strides.
 inline bool own::where_nd(gpu::span cond, const int64_t* c_strides, gpu::span a,
                           const int64_t* a_strides, gpu::span b,
                           const int64_t* b_strides, gpu::span out,
                           const int64_t* out_shape, int rank, int64_t n) {
-  auto& c = context::get();
-  if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank || n <= 0) return false;
-  params p = {};
-  uint32_t b_elem_off;
-  if (!elem_off_(cond.off, &p.a_off) || !elem_off_(a.off, &p.b_off) ||
-      !elem_off_(b.off, &b_elem_off) || !elem_off_(out.off, &p.c_off)) {
-    return false;
-  }
-  context::mirror* mcond = c.mirror_(cond.buf);
-  context::mirror* ma = c.mirror_(a.buf);
-  context::mirror* mb = c.mirror_(b.buf);
-  context::mirror* mo = c.mirror_(out.buf);
-  if (!mcond || !ma || !mb || !mo) return false;
-  c.device_read_(cond.buf);
-  c.device_read_(a.buf);
-  c.device_read_(b.buf);
-  c.device_write_(out.buf);
-
-  uint32_t word_off, *raw;
-  void* ring_tok = reserve_meta_(c, &word_off, &raw);
-  if (!ring_tok) return false;
-  for (int d = 0; d < rank; d++) raw[d] = static_cast<uint32_t>(out_shape[d]);
-  for (int d = 0; d < rank; d++) {
-    raw[rank + d] = static_cast<uint32_t>(c_strides[d]);
-  }
-  for (int d = 0; d < rank; d++) {
-    raw[2 * rank + d] = static_cast<uint32_t>(a_strides[d]);
-  }
-  for (int d = 0; d < rank; d++) {
-    raw[3 * rank + d] = static_cast<uint32_t>(b_strides[d]);
-  }
-  context::mirror* mm =
-      commit_meta_(c, ring_tok, word_off, raw, 4 * static_cast<size_t>(rank));
-
-  p.M = static_cast<uint32_t>(n);
-  p.pad0 = static_cast<uint32_t>(rank);
-  p.pad3 = b_elem_off;
-  p.pad4 = word_off;
-  return c.encode_("where_nd", mcond, ma, mo, p, (n + 255) / 256, 1, mb, mm);
+  using detail_::u32;
+  if (rank <= 0 || rank > kPadFoldMaxRank || n <= 0) return false;
+  gpu::span meta = meta_({{out_shape, rank}, {c_strides, rank},
+                          {a_strides, rank}, {b_strides, rank}});
+  if (!meta) return false;
+  return detail_::launch_own_(
+      "where_nd", -1,
+      {gpu::in(cond), gpu::in(a), gpu::in(b), gpu::in(meta), gpu::out(out)},
+      detail_::where_nd_params{u32(n), u32(rank)}, gpu::policy::flat(n));
 }
 
 // sum_to (un-broadcast a gradient): gather, mirrors cuda.h's tl_sum_to and
 // metal.h's own sum_to -- one invocation per OUTPUT element sums every `a`
-// element that broadcasts onto it, so no atomics (unlike index_add). Only
-// one real tensor operand (`a`), so -- like pad/fold above -- B is free for
-// the meta ring: [a_shape(rank), a_strides(rank), acc(rank)].
+// element that broadcasts onto it, so no atomics (unlike index_add).
 inline bool own::sum_to(gpu::span a, const int64_t* a_shape,
                         const int64_t* a_strides, const int64_t* acc, int rank,
                         int64_t out_n, int64_t reduced_n, gpu::span out) {
-  auto& c = context::get();
-  if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank) return false;
-  params p = {};
-  if (!elem_off_(a.off, &p.a_off) || !elem_off_(out.off, &p.c_off)) return false;
-  context::mirror* ma = c.mirror_(a.buf);
-  context::mirror* mo = c.mirror_(out.buf);
-  if (!ma || !mo) return false;
-  c.device_read_(a.buf);
-  c.device_write_(out.buf);
-
-  uint32_t word_off, *raw;
-  void* ring_tok = reserve_meta_(c, &word_off, &raw);
-  if (!ring_tok) return false;
-  for (int d = 0; d < rank; d++) {
-    raw[d] = static_cast<uint32_t>(a_shape[d]);
-  }
-  for (int d = 0; d < rank; d++) {
-    raw[rank + d] = static_cast<uint32_t>(a_strides[d]);
-  }
-  for (int d = 0; d < rank; d++) {
-    raw[2 * rank + d] = static_cast<uint32_t>(acc[d]);
-  }
-  context::mirror* mm =
-      commit_meta_(c, ring_tok, word_off, raw, 3 * static_cast<size_t>(rank));
-
-  p.M = static_cast<uint32_t>(out_n);
-  p.b_off = word_off;
-  p.pad0 = static_cast<uint32_t>(rank);
-  p.pad1 = static_cast<uint32_t>(reduced_n);
-  return c.encode_("sum_to", ma, mm, mo, p, (out_n + 255) / 256, 1);
+  using detail_::u32;
+  if (rank <= 0 || rank > kPadFoldMaxRank || out_n <= 0) return false;
+  gpu::span meta = meta_({{a_shape, rank}, {a_strides, rank}, {acc, rank}});
+  if (!meta) return false;
+  return detail_::launch_own_(
+      "sum_to", -1, {gpu::in(a), gpu::in(meta), gpu::out(out)},
+      detail_::sum_to_params{u32(out_n), u32(rank), u32(reduced_n)},
+      gpu::policy::flat(out_n));
 }
 
 // concat_part (Tensor.concat along an arbitrary axis, KV-cache append):
@@ -1130,78 +881,39 @@ inline bool own::sum_to(gpu::span a, const int64_t* a_shape,
 // axis -- see kernels/tensorlib_webgpu.wgsl's own concat_part for why this
 // is its own entry rather than reusing pad's (that one dispatches over
 // OUTPUT elements for its zero border; concat has no border and wants the
-// much smaller SOURCE element count instead). Only one real tensor operand
-// (`a`), so -- like pad/fold/sum_to above -- B is free for the meta ring:
-// [a_shape(rank), out_strides(rank)] (out_strides computed host-side,
-// mirrors cuda.h's own upload_pad_fold_meta_).
+// much smaller SOURCE element count instead). out_strides are computed
+// host-side, as cuda.h's upload_pad_fold_meta_ does.
 inline bool own::concat_part(gpu::span a, gpu::span out, const int64_t* a_shape,
                              const int64_t* out_shape, int rank, int axis,
                              int64_t before, int64_t n) {
-  auto& c = context::get();
-  if (!c.ready || rank <= 0 || rank > kPadFoldMaxRank || n <= 0) {
-    return false;
-  }
-  params p = {};
-  if (!elem_off_(a.off, &p.a_off) || !elem_off_(out.off, &p.c_off)) return false;
-  context::mirror* ma = c.mirror_(a.buf);
-  context::mirror* mo = c.mirror_(out.buf);
-  if (!ma || !mo) return false;
-  c.device_read_(a.buf);
-  c.device_write_(out.buf);
-
+  using detail_::u32;
+  if (rank <= 0 || rank > kPadFoldMaxRank || n <= 0) return false;
   int64_t out_strides[kPadFoldMaxRank];
-  int64_t acc = 1;
-  for (int d = rank - 1; d >= 0; d--) {
-    out_strides[d] = acc;
-    acc *= out_shape[d];
-  }
-
-  uint32_t word_off, *raw;
-  void* ring_tok = reserve_meta_(c, &word_off, &raw);
-  if (!ring_tok) return false;
-  for (int d = 0; d < rank; d++) raw[d] = static_cast<uint32_t>(a_shape[d]);
-  for (int d = 0; d < rank; d++) {
-    raw[rank + d] = static_cast<uint32_t>(out_strides[d]);
-  }
-  context::mirror* mm =
-      commit_meta_(c, ring_tok, word_off, raw, 2 * static_cast<size_t>(rank));
-
-  p.M = static_cast<uint32_t>(n);
-  p.b_off = word_off;
-  p.pad0 = static_cast<uint32_t>(rank);
-  p.pad1 = static_cast<uint32_t>(before * out_strides[axis]);
-  return c.encode_("concat_part", ma, mm, mo, p, (n + 255) / 256, 1);
+  contiguous_strides_into(out_shape, rank, out_strides);
+  gpu::span meta = meta_({{a_shape, rank}, {out_strides, rank}});
+  if (!meta) return false;
+  return detail_::launch_own_(
+      "concat_part", -1, {gpu::in(a), gpu::in(meta), gpu::out(out)},
+      detail_::concat_params{u32(n), u32(rank), u32(before * out_strides[axis])},
+      gpu::policy::flat(n));
 }
 
 // RoPE (rotary position embedding), half-split (GPT-NeoX / HF-llama)
 // convention -- mirrors cuda.h's/metal.h's own rope. x is [rows, D]
-// contiguous (rows = H*T); dispatched flat over rows*(D/2), matching
-// this file's other flat-1D kernels. No second real tensor operand, so
-// -- like unary()/clamp() above -- B binds x a second time (unused by
-// the WGSL). x/out always view at offset 0 (array.h's gpu_rope_ requires
-// x.offset_ == 0 and hands a fresh allocation for out), so there is no
-// ao/oo in this signature to convert.
+// contiguous (rows = H*T); dispatched flat over rows*(D/2), one invocation a
+// rotated pair.
 inline bool own::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                       int64_t D, int64_t pos, float base, gpu::span bias) {
-  auto& c = context::get();
-  if (!c.ready || D <= 0 || (D & 1) || bias.buf) return false;  // no fused bias
-  int64_t half = D / 2;
-  int64_t n = rows * half;
+  using detail_::u32;
+  if (D <= 0 || (D & 1) || bias.buf) return false;  // no fused bias
+  const int64_t half = D / 2;
+  const int64_t n = rows * half;
   if (n <= 0) return false;
-  params p = {};
-  if (!elem_off_(x.off, &p.a_off) || !elem_off_(out.off, &p.c_off)) return false;
-  context::mirror *ma, *mb, *mo;
-  if (!operands_(c, x.buf, nullptr, out.buf, &ma, &mb, &mo)) return false;
-  p.b_off = p.a_off;
-  p.M = static_cast<uint32_t>(n);
-  p.N = static_cast<uint32_t>(T);
-  p.K = static_cast<uint32_t>(D);
-  p.pad0 = static_cast<uint32_t>(pos);
-  p.pad1 = static_cast<uint32_t>(half);
-  p.scale = base;
-  return c.encode_("rope", ma, mb, mo, p, (n + 255) / 256, 1);
+  return detail_::launch_own_(
+      "rope", -1, {gpu::in(x), gpu::out(out)},
+      detail_::rope_params{u32(n), u32(T), u32(D), u32(pos), u32(half), base},
+      gpu::policy::flat(n));
 }
-
 
 // What a model may ask of this backend beyond the kernel contract (gpu.h),
 // and the graph-capture group it names: none of it here, so each answers
