@@ -100,11 +100,15 @@ That is what lets a backend realize a launch with no per-kernel host code:
   followed by the params' fields, four bytes apiece. Its kernels take their
   pointers first and 4-byte scalars after (116 of the 117 do;
   `tools/cuda_trace/gen_kernel_sigs.py` reads this off the `.cu`).
-- **WebGPU**'s kernels predate the ABI: every entry point reads one 96-byte
-  uniform layout, a family picks its operation by number, and the bind group is
-  fixed (A and B read, C written, D and E read). Its core carries a `marshal_`
-  from the canonical params into that layout, per kernel id. This stays inside
-  `webgpu.h`; a backend whose kernels follow the ABI needs none.
+- **WebGPU** binds view *i*, whole, at binding *i* and a uniform at binding
+  *n*: the views' element offsets, then the params. A binding offset has to be
+  256-byte aligned, which a view's is not, so the offsets travel in the uniform
+  and each kernel folds them into its indexing. The WGSL declares each
+  kernel's bindings, read-only for an input and read-write for an output, and
+  each pipeline takes its layout from them. WGSL has no templates, so a family
+  of operations (add, sub, ...) is one entry point, and the operation is the
+  pipeline-overridable constant `OP`, set per kernel id from the kernel table
+  rather than carried in the params.
 
 Where two backends' kernels disagreed, the CUDA kernel's order is canonical,
 because the `.cu` is the one source no development machine here can run, and
@@ -228,7 +232,7 @@ which never reaches the evaluator, is profiled from its first kernel.
 1. If every backend can run it as one kernel with the same buffers: add its
    params struct to `gpu_abi.h`, the function to `gpu_ops.h`, the kernel to each
    backend's source with that layout, and the id to each backend's kernel table
-   (`kernel_name_` in `metal.h` and `cuda.h`, `marshal_` in `webgpu.h`).
+   (`kernel_name_` in `metal.h` and `cuda.h`, `kernel_` in `webgpu.h`).
 2. Otherwise add the detecting wrapper to `gpu_ops.h` and the member to the
    `own` struct of each backend that implements it.
 3. A backend that gets neither simply declines the op. Nothing else changes.
@@ -265,11 +269,6 @@ What a test may ask of a backend is asked in code, not by platform macro:
 `gpu::has_<op>` (whether the selected backend runs a backend-own op),
 `gpu::caps`, `gpu::traits`. A test that needs to know whether a kernel exists
 asks; a new backend edits no test.
-
-## What is not shared yet
-
-- WebGPU's kernels still predate the canonical ABI and go through `marshal_`
-  (see above).
 
 ## Verifying a change
 
