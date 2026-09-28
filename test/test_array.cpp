@@ -94,6 +94,17 @@ TEST_CASE("creation and introspection") {
   CHECK_THROWS(array::from({1, 2, 3}, {2, 2}));
 }
 
+TEST_CASE("a size past int64 is refused, not wrapped into a small buffer") {
+  // 2^62 f32 elements are 2^64 bytes: wrapped, that was a 0-byte buffer every
+  // element was then written into.
+  CHECK_THROWS_AS(array::zeros({int64_t{1} << 40, int64_t{1} << 22}),
+                  std::length_error);
+  CHECK_THROWS_AS(array::zeros({int64_t{1} << 40, int64_t{1} << 40}),
+                  std::length_error);
+  // a zero extent is empty however large the others are
+  CHECK(array::zeros({int64_t{1} << 40, int64_t{1} << 40, 0}).size() == 0);
+}
+
 TEST_CASE("elementwise with broadcasting") {
   auto a = array::from({1, 2, 3, 4, 5, 6}, {2, 3});
   auto row = array::from({10, 20, 30});

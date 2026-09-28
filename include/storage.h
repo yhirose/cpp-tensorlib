@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 
 namespace tl {
 
@@ -69,8 +70,15 @@ struct storage {
     return heap_bytes_(elems, nb, dt);
   }
 
-  // Plain elems x width in bytes; the allocators clamp the empty case.
-  static int64_t plain_bytes_(int64_t n, dtype dt) { return n * dtype_size(dt); }
+  // Plain elems x width in bytes; the allocators clamp the empty case. A
+  // product past int64 is refused where it is formed: wrapped, it sized a few
+  // bytes that every element was then written into.
+  static int64_t plain_bytes_(int64_t n, dtype dt) {
+    int64_t bytes;
+    if (!size_mul(n, dtype_size(dt), bytes))
+      throw std::length_error("tensorlib: buffer too large");
+    return bytes;
+  }
 
  private:
   // A zero-length allocation still needs a distinct, dereferenceable address —

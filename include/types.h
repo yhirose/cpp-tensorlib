@@ -22,6 +22,17 @@ enum class dtype : uint8_t { f32, bf16, q4 };
 // Byte width for the plain widths (q4 is variable — use q4_bytes()).
 inline int64_t dtype_size(dtype dt) { return dt == dtype::bf16 ? 2 : 4; }
 
+// `a * b` of two non-negative sizes into `out`, or false when it passes int64.
+inline bool size_mul(int64_t a, int64_t b, int64_t& out) {
+#if defined(_MSC_VER) && !defined(__clang__)
+  if (b != 0 && a > INT64_MAX / b) return false;
+  out = a * b;
+  return true;
+#else
+  return !__builtin_mul_overflow(a, b, &out);
+#endif
+}
+
 // For error messages that name the actual non-f32 storage kind rather than
 // assuming it's always bf16 (raw()/data() used to hardcode "bf16 storage"
 // even when the real culprit was q4).

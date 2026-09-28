@@ -48,9 +48,14 @@ using shape_t = std::vector<int64_t>;
 
 namespace detail {
 
+// A count past int64 is refused where it is formed, not wrapped into one a
+// buffer is then sized by. A zero extent is an empty shape whatever the rest.
 inline int64_t num_elements(const shape_t& s) {
+  for (auto d : s)
+    if (d == 0) return 0;
   int64_t n = 1;
-  for (auto d : s) n *= d;
+  for (auto d : s)
+    if (!size_mul(n, d, n)) throw std::length_error("tensorlib: shape too large");
   return n;
 }
 
