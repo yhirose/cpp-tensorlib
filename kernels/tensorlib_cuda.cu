@@ -1753,25 +1753,48 @@ __device__ __forceinline__ void attn_span_core(
 
   float m = -1e30f, l = 0.0f;
   float acc[NW] = {};  // lane holds dims d = lane, lane+32, ..., lane+(NW-1)*32
-  for (unsigned i = k0 + warp; i < k1; i += (unsigned)NW) {
-    const KT* Ki = Kh + (size_t)i * AD;
-    float partial = 0.0f;
+  // A warp's keys, U at a time: the U K rows are read and their scores reduced
+  // together, so each key's load latency overlaps the others' instead of
+  // standing alone at the head of a serial chain; the softmax update and the V
+  // accumulation then take the keys one by one, in the order they would have
+  // gone alone, so the sums are the same. (A tail of fewer than U keys masks
+  // the rest out.)
+  constexpr int U = 4;
+  for (unsigned i0 = k0 + warp; i0 < k1; i0 += (unsigned)(NW * U)) {
+    float sc[U];
 #pragma unroll
-    for (int r = 0; r < NW; r++)
-      partial += q_sh[lane + r * 32] * kv_ld(Ki[lane + r * 32]);
+    for (int u = 0; u < U; u++) {
+      const unsigned i = i0 + (unsigned)(u * NW);
+      float partial = 0.0f;
+      if (i < k1) {
+        const KT* Ki = Kh + (size_t)i * AD;
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1)
-      partial += __shfl_down_sync(0xffffffffu, partial, off);
-    float sc = __shfl_sync(0xffffffffu, partial, 0) * scale;  // lane0's sum
-    float m_new = fmaxf(m, sc);
-    float corr = __expf(m - m_new);
-    float p = __expf(sc - m_new);
-    l = l * corr + p;
-    const KT* Vi = Vh + (size_t)i * AD;
+        for (int r = 0; r < NW; r++)
+          partial += q_sh[lane + r * 32] * kv_ld(Ki[lane + r * 32]);
+      }
+      sc[u] = partial;
+    }
 #pragma unroll
-    for (int r = 0; r < NW; r++)
-      acc[r] = acc[r] * corr + p * kv_ld(Vi[lane + r * 32]);
-    m = m_new;
+    for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+      for (int u = 0; u < U; u++)
+        sc[u] += __shfl_down_sync(0xffffffffu, sc[u], off);
+    }
+#pragma unroll
+    for (int u = 0; u < U; u++) {
+      const unsigned i = i0 + (unsigned)(u * NW);
+      if (i >= k1) break;
+      float s = __shfl_sync(0xffffffffu, sc[u], 0) * scale;  // lane0's sum
+      float m_new = fmaxf(m, s);
+      float corr = __expf(m - m_new);
+      float p = __expf(s - m_new);
+      l = l * corr + p;
+      const KT* Vi = Vh + (size_t)i * AD;
+#pragma unroll
+      for (int r = 0; r < NW; r++)
+        acc[r] = acc[r] * corr + p * kv_ld(Vi[lane + r * 32]);
+      m = m_new;
+    }
   }
 
   // Merge the NW warps' partial softmax states through shared memory (warps
