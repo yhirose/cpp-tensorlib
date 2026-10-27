@@ -841,9 +841,15 @@ inline bool swiglu(span gu, span o, int64_t ff, int64_t rows = 1) {
 // state holds the K-1 inputs before the first token [K-1, C], oldest first,
 // and is left holding the K-1 before the next call. The kernels keep the
 // window in registers, to K = 8.
+TL_GPU_DETECT_OWN(ssm_conv_tokens)
+template <class Own = own>
 inline bool ssm_conv(span x, int64_t ld, span state, span w, span o, int64_t C,
                      int64_t K, int64_t T = 1) {
   if (C <= 0 || K < 2 || T <= 0 || ld < C) return false;
+  // A prefill's many tokens: a backend's token-parallel form, where it has one.
+  if constexpr (detail::owns_ssm_conv_tokens<Own>::value) {
+    if (T > 1 && detail::ran(Own::ssm_conv_tokens(x, ld, state, w, o, C, K, T))) return true;
+  }
   return (K <= 8 &&
           launch(kop::ssm_conv_, {in(x), inout(state), in(w), out(o)},
                  ssm_conv_params{static_cast<uint32_t>(C), static_cast<uint32_t>(K),

@@ -3263,6 +3263,21 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     CHECK(same(Sa, Sb, 0.0f));
     CHECK(same(ca, cc, 1e-5f));  // the kernel against the composition
     CHECK(same(csa, csc, 0.0f));
+    // Two tokens, fewer than the K-1 the window holds: the state left behind
+    // keeps one row of the old one.
+    {
+      array s2a = dev(cs0), s2b = dev(cs0);
+      array c2a = array::empty({2, C}), c2b = array::empty({2, C});
+      REQUIRE(gpu::ssm_conv(x.device_span(), ld, s2a.device_span(), w.device_span(),
+                            c2a.device_span(), C, K, 2));
+      for (int64_t t = 0; t < 2; t++) {
+        REQUIRE(gpu::ssm_conv(x.device_span().at(t * ld * 4), ld, s2b.device_span(),
+                              w.device_span(), c2b.device_span().at(t * C * 4), C, K));
+      }
+      tl::gpu::flush();
+      CHECK(same(c2a, c2b, 0.0f));
+      CHECK(same(s2a, s2b, 0.0f));
+    }
     CHECK(same(oa, oc, 1e-4f));
     CHECK(same(Sa, Sc, 1e-4f));
   }

@@ -351,7 +351,7 @@ Decode started at 3.5 tok/s and reached ~460 by removing host-side graph
 construction, then per-launch overhead, then GEMV inefficiency. Against
 llama.cpp on the same files and GPU, decode is at parity or ahead for
 Qwen2.5, Qwen3 and Qwen3.5, with or without 2048 tokens cached, and prefill
-is 1.3-1.8x behind:
+is 1.2-1.6x behind, mostly because llama.cpp sums F16 products in f16:
 [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md) has the numbers,
 what differs between the two runs, and how to reproduce them.
 

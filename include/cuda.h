@@ -569,6 +569,9 @@ struct context {
   CUfunction gemm_bf16_nt_sk_() {
     return cached_(gemm_bf16_nt_sk_fn, "tl_gemm_bf16_nt_sk");
   }
+  CUfunction conv_tok_fn = nullptr, conv_state_fn = nullptr;  // a prefill's conv
+  CUfunction conv_tok_() { return cached_(conv_tok_fn, "tl_ssm_conv_tokens"); }
+  CUfunction conv_state_() { return cached_(conv_state_fn, "tl_ssm_conv_state"); }
   CUfunction gdc_prep_fn = nullptr, gdc_scan_fn = nullptr;  // the chunked delta rule
   CUfunction gdc_prep_() { return cached_(gdc_prep_fn, "tl_gated_delta_chunk_prep"); }
   CUfunction gdc_scan_() { return cached_(gdc_scan_fn, "tl_gated_delta_chunk_scan"); }
@@ -907,6 +910,9 @@ struct own {
                                int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
                                int64_t kv_max, int64_t D, float scale,
                                bool kv_bf16 = false, int64_t pos0 = 0);
+  // Gated DeltaNet's conv over a prefill's T tokens, a thread a (channel, token).
+  static bool ssm_conv_tokens(gpu::span x, int64_t ld, gpu::span state, gpu::span w,
+                              gpu::span o, int64_t C, int64_t K, int64_t T);
   // The gated delta rule over a prefill's T tokens, in chunks (gpu::gated_delta).
   static bool gated_delta_chunked(gpu::span qkv, gpu::span ab, int64_t ab_ld,
                                   gpu::span adt, gpu::span state, gpu::span o,
@@ -1962,6 +1968,27 @@ inline bool own::attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V,
                    pk, pv, po, uT, static_cast<unsigned>(kv_max * D),
                    static_cast<unsigned>(n_q_heads / n_kv_heads), scale,
                    static_cast<unsigned>(pos0));
+}
+
+// A prefill's conv (tl_ssm_conv_tokens, then tl_ssm_conv_state for the window
+// the next call starts from).
+inline bool own::ssm_conv_tokens(gpu::span x, int64_t ld, gpu::span state,
+                                 gpu::span w, gpu::span o, int64_t C, int64_t K,
+                                 int64_t T) {
+  auto& c = context::get();
+  if (!c.ready || K < 2 || K > 8 || T < 2 || T > 65535) return false;
+  c.device_read_(x.buf);
+  c.device_rmw_(state.buf);
+  c.device_read_(w.buf);
+  c.device_write_(o.buf);
+  float* px = context::off_(x.buf, x.off);
+  float* ps = context::off_(state.buf, state.off);
+  float* pw = context::off_(w.buf, w.off);
+  float* po = context::off_(o.buf, o.off);
+  const unsigned uC = (unsigned)C, uK = (unsigned)K, uT = (unsigned)T, uld = (unsigned)ld;
+  const unsigned gx = (uC + 255) / 256;
+  return c.launch_(c.conv_tok_(), {gx, uT}, {256}, 0, px, ps, pw, po, uC, uK, uT, uld) &&
+         c.launch_(c.conv_state_(), {gx}, {256}, 0, px, ps, uC, uK, uT, uld);
 }
 
 // The chunked delta rule (tl_gated_delta_chunk_prep, then _scan): dk 128, dv a

@@ -26,25 +26,51 @@ out).
 | | pp512 @ d2048 | 20,003 | 30,004 | 0.67 |
 | Qwen3.5-0.8B F16 | tg128 | 386 | 290-291 | 1.33 |
 | | tg128 @ d2048 | 376 | 289-292 | 1.29-1.30 |
-| | pp512 | 17,953 | 27,916 | 0.64 |
-| | pp512 @ d2048 | 15,298 | 27,401 | 0.56 |
+| | pp512 | 20,729 | 27,916 | 0.74 |
+| | pp512 @ d2048 | 17,457 | 27,401 | 0.64 |
 | Qwen3.5-0.8B BF16 | tg128 | 379 | 288 | 1.32 |
 | | tg128 @ d2048 | 372 | 288 | 1.29 |
-| | pp512 | 16,618 | 23,963 | 0.69 |
-| | pp512 @ d2048 | 14,049 | 23,208 | 0.61 |
+| | pp512 | 20,057 | 23,963 | 0.84 |
+| | pp512 @ d2048 | 16,710 | 23,208 | 0.72 |
 
 Decode is at parity or ahead on every model, with or without 2048 tokens
 cached. Until the decode attention overlapped its key loads and split its
 keys finer (2026-10-27), Qwen2.5 trailed by 18% at depth: a block's warps
 walked ~64 keys each in series, one load at a time.
 
-Prefill is 1.3-1.8x behind. Its GEMM and its attention now run on the tensor
+Prefill is 1.2-1.6x behind; most of that is accumulation precision (below). Its GEMM and its attention now run on the tensor
 cores too: the GEMM with the activations rounded to bf16, the attention with
 q, k and v rounded to f16 (both computed in f32 on the CUDA cores until
 2026-10-27, when prefill was 2.6-5.6x behind and Qwen3's dropped 3x at
 depth). Qwen3.5's DeltaNet layers run the gated delta rule in 32-token
 chunks (as small matrix products, f32), where they had walked it a token at
 a time.
+
+## Why prefill is still behind
+
+**Most of it is accumulation precision.** llama.cpp multiplies F16 weights
+through cuBLAS with `CUBLAS_COMPUTE_16F`, summing in f16
+(`ggml_cuda_mul_mat_cublas`); BF16 weights get `CUBLAS_COMPUTE_32F`. On this
+GPU the tensor cores run f16-accumulate at twice the f32-accumulate rate,
+measured with `mma.sync.m16n8k16`: 142 against 71 TFLOPS (bf16 with f32
+accumulation is 71 as well). This library sums in f32, so its ceiling is
+the lower one. llama.cpp's own F16 files prefill 1.16-1.21x faster than the
+same weights as BF16.
+
+**At the same precision** — bf16 weights, f32 sums on the tensor cores,
+which is what llama.cpp does for a BF16 file (the Qwen2.5 and Qwen3 BF16
+files below were made from the F16 ones with `llama-quantize ... BF16`) —
+pp512 measured:
+
+| model | tensorlib | llama.cpp | ratio |
+|---|---:|---:|---:|
+| Qwen2.5-0.5B BF16 | 37,678 | 41,255 | 0.91 |
+| Qwen3-0.6B BF16 | 27,225 | 33,111 | 0.82 |
+| Qwen3.5-0.8B BF16 | 20,057 | 24,801 | 0.81 |
+
+What is left there is mostly the GEMM: this library's runs at ~46% of the
+71 TFLOPS ceiling, and the narrow projections (QKV, O, down) fall to its
+64x64 tile to fill the GPU.
 
 ## What differs between the two runs
 

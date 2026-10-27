@@ -510,6 +510,40 @@ extern "C" __global__ void tl_ssm_conv(const float* __restrict__ x,
   for (unsigned k = 0; k + 1 < K; k++) state[(size_t)k * C + c] = win[k];
 }
 
+// The same conv over a prefill's tokens with a thread a (channel, token): each
+// output reads its window from x and, for the first K-1 tokens, the state, in
+// the order tl_ssm_conv sums it (so the outputs are the same bits). The state
+// moves on in tl_ssm_conv_state, once every window has read the old one.
+extern "C" __global__ void tl_ssm_conv_tokens(const float* __restrict__ x,
+                                              const float* __restrict__ state,
+                                              const float* __restrict__ w,
+                                              float* __restrict__ out, unsigned C,
+                                              unsigned K, unsigned T, unsigned ld) {
+  const unsigned c = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+  if (c >= C) return;
+  // in(u): input u of the window, u < 0 reaching back into the state.
+  auto in = [&](int u) {
+    return u >= 0 ? x[(size_t)u * ld + c] : state[(size_t)((int)K - 1 + u) * C + c];
+  };
+  float acc = in((int)t) * w[(size_t)(K - 1) * C + c];
+  for (unsigned k = 0; k + 1 < K; k++) acc += in((int)t - (int)(K - 1) + (int)k) * w[(size_t)k * C + c];
+  out[(size_t)t * C + c] = acc / (1.0f + expf(-acc));
+}
+// The window after the last token: the K-1 inputs before the next call, read
+// whole before any is written (a short prompt keeps some of the old state).
+extern "C" __global__ void tl_ssm_conv_state(const float* __restrict__ x,
+                                             float* __restrict__ state, unsigned C,
+                                             unsigned K, unsigned T, unsigned ld) {
+  const unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= C) return;
+  float keep[7];  // K <= 8, which the launcher checks
+  for (unsigned k = 0; k + 1 < K; k++) {
+    const int u = (int)T - (int)(K - 1) + (int)k;
+    keep[k] = u >= 0 ? x[(size_t)u * ld + c] : state[(size_t)((int)K - 1 + u) * C + c];
+  }
+  for (unsigned k = 0; k + 1 < K; k++) state[(size_t)k * C + c] = keep[k];
+}
+
 // The gated delta rule over T tokens (gpu_ops.h gated_delta has the math).
 // grid = (ceil(dv/32), H), blockDim = dk (a power of two, 32 to 1024): a block
 // owns 32 columns of its head's state S [dk, dv], and warp w the 32 rows from
