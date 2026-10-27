@@ -142,7 +142,24 @@ static bool check_hybrid(const qm::gg::model& m, const Oracle& O) {
   }
   dec.destroy();
   std::printf("\n  greedy %s\n", dec_ok ? "MATCH" : "DIVERGE");
-  return ok && bf16_ok && logits_ok && dec_ok;
+
+  // A prompt past one chunk of the delta rule (32 tokens), so the batched
+  // prefill takes the backend's chunked form where it has one: its last
+  // token's top-5 logits against the imperative path's.
+  std::vector<int> longp;
+  for (int64_t i = 0; i < 96; i++) longp.push_back(O.prompt_ids[i % NP]);
+  qm::reset_cache(B);
+  for (int64_t i = 0; i < (int64_t)longp.size(); i++) qm::step_imperative(B, longp[i], i);
+  const std::vector<float> imp_long = logits_of(B);
+  qm::reset_cache(B);
+  bool long_ok = true;
+  if (qm::prefill_batched(B, longp) >= 0) {
+    const double l5 = qm::top5_maxrel(logits_of(B).data(), imp_long.data(), B.c.VOCAB);
+    long_ok = l5 < 1e-2;
+    std::printf("\n96-token prompt, batched vs imperative: top-5 logits maxrel %.2e %s\n", l5,
+                long_ok ? "OK" : "FAIL");
+  }
+  return ok && bf16_ok && logits_ok && dec_ok && long_ok;
 }
 
 int main(int argc, char** argv) {

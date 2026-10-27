@@ -580,6 +580,238 @@ extern "C" __global__ void tl_gated_delta(const float* __restrict__ qkv,
   }
 }
 
+// ---- The gated delta rule in chunks (a prefill's T tokens; the math of
+// gpu_ops.h gated_delta, regrouped). Within a chunk of C tokens with g_t the
+// cumulative log-decay from its start, each token's correction
+// d_t = beta_t (v_t - k_t . S'_t) solves (I + A) D = beta V - beta e^g K h, h
+// the state entering the chunk and A_ts = beta_t e^(g_t - g_s) k_t . k_s for
+// s < t. With T = (I + A)^-1, W = T diag(beta e^g) K and U = T diag(beta) V:
+//   D = U - W h,  o_t = e^(g_t) q_t h + sum_{s<=t} (q_t . k_s) e^(g_t - g_s) d_s,
+//   h' = e^(g_C) h + sum_s e^(g_C - g_s) k_s d_s^T.
+// Everything but h is the chunk's own, so a first kernel builds it for every
+// (chunk, head) at once, and a second walks the chunks in order, a block a
+// (head, 32 columns of the state): a few small matrix products a chunk where
+// the per-token kernel had a dependent step a token. All f32.
+#define TL_GDC 32  // tokens a chunk
+extern "C" __global__ void tl_gated_delta_chunk_prep(
+    const float* __restrict__ qkv, const float* __restrict__ ab,
+    const float* __restrict__ adt, float* __restrict__ Qn, float* __restrict__ Kn,
+    float* __restrict__ W, float* __restrict__ U, float* __restrict__ P,
+    float* __restrict__ G, unsigned H, unsigned dv, unsigned T, unsigned ab_ld,
+    float eps) {
+  constexpr int C = TL_GDC, DK = 128;
+  __shared__ float Qs[C][DK], Ks[C][DK];  // Qs later holds V
+  __shared__ float Am[C][C + 1], Tm[C][C + 1];
+  __shared__ float gs[C], bs[C], bg[C];  // bg = beta e^g
+  const unsigned c = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, NTH = blockDim.x;
+  const unsigned warp = tid >> 5, lane = tid & 31, NW = NTH >> 5;
+  const unsigned t0 = c * C, n = min((unsigned)C, T - t0);
+  const size_t nq = (size_t)H * DK, Cq = 2 * nq + (size_t)H * dv;
+  const size_t hb = (size_t)h * T;  // this head's first row in the scratch
+  // q and k, L2-normalized (q also over sqrt(DK)); rows past the chunk zero.
+  for (unsigned t = warp; t < C; t += NW) {
+    float a[DK / 32], b[DK / 32], sq = 0.0f, sk = 0.0f;
+#pragma unroll
+    for (int r = 0; r < DK / 32; r++) {
+      const unsigned d = lane + 32 * r;
+      a[r] = t < n ? qkv[(t0 + t) * Cq + (size_t)h * DK + d] : 0.0f;
+      b[r] = t < n ? qkv[(t0 + t) * Cq + nq + (size_t)h * DK + d] : 0.0f;
+      sq += a[r] * a[r];
+      sk += b[r] * b[r];
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      sq += __shfl_xor_sync(0xffffffffu, sq, off);
+      sk += __shfl_xor_sync(0xffffffffu, sk, off);
+    }
+    const float qn = 1.0f / sqrtf(sq + eps) / sqrtf((float)DK), kn = 1.0f / sqrtf(sk + eps);
+#pragma unroll
+    for (int r = 0; r < DK / 32; r++) {
+      const unsigned d = lane + 32 * r;
+      Qs[t][d] = a[r] * qn;
+      Ks[t][d] = b[r] * kn;
+      if (t < n) {
+        Qn[(hb + t0 + t) * DK + d] = a[r] * qn;
+        Kn[(hb + t0 + t) * DK + d] = b[r] * kn;
+      }
+    }
+  }
+  // The gates, then g's running sum over the chunk.
+  if (tid < C) {
+    float la = 0.0f, be = 0.0f;
+    if (tid < n) {
+      const float* abt = ab + (size_t)(t0 + tid) * ab_ld;
+      const float x = abt[h] + adt[H + h];
+      la = adt[h] * (x > 20.0f ? x : log1pf(expf(x)));
+      be = 1.0f / (1.0f + expf(-abt[H + h]));
+    }
+    gs[tid] = la;
+    bs[tid] = be;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float acc = 0.0f;
+    for (int t = 0; t < C; t++) gs[t] = (acc += gs[t]);
+  }
+  __syncthreads();
+  if (tid < n) G[hb + t0 + tid] = gs[tid];
+  if (tid < C) bg[tid] = bs[tid] * expf(gs[tid]);
+  // A (strictly lower) and P (lower with the diagonal), a dot product a cell.
+  for (unsigned e = tid; e < C * C; e += NTH) {
+    const unsigned t = e / C, sc = e % C;
+    float kk = 0.0f, qk = 0.0f;
+    if (sc <= t && t < n) {
+#pragma unroll 8
+      for (int d = 0; d < DK; d++) {
+        kk += Ks[t][d] * Ks[sc][d];
+        qk += Qs[t][d] * Ks[sc][d];
+      }
+    }
+    const float dec = sc <= t && t < n ? expf(gs[t] - gs[sc]) : 0.0f;
+    Am[t][sc] = sc < t ? bs[t] * dec * kk : 0.0f;
+    P[((size_t)h * gridDim.x + c) * C * C + e] = qk * dec;
+  }
+  __syncthreads();
+  // T = (I + A)^-1 by forward substitution, a warp a pass: row t is e_t minus
+  // A[t][s] times row s for every s < t.
+  if (warp == 0) {
+    for (unsigned t = 0; t < C; t++) {
+      float v = lane == t ? 1.0f : 0.0f;
+      for (unsigned sc = 0; sc < t; sc++) v -= Am[t][sc] * Tm[sc][lane];
+      Tm[t][lane] = v;
+      __syncwarp();
+    }
+  }
+  // V into Qs, whose q is spent.
+  for (unsigned e = tid; e < C * dv; e += NTH) {
+    const unsigned t = e / dv, d = e % dv;
+    Qs[t][d] = t < n ? qkv[(t0 + t) * Cq + 2 * nq + (size_t)h * dv + d] : 0.0f;
+  }
+  __syncthreads();
+  // W = T diag(beta e^g) K and U = T diag(beta) V, the rows of the chunk.
+  for (unsigned e = tid; e < n * DK; e += NTH) {
+    const unsigned t = e / DK, d = e % DK;
+    float w = 0.0f;
+    for (unsigned sc = 0; sc <= t; sc++) w += Tm[t][sc] * bg[sc] * Ks[sc][d];
+    W[(hb + t0 + t) * DK + d] = w;
+  }
+  for (unsigned e = tid; e < n * dv; e += NTH) {
+    const unsigned t = e / dv, d = e % dv;
+    float u = 0.0f;
+    for (unsigned sc = 0; sc <= t; sc++) u += Tm[t][sc] * bs[sc] * Qs[sc][d];
+    U[(hb + t0 + t) * dv + d] = u;
+  }
+}
+// The chunks in order, a block a (head, 32 state columns): 4 warps, warp w
+// holding rows 32w.. of its lane's column in registers as the decode kernel
+// does, and each chunk's W, q and k rows staged in turn through one buffer.
+extern "C" __global__ void tl_gated_delta_chunk_scan(
+    const float* __restrict__ Qn, const float* __restrict__ Kn,
+    const float* __restrict__ W, const float* __restrict__ U,
+    const float* __restrict__ P, const float* __restrict__ G,
+    float* __restrict__ state, float* __restrict__ out, unsigned H, unsigned dv,
+    unsigned T) {
+  constexpr int C = TL_GDC, DK = 128, R = 32;
+  __shared__ __align__(16) float Buf[C][DK];
+  __shared__ float red[DK / R][C][32];
+  __shared__ float Dl[C][32];
+  __shared__ float Pc[C][C + 1];
+  __shared__ float gc[C], ed[C];
+  const unsigned h = blockIdx.y, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+  const unsigned j = blockIdx.x * 32 + lane, i0 = w * R;
+  const size_t hb = (size_t)h * T;
+  const unsigned nch = (T + C - 1) / C;
+  float* S = state + (size_t)h * DK * dv;
+  float Sr[R];
+#pragma unroll
+  for (int r = 0; r < R; r++) Sr[r] = S[(size_t)(i0 + r) * dv + j];
+  // A chunk's rows of W, q and k reach Buf in turn, but are all read into
+  // registers at the chunk's start, 16 bytes a load: with 4 warps an SM there
+  // is no other work to hide a load behind, so the three latencies overlap.
+  constexpr int NV = C * DK / 4 / 128;  // float4s a thread a matrix (128 threads)
+  auto load = [&](const float* src, unsigned t0, unsigned n, float4* v) {
+#pragma unroll
+    for (int k = 0; k < NV; k++) {
+      const unsigned e = (tid + k * 128) * 4, t = e / DK, d = e % DK;
+      v[k] = t < n ? *reinterpret_cast<const float4*>(src + (hb + t0 + t) * DK + d)
+                   : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+  };
+  auto put = [&](const float4* v) {
+#pragma unroll
+    for (int k = 0; k < NV; k++) {
+      const unsigned e = (tid + k * 128) * 4, t = e / DK, d = e % DK;
+      *reinterpret_cast<float4*>(&Buf[t][d]) = v[k];
+    }
+  };
+  // red[w][t][lane]: warp w's part of sum_i Buf[t][i] h[i][j], over its rows,
+  // four tokens at a time so four sums are in flight (one warp a scheduler
+  // has nothing else to hide a dependent chain behind).
+  auto partial = [&]() {
+    for (unsigned t = 0; t < C; t += 4) {
+      float p[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+      for (int r = 0; r < R; r++)
+#pragma unroll
+        for (int u = 0; u < 4; u++) p[u] += Buf[t + u][i0 + r] * Sr[r];
+#pragma unroll
+      for (int u = 0; u < 4; u++) red[w][t + u][lane] = p[u];
+    }
+  };
+  for (unsigned c = 0; c < nch; c++) {
+    const unsigned t0 = c * C, n = min((unsigned)C, T - t0);
+    __syncthreads();  // the previous chunk is done with every buffer
+    float4 vw[NV], vq[NV], vk[NV];
+    load(W, t0, n, vw);
+    load(Qn, t0, n, vq);
+    load(Kn, t0, n, vk);
+    for (unsigned e = tid; e < C * C; e += blockDim.x)
+      Pc[e / C][e % C] = P[((size_t)h * nch + c) * C * C + e];
+    if (tid < C) gc[tid] = tid < n ? G[hb + t0 + tid] : 0.0f;
+    put(vw);
+    __syncthreads();
+    if (tid < C) ed[tid] = tid < n ? expf(gc[n - 1] - gc[tid]) : 0.0f;
+    partial();
+    __syncthreads();
+    // D = U - W h; each warp finishes C/4 of the chunk's tokens.
+    for (unsigned t = w * (C / 4); t < (w + 1) * (C / 4); t++) {
+      float wh = 0.0f;
+#pragma unroll
+      for (int ww = 0; ww < DK / R; ww++) wh += red[ww][t][lane];
+      Dl[t][lane] = t < n ? U[(hb + t0 + t) * dv + j] - wh : 0.0f;
+    }
+    __syncthreads();
+    put(vq);
+    __syncthreads();
+    partial();
+    __syncthreads();
+    // o_t = e^(g_t) q_t h + sum_{s<=t} P[t][s] d_s.
+    for (unsigned t = w * (C / 4); t < (w + 1) * (C / 4) && t < n; t++) {
+      float qh = 0.0f;
+#pragma unroll
+      for (int ww = 0; ww < DK / R; ww++) qh += red[ww][t][lane];
+      float o = expf(gc[t]) * qh;
+      for (unsigned sc = 0; sc <= t; sc++) o += Pc[t][sc] * Dl[sc][lane];
+      out[(size_t)(t0 + t) * H * dv + (size_t)h * dv + j] = o;
+    }
+    __syncthreads();  // every warp is done with q's rows
+    put(vk);
+    __syncthreads();
+    // h' = e^(g_C) h + sum_t e^(g_C - g_t) k_t d_t^T.
+    // The token loop outside: the 32 rows are 32 independent sums.
+    const float eC = expf(gc[n - 1]);
+#pragma unroll
+    for (int r = 0; r < R; r++) Sr[r] *= eC;
+    for (unsigned t = 0; t < n; t++) {
+      const float cf = ed[t] * Dl[t][lane];
+#pragma unroll
+      for (int r = 0; r < R; r++) Sr[r] += cf * Buf[t][i0 + r];
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < R; r++) S[(size_t)(i0 + r) * dv + j] = Sr[r];
+}
+
 // Token-major [T, ld] -> head-major [H, T, D], adding an optional per-head bias.
 // The batched projections produce all heads of a token contiguously, while the
 // attention kernels want each head's token sequence contiguous; `off` selects a

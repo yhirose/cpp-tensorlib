@@ -860,10 +860,20 @@ inline bool ssm_conv(span x, int64_t ld, span state, span w, span o, int64_t C,
 //   decay = exp(A * softplus(alpha + dt)), beta = sigmoid(beta),
 //   S = S * decay;  S += k (x) ((v - k.S) * beta);  o_t = q.S
 // into row t of o [T, H*dv]. State and output are f32.
+TL_GPU_DETECT_OWN(gated_delta_chunked)
+template <class Own = own>
 inline bool gated_delta(span qkv, span ab, int64_t ab_ld, span adt, span state,
                         span o, int64_t H, int64_t dk, int64_t dv, int64_t T,
                         float eps) {
   if (H <= 0 || dk <= 0 || dv <= 0 || T <= 0) return false;
+  // A prefill's many tokens: a backend's chunked form, where it has one for
+  // the shape, regroups the same rule into per-chunk matrix products.
+  if constexpr (detail::owns_gated_delta_chunked<Own>::value) {
+    if (T > 1 && detail::ran(Own::gated_delta_chunked(qkv, ab, ab_ld, adt, state, o, H,
+                                                      dk, dv, T, eps))) {
+      return true;
+    }
+  }
   // The kernels run a block of dk threads over 32 columns of a head's state,
   // each warp holding 32 of its rows: dk a power of two a group can be.
   const bool shape = dk >= 32 && dk <= policy::max_group_threads && (dk & (dk - 1)) == 0;

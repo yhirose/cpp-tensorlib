@@ -569,6 +569,9 @@ struct context {
   CUfunction gemm_bf16_nt_sk_() {
     return cached_(gemm_bf16_nt_sk_fn, "tl_gemm_bf16_nt_sk");
   }
+  CUfunction gdc_prep_fn = nullptr, gdc_scan_fn = nullptr;  // the chunked delta rule
+  CUfunction gdc_prep_() { return cached_(gdc_prep_fn, "tl_gated_delta_chunk_prep"); }
+  CUfunction gdc_scan_() { return cached_(gdc_scan_fn, "tl_gated_delta_chunk_scan"); }
   CUfunction gemm_bf16_nt_tc_fn = nullptr, gemm_bf16_nt_tc_s_fn = nullptr;
   CUfunction gemm_bf16_nt_tc_(bool big) {
     return big ? cached_(gemm_bf16_nt_tc_fn, "tl_gemm_bf16_nt_tc")
@@ -706,6 +709,13 @@ struct context {
   size_t attn_scratch_bytes = 0;
   CUdeviceptr attn_scratch_(size_t bytes) {
     return grow_scratch_(attn_scratch, attn_scratch_bytes, bytes);
+  }
+  // The chunked delta rule's per-chunk products (q, k, W, U, P, g), reused
+  // across layers and calls like the partials above.
+  CUdeviceptr delta_scratch = 0;
+  size_t delta_scratch_bytes = 0;
+  CUdeviceptr delta_scratch_(size_t bytes) {
+    return grow_scratch_(delta_scratch, delta_scratch_bytes, bytes);
   }
 
   // Reusable device scratch for pad_/fold_'s per-call shape/stride metadata
@@ -897,6 +907,11 @@ struct own {
                                int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
                                int64_t kv_max, int64_t D, float scale,
                                bool kv_bf16 = false, int64_t pos0 = 0);
+  // The gated delta rule over a prefill's T tokens, in chunks (gpu::gated_delta).
+  static bool gated_delta_chunked(gpu::span qkv, gpu::span ab, int64_t ab_ld,
+                                  gpu::span adt, gpu::span state, gpu::span o,
+                                  int64_t H, int64_t dk, int64_t dv, int64_t T,
+                                  float eps);
   static bool attn_prefill_dq(gpu::span q, gpu::span K, gpu::span V,
                               gpu::span dO, gpu::span O, gpu::span dq,
                               gpu::span stats, int64_t H, int64_t T, int64_t D,
@@ -1947,6 +1962,45 @@ inline bool own::attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V,
                    pk, pv, po, uT, static_cast<unsigned>(kv_max * D),
                    static_cast<unsigned>(n_q_heads / n_kv_heads), scale,
                    static_cast<unsigned>(pos0));
+}
+
+// The chunked delta rule (tl_gated_delta_chunk_prep, then _scan): dk 128, dv a
+// multiple of 32 up to 128, and T past one chunk. The scratch holds, per head,
+// T rows each of q, k and W (dk) and U (dv), g, and a C x C P per chunk.
+inline bool own::gated_delta_chunked(gpu::span qkv, gpu::span ab, int64_t ab_ld,
+                                     gpu::span adt, gpu::span state, gpu::span o,
+                                     int64_t H, int64_t dk, int64_t dv, int64_t T,
+                                     float eps) {
+  constexpr int64_t C = 32;
+  auto& c = context::get();
+  if (!c.ready || dk != 128 || dv % 32 || dv > 128 || T < C) return false;
+  const int64_t nch = (T + C - 1) / C;
+  const size_t rows = (size_t)H * T;
+  const size_t floats = rows * (3 * dk + dv + 1) + (size_t)H * nch * C * C;
+  CUdeviceptr scr = c.delta_scratch_(floats * sizeof(float));
+  if (!scr) return false;
+  float* Qn = reinterpret_cast<float*>(scr);
+  float* Kn = Qn + rows * dk;
+  float* W = Kn + rows * dk;
+  float* U = W + rows * dk;
+  float* G = U + rows * dv;
+  float* P = G + rows;
+  c.device_read_(qkv.buf);
+  c.device_read_(ab.buf);
+  c.device_read_(adt.buf);
+  c.device_rmw_(state.buf);
+  c.device_write_(o.buf);
+  float* pqkv = context::off_(qkv.buf, qkv.off);
+  float* pab = context::off_(ab.buf, ab.off);
+  float* padt = context::off_(adt.buf, adt.off);
+  float* pst = context::off_(state.buf, state.off);
+  float* po = context::off_(o.buf, o.off);
+  const unsigned uH = (unsigned)H, udv = (unsigned)dv, uT = (unsigned)T,
+                 uld = (unsigned)ab_ld;
+  return c.launch_(c.gdc_prep_(), {(unsigned)nch, uH}, {256}, 0, pqkv, pab, padt, Qn,
+                   Kn, W, U, P, G, uH, udv, uT, uld, eps) &&
+         c.launch_(c.gdc_scan_(), {udv / 32, uH}, {128}, 0, Qn, Kn, W, U, P, G, pst,
+                   po, uH, udv, uT);
 }
 
 // The query half of causal prefill attention's pullback: q, K, V, dO, O and dq
