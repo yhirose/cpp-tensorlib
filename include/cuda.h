@@ -1644,14 +1644,17 @@ inline bool own::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
 
 // Split-KV split-count heuristic: how many ctx-splits make grid = heads×S fill
 // the SMs (heads alone is ~32 blocks « 82 SMs; target ~4 blocks/SM, and each
-// split needs >=128 keys to amortize its fixed cost). Shared by attn_decode
+// split needs >=64 keys to amortize its fixed cost). Shared by attn_decode
 // (evaluated at the live ctx) and attn_decode_dpos (evaluated at max_ctx, so
 // the CUDA-graph grid is pos-independent).
 // The kernel's rule: 128-thread blocks, so twice the fill (~4 per SM); no
-// split under 256 keys, a split at least 128 keys and a multiple of its 4
-// warps.
+// split under 256 keys, a split at least 64 keys and a multiple of its 4
+// warps. A block's warps walk their keys in series, so it is the length of a
+// split, not the bytes, that sets the time at depth: 64 against 128 took
+// Qwen2.5-0.5B at 2048 cached tokens from 396 to 426 tok/s, and 32 bought
+// nothing more.
 inline constexpr gpu::policy::split_rule attn_split_rule{
-    2 * traits::fill_groups, 256, 128, 4};
+    2 * traits::fill_groups, 256, 64, 4};
 inline unsigned attn_split_count(unsigned n_heads, int64_t ctx) {
   return static_cast<unsigned>(
       gpu::policy::split_parts(n_heads, ctx, attn_split_rule));

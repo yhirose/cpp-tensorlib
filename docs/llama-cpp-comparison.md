@@ -10,27 +10,34 @@ already cached when the test started.
 RTX 3090, driver 610.88, WSL2; llama.cpp `19cce6919` (2026-10-27), built with
 `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86`. tok/s; this library's column
 is the median of 5 runs, llama.cpp's the mean of 5 (what `llama-bench` prints).
+Where llama.cpp was measured more than once the range is given: its decode
+moved by up to 5% between invocations here (one Qwen3 run, ± 139, is left
+out).
 
 | model (GGUF) | test | tensorlib | llama.cpp | ratio |
 |---|---|---:|---:|---:|
-| Qwen2.5-0.5B-Instruct F16 | tg128 | 436 | 439 | 0.99 |
-| | tg128 @ d2048 | 347 | 421 | 0.82 |
+| Qwen2.5-0.5B-Instruct F16 | tg128 | 461 | 429-439 | 1.05-1.07 |
+| | tg128 @ d2048 | 423 | 407-430 | 0.98-1.04 |
 | | pp512 | 18,440 | 49,132 | 0.38 |
 | | pp512 @ d2048 | 12,127 | 41,106 | 0.30 |
-| Qwen3-0.6B F16 | tg128 | 392 | 373 | 1.05 |
-| | tg128 @ d2048 | 326 | 330 | 0.99 |
+| Qwen3-0.6B F16 | tg128 | 400 | 351-373 | 1.07-1.14 |
+| | tg128 @ d2048 | 342 | 330-334 | 1.02-1.04 |
 | | pp512 | 11,743 | 38,881 | 0.30 |
 | | pp512 @ d2048 | 5,303 | 30,004 | 0.18 |
-| Qwen3.5-0.8B F16 | tg128 | 326 | 291 | 1.12 |
-| | tg128 @ d2048 | 320 | 289 | 1.11 |
+| Qwen3.5-0.8B F16 | tg128 | 327 | 290-291 | 1.12 |
+| | tg128 @ d2048 | 323 | 289-292 | 1.11-1.12 |
 | | pp512 | 4,537 | 27,916 | 0.16 |
 | | pp512 @ d2048 | 4,280 | 27,401 | 0.16 |
-| Qwen3.5-0.8B BF16 | tg128 | 324 | 288 | 1.12 |
-| | tg128 @ d2048 | 320 | 288 | 1.11 |
+| Qwen3.5-0.8B BF16 | tg128 | 325 | 288 | 1.13 |
+| | tg128 @ d2048 | 322 | 288 | 1.12 |
 | | pp512 | 4,507 | 23,963 | 0.19 |
 | | pp512 @ d2048 | 4,224 | 23,208 | 0.18 |
 
-Decode is at parity or ahead, except Qwen2.5 at depth, where it is 18% behind.
+Decode is at parity or ahead on every model, with or without 2048 tokens
+cached. Until the decode attention overlapped its key loads and split its
+keys finer (2026-10-27), Qwen2.5 trailed by 18% at depth: a block's warps
+walked ~64 keys each in series, one load at a time.
+
 Prefill is 2.6-6x behind: this library's prefill GEMM computes in f32 on the
 CUDA cores, where llama.cpp's uses the tensor cores, and Qwen3.5's DeltaNet
 layers run their recurrence token by token within each launch.
@@ -45,10 +52,10 @@ layers run their recurrence token by token within each launch.
   (by at most 0.39%).
 - **KV cache.** llama.cpp's default is F16 and `llama-bench` offers no f32;
   this library's is f32, so at depth it reads twice the cache bytes per step.
-  At 2048 tokens that is tens of microseconds of a ~3 ms step, too little to
-  explain the Qwen2.5 gap at depth, whose cause is not yet known.
-- **Variance.** llama.cpp's prefill rows vary by 5-10% between runs here,
-  this library's by 1-2%; decode varies by about 1% on both.
+  At 2048 tokens that is tens of microseconds of a ~2.5 ms step.
+- **Variance.** Within one invocation, llama.cpp's prefill rows vary by
+  5-10% here and this library's by 1-2%, decode by 1-2% on both. Between
+  invocations llama.cpp's decode moved by up to 5%, hence the ranges.
 
 ## Reproducing
 

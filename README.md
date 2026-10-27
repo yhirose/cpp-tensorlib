@@ -342,16 +342,16 @@ On an RTX 3090, Qwen2.5-0.5B (F16 GGUF, bf16 weight storage):
 
 | Path | tok/s |
 |---|---|
-| decode, CUDA-graph replay | ~430 |
+| decode, CUDA-graph replay | ~460 |
 | decode, imperative (no graph capture) | ~305 |
 | prefill, 512-token chunk | ~19500 |
 | prefill, 2048-token prompt | ~15200 |
 
-Decode started at 3.5 tok/s and reached ~430 by removing host-side graph
+Decode started at 3.5 tok/s and reached ~460 by removing host-side graph
 construction, then per-launch overhead, then GEMV inefficiency. Against
 llama.cpp on the same files and GPU, decode is at parity or ahead for
-Qwen2.5, Qwen3 and Qwen3.5 on a short context (Qwen2.5 trails by 18% with
-2048 tokens cached), and prefill is 2.6-6x behind:
+Qwen2.5, Qwen3 and Qwen3.5, with or without 2048 tokens cached, and prefill
+is 2.6-6x behind:
 [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md) has the numbers,
 what differs between the two runs, and how to reproduce them.
 

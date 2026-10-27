@@ -1951,7 +1951,7 @@ __device__ __forceinline__ unsigned attn_dpos_chunk(unsigned ctx, unsigned H) {
   unsigned S = 1;
   if (H < 328u && ctx >= 256u) {  // target ~4 blocks/SM (328 = 4 * 82 SMs)
     unsigned want = (328u + H - 1u) / H;
-    unsigned max_s = ctx / 128u;  // >=128 keys per split
+    unsigned max_s = ctx / 64u;  // >=64 keys per split
     if (want > max_s) want = max_s;
     if (want > 1u) S = want;
   }
