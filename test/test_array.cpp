@@ -3025,8 +3025,9 @@ TEST_CASE("a graph replay leaves what it wrote device-current") {
 
 // Partial RoPE (Qwen3.5: 64 of a 256-wide head) against a host reference: the
 // first `rot` dims of each row rotate as a half-split RoPE of width rot, the
-// rest pass through. Every backend takes the composition here, so the
-// reference is the only independent program.
+// rest pass through. A backend runs its own kernel or the composition (the
+// "generic compositions" case holds the two together); this holds either to
+// an independent program.
 TEST_CASE("partial rope rotates the first rot dims and keeps the rest") {
   if (!tl::gpu_available()) return;
   auto prev = tl::device_;

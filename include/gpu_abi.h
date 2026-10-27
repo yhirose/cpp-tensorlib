@@ -54,7 +54,7 @@ enum class kop {
   gemv_bf16_row_,                    // ... and the [N,K] weight layout's own
   gemm_bf16_nt_, gemm_bf16_nt32_,    // the prefill's bf16 GEMM, per M tile
   gather_axis_, row_logsumexp_, xent_bwd_, adam_step_,  // cross-entropy, Adam
-  ssm_conv_, gated_delta_  // Gated DeltaNet's decode step (Qwen3.5)
+  ssm_conv_, gated_delta_  // Gated DeltaNet (Qwen3.5): its conv and its rule
 };
 inline constexpr size_t kKopCount = static_cast<size_t>(kop::gated_delta_) + 1;
 
@@ -355,12 +355,12 @@ inline grid row_reduce(int64_t rows, int64_t k, uint32_t step = 8) {
           threads > 32 ? (threads >> 5) * static_cast<uint32_t>(sizeof(float)) : 0};
 }
 
-// One group per (head, row), a thread per head-dim element: the attention
-// and KV-cache kernels' shape.
 // The most threads a group may have on the backends whose kernels take a
 // head per group (CUDA's block limit and Metal's threadgroup limit agree).
 inline constexpr int64_t max_group_threads = 1024;
 
+// One group per (head, row), a thread per head-dim element: the attention
+// and KV-cache kernels' shape.
 inline grid per_head(int64_t heads, int64_t rows, int64_t D) {
   return {static_cast<uint32_t>(heads), static_cast<uint32_t>(rows), 1,
           static_cast<uint32_t>(D), 1, 1, 0};

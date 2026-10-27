@@ -449,6 +449,38 @@ extern "C" __global__ void tl_swiglu(const float* __restrict__ gu,
   out[(size_t)blockIdx.y * ff + f] = (g / (1.0f + expf(-g))) * gu[src + ff];
 }
 
+// Tree-sum one value per thread through the block's shared `s`, handing every
+// thread the total; the trailing barrier lets a second sum reuse `s`.
+__device__ __forceinline__ float tl_tree_sum_(float* s, unsigned t, unsigned T, float v) {
+  s[t] = v;
+  __syncthreads();
+  for (unsigned h = T >> 1; h > 0; h >>= 1) {
+    if (t < h) s[t] += s[t + h];
+    __syncthreads();
+  }
+  const float total = s[0];
+  __syncthreads();
+  return total;
+}
+
+// tl_tree_sum_ for two values at once, in the same order; `s` holds 2·T.
+__device__ __forceinline__ float2 tl_tree_sum2_(float* s, unsigned t, unsigned T,
+                                                float a, float b) {
+  s[t] = a;
+  s[T + t] = b;
+  __syncthreads();
+  for (unsigned h = T >> 1; h > 0; h >>= 1) {
+    if (t < h) {
+      s[t] += s[t + h];
+      s[T + t] += s[T + t + h];
+    }
+    __syncthreads();
+  }
+  const float2 total = make_float2(s[0], s[T]);
+  __syncthreads();
+  return total;
+}
+
 // Gated DeltaNet's causal depthwise conv over T tokens, then SiLU. Token t
 // reads row t of x (rows ld apart) and writes row t of out [T, C]; state is
 // the K-1 inputs before the first token [K-1, C] (oldest first), w the tap-
@@ -483,7 +515,7 @@ extern "C" __global__ void tl_ssm_conv(const float* __restrict__ x,
 // down its column, the first for k.S, the second rewriting it and
 // accumulating q.S. Consecutive threads read consecutive j, so every pass is
 // coalesced; the state stays in place, cached in L2 between tokens. Dynamic
-// shared memory: (2*dk + blockDim) floats; blockDim a power of two.
+// shared memory: (2*dk + 2*blockDim) floats; blockDim a power of two.
 extern "C" __global__ void tl_gated_delta(const float* __restrict__ qkv,
                                           const float* __restrict__ ab,
                                           const float* __restrict__ adt,
@@ -511,22 +543,9 @@ extern "C" __global__ void tl_gated_delta(const float* __restrict__ qkv,
       sq += a * a;
       sk += b * b;
     }
-    // The two sums, one tree after the other.
-    red[t] = sq;
-    __syncthreads();
-    for (unsigned s = NT / 2; s > 0; s >>= 1) {
-      if (t < s) red[t] += red[t + s];
-      __syncthreads();
-    }
-    const float qn = 1.0f / sqrtf(red[0] + eps) / sqrtf((float)dk);
-    __syncthreads();
-    red[t] = sk;
-    __syncthreads();
-    for (unsigned s = NT / 2; s > 0; s >>= 1) {
-      if (t < s) red[t] += red[t + s];
-      __syncthreads();
-    }
-    const float kn = 1.0f / sqrtf(red[0] + eps);
+    const float2 sums = tl_tree_sum2_(red, t, NT, sq, sk);
+    const float qn = 1.0f / sqrtf(sums.x + eps) / sqrtf((float)dk);
+    const float kn = 1.0f / sqrtf(sums.y + eps);
     for (unsigned i = t; i < dk; i += NT) {
       qs[i] *= qn;
       ks[i] *= kn;
@@ -814,37 +833,6 @@ extern "C" __global__ void tl_adam_step(float* __restrict__ p,
   p[i] -= (mi * lr_over_bc1) / (sqrtf(vi * inv_bc2) + eps);
 }
 
-// Tree-sum one value per thread through the block's shared `s`, handing every
-// thread the total; the trailing barrier lets a second sum reuse `s`.
-__device__ __forceinline__ float tl_tree_sum_(float* s, unsigned t, unsigned T, float v) {
-  s[t] = v;
-  __syncthreads();
-  for (unsigned h = T >> 1; h > 0; h >>= 1) {
-    if (t < h) s[t] += s[t + h];
-    __syncthreads();
-  }
-  const float total = s[0];
-  __syncthreads();
-  return total;
-}
-
-// tl_tree_sum_ for two values at once, in the same order; `s` holds 2·T.
-__device__ __forceinline__ float2 tl_tree_sum2_(float* s, unsigned t, unsigned T,
-                                                float a, float b) {
-  s[t] = a;
-  s[T + t] = b;
-  __syncthreads();
-  for (unsigned h = T >> 1; h > 0; h >>= 1) {
-    if (t < h) {
-      s[t] += s[t + h];
-      s[T + t] += s[T + t + h];
-    }
-    __syncthreads();
-  }
-  const float2 total = make_float2(s[0], s[T]);
-  __syncthreads();
-  return total;
-}
 
 // A row's mean and 1/sqrt(biased variance + eps) for layer norm and its
 // pullback: two shared sums (x, then the squared deviations), each scaled by

@@ -199,6 +199,14 @@ if(TENSORLIB_CUDA)
   target_link_libraries(tensorlib_bench_qwen_prefill PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_bench_qwen_prefill)
 
+  # llama-bench's pp<P> / tg<N> on this library's path, for any Qwen GGUF, so
+  # the two engines can be read side by side. Not a ctest (external model).
+  add_executable(tensorlib_bench_qwen_llama bench/cuda/speed/bench_qwen_llama.cpp)
+  target_include_directories(tensorlib_bench_qwen_llama BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench/cuda)
+  target_link_libraries(tensorlib_bench_qwen_llama PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_bench_qwen_llama)
+
   # M8 int4-weight decode GEMV bench (Path-B style). Direct cuda:: API.
   add_executable(tensorlib_bench_q4 bench/cuda/speed/bench_q4_gemv.cpp)
   target_include_directories(tensorlib_bench_q4 BEFORE PRIVATE

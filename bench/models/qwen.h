@@ -70,9 +70,15 @@ struct Config {
   // Output widths of the fused projections (and so of the scratch they land in).
   int64_t attn_proj() const { return (NH + 2 * NKV) * HD + (attn_gate ? NH * HD : 0); }
   int64_t ssm_conv_ch() const { return 2 * SH * SDK + SH * SDV; }  // q|k|v
-  // q|k|v | alpha | beta | z, then a slot for the rule's output right after z,
-  // so the gated norm's silu(z) * o reads them as one fused gate|up buffer.
-  int64_t ssm_proj() const { return ssm_conv_ch() + 2 * SH + SH * SDV; }
+  int64_t ssm_v() const { return SH * SDV; }                        // the rule's out
+  // q|k|v | alpha | beta | z. The decode scratch puts the rule's output right
+  // after z, so the gated norm's silu(z) * o reads them as one gate|up buffer.
+  int64_t ssm_proj() const { return ssm_conv_ch() + 2 * SH + ssm_v(); }
+  // A DeltaNet layer's recurrent state: the conv window, and the rule's.
+  int64_t conv_state_n() const { return (SCONV - 1) * ssm_conv_ch(); }
+  int64_t ssm_state_n() const { return SH * SDK * SDV; }
+  // The first full-attention layer (layer 0 may be DeltaNet).
+  int64_t first_attn() const { return INTERVAL - 1; }
   std::string output_name() const {
     return tied_output ? "token_embd.weight" : "output.weight";
   }
@@ -116,7 +122,7 @@ inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
       throw std::runtime_error("qwen: DeltaNet key heads != value heads");
   }
   // The switches are read off the first attention layer (layer 0 may be DeltaNet).
-  const std::string a0 = "blk." + std::to_string(c.INTERVAL - 1) + ".";
+  const std::string a0 = "blk." + std::to_string(c.first_attn()) + ".";
   c.qkv_bias = m.tensor(a0 + "attn_q.bias") != nullptr;
   c.qk_norm = m.tensor(a0 + "attn_q_norm.weight") != nullptr;
   const auto* wq = m.tensor(a0 + "attn_q.weight");
@@ -383,8 +389,8 @@ struct Scratch {
     hb = scratch_f32(c.NE);
     h2b = scratch_f32(c.NE);
     qb = scratch_f32(c.NH * c.HD);
-    qkvb = scratch_f32(std::max(c.attn_proj(), c.ssm_proj() + c.SH * c.SDV));
-    ab = scratch_f32(std::max(c.NH * c.HD, c.SH * c.SDV));
+    qkvb = scratch_f32(std::max(c.attn_proj(), c.ssm_proj() + c.ssm_v()));
+    ab = scratch_f32(std::max(c.NH * c.HD, c.ssm_v()));
     if (c.hybrid()) convb = scratch_f32(c.ssm_conv_ch());
     if (c.attn_gate) gateb = scratch_f32(c.NH * c.HD);
     mb = scratch_f32(c.FF);
@@ -436,14 +442,14 @@ struct PrefillScratch {
     qkv = scratch_f32(cap * std::max(c.attn_proj(), c.ssm_proj()));
     qkvh = scratch_f32((c.NH + 2 * c.NKV) * cap * c.HD);
     ah = scratch_f32(c.NH * cap * c.HD);
-    at = scratch_f32(cap * std::max(c.NH * c.HD, c.SH * c.SDV));
+    at = scratch_f32(cap * std::max(c.NH * c.HD, c.ssm_v()));
     if (c.attn_gate) {
       gt = scratch_f32(cap * c.NH * c.HD);
       gs = scratch_f32(cap * c.NH * c.HD);
     }
     if (c.hybrid()) {
       conv = scratch_f32(cap * c.ssm_conv_ch());
-      zo = scratch_f32(2 * cap * c.SH * c.SDV);
+      zo = scratch_f32(2 * cap * c.ssm_v());
     }
     zero = scratch_f32(1);
     const float z0 = 0.0f;
@@ -489,16 +495,15 @@ inline int64_t argmax_logits(Model& M) {
 // The sequence position lives in the KV caches, every one at the same place.
 // Layer 0 is DeltaNet in Qwen3.5 and has none, so this is the first that does.
 inline const tl::kv_cache& seq_cache(const Model& M) {
-  return M.layers[M.c.INTERVAL - 1].cache;
+  return M.layers[M.c.first_attn()].cache;
 }
 
 // A DeltaNet layer's recurrent state back to zero: the conv window and the
 // rule's state, both read before they are written on the first token.
 inline void zero_state_(const Config& c, Layer& L) {
-  const int64_t nconv = (c.SCONV - 1) * c.ssm_conv_ch(), nssm = c.SH * c.SDK * c.SDV;
-  const std::vector<float> z((size_t)std::max(nconv, nssm), 0.0f);
-  gpu::upload(L.conv_state.native, z.data(), nconv);
-  gpu::upload(L.ssm_state.native, z.data(), nssm);
+  const std::vector<float> z((size_t)std::max(c.conv_state_n(), c.ssm_state_n()), 0.0f);
+  gpu::upload(L.conv_state.native, z.data(), c.conv_state_n());
+  gpu::upload(L.ssm_state.native, z.data(), c.ssm_state_n());
 }
 
 // A copy of every DeltaNet layer's recurrent state, for a forward run only for
@@ -506,29 +511,28 @@ inline void zero_state_(const Config& c, Layer& L) {
 // writes is rewritten by the next real step at the same position; the state is
 // advanced in place, so nothing would undo it.
 struct delta_snapshot {
-  std::vector<storage> conv, ssm;
+  struct saved {
+    Layer* L;
+    storage conv, ssm;
+  };
+  std::vector<saved> layers;
   static void copy_(gpu::span from, gpu::span to, int64_t n) {
     gpu::unary(gpu::kop::affine, from, to, n, 1.0f, 0.0f);
   }
   void save(Model& M) {
     const Config& c = M.c;
-    const int64_t nconv = (c.SCONV - 1) * c.ssm_conv_ch(), nssm = c.SH * c.SDK * c.SDV;
     for (int64_t l = 0; l < c.NL; l++) {
       if (!c.is_delta(l)) continue;
-      conv.push_back(scratch_f32(nconv));
-      ssm.push_back(scratch_f32(nssm));
-      copy_(sp(M.layers[l].conv_state), sp(conv.back()), nconv);
-      copy_(sp(M.layers[l].ssm_state), sp(ssm.back()), nssm);
+      saved& s = layers.emplace_back(
+          saved{&M.layers[l], scratch_f32(c.conv_state_n()), scratch_f32(c.ssm_state_n())});
+      copy_(sp(s.L->conv_state), sp(s.conv), c.conv_state_n());
+      copy_(sp(s.L->ssm_state), sp(s.ssm), c.ssm_state_n());
     }
   }
-  void restore(Model& M) const {
-    const Config& c = M.c;
-    const int64_t nconv = (c.SCONV - 1) * c.ssm_conv_ch(), nssm = c.SH * c.SDK * c.SDV;
-    for (int64_t l = 0, i = 0; l < c.NL; l++) {
-      if (!c.is_delta(l)) continue;
-      copy_(sp(conv[i]), sp(M.layers[l].conv_state), nconv);
-      copy_(sp(ssm[i]), sp(M.layers[l].ssm_state), nssm);
-      i++;
+  void restore(const Config& c) const {
+    for (const saved& s : layers) {
+      copy_(sp(s.conv), sp(s.L->conv_state), c.conv_state_n());
+      copy_(sp(s.ssm), sp(s.L->ssm_state), c.ssm_state_n());
     }
   }
 };
@@ -577,10 +581,9 @@ inline void prefill_chunk_(Model& M, int64_t T) {
   // same source rather than taking it as a parameter that could disagree.
   const int64_t pos0 = seq_cache(M).pos;
   const int64_t AP = c.attn_proj(), Q = c.NH * c.HD;
-  // A strided [T, n] block of rows `ld` apart, copied contiguous: the
-  // broadcast add of the one zero.
+  // A strided [T, n] block of rows `ld` apart, copied contiguous.
   auto rows_out = [&](gpu::span src, int64_t ld, gpu::span dst, int64_t n) {
-    gpu::binary_bcast(gpu::kop::badd, src, ld, 1, sp(P.zero), 0, 0, dst, T, n, 1, 0);
+    gpu::generic::copy_2d(src, ld, 1, sp(P.zero), dst, T, n);
   };
   gpu::span x = sp(P.emb);
   gpu::rmsnorm(x, sp(M.layers[0].an), sp(P.h), c.NE, c.EPS, T);
@@ -593,7 +596,7 @@ inline void prefill_chunk_(Model& M, int64_t T) {
       // rule's output lands in o, the second half of [z | o]; z is copied out
       // of the projection rows into the first, so silu(z) * rmsnorm(o) is one
       // swiglu over the flattened [T, V].
-      const int64_t C = c.ssm_conv_ch(), V = c.SH * c.SDV, PJ = c.ssm_proj();
+      const int64_t C = c.ssm_conv_ch(), V = c.ssm_v(), PJ = c.ssm_proj();
       const gpu::span z = sp(P.zo), o = at_f32(z, T * V);
       gpu::gemm_bf16_nt(sp(P.h), sp(L.wssm), sp(P.qkv), T, PJ, c.NE);
       gpu::ssm_conv(sp(P.qkv), PJ, sp(L.conv_state), sp(L.wconv), sp(P.conv), C,
@@ -777,7 +780,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
     if (c.is_delta(l)) {
       // Gated DeltaNet. The fused projection's order puts z right before the
       // slot the rule writes its output to (Config::ssm_proj).
-      const int64_t C = c.ssm_conv_ch(), V = c.SH * c.SDV;
+      const int64_t C = c.ssm_conv_ch(), V = c.ssm_v();
       L.wssm = fused({{p + "attn_qkv.weight", C},
                       {p + "ssm_alpha.weight", c.SH},
                       {p + "ssm_beta.weight", c.SH},
@@ -795,8 +798,8 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
       L.wconv = array::from(std::move(taps), {c.SCONV, C});
       L.adt = load_f32_cat(m, {{p + "ssm_a", c.SH}, {p + "ssm_dt.bias", c.SH}});
       L.sn = load_f32(m, p + "ssm_norm.weight", c.SDV);
-      L.conv_state = scratch_f32((c.SCONV - 1) * C);
-      L.ssm_state = scratch_f32(c.SH * c.SDK * c.SDV);
+      L.conv_state = scratch_f32(c.conv_state_n());
+      L.ssm_state = scratch_f32(c.ssm_state_n());
       zero_state_(c, L);
     } else {
       // Attention. Qwen3.5's q projection interleaves q and its output gate per
@@ -1041,7 +1044,7 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
       // Gated DeltaNet: one GEMV -> q|k|v | alpha | beta | z in S.qkvb, the conv
       // over q|k|v, the rule (its output lands right after z), the gated norm
       // silu(z) * rmsnorm(o) as one swiglu over [z | o], then the out projection.
-      const int64_t C = c.ssm_conv_ch(), V = c.SH * c.SDV;
+      const int64_t C = c.ssm_conv_ch(), V = c.ssm_v();
       const gpu::span pj = sp(S.qkvb), o = at_f32(pj, c.ssm_proj());
       gv(L.wssm, sp(S.hb), pj, c.ssm_proj(), c.NE);
       gpu::ssm_conv(pj, C, sp(L.conv_state), sp(L.wconv), sp(S.convb), C, c.SCONV);
@@ -1195,7 +1198,7 @@ struct captured_decoder {
     delta_snapshot before;
     before.save(M);
     run_layers_(M, sp(M.scratch.embed), pos, dp, sp(M.scratch.logits_sink));
-    before.restore(M);
+    before.restore(M.c);
     gpu::flush();
     gpu::upload_u32(d_pos.native, (unsigned)pos);  // reset after warm
     if (!gpu::capture_begin()) return;
@@ -1286,5 +1289,11 @@ inline std::string default_path() {
 // Deterministic short-prefill fixture shared by the decode benches (arbitrary
 // valid token ids — enough to make the cache/pos realistic without a tokenizer).
 constexpr int PREFILL_IDS[4] = {40, 2610, 264, 3974};
+// A prompt of n of them, cycled: for the benches that only need its length.
+inline std::vector<int> fixture_ids(int64_t n) {
+  std::vector<int> ids((size_t)n);
+  for (int64_t i = 0; i < n; i++) ids[(size_t)i] = PREFILL_IDS[i % 4];
+  return ids;
+}
 
 }  // namespace qwenmodel

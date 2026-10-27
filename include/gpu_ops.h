@@ -867,7 +867,7 @@ inline bool gated_delta(span qkv, span ab, int64_t ab_ld, span adt, span state,
   constexpr uint32_t threads = 64;
   const grid g{static_cast<uint32_t>((dv + threads - 1) / threads),
                static_cast<uint32_t>(H), 1, threads, 1, 1,
-               static_cast<uint32_t>((2 * dk + threads) * sizeof(float))};
+               static_cast<uint32_t>((2 * dk + 2 * threads) * sizeof(float))};
   return launch(kop::gated_delta_,
                 {in(qkv), in(ab), in(adt), inout(state), out(o)},
                 gated_delta_params{static_cast<uint32_t>(H), static_cast<uint32_t>(dk),

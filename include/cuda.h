@@ -46,6 +46,7 @@
 #include <dlfcn.h>
 #endif
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1097,7 +1098,14 @@ inline CUgraphExec capture_end() {
   CUgraphExec e = nullptr;
   if (c.d.GraphInstantiate(&e, g, 0) != 0) e = nullptr;
   c.d.GraphDestroy(g);
-  if (e) c.graph_touches[e] = std::move(c.capture_touches);
+  if (e) {
+    // A touch a buffer has already had leaves its residency where it was, so
+    // the first of each (buffer, access) pair, in order, replays the same:
+    // one walk of a few dozen entries a replay rather than one per argument.
+    auto& kept = c.graph_touches[e];
+    for (const auto& t : c.capture_touches)
+      if (std::find(kept.begin(), kept.end(), t) == kept.end()) kept.push_back(t);
+  }
   c.capture_touches.clear();
   return e;
 }

@@ -1,6 +1,6 @@
 // M9 "actually chat" — numeric proof. Load a real Qwen2.5-0.5B-Instruct, Qwen3
-// or Qwen3.5 GGUF (F16 weights) and run the decoder end to end, verified against
-// a tight numpy reference that reads the SAME F16 weights (tools/qwen_oracle.py
+// or Qwen3.5 GGUF (F16 or BF16 weights) and run the decoder end to end, verified
+// against a tight numpy reference that reads the SAME weights (tools/qwen_oracle.py
 // wrote qwen_oracle_data.h / qwen3_oracle_data.h / qwen35_oracle_data.h; the
 // model's arch picks one). Identical
 // weights => the C++ forward must match the reference to ~1e-4 at every checkpoint

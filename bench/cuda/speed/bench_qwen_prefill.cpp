@@ -45,19 +45,12 @@ static void* zeros(int64_t n) {
   return p;
 }
 
-// Deterministic prompt of T arbitrary-but-valid ids.
-static std::vector<int> make_ids(int64_t T) {
-  std::vector<int> ids((size_t)T);
-  for (int64_t i = 0; i < T; i++) ids[(size_t)i] = qm::PREFILL_IDS[i % 4];
-  return ids;
-}
-
 // Prefill T tokens through one token-by-token path; returns wall-clock ms
 // (-1 when the path is unavailable). The cache is reset first, so each run
 // starts from a real pos=0 prompt.
 static double prefill_ms(qm::Model& M, int64_t T, Path p) {
   qm::reset_cache(M);
-  std::vector<int> ids = make_ids(T);
+  std::vector<int> ids = qm::fixture_ids(T);
 
   if (p == Path::Captured) {
     // The COUNTERFACTUAL: what the prompt costs replayed one token at a time
@@ -123,7 +116,7 @@ int main(int argc, char** argv) {
   // the k/v they write, and that difference accumulates over T cached rows.
   {
     const int64_t T = 64;
-    std::vector<int> ids = make_ids(T);
+    std::vector<int> ids = qm::fixture_ids(T);
     qm::reset_cache(M);
     std::vector<float> ref;
     for (int64_t i = 0; i < T; i++) ref = qm::step(M, ids[(size_t)i], i);
