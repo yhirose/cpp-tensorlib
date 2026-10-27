@@ -1706,7 +1706,8 @@ __global__ void tl_gemv_q4(const float* __restrict__ a,
 //
 // head_dim generalization (M9): the kernels are templated on AD (compile-time,
 // because acc[]/sacc[][] are register/smem arrays sized AD/32) and instantiated
-// for {64,128} — the head dims of the target models (Qwen2 = 64, llama-7B = 128).
+// for {64,128} — the head dims of the target models (Qwen2 = 64, llama-7B = 128)
+// — and 256 (Qwen3.5's full-attention layers) in the f32-cache decode forms.
 // Each lane holds NW = AD/32 dims (d = lane, lane+32, ..., lane+(NW-1)*32) and
 // there are exactly NW warps, so the warp count and the per-lane dim count
 // coincide. extern "C" wrappers below give each instantiation a stable symbol
@@ -1821,6 +1822,11 @@ extern "C" __global__ void tl_attn_decode_f32_64(const float* q, const float* K,
     unsigned group, float scale) {
   attn_decode_core<64>(q, K, V, out, ctx, kv_stride, group, scale);
 }
+extern "C" __global__ void tl_attn_decode_f32_256(const float* q, const float* K,
+    const float* V, float* out, unsigned ctx, unsigned kv_stride,
+    unsigned group, float scale) {
+  attn_decode_core<256>(q, K, V, out, ctx, kv_stride, group, scale);
+}
 extern "C" __global__ void tl_attn_decode_bf16(const float* q,
     const __nv_bfloat16* K, const __nv_bfloat16* V, float* out, unsigned ctx,
     unsigned kv_stride, unsigned group, float scale) {
@@ -1872,6 +1878,13 @@ extern "C" __global__ void tl_attn_decode_split_64(const float* q,
     float scale) {
   attn_decode_split_core<64>(q, K, V, pm, pl, pacc, ctx, kv_stride, group,
                              chunk, scale);
+}
+extern "C" __global__ void tl_attn_decode_split_256(const float* q,
+    const float* K, const float* V, float* pm, float* pl, float* pacc,
+    unsigned ctx, unsigned kv_stride, unsigned group, unsigned chunk,
+    float scale) {
+  attn_decode_split_core<256>(q, K, V, pm, pl, pacc, ctx, kv_stride, group,
+                              chunk, scale);
 }
 extern "C" __global__ void tl_attn_decode_split_bf16(const float* q,
     const __nv_bfloat16* K, const __nv_bfloat16* V, float* pm, float* pl,
@@ -1934,6 +1947,14 @@ extern "C" __global__ void tl_attn_decode_split_64_dpos(const float* q,
   const unsigned ctx = *d_pos + 1u;
   attn_decode_split_core<64>(q, K, V, pm, pl, pacc, ctx, kv_stride, group,
                              attn_dpos_chunk(ctx, gridDim.x), scale);
+}
+extern "C" __global__ void tl_attn_decode_split_256_dpos(const float* q,
+    const float* K, const float* V, float* pm, float* pl, float* pacc,
+    const unsigned* __restrict__ d_pos, unsigned kv_stride, unsigned group,
+    float scale) {
+  const unsigned ctx = *d_pos + 1u;
+  attn_decode_split_core<256>(q, K, V, pm, pl, pacc, ctx, kv_stride, group,
+                              attn_dpos_chunk(ctx, gridDim.x), scale);
 }
 
 // Merge the S per-head partials (each already at its local max) into out. Not

@@ -563,6 +563,7 @@ struct context {
   // M9 fused decode attention (single-pass + split-KV two-pass).
   // head_dim {64,128} variants (M9): each templated instantiation has its own
   // symbol; the launchers pick by D. The unsuffixed name is the D=128 build.
+  // D=256 (Qwen3.5) exists for an f32 cache only (attn_decode_head_ok).
   // Each attention/KV kernel has an f32 and a bf16-KV-storage instantiation
   // (M9 bf16 KV cache): the bf16 variants read/write K,V as __nv_bfloat16 while
   // q/out/scratch stay f32. The getters pick by (D, kv_bf16); a small 2x2 cache.
@@ -571,13 +572,16 @@ struct context {
   CUfunction attn_decode_64_fn = nullptr, attn_split_64_fn = nullptr;
   CUfunction attn_decode_bf16_fn = nullptr, attn_decode_bf16_64_fn = nullptr;
   CUfunction attn_split_bf16_fn = nullptr, attn_split_bf16_64_fn = nullptr;
+  CUfunction attn_decode_256_fn = nullptr, attn_split_256_fn = nullptr;
   CUfunction attn_decode_(int64_t D, bool bf16 = false) {
+    if (D == 256) return cached_(attn_decode_256_fn, "tl_attn_decode_f32_256");
     return bf16 ? (D == 64 ? cached_(attn_decode_bf16_64_fn, "tl_attn_decode_bf16_64")
                            : cached_(attn_decode_bf16_fn, "tl_attn_decode_bf16"))
                 : (D == 64 ? cached_(attn_decode_64_fn, "tl_attn_decode_f32_64")
                            : cached_(attn_decode_fn, "tl_attn_decode_f32"));
   }
   CUfunction attn_split_(int64_t D, bool bf16 = false) {
+    if (D == 256) return cached_(attn_split_256_fn, "tl_attn_decode_split_256");
     return bf16 ? (D == 64 ? cached_(attn_split_bf16_64_fn, "tl_attn_decode_split_bf16_64")
                            : cached_(attn_split_bf16_fn, "tl_attn_decode_split_bf16"))
                 : (D == 64 ? cached_(attn_split_64_fn, "tl_attn_decode_split_64")
@@ -595,13 +599,14 @@ struct context {
   // so one instantiated graph replays correctly as the decode position advances.
   CUfunction rope_dpos_fn = nullptr, incr_u32_fn = nullptr,
              kv_append_dpos_fn = nullptr, attn_split_dpos_fn = nullptr,
-             attn_split_dpos_64_fn = nullptr;
+             attn_split_dpos_64_fn = nullptr, attn_split_dpos_256_fn = nullptr;
   CUfunction rope_dpos_() { return cached_(rope_dpos_fn, "tl_rope_dpos"); }
   CUfunction incr_u32_() { return cached_(incr_u32_fn, "tl_incr_u32"); }
   CUfunction kv_append_dpos_() {
     return cached_(kv_append_dpos_fn, "tl_kv_append_dpos");
   }
   CUfunction attn_split_dpos_(int64_t D) {
+    if (D == 256) return cached_(attn_split_dpos_256_fn, "tl_attn_decode_split_256_dpos");
     return D == 64 ? cached_(attn_split_dpos_64_fn, "tl_attn_decode_split_64_dpos")
                    : cached_(attn_split_dpos_fn, "tl_attn_decode_split_dpos");
   }
@@ -1672,16 +1677,23 @@ struct attn_partials {
   }
 };
 
+// The head widths the decode-attention kernels are instantiated for: 64 and
+// 128 with either cache dtype, 256 with an f32 cache.
+inline bool attn_decode_head_ok(int64_t D, bool kv_bf16) {
+  return D == 64 || D == 128 || (D == 256 && !kv_bf16);
+}
+
 // M9 fused decode attention: out(h,:) = softmax(scale·q(h,:)·K(kv,:)^T)·V(kv) in
 // one pass. q [n_q_heads,D], out [n_q_heads,D]; K/V are a [n_kv_heads,kv_max,D]
 // cache read over its valid prefix [0,ctx) (kv_max==ctx is the no-cache case).
-// GQA: q head h reads kv head h/(n_q_heads/n_kv_heads). Contiguous, D∈{64,128}.
+// GQA: q head h reads kv head h/(n_q_heads/n_kv_heads). Contiguous, D as
+// attn_decode_head_ok allows.
 inline bool own::attn_decode(gpu::span q, gpu::span K, gpu::span V,
                              gpu::span out, int64_t n_q_heads,
                              int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
                              int64_t D, float scale, bool kv_bf16) {
   auto& c = context::get();
-  if (!c.ready || (D != 128 && D != 64)) return false;
+  if (!c.ready || !attn_decode_head_ok(D, kv_bf16)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
   c.device_read_(q.buf);
   c.device_read_(K.buf);
@@ -1757,7 +1769,7 @@ inline bool own::kv_append_dpos(gpu::span Kc, gpu::span Vc, gpu::span k_new,
                                 gpu::span v_new, gpu::span d_pos,
                                 int64_t kv_max, int64_t n_kv_heads, int64_t D) {
   auto& c = context::get();
-  if (!c.ready || (D != 128 && D != 64)) return false;
+  if (!c.ready || D <= 0 || D > gpu::policy::max_group_threads) return false;
   c.device_read_(k_new.buf);
   c.device_read_(v_new.buf);
   c.device_read_(d_pos.buf);
@@ -1791,7 +1803,7 @@ inline bool own::attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
                                   int64_t kv_max, int64_t D, float scale,
                                   gpu::span partials) {
   auto& c = context::get();
-  if (!c.ready || (D != 128 && D != 64) || !partials.buf) return false;
+  if (!c.ready || !attn_decode_head_ok(D, false) || !partials.buf) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
   c.device_read_(q.buf);
   c.device_read_(K.buf);

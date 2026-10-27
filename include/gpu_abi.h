@@ -357,6 +357,10 @@ inline grid row_reduce(int64_t rows, int64_t k, uint32_t step = 8) {
 
 // One group per (head, row), a thread per head-dim element: the attention
 // and KV-cache kernels' shape.
+// The most threads a group may have on the backends whose kernels take a
+// head per group (CUDA's block limit and Metal's threadgroup limit agree).
+inline constexpr int64_t max_group_threads = 1024;
+
 inline grid per_head(int64_t heads, int64_t rows, int64_t D) {
   return {static_cast<uint32_t>(heads), static_cast<uint32_t>(rows), 1,
           static_cast<uint32_t>(D), 1, 1, 0};

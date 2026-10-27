@@ -44,11 +44,15 @@ int main() {
     return (int32_t)st * (1.0f / 2147483648.0f);
   };
 
-  // ---- KV cache + GQA at D=64: grow one token at a time, verify prefix reads +
-  // GQA mapping at checkpoints straddling the split-KV boundary (ctx>=256). ----
-  {
+  // ---- KV cache + GQA: grow one token at a time, verify prefix reads + GQA
+  // mapping at checkpoints straddling the split-KV boundary (ctx>=256), at
+  // each head width the decode kernels serve a model at. ----
+  auto decode_check = [&](int64_t D, int64_t HQ, int64_t HKV) -> bool {
+    const int64_t group = HQ / HKV;
+    const float scale = 1.0f / std::sqrt((float)D);
+    bool ok = true;
     tl::kv_cache cache;
-    if (!cache.init(HKV, MAXC, D)) { std::printf("  cache init failed\n"); return 1; }
+    if (!cache.init(HKV, MAXC, D)) { std::printf("  cache init failed\n"); return false; }
     float *hkn = nullptr, *hvn = nullptr, *hq = nullptr, *ho = nullptr;
     void* kn = alloc(HKV * D * 4, &hkn);
     void* vn = alloc(HKV * D * 4, &hvn);
@@ -80,7 +84,7 @@ int main() {
       }
       sync_to_host(kn, true);
       sync_to_host(vn, true);
-      if (!cache.append({kn, 0}, {vn, 0})) { std::printf("  append failed pos %lld\n", (long long)pos); return 1; }
+      if (!cache.append({kn, 0}, {vn, 0})) { std::printf("  append failed pos %lld\n", (long long)pos); return false; }
 
       if (ci < sizeof(checks) / sizeof(checks[0]) && step == checks[ci]) {
         ci++;
@@ -126,8 +130,8 @@ int main() {
       }
     }
     ok &= maxrel < 1e-4;
-    std::printf("  kv cache grow to %lld tokens (%zu checkpoints, split-KV @>=256) "
-                "— maxrel %.1e %s\n", (long long)cache.pos,
+    std::printf("  D=%lld kv cache grow to %lld tokens (%zu checkpoints, split-KV @>=256) "
+                "— maxrel %.1e %s\n", (long long)D, (long long)cache.pos,
                 sizeof(checks) / sizeof(checks[0]), maxrel, maxrel < 1e-4 ? "OK" : "FAIL");
     ok &= dpos_eq;
     std::printf("  attn_dpos (capacity-grid split) vs attn — bit-equal at every "
@@ -135,7 +139,10 @@ int main() {
     release(kn, 0, nullptr); release(vn, 0, nullptr);
     release(q, 0, nullptr);  release(o, 0, nullptr);
     release(o2, 0, nullptr); release(dp, 0, nullptr);
-  }
+      return ok;
+  };
+  ok &= decode_check(64, 14, 2);  // Qwen2.5-0.5B
+  ok &= decode_check(256, 8, 2);  // Qwen3.5's full-attention layers
 
   // ---- Causal prefill at D=64 + prefill->decode handoff. ----
   {

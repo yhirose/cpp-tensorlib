@@ -879,9 +879,9 @@ inline bool kv_append(span Kc, span Vc, span k_new, span v_new, int64_t pos,
                       int64_t kv_max, int64_t n_kv_heads, int64_t D,
                       bool kv_bf16 = false) {
   if (n_kv_heads <= 0 || D <= 0) return false;
-  // The kernels are written for a head of 64 or 128; any other width takes the
-  // composition.
-  return ((D == 64 || D == 128) &&
+  // The kernels run a head as one group of D threads; a head wider than a group
+  // can be takes the composition.
+  return (D <= policy::max_group_threads &&
           launch(kv_bf16 ? kop::kv_append_bf16_ : kop::kv_append_,
                  {out(Kc), out(Vc), in(k_new), in(v_new)},
                  kv_append_params{static_cast<uint32_t>(pos),
@@ -896,7 +896,7 @@ inline bool kv_fill(span Kc, span Vc, span K, span V, int64_t T, int64_t kv_max,
                     int64_t n_kv_heads, int64_t D, bool kv_bf16 = false,
                     int64_t pos0 = 0) {
   if (n_kv_heads <= 0 || D <= 0 || T <= 0) return false;
-  return ((D == 64 || D == 128) &&  // the kernels' widths, as in kv_append
+  return (D <= policy::max_group_threads &&  // a group a head, as in kv_append
           launch(kv_bf16 ? kop::kv_fill_bf16_ : kop::kv_fill_,
                  {out(Kc), out(Vc), in(K), in(V)},
                  kv_fill_params{static_cast<uint32_t>(T),
