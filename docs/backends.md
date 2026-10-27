@@ -98,7 +98,7 @@ That is what lets a backend realize a launch with no per-kernel host code:
   and the params at index *n* (`setBytes`).
 - **CUDA** builds `cuLaunchKernel`'s `argv` as the views' device addresses
   followed by the params' fields, four bytes apiece. Its kernels take their
-  pointers first and 4-byte scalars after (116 of the 117 do;
+  pointers first and 4-byte scalars after (118 of the 119 do;
   `tools/cuda_trace/gen_kernel_sigs.py` reads this off the `.cu`).
 - **WebGPU** binds view *i*, whole, at binding *i* and a uniform at binding
   *n*: the views' element offsets, then the params. A binding offset has to be
@@ -159,7 +159,8 @@ The ops fall in two tiers. Tier 0 — elementwise, broadcast, reduction, GEMM,
 copy and index — closes the array surface: a backend with those kernels runs
 every graph. Tier 1 is the fused ops — the model path's `rmsnorm`, `swiglu`,
 the decode GEMV, the cache writes, `rope`, the attention, `split_heads` /
-`merge_heads`, `argmax`, plus two training ops off that path, `xent_bwd` and
+`merge_heads`, `argmax`, Gated DeltaNet's `ssm_conv_step` and
+`gated_delta_step`, plus two training ops off that path, `xent_bwd` and
 `adam_step` — each a kernel a backend *may* have. Under each of them
 `gpu_ops.h` holds one generic composition out of tier 0 (`gpu::generic`), and
 the op
@@ -291,7 +292,7 @@ block, shared-memory bytes and each argument, with pointers printed as
 (allocation, byte offset) so two runs diff. What a change to the backend's host
 side must preserve is that the same kernels get the same arguments, and that is
 what the trace holds. `bench/cuda/check/trace_sweep.cpp` reaches the kernels the
-suite does not, so all 117 appear. `TL_CUDA_TRACE_CHECK=1 tools/cuda_trace/run.sh
+suite does not, so all 119 appear. `TL_CUDA_TRACE_CHECK=1 tools/cuda_trace/run.sh
 <dir>` only compiles: every test, checker, bench and model driver against the
 CUDA branch of the headers. Whether the kernels compute the right thing is
 still a `ctest` on NVIDIA hardware.

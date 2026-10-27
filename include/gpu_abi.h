@@ -53,9 +53,10 @@ enum class kop {
   gemv_combine_,                     // their split-K partials
   gemv_bf16_row_,                    // ... and the [N,K] weight layout's own
   gemm_bf16_nt_, gemm_bf16_nt32_,    // the prefill's bf16 GEMM, per M tile
-  gather_axis_, row_logsumexp_, xent_bwd_, adam_step_  // cross-entropy, Adam
+  gather_axis_, row_logsumexp_, xent_bwd_, adam_step_,  // cross-entropy, Adam
+  ssm_conv_, gated_delta_  // Gated DeltaNet's decode step (Qwen3.5)
 };
-inline constexpr size_t kKopCount = static_cast<size_t>(kop::adam_step_) + 1;
+inline constexpr size_t kKopCount = static_cast<size_t>(kop::gated_delta_) + 1;
 
 // The ids' names, for what reports by kernel (the census, tl::profile).
 inline constexpr const char* kKopNames[] = {
@@ -73,7 +74,7 @@ inline constexpr const char* kKopNames[] = {
     "add_rmsnorm_", "swiglu_", "split_heads_", "merge_heads_", "gemv_f32_",
     "gemv_bf16_", "gemv_q4_", "gemv_combine_", "gemv_bf16_row_",
     "gemm_bf16_nt_", "gemm_bf16_nt32_", "gather_axis_", "row_logsumexp_",
-    "xent_bwd_", "adam_step_",
+    "xent_bwd_", "adam_step_", "ssm_conv_", "gated_delta_",
 };
 static_assert(sizeof(kKopNames) / sizeof(kKopNames[0]) == kKopCount,
               "kKopNames lists every kop, in order");
@@ -287,6 +288,13 @@ struct kv_fill_params {
 };
 struct merge_heads_params {
   uint32_t T, H, D;
+};
+struct ssm_conv_params {  // C channels, a K-tap causal window
+  uint32_t C, K;
+};
+struct gated_delta_params {  // H heads, a [dk, dv] state each
+  uint32_t H, dk, dv;
+  float eps;  // of the q / k L2 norms
 };
 
 // The launch record. Every kernel launch on every backend is one row under

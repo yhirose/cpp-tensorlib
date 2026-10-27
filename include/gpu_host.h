@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "gpu_abi.h"
 #include "profile.h"
@@ -234,6 +235,58 @@ inline bool swiglu(const gpu::arg* v, const void* params, const gpu::grid& g) {
   }
   return true;
 }
+inline bool ssm_conv(const gpu::arg* v, const void* params) {
+  const auto& p = as<gpu::ssm_conv_params>(params);
+  const float* x = at<const float>(v[0]);
+  float* state = at<float>(v[1]);
+  const float* w = at<const float>(v[2]);
+  float* o = at<float>(v[3]);
+  for (uint32_t c = 0; c < p.C; c++) {
+    float acc = x[c] * w[size_t(p.K - 1) * p.C + c];
+    for (uint32_t k = 0; k + 1 < p.K; k++) acc += state[size_t(k) * p.C + c] * w[size_t(k) * p.C + c];
+    o[c] = acc / (1.0f + std::exp(-acc));
+    for (uint32_t k = 0; k + 2 < p.K; k++) state[size_t(k) * p.C + c] = state[size_t(k + 1) * p.C + c];
+    state[size_t(p.K - 2) * p.C + c] = x[c];
+  }
+  return true;
+}
+inline bool gated_delta(const gpu::arg* v, const void* params) {
+  const auto& p = as<gpu::gated_delta_params>(params);
+  const float *qkv = at<const float>(v[0]), *ab = at<const float>(v[1]),
+              *adt = at<const float>(v[2]);
+  float* state = at<float>(v[3]);
+  float* o = at<float>(v[4]);
+  const size_t nq = size_t(p.H) * p.dk;
+  std::vector<float> q(p.dk), k(p.dk), kv(p.dv);
+  for (uint32_t h = 0; h < p.H; h++) {
+    const float *qh = qkv + size_t(h) * p.dk, *kh = qkv + nq + size_t(h) * p.dk,
+                *vh = qkv + 2 * nq + size_t(h) * p.dv;
+    double sq = 0, sk = 0;
+    for (uint32_t i = 0; i < p.dk; i++) sq += double(qh[i]) * qh[i], sk += double(kh[i]) * kh[i];
+    const float iq = float(1.0 / std::sqrt(sq + p.eps)) / std::sqrt(float(p.dk)),
+                ik = float(1.0 / std::sqrt(sk + p.eps));
+    for (uint32_t i = 0; i < p.dk; i++) q[i] = qh[i] * iq, k[i] = kh[i] * ik;
+    const float x = ab[h] + adt[p.H + h];
+    const float decay = std::exp(adt[h] * (x > 20.0f ? x : std::log1p(std::exp(x))));
+    const float beta = 1.0f / (1.0f + std::exp(-ab[p.H + h]));
+    float* S = state + size_t(h) * p.dk * p.dv;
+    for (uint32_t j = 0; j < p.dv; j++) {
+      double acc = 0;
+      for (uint32_t i = 0; i < p.dk; i++) acc += double(S[size_t(i) * p.dv + j]) * k[i];
+      kv[j] = (vh[j] - decay * float(acc)) * beta;  // the delta, already beta-scaled
+    }
+    for (uint32_t j = 0; j < p.dv; j++) {
+      double acc = 0;
+      for (uint32_t i = 0; i < p.dk; i++) {
+        float& s = S[size_t(i) * p.dv + j];
+        s = s * decay + k[i] * kv[j];
+        acc += double(s) * q[i];
+      }
+      o[size_t(h) * p.dv + j] = float(acc);
+    }
+  }
+  return true;
+}
 inline bool index_select(const gpu::arg* v, const void* params) {
   const auto& p = as<gpu::gather_params>(params);
   const float *a = at<const float>(v[0]), *idx = at<const float>(v[1]);
@@ -425,6 +478,8 @@ inline bool kernel_(kop k, const gpu::arg* v, const void* params,
     case kop::kv_fill_: return d::kv_fill(v, params, g, false);
     case kop::kv_fill_bf16_: return d::kv_fill(v, params, g, true);
     case kop::merge_heads_: return d::merge_heads(v, params);
+    case kop::ssm_conv_: return d::ssm_conv(v, params);
+    case kop::gated_delta_: return d::gated_delta(v, params);
     default: return false;
   }
 }

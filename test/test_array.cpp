@@ -2948,6 +2948,40 @@ TEST_CASE("policy: a split measures its groups against the device's fill") {
   CHECK(split_chunk(1, 1, gemv) == 32);
 }
 
+// Partial RoPE (Qwen3.5: 64 of a 256-wide head) against a host reference: the
+// first `rot` dims of each row rotate as a half-split RoPE of width rot, the
+// rest pass through. Every backend takes the composition here, so the
+// reference is the only independent program.
+TEST_CASE("partial rope rotates the first rot dims and keeps the rest") {
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+  tl::use_gpu();
+  const int64_t H = 3, T = 4, D = 256, rot = 64, pos = 11;
+  const float base = 1e7f;
+  array xh = random_array({H * T, D}, 990);
+  xh.eval();
+  std::vector<float> want((size_t)H * T * D);
+  for (int64_t r = 0; r < H * T; r++) {
+    const float* x = xh.raw() + r * D;
+    float* w = want.data() + r * D;
+    for (int64_t j = 0; j < D; j++) w[j] = x[j];
+    const double p = (double)(pos + r % T);
+    for (int64_t j = 0; j < rot / 2; j++) {
+      const double ang = p * std::pow((double)base, -2.0 * j / rot);
+      const float c = (float)std::cos(ang), s = (float)std::sin(ang);
+      w[j] = x[j] * c - x[j + rot / 2] * s;
+      w[j + rot / 2] = x[j] * s + x[j + rot / 2] * c;
+    }
+  }
+  array x = xh.clone();
+  x.eval();
+  array o = array::empty({H * T, D});
+  REQUIRE(tl::gpu::rope(x.device_span(), o.device_span(), H * T, T, D, pos, base, {}, rot));
+  tl::gpu::flush();
+  CHECK(tl::allclose(o, array::from(std::move(want), {H * T, D}), 1e-5f, 1e-5f));
+  tl::device_ = prev;
+}
+
 // The generic compositions (gpu_ops.h, tier 1 out of tier 0) against the op
 // as the backend runs it. Where the backend has the fused kernel the two are
 // different programs that must agree; where it does not, the op is the
@@ -3057,16 +3091,80 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     CHECK(same(pa, pb, 1e-4f));
   }
 
+  SUBCASE("the cache at a head width no kernel has (Qwen3.5's 256)") {
+    // The ops take the composition rather than declining: a decoder ignores
+    // their bool, so a decline would leave the cache silently unwritten.
+    const int64_t D = 256, HKV = 2, HQ = 8, MAXC = 16, T = 5;
+    const float scale = 1.0f / std::sqrt((float)D);
+    array K = dev(random_array({HKV, T, D}, 1000)), V = dev(random_array({HKV, T, D}, 1001));
+    array Ka = dev(array::zeros({HKV, MAXC, D})), Va = dev(array::zeros({HKV, MAXC, D}));
+    array Kb = dev(array::zeros({HKV, MAXC, D})), Vb = dev(array::zeros({HKV, MAXC, D}));
+    REQUIRE(gpu::kv_fill(Ka.device_span(), Va.device_span(), K.device_span(), V.device_span(), T,
+                         MAXC, HKV, D));
+    REQUIRE(gen::kv_fill(Kb.device_span(), Vb.device_span(), K.device_span(), V.device_span(), T,
+                         MAXC, HKV, D, 0));
+    array k1 = dev(random_array({HKV, D}, 1002)), v1 = dev(random_array({HKV, D}, 1003));
+    REQUIRE(gpu::kv_append(Ka.device_span(), Va.device_span(), k1.device_span(), v1.device_span(),
+                           T, MAXC, HKV, D));
+    REQUIRE(gen::kv_append(Kb.device_span(), Vb.device_span(), k1.device_span(), v1.device_span(),
+                           T, MAXC, HKV, D));
+    tl::gpu::flush();
+    CHECK(same(Ka, Kb, 0.0f));
+    CHECK(same(Va, Vb, 0.0f));
+    array q = dev(random_array({HQ, D}, 1004));
+    array oa = array::empty({HQ, D}), ob = array::empty({HQ, D});
+    REQUIRE(gpu::attn_decode(q.device_span(), Ka.device_span(), Va.device_span(), oa.device_span(),
+                             HQ, HKV, T + 1, MAXC, D, scale));
+    REQUIRE(gen::attn_decode(q.device_span(), Kb.device_span(), Vb.device_span(), ob.device_span(),
+                             HQ, HKV, T + 1, MAXC, D, scale, false));
+    tl::gpu::flush();
+    CHECK(same(oa, ob, 1e-4f));
+  }
+
+  SUBCASE("Gated DeltaNet: ssm_conv_step and gated_delta_step") {
+    // Qwen3.5-0.8B's shapes: 16 heads of 128, a 4-tap conv over q|k|v.
+    const int64_t H = 16, dk = 128, dv = 128, K = 4, C = 2 * H * dk + H * dv;
+    array w = dev(random_array({K, C}, 980));
+    array sa = dev(random_array({K - 1, C}, 981)), sb = dev(sa);
+    // A < 0 (the decay is exp of a negative); alpha, beta and dt_bias raw.
+    array ab = dev(random_array({2 * H}, 983));
+    array r = random_array({2 * H}, 984);
+    r.eval();
+    std::vector<float> adt_h(r.raw(), r.raw() + 2 * H);
+    for (int64_t h = 0; h < H; h++) adt_h[h] = -std::fabs(adt_h[h]) - 0.1f;
+    array adt = dev(array::from(std::move(adt_h), {2 * H}));
+    array Sa = dev(random_array({H, dk, dv}, 986) * 0.1f), Sb = dev(Sa);
+    for (int step = 0; step < 2; step++) {  // the second step reads the first's state
+      array x = dev(random_array({C}, 990 + step));
+      array ca = array::empty({C}), cb = array::empty({C});
+      REQUIRE(gpu::ssm_conv_step(x.device_span(), sa.device_span(), w.device_span(),
+                                 ca.device_span(), C, K));
+      REQUIRE(gen::ssm_conv_step(x.device_span(), sb.device_span(), w.device_span(),
+                                 cb.device_span(), C, K));
+      tl::gpu::flush();
+      CHECK(same(ca, cb, 1e-5f));
+      CHECK(same(sa, sb, 0.0f));
+      array oa = array::empty({H, dv}), ob = array::empty({H, dv});
+      REQUIRE(gpu::gated_delta_step(ca.device_span(), ab.device_span(), adt.device_span(),
+                                    Sa.device_span(), oa.device_span(), H, dk, dv, 1e-6f));
+      REQUIRE(gen::gated_delta_step(ca.device_span(), ab.device_span(), adt.device_span(),
+                                    Sb.device_span(), ob.device_span(), H, dk, dv, 1e-6f));
+      tl::gpu::flush();
+      CHECK(same(oa, ob, 1e-4f));
+      CHECK(same(Sa, Sb, 1e-4f));
+    }
+  }
+
   SUBCASE("rope, split_heads, merge_heads and argmax") {
     const int64_t H = 14, T = 5, D = 64, ld = H * D;
     array x = dev(random_array({H * T, D}, 970)), b = dev(random_array({H * T, D}, 971));
     array ra = array::empty({H * T, D}), rb = array::empty({H * T, D});
     REQUIRE(gpu::rope(x.device_span(), ra.device_span(), H * T, T, D, 37, 1e6f, b.device_span()));
-    REQUIRE(gen::rope(x.device_span(), rb.device_span(), H * T, T, D, 37, 1e6f, b.device_span()));
+    REQUIRE(gen::rope(x.device_span(), rb.device_span(), H * T, T, D, 37, 1e6f, b.device_span(), D));
     tl::gpu::flush();
     CHECK(same(ra, rb, 1e-4f));
     REQUIRE(gpu::rope(x.device_span(), ra.device_span(), H * T, T, D, 37, 1e6f));
-    REQUIRE(gen::rope(x.device_span(), rb.device_span(), H * T, T, D, 37, 1e6f, {}));
+    REQUIRE(gen::rope(x.device_span(), rb.device_span(), H * T, T, D, 37, 1e6f, {}, D));
     tl::gpu::flush();
     CHECK(same(ra, rb, 1e-4f));
 

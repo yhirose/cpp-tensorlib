@@ -533,30 +533,42 @@ inline bool split_heads(span src, span bias, span dst, int64_t T, int64_t ld,
   return true;
 }
 
-// Rotary embedding over [rows, D], rows = H*T, row r at position pos + r % T:
-// out = x * C + swap(x) * S, with C and S the [T, D] tables of cos and of
-// (-sin | +sin) over the two halves, and swap(x) the halves exchanged (a row
-// gather of x seen as [2T, D/2]). Four launches a head over shared tables.
+// Rotary embedding over [rows, D], rows = H*T, row r at position pos + r % T,
+// rotating the first `rot` dims of each row (all D when rot == D) and passing
+// the rest through: out = x * C + swap(x) * S, with C and S the [T, D] tables
+// of cos and of (-sin | +sin) over the two rotated halves (1 and 0 past rot),
+// and swap(x) the halves exchanged — a row gather of x seen as rows of rot/2,
+// which leaves the chunks past rot in place. Four launches a head over shared
+// tables.
 inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
-                 int64_t pos, float base, span bias) {
-  if (rows <= 0 || T <= 0 || D <= 0 || D % 2 || rows % T) return false;
-  const int64_t half = D / 2, H = rows / T;
-  scratch C(T * D, true), S(T * D, true), idx(2 * T, true),
+                 int64_t pos, float base, span bias, int64_t rot) {
+  if (rows <= 0 || T <= 0 || D <= 0 || rot <= 0 || rot % 2 || rot > D ||
+      rows % T || D % (rot / 2)) {
+    return false;
+  }
+  const int64_t half = rot / 2, chunks = D / half, H = rows / T;
+  scratch C(T * D, true), S(T * D, true), idx(T * chunks, true),
       xb(bias ? rows * D : 1), sw(T * D), xc(T * D), xs(T * D);
   if (!C || !S || !idx || (bias && !xb) || !sw || !xc || !xs) return false;
   for (int64_t t = 0; t < T; t++) {
     const double position = static_cast<double>(pos + t);
     for (int64_t j = 0; j < half; j++) {
       const double ang = position * std::pow(static_cast<double>(base),
-                                             -2.0 * static_cast<double>(j) / D);
+                                             -2.0 * static_cast<double>(j) / rot);
       const float c = static_cast<float>(std::cos(ang)),
                   s = static_cast<float>(std::sin(ang));
       C.contents[t * D + j] = C.contents[t * D + j + half] = c;
       S.contents[t * D + j] = -s;
       S.contents[t * D + j + half] = s;
     }
-    idx.contents[2 * t] = static_cast<float>(2 * t + 1);
-    idx.contents[2 * t + 1] = static_cast<float>(2 * t);
+    for (int64_t j = rot; j < D; j++) {
+      C.contents[t * D + j] = 1.0f;
+      S.contents[t * D + j] = 0.0f;
+    }
+    for (int64_t c = 0; c < chunks; c++) {  // swap the two rotated chunks only
+      const int64_t from = c < 2 ? 1 - c : c;
+      idx.contents[t * chunks + c] = static_cast<float>(t * chunks + from);
+    }
   }
   span src = x;
   if (bias) {
@@ -565,7 +577,7 @@ inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
   }
   for (int64_t h = 0; h < H; h++) {
     const span xh = src.at(h * T * D * 4), oh = o.at(h * T * D * 4);
-    if (!index_select(xh, idx, sw, half, 2 * T) ||
+    if (!index_select(xh, idx, sw, half, T * chunks) ||
         !binary(kop::mul, xh, C, xc, T * D, 1.0f, 0.0f) ||
         !binary(kop::mul, sw, S, xs, T * D, 1.0f, 0.0f) ||
         !binary(kop::add, xc, xs, oh, T * D, 1.0f, 0.0f)) {
@@ -686,6 +698,83 @@ inline bool adam_step(span p, span m, span v, span g, int64_t n, float beta1,
          unary(kop::affine, a, p, n, 1.0f, 0.0f);
 }
 
+// Gated DeltaNet's causal conv, one token: win = [state rows, x] ([K, C],
+// oldest first), o = silu(column sums of win * w), and state takes win's last
+// K-1 rows. A ones-row GEMM does the column sums.
+inline bool ssm_conv_step(span x, span state, span w, span o, int64_t C,
+                          int64_t K) {
+  scratch win(K * C), prod(K * C), ones(K, true), sum(C), sg(C);
+  if (!win || !prod || !ones || !sum || !sg) return false;
+  for (int64_t k = 0; k < K; k++) ones.contents[k] = 1.0f;
+  const span wv = win;
+  return unary(kop::affine, state, wv, (K - 1) * C, 1.0f, 0.0f) &&
+         unary(kop::affine, x, wv.at((K - 1) * C * 4), C, 1.0f, 0.0f) &&
+         binary(kop::mul, wv, w, prod, K * C, 1.0f, 0.0f) &&
+         gemm(ones, K, false, prod, C, false, sum, 1, C, K, 1.0f, 0.0f) &&
+         unary(kop::sigmoid, sum, sg, C, 1.0f, 0.0f) &&
+         binary(kop::mul, sum, sg, o, C, 1.0f, 0.0f) &&
+         unary(kop::affine, wv.at(C * 4), state, (K - 1) * C, 1.0f, 0.0f);
+}
+
+// One token of the gated delta rule (see the shared op below): the L2 norms
+// as a row reduction and two broadcasts, the gates elementwise, and per head
+// three GEMVs (the state read by k, the rank-1 update, the state read by q).
+inline bool gated_delta_step(span qkv, span ab, span adt, span state, span o,
+                             int64_t H, int64_t dk, int64_t dv, float eps) {
+  const int64_t nq = H * dk, S = dk * dv;
+  scratch sq(2 * nq), ss(2 * H), inv(2 * H), qk(2 * nq), t(H), e(H), e1(H),
+      sp(H), g(H), decay(H), beta(H), S2(H * S), kvm(H * dv), d1(H * dv),
+      d2(H * dv), up(S);
+  if (!sq || !ss || !inv || !qk || !t || !e || !e1 || !sp || !g || !decay ||
+      !beta || !S2 || !kvm || !d1 || !d2 || !up) {
+    return false;
+  }
+  const span qn = qk, kn = qn.at(nq * 4);
+  // q and k rows over 1 / sqrt(sum(x^2) + eps), q also over sqrt(dk).
+  if (!binary(kop::mul, qkv, qkv, sq, 2 * nq, 1.0f, 0.0f) ||
+      !row_op(kop::row_sum, sq, ss, 2 * H, dk, 1.0f, eps) ||
+      !scalar_binary(scalar_op::pow, ss, inv, 2 * H, -0.5f, 1.0f, 0.0f) ||
+      !binary_bcast(kop::bmul, qkv, dk, 1, inv, 1, 0, qn, H, dk,
+                    1.0f / std::sqrt(static_cast<float>(dk)), 0.0f) ||
+      !binary_bcast(kop::bmul, qkv.at(nq * 4), dk, 1, span(inv).at(H * 4), 1,
+                    0, kn, H, dk, 1.0f, 0.0f)) {
+    return false;
+  }
+  // decay = exp(A * softplus(alpha + dt)), beta = sigmoid(beta).
+  if (!binary(kop::add, ab, adt.at(H * 4), t, H, 1.0f, 0.0f) ||
+      !unary(kop::exp_, t, e, H, 1.0f, 0.0f) ||
+      !unary(kop::affine, e, e1, H, 1.0f, 1.0f) ||
+      !unary(kop::log_, e1, sp, H, 1.0f, 0.0f) ||
+      !binary(kop::mul, adt, sp, g, H, 1.0f, 0.0f) ||
+      !unary(kop::exp_, g, decay, H, 1.0f, 0.0f) ||
+      !unary(kop::sigmoid, ab.at(H * 4), beta, H, 1.0f, 0.0f) ||
+      !binary_bcast(kop::bmul, state, S, 1, decay, 1, 0, S2, H, S, 1.0f, 0.0f)) {
+    return false;
+  }
+  const span S2v = S2;
+  for (int64_t h = 0; h < H; h++) {  // kv memory = k . S
+    if (!gemm(kn.at(h * dk * 4), dk, false, S2v.at(h * S * 4), dv, false,
+              span(kvm).at(h * dv * 4), 1, dv, dk, 1.0f, 0.0f)) {
+      return false;
+    }
+  }
+  if (!binary(kop::sub, qkv.at(2 * nq * 4), kvm, d1, H * dv, 1.0f, 0.0f) ||
+      !binary_bcast(kop::bmul, d1, dv, 1, beta, 1, 0, d2, H, dv, 1.0f, 0.0f)) {
+    return false;
+  }
+  for (int64_t h = 0; h < H; h++) {  // S += k (x) delta, then o = q . S
+    const span Sh = state.at(h * S * 4);
+    if (!gemm(kn.at(h * dk * 4), 1, false, span(d2).at(h * dv * 4), dv, false,
+              up, dk, dv, 1, 1.0f, 0.0f) ||
+        !binary(kop::add, S2v.at(h * S * 4), up, Sh, S, 1.0f, 0.0f) ||
+        !gemm(qn.at(h * dk * 4), dk, false, Sh, dv, false, o.at(h * dv * 4), 1,
+              dv, dk, 1.0f, 0.0f)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace generic
 
 // ---- the model path: what a decoder runs on raw device buffers between its
@@ -726,6 +815,41 @@ inline bool swiglu(span gu, span o, int64_t ff, int64_t rows = 1) {
          generic::swiglu(gu, o, ff, rows);
 }
 
+// Gated DeltaNet's causal depthwise conv, one token, with its SiLU: over the
+// window [state, x] — state holds the K-1 previous inputs [K-1, C], oldest
+// first — o[c] = silu(sum_k win[k][c] * w[k][c]) for the tap-major weights w
+// [K, C]; then state drops its oldest row and takes x.
+inline bool ssm_conv_step(span x, span state, span w, span o, int64_t C,
+                          int64_t K) {
+  if (C <= 0 || K < 2) return false;
+  return launch(kop::ssm_conv_, {in(x), inout(state), in(w), out(o)},
+                ssm_conv_params{static_cast<uint32_t>(C), static_cast<uint32_t>(K)},
+                policy::flat(C)) ||
+         generic::ssm_conv_step(x, state, w, o, C, K);
+}
+
+// One token of the gated delta rule (Gated DeltaNet, Qwen3.5), per head h with
+// a state S_h [dk, dv]. qkv = q [H, dk] | k [H, dk] | v [H, dv] as the conv left
+// them; ab = alpha [H] | beta [H] raw; adt = A [H] | dt_bias [H]. q and k are
+// L2-normalized (q also over sqrt(dk)), then
+//   decay = exp(A * softplus(alpha + dt)), beta = sigmoid(beta),
+//   S = S * decay;  S += k (x) ((v - k.S) * beta);  o = q.S
+// State and output are f32.
+inline bool gated_delta_step(span qkv, span ab, span adt, span state, span o,
+                             int64_t H, int64_t dk, int64_t dv, float eps) {
+  if (H <= 0 || dk <= 0 || dv <= 0) return false;
+  constexpr uint32_t threads = 64;
+  const grid g{static_cast<uint32_t>((dv + threads - 1) / threads),
+               static_cast<uint32_t>(H), 1, threads, 1, 1,
+               static_cast<uint32_t>((2 * dk + threads) * sizeof(float))};
+  return launch(kop::gated_delta_,
+                {in(qkv), in(ab), in(adt), inout(state), out(o)},
+                gated_delta_params{static_cast<uint32_t>(H), static_cast<uint32_t>(dk),
+                                   static_cast<uint32_t>(dv), eps},
+                g) ||
+         generic::gated_delta_step(qkv, ab, adt, state, o, H, dk, dv, eps);
+}
+
 // y[1,N] = a[1,K] . W[N,K]^T with the bf16 weight row-major (GGML-native): one
 // group an output row. Requires k % 8 == 0.
 inline bool gemv_bf16_row(span a, span W, span y, int64_t n, int64_t k) {
@@ -754,12 +878,15 @@ inline bool gemv_q4(span a, span qw, span scales, span y, int64_t N, int64_t K,
 inline bool kv_append(span Kc, span Vc, span k_new, span v_new, int64_t pos,
                       int64_t kv_max, int64_t n_kv_heads, int64_t D,
                       bool kv_bf16 = false) {
-  if ((D != 64 && D != 128) || n_kv_heads <= 0) return false;
-  return launch(kv_bf16 ? kop::kv_append_bf16_ : kop::kv_append_,
-                {out(Kc), out(Vc), in(k_new), in(v_new)},
-                kv_append_params{static_cast<uint32_t>(pos),
-                                 static_cast<uint32_t>(kv_max * D)},
-                policy::per_head(n_kv_heads, 1, D)) ||
+  if (n_kv_heads <= 0 || D <= 0) return false;
+  // The kernels are written for a head of 64 or 128; any other width takes the
+  // composition.
+  return ((D == 64 || D == 128) &&
+          launch(kv_bf16 ? kop::kv_append_bf16_ : kop::kv_append_,
+                 {out(Kc), out(Vc), in(k_new), in(v_new)},
+                 kv_append_params{static_cast<uint32_t>(pos),
+                                  static_cast<uint32_t>(kv_max * D)},
+                 policy::per_head(n_kv_heads, 1, D))) ||
          (!kv_bf16 &&
           generic::kv_append(Kc, Vc, k_new, v_new, pos, kv_max, n_kv_heads, D));
 }
@@ -768,13 +895,14 @@ inline bool kv_append(span Kc, span Vc, span k_new, span v_new, int64_t pos,
 inline bool kv_fill(span Kc, span Vc, span K, span V, int64_t T, int64_t kv_max,
                     int64_t n_kv_heads, int64_t D, bool kv_bf16 = false,
                     int64_t pos0 = 0) {
-  if ((D != 64 && D != 128) || n_kv_heads <= 0 || T <= 0) return false;
-  return launch(kv_bf16 ? kop::kv_fill_bf16_ : kop::kv_fill_,
-                {out(Kc), out(Vc), in(K), in(V)},
-                kv_fill_params{static_cast<uint32_t>(T),
-                               static_cast<uint32_t>(kv_max * D),
-                               static_cast<uint32_t>(pos0)},
-                policy::per_head(n_kv_heads, T, D)) ||
+  if (n_kv_heads <= 0 || D <= 0 || T <= 0) return false;
+  return ((D == 64 || D == 128) &&  // the kernels' widths, as in kv_append
+          launch(kv_bf16 ? kop::kv_fill_bf16_ : kop::kv_fill_,
+                 {out(Kc), out(Vc), in(K), in(V)},
+                 kv_fill_params{static_cast<uint32_t>(T),
+                                static_cast<uint32_t>(kv_max * D),
+                                static_cast<uint32_t>(pos0)},
+                 policy::per_head(n_kv_heads, T, D))) ||
          (!kv_bf16 &&
           generic::kv_fill(Kc, Vc, K, V, T, kv_max, n_kv_heads, D, pos0));
 }
@@ -820,15 +948,21 @@ inline bool argmax(span a, int64_t n, int64_t* out_idx) {
 }
 
 // Rotary embedding over [rows, T, D] at position `pos`, adding the optional
-// per-row bias first.
+// per-row bias first. `rot` (0: all of D) rotates only the first rot dims of
+// each row, the partial RoPE of Qwen3.5; the backends' own kernels rotate the
+// whole row, so a partial one takes the composition.
 TL_GPU_DETECT_OWN(rope)
 template <class Own = own>
 inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
-                 int64_t pos, float base, span bias = {}) {
+                 int64_t pos, float base, span bias = {}, int64_t rot = 0) {
+  if (rot == 0) rot = D;
   if constexpr (detail::owns_rope<Own>::value) {
-    if (detail::ran(Own::rope(x, o, rows, T, D, pos, base, bias))) return true;
+    if (rot == D &&
+        detail::ran(Own::rope(x, o, rows, T, D, pos, base, bias))) {
+      return true;
+    }
   }
-  return generic::rope(x, o, rows, T, D, pos, base, bias);
+  return generic::rope(x, o, rows, T, D, pos, base, bias, rot);
 }
 
 // ---- the LLM path.
