@@ -37,10 +37,13 @@ class tokenizer {
     for (size_t i = 0; i < merges.size(); i++)
       merge_rank_.emplace(merges[i], static_cast<int>(i));
 
-    // Special (CONTROL, type==3) tokens are matched atomically in encode.
+    // Special tokens are matched atomically in encode: CONTROL (type 3, the chat
+    // markers) and USER_DEFINED (type 4: HF "added tokens" that are not marked
+    // special, e.g. Qwen3's <think> / </think>). Both are literal text the model
+    // was trained to see as one id, so neither may fall through to BPE.
     const auto& tt = m.kv("tokenizer.ggml.token_type");
     for (size_t i = 0; i < tt.arr.size() && i < tokens_.size(); i++)
-      if (tt.arr[i].i == 3)
+      if (tt.arr[i].i == 3 || tt.arr[i].i == 4)
         specials_.emplace_back(tokens_[i], static_cast<int>(i));
 
     eos_id_ = static_cast<int>(m.kv("tokenizer.ggml.eos_token_id").as_u32());
@@ -297,7 +300,7 @@ class tokenizer {
   std::vector<std::string> tokens_;                    // id -> vocab string
   std::unordered_map<std::string, int> token2id_;      // vocab string -> id
   std::unordered_map<std::string, int> merge_rank_;    // "A B" -> rank
-  std::vector<std::pair<std::string, int>> specials_;  // CONTROL tokens
+  std::vector<std::pair<std::string, int>> specials_;  // CONTROL + USER_DEFINED tokens
   std::unordered_map<uint32_t, uint8_t> cp2byte_;      // inverse byte2cp
   int eos_id_ = -1;
   int bos_id_ = -1;
