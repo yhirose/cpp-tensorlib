@@ -698,29 +698,34 @@ inline bool adam_step(span p, span m, span v, span g, int64_t n, float beta1,
          unary(kop::affine, a, p, n, 1.0f, 0.0f);
 }
 
-// Gated DeltaNet's causal conv, one token: win = [state rows, x] ([K, C],
-// oldest first), o = silu(column sums of win * w), and state takes win's last
-// K-1 rows. A ones-row GEMM does the column sums.
-inline bool ssm_conv_step(span x, span state, span w, span o, int64_t C,
-                          int64_t K) {
+// Gated DeltaNet's causal conv, a token at a time: win = [state rows, x_t]
+// ([K, C], oldest first), o_t = silu(column sums of win * w), and state takes
+// win's last K-1 rows. A ones-row GEMM does the column sums.
+inline bool ssm_conv(span x, int64_t ld, span state, span w, span o, int64_t C,
+                     int64_t K, int64_t T) {
   scratch win(K * C), prod(K * C), ones(K, true), sum(C), sg(C);
   if (!win || !prod || !ones || !sum || !sg) return false;
   for (int64_t k = 0; k < K; k++) ones.contents[k] = 1.0f;
   const span wv = win;
-  return unary(kop::affine, state, wv, (K - 1) * C, 1.0f, 0.0f) &&
-         unary(kop::affine, x, wv.at((K - 1) * C * 4), C, 1.0f, 0.0f) &&
-         binary(kop::mul, wv, w, prod, K * C, 1.0f, 0.0f) &&
-         gemm(ones, K, false, prod, C, false, sum, 1, C, K, 1.0f, 0.0f) &&
-         unary(kop::sigmoid, sum, sg, C, 1.0f, 0.0f) &&
-         binary(kop::mul, sum, sg, o, C, 1.0f, 0.0f) &&
-         unary(kop::affine, wv.at(C * 4), state, (K - 1) * C, 1.0f, 0.0f);
+  for (int64_t t = 0; t < T; t++) {
+    if (!unary(kop::affine, state, wv, (K - 1) * C, 1.0f, 0.0f) ||
+        !unary(kop::affine, x.at(t * ld * 4), wv.at((K - 1) * C * 4), C, 1.0f, 0.0f) ||
+        !binary(kop::mul, wv, w, prod, K * C, 1.0f, 0.0f) ||
+        !gemm(ones, K, false, prod, C, false, sum, 1, C, K, 1.0f, 0.0f) ||
+        !unary(kop::sigmoid, sum, sg, C, 1.0f, 0.0f) ||
+        !binary(kop::mul, sum, sg, o.at(t * C * 4), C, 1.0f, 0.0f) ||
+        !unary(kop::affine, wv.at(C * 4), state, (K - 1) * C, 1.0f, 0.0f)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // One token of the gated delta rule (see the shared op below): the L2 norms
 // as a row reduction and two broadcasts, the gates elementwise, and per head
 // three GEMVs (the state read by k, the rank-1 update, the state read by q).
-inline bool gated_delta_step(span qkv, span ab, span adt, span state, span o,
-                             int64_t H, int64_t dk, int64_t dv, float eps) {
+inline bool gated_delta_token_(span qkv, span ab, span adt, span state, span o,
+                               int64_t H, int64_t dk, int64_t dv, float eps) {
   const int64_t nq = H * dk, S = dk * dv;
   scratch sq(2 * nq), ss(2 * H), inv(2 * H), qk(2 * nq), t(H), e(H), e1(H),
       sp(H), g(H), decay(H), beta(H), S2(H * S), kvm(H * dv), d1(H * dv),
@@ -775,6 +780,20 @@ inline bool gated_delta_step(span qkv, span ab, span adt, span state, span o,
   return true;
 }
 
+// The rule over T tokens is the one-token step T times, in order.
+inline bool gated_delta(span qkv, span ab, int64_t ab_ld, span adt, span state,
+                        span o, int64_t H, int64_t dk, int64_t dv, int64_t T,
+                        float eps) {
+  const int64_t C = 2 * H * dk + H * dv;
+  for (int64_t t = 0; t < T; t++) {
+    if (!gated_delta_token_(qkv.at(t * C * 4), ab.at(t * ab_ld * 4), adt, state,
+                            o.at(t * H * dv * 4), H, dk, dv, eps)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace generic
 
 // ---- the model path: what a decoder runs on raw device buffers between its
@@ -815,29 +834,36 @@ inline bool swiglu(span gu, span o, int64_t ff, int64_t rows = 1) {
          generic::swiglu(gu, o, ff, rows);
 }
 
-// Gated DeltaNet's causal depthwise conv, one token, with its SiLU: over the
-// window [state, x] — state holds the K-1 previous inputs [K-1, C], oldest
-// first — o[c] = silu(sum_k win[k][c] * w[k][c]) for the tap-major weights w
-// [K, C]; then state drops its oldest row and takes x.
-inline bool ssm_conv_step(span x, span state, span w, span o, int64_t C,
-                          int64_t K) {
-  if (C <= 0 || K < 2) return false;
-  return launch(kop::ssm_conv_, {in(x), inout(state), in(w), out(o)},
-                ssm_conv_params{static_cast<uint32_t>(C), static_cast<uint32_t>(K)},
-                policy::flat(C)) ||
-         generic::ssm_conv_step(x, state, w, o, C, K);
+// Gated DeltaNet's causal depthwise conv over T tokens, with its SiLU. Token t
+// reads row t of x (rows `ld` apart, its first C channels) and writes row t of
+// o [T, C]: over the window of the K-1 inputs before it and itself,
+// o_t[c] = silu(sum_k win[k][c] * w[k][c]) for the tap-major weights w [K, C].
+// state holds the K-1 inputs before the first token [K-1, C], oldest first,
+// and is left holding the K-1 before the next call. The kernels keep the
+// window in registers, to K = 8.
+inline bool ssm_conv(span x, int64_t ld, span state, span w, span o, int64_t C,
+                     int64_t K, int64_t T = 1) {
+  if (C <= 0 || K < 2 || T <= 0 || ld < C) return false;
+  return (K <= 8 &&
+          launch(kop::ssm_conv_, {in(x), inout(state), in(w), out(o)},
+                 ssm_conv_params{static_cast<uint32_t>(C), static_cast<uint32_t>(K),
+                                 static_cast<uint32_t>(T), static_cast<uint32_t>(ld)},
+                 policy::flat(C))) ||
+         generic::ssm_conv(x, ld, state, w, o, C, K, T);
 }
 
-// One token of the gated delta rule (Gated DeltaNet, Qwen3.5), per head h with
-// a state S_h [dk, dv]. qkv = q [H, dk] | k [H, dk] | v [H, dv] as the conv left
-// them; ab = alpha [H] | beta [H] raw; adt = A [H] | dt_bias [H]. q and k are
-// L2-normalized (q also over sqrt(dk)), then
+// The gated delta rule (Gated DeltaNet, Qwen3.5) over T tokens in order, per
+// head h with a state S_h [dk, dv]. Token t reads row t of qkv [T, C] —
+// q [H, dk] | k [H, dk] | v [H, dv] as the conv left them — and of ab (rows
+// ab_ld apart) — alpha [H] | beta [H] raw; adt = A [H] | dt_bias [H]. q and k
+// are L2-normalized (q also over sqrt(dk)), then
 //   decay = exp(A * softplus(alpha + dt)), beta = sigmoid(beta),
-//   S = S * decay;  S += k (x) ((v - k.S) * beta);  o = q.S
-// State and output are f32.
-inline bool gated_delta_step(span qkv, span ab, span adt, span state, span o,
-                             int64_t H, int64_t dk, int64_t dv, float eps) {
-  if (H <= 0 || dk <= 0 || dv <= 0) return false;
+//   S = S * decay;  S += k (x) ((v - k.S) * beta);  o_t = q.S
+// into row t of o [T, H*dv]. State and output are f32.
+inline bool gated_delta(span qkv, span ab, int64_t ab_ld, span adt, span state,
+                        span o, int64_t H, int64_t dk, int64_t dv, int64_t T,
+                        float eps) {
+  if (H <= 0 || dk <= 0 || dv <= 0 || T <= 0) return false;
   constexpr uint32_t threads = 64;
   const grid g{static_cast<uint32_t>((dv + threads - 1) / threads),
                static_cast<uint32_t>(H), 1, threads, 1, 1,
@@ -845,9 +871,10 @@ inline bool gated_delta_step(span qkv, span ab, span adt, span state, span o,
   return launch(kop::gated_delta_,
                 {in(qkv), in(ab), in(adt), inout(state), out(o)},
                 gated_delta_params{static_cast<uint32_t>(H), static_cast<uint32_t>(dk),
-                                   static_cast<uint32_t>(dv), eps},
+                                   static_cast<uint32_t>(dv), static_cast<uint32_t>(T),
+                                   static_cast<uint32_t>(ab_ld), eps},
                 g) ||
-         generic::gated_delta_step(qkv, ab, adt, state, o, H, dk, dv, eps);
+         generic::gated_delta(qkv, ab, ab_ld, adt, state, o, H, dk, dv, T, eps);
 }
 
 // y[1,N] = a[1,K] . W[N,K]^T with the bf16 weight row-major (GGML-native): one

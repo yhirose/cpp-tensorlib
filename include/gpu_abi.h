@@ -289,12 +289,12 @@ struct kv_fill_params {
 struct merge_heads_params {
   uint32_t T, H, D;
 };
-struct ssm_conv_params {  // C channels, a K-tap causal window
-  uint32_t C, K;
+struct ssm_conv_params {  // C channels, a K-tap causal window, T tokens
+  uint32_t C, K, T, ld;   // ld: elements between the input's token rows
 };
-struct gated_delta_params {  // H heads, a [dk, dv] state each
-  uint32_t H, dk, dv;
-  float eps;  // of the q / k L2 norms
+struct gated_delta_params {  // H heads, a [dk, dv] state each, T tokens
+  uint32_t H, dk, dv, T, ab_ld;  // ab_ld: elements between alpha|beta rows
+  float eps;                     // of the q / k L2 norms
 };
 
 // The launch record. Every kernel launch on every backend is one row under

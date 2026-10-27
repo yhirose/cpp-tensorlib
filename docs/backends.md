@@ -159,8 +159,8 @@ The ops fall in two tiers. Tier 0 — elementwise, broadcast, reduction, GEMM,
 copy and index — closes the array surface: a backend with those kernels runs
 every graph. Tier 1 is the fused ops — the model path's `rmsnorm`, `swiglu`,
 the decode GEMV, the cache writes, `rope`, the attention, `split_heads` /
-`merge_heads`, `argmax`, Gated DeltaNet's `ssm_conv_step` and
-`gated_delta_step`, plus two training ops off that path, `xent_bwd` and
+`merge_heads`, `argmax`, Gated DeltaNet's `ssm_conv` and
+`gated_delta`, plus two training ops off that path, `xent_bwd` and
 `adam_step` — each a kernel a backend *may* have. Under each of them
 `gpu_ops.h` holds one generic composition out of tier 0 (`gpu::generic`), and
 the op

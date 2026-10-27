@@ -3149,38 +3149,54 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     CHECK(same(oa, ob, 1e-4f));
   }
 
-  SUBCASE("Gated DeltaNet: ssm_conv_step and gated_delta_step") {
-    // Qwen3.5-0.8B's shapes: 16 heads of 128, a 4-tap conv over q|k|v.
+  SUBCASE("Gated DeltaNet: ssm_conv and gated_delta") {
+    // Qwen3.5-0.8B's shapes: 16 heads of 128, a 4-tap conv over q|k|v. The
+    // conv's input rows are a fused projection's, wider than C.
     const int64_t H = 16, dk = 128, dv = 128, K = 4, C = 2 * H * dk + H * dv;
+    const int64_t T = 5, ld = C + 3 * H;
     array w = dev(random_array({K, C}, 980));
-    array sa = dev(random_array({K - 1, C}, 981)), sb = dev(sa);
-    // A < 0 (the decay is exp of a negative); alpha, beta and dt_bias raw.
-    array ab = dev(random_array({2 * H}, 983));
     array r = random_array({2 * H}, 984);
     r.eval();
     std::vector<float> adt_h(r.raw(), r.raw() + 2 * H);
-    for (int64_t h = 0; h < H; h++) adt_h[h] = -std::fabs(adt_h[h]) - 0.1f;
+    for (int64_t h = 0; h < H; h++) adt_h[h] = -std::fabs(adt_h[h]) - 0.1f;  // A < 0
     array adt = dev(array::from(std::move(adt_h), {2 * H}));
-    array Sa = dev(random_array({H, dk, dv}, 986) * 0.1f), Sb = dev(Sa);
-    for (int step = 0; step < 2; step++) {  // the second step reads the first's state
-      array x = dev(random_array({C}, 990 + step));
-      array ca = array::empty({C}), cb = array::empty({C});
-      REQUIRE(gpu::ssm_conv_step(x.device_span(), sa.device_span(), w.device_span(),
-                                 ca.device_span(), C, K));
-      REQUIRE(gen::ssm_conv_step(x.device_span(), sb.device_span(), w.device_span(),
-                                 cb.device_span(), C, K));
-      tl::gpu::flush();
-      CHECK(same(ca, cb, 1e-5f));
-      CHECK(same(sa, sb, 0.0f));
-      array oa = array::empty({H, dv}), ob = array::empty({H, dv});
-      REQUIRE(gpu::gated_delta_step(ca.device_span(), ab.device_span(), adt.device_span(),
-                                    Sa.device_span(), oa.device_span(), H, dk, dv, 1e-6f));
-      REQUIRE(gen::gated_delta_step(ca.device_span(), ab.device_span(), adt.device_span(),
-                                    Sb.device_span(), ob.device_span(), H, dk, dv, 1e-6f));
-      tl::gpu::flush();
-      CHECK(same(oa, ob, 1e-4f));
-      CHECK(same(Sa, Sb, 1e-4f));
+    array x = dev(random_array({T, ld}, 990));
+    array ab = dev(random_array({T, ld}, 983));  // alpha|beta at each row's start
+    array cs0 = dev(random_array({K - 1, C}, 981));
+    array S0 = dev(random_array({H, dk, dv}, 986) * 0.1f);
+    // Three routes from the same state: all T tokens in one call (the
+    // prefill's), one call a token (the decode's), and the composition.
+    array csa = dev(cs0), csb = dev(cs0), csc = dev(cs0);
+    array Sa = dev(S0), Sb = dev(S0), Sc = dev(S0);
+    array ca = array::empty({T, C}), cb = array::empty({T, C}), cc = array::empty({T, C});
+    array oa = array::empty({T, H * dv}), ob = array::empty({T, H * dv}),
+          oc = array::empty({T, H * dv});
+    REQUIRE(gpu::ssm_conv(x.device_span(), ld, csa.device_span(), w.device_span(),
+                          ca.device_span(), C, K, T));
+    REQUIRE(gen::ssm_conv(x.device_span(), ld, csc.device_span(), w.device_span(),
+                          cc.device_span(), C, K, T));
+    for (int64_t t = 0; t < T; t++) {
+      REQUIRE(gpu::ssm_conv(x.device_span().at(t * ld * 4), ld, csb.device_span(),
+                            w.device_span(), cb.device_span().at(t * C * 4), C, K));
     }
+    REQUIRE(gpu::gated_delta(ca.device_span(), ab.device_span(), ld, adt.device_span(),
+                             Sa.device_span(), oa.device_span(), H, dk, dv, T, 1e-6f));
+    REQUIRE(gen::gated_delta(cc.device_span(), ab.device_span(), ld, adt.device_span(),
+                             Sc.device_span(), oc.device_span(), H, dk, dv, T, 1e-6f));
+    for (int64_t t = 0; t < T; t++) {
+      REQUIRE(gpu::gated_delta(cb.device_span().at(t * C * 4), ab.device_span().at(t * ld * 4),
+                               0, adt.device_span(), Sb.device_span(),
+                               ob.device_span().at(t * H * dv * 4), H, dk, dv, 1, 1e-6f));
+    }
+    tl::gpu::flush();
+    CHECK(same(ca, cb, 0.0f));  // the same kernel, a token at a time
+    CHECK(same(csa, csb, 0.0f));
+    CHECK(same(oa, ob, 0.0f));
+    CHECK(same(Sa, Sb, 0.0f));
+    CHECK(same(ca, cc, 1e-5f));  // the kernel against the composition
+    CHECK(same(csa, csc, 0.0f));
+    CHECK(same(oa, oc, 1e-4f));
+    CHECK(same(Sa, Sc, 1e-4f));
   }
 
   SUBCASE("rope, split_heads, merge_heads and argmax") {

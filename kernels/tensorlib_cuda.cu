@@ -449,89 +449,105 @@ extern "C" __global__ void tl_swiglu(const float* __restrict__ gu,
   out[(size_t)blockIdx.y * ff + f] = (g / (1.0f + expf(-g))) * gu[src + ff];
 }
 
-// Gated DeltaNet's causal depthwise conv, one token, then SiLU. state is the
-// K-1 previous inputs [K-1, C] (oldest first), w the tap-major weights [K, C].
-// A thread per channel, which reads and rewrites only its own column of the
-// state, so the update is in place. grid = ceil(C/256).
+// Gated DeltaNet's causal depthwise conv over T tokens, then SiLU. Token t
+// reads row t of x (rows ld apart) and writes row t of out [T, C]; state is
+// the K-1 inputs before the first token [K-1, C] (oldest first), w the tap-
+// major weights [K, C]. A thread per channel walks the tokens with the window
+// in registers (K <= 8, which the launcher checks) and leaves the last K-1
+// inputs in its own column of the state. grid = ceil(C/256).
 extern "C" __global__ void tl_ssm_conv(const float* __restrict__ x,
                                        float* __restrict__ state,
                                        const float* __restrict__ w,
                                        float* __restrict__ out, unsigned C,
-                                       unsigned K) {
+                                       unsigned K, unsigned T, unsigned ld) {
   const unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
-  const float xc = x[c];
-  float acc = xc * w[(size_t)(K - 1) * C + c];
-  for (unsigned k = 0; k + 1 < K; k++) acc += state[(size_t)k * C + c] * w[(size_t)k * C + c];
-  out[c] = acc / (1.0f + expf(-acc));
-  for (unsigned k = 0; k + 2 < K; k++) state[(size_t)k * C + c] = state[(size_t)(k + 1) * C + c];
-  state[(size_t)(K - 2) * C + c] = xc;
+  float win[7], wk[8];
+  for (unsigned k = 0; k + 1 < K; k++) win[k] = state[(size_t)k * C + c];
+  for (unsigned k = 0; k < K; k++) wk[k] = w[(size_t)k * C + c];
+  for (unsigned t = 0; t < T; t++) {
+    const float xc = x[(size_t)t * ld + c];
+    float acc = xc * wk[K - 1];
+    for (unsigned k = 0; k + 1 < K; k++) acc += win[k] * wk[k];
+    out[(size_t)t * C + c] = acc / (1.0f + expf(-acc));
+    for (unsigned k = 0; k + 2 < K; k++) win[k] = win[k + 1];
+    win[K - 2] = xc;
+  }
+  for (unsigned k = 0; k + 1 < K; k++) state[(size_t)k * C + c] = win[k];
 }
 
-// One token of the gated delta rule (gpu_ops.h gated_delta_step has the math).
-// grid = (ceil(dv/64), H), 64 threads: the block stages its head's q and k in
-// shared memory, L2-normalizes them, and each thread owns one column j of the
-// head's state S [dk, dv] — two passes down it, the first for k.S, the second
-// rewriting it and accumulating q.S. Consecutive threads read consecutive j,
-// so every pass is coalesced. Dynamic shared memory: (2*dk + blockDim) floats.
+// The gated delta rule over T tokens (gpu_ops.h gated_delta has the math).
+// grid = (ceil(dv/64), H), 64 threads, and each thread owns one column j of
+// its head's state S [dk, dv] across every token: a token stages its q and k
+// in shared memory and L2-normalizes them, then each thread makes two passes
+// down its column, the first for k.S, the second rewriting it and
+// accumulating q.S. Consecutive threads read consecutive j, so every pass is
+// coalesced; the state stays in place, cached in L2 between tokens. Dynamic
+// shared memory: (2*dk + blockDim) floats; blockDim a power of two.
 extern "C" __global__ void tl_gated_delta(const float* __restrict__ qkv,
                                           const float* __restrict__ ab,
                                           const float* __restrict__ adt,
                                           float* __restrict__ state,
                                           float* __restrict__ out, unsigned H,
-                                          unsigned dk, unsigned dv, float eps) {
+                                          unsigned dk, unsigned dv, unsigned T,
+                                          unsigned ab_ld, float eps) {
   extern __shared__ float sm[];
   float *qs = sm, *ks = sm + dk, *red = sm + 2 * dk;
-  const unsigned h = blockIdx.y, t = threadIdx.x, T = blockDim.x;
-  const size_t nq = (size_t)H * dk;
-  const float* qh = qkv + (size_t)h * dk;
-  const float* kh = qkv + nq + (size_t)h * dk;
-  float sq = 0.0f, sk = 0.0f;
-  for (unsigned i = t; i < dk; i += T) {
-    const float a = qh[i], b = kh[i];
-    qs[i] = a;
-    ks[i] = b;
-    sq += a * a;
-    sk += b * b;
-  }
-  // The two sums, one tree after the other (blockDim is a power of two).
-  red[t] = sq;
-  __syncthreads();
-  for (unsigned s = T / 2; s > 0; s >>= 1) {
-    if (t < s) red[t] += red[t + s];
-    __syncthreads();
-  }
-  const float qn = 1.0f / sqrtf(red[0] + eps) / sqrtf((float)dk);
-  __syncthreads();
-  red[t] = sk;
-  __syncthreads();
-  for (unsigned s = T / 2; s > 0; s >>= 1) {
-    if (t < s) red[t] += red[t + s];
-    __syncthreads();
-  }
-  const float kn = 1.0f / sqrtf(red[0] + eps);
-  for (unsigned i = t; i < dk; i += T) {
-    qs[i] *= qn;
-    ks[i] *= kn;
-  }
-  __syncthreads();
-
-  const unsigned j = blockIdx.x * T + t;
-  if (j >= dv) return;
-  const float x = ab[h] + adt[H + h];
-  const float decay = expf(adt[h] * (x > 20.0f ? x : log1pf(expf(x))));
-  const float beta = 1.0f / (1.0f + expf(-ab[H + h]));
+  const unsigned h = blockIdx.y, t = threadIdx.x, NT = blockDim.x;
+  const unsigned j = blockIdx.x * NT + t;
+  const size_t nq = (size_t)H * dk, C = 2 * nq + (size_t)H * dv;
+  const float A = adt[h], dt = adt[H + h];
   float* S = state + (size_t)h * dk * dv + j;
-  float kv = 0.0f;
-  for (unsigned i = 0; i < dk; i++) kv += S[(size_t)i * dv] * ks[i];
-  const float delta = (qkv[2 * nq + (size_t)h * dv + j] - decay * kv) * beta;
-  float o = 0.0f;
-  for (unsigned i = 0; i < dk; i++) {
-    const float v = S[(size_t)i * dv] * decay + ks[i] * delta;
-    S[(size_t)i * dv] = v;
-    o += v * qs[i];
+  for (unsigned tok = 0; tok < T; tok++) {
+    const float* row = qkv + tok * C;
+    const float* qh = row + (size_t)h * dk;
+    const float* kh = row + nq + (size_t)h * dk;
+    float sq = 0.0f, sk = 0.0f;
+    __syncthreads();  // the previous token is done reading qs / ks
+    for (unsigned i = t; i < dk; i += NT) {
+      const float a = qh[i], b = kh[i];
+      qs[i] = a;
+      ks[i] = b;
+      sq += a * a;
+      sk += b * b;
+    }
+    // The two sums, one tree after the other.
+    red[t] = sq;
+    __syncthreads();
+    for (unsigned s = NT / 2; s > 0; s >>= 1) {
+      if (t < s) red[t] += red[t + s];
+      __syncthreads();
+    }
+    const float qn = 1.0f / sqrtf(red[0] + eps) / sqrtf((float)dk);
+    __syncthreads();
+    red[t] = sk;
+    __syncthreads();
+    for (unsigned s = NT / 2; s > 0; s >>= 1) {
+      if (t < s) red[t] += red[t + s];
+      __syncthreads();
+    }
+    const float kn = 1.0f / sqrtf(red[0] + eps);
+    for (unsigned i = t; i < dk; i += NT) {
+      qs[i] *= qn;
+      ks[i] *= kn;
+    }
+    __syncthreads();
+    if (j >= dv) continue;  // past the head's columns, but still at the syncs
+    const float* abt = ab + (size_t)tok * ab_ld;
+    const float x = abt[h] + dt;
+    const float decay = expf(A * (x > 20.0f ? x : log1pf(expf(x))));
+    const float beta = 1.0f / (1.0f + expf(-abt[H + h]));
+    float kv = 0.0f;
+    for (unsigned i = 0; i < dk; i++) kv += S[(size_t)i * dv] * ks[i];
+    const float delta = (row[2 * nq + (size_t)h * dv + j] - decay * kv) * beta;
+    float o = 0.0f;
+    for (unsigned i = 0; i < dk; i++) {
+      const float v = S[(size_t)i * dv] * decay + ks[i] * delta;
+      S[(size_t)i * dv] = v;
+      o += v * qs[i];
+    }
+    out[(size_t)tok * H * dv + (size_t)h * dv + j] = o;
   }
-  out[(size_t)h * dv + j] = o;
 }
 
 // Token-major [T, ld] -> head-major [H, T, D], adding an optional per-head bias.

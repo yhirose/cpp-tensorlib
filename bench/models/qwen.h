@@ -377,12 +377,19 @@ struct PrefillScratch {
   storage res[2];  // residual ping-pong [cap, NE]
   storage h;       // input-norm out [cap, NE]
   storage h2;      // post-attn norm out [cap, NE]
-  storage qkv;     // fused QKV out [cap, (NH+2*NKV)*HD]
+  storage qkv;     // fused projection out [cap, attn_proj | ssm_proj]
   // q|k|v head-major in ONE buffer [NH+2*NKV, cap, HD]: one split_heads pass
   // over every head, and k / v are views into it.
   storage qkvh;
   storage ah;  // attn out head-major [NH, cap, HD]
-  storage at;  // attn out token-major [cap, NH*HD]
+  storage at;  // attn (or DeltaNet gated-norm) out token-major [cap, NH*HD | V]
+  // Qwen3.5 attention: the gate copied out of the projection rows, and its
+  // sigmoid [cap, NH*HD].
+  storage gt, gs;
+  // DeltaNet: the conv out [cap, C], and [z | o] — the gate and the rule's
+  // output, each [cap, V] — so one swiglu over the flattened rows is the
+  // gated norm. zero is the one float a strided copy adds.
+  storage conv, zo, zero;
   storage gu;  // fused gate|up [cap, 2*FF]
   storage mb;  // swiglu out [cap, FF]
   storage md;  // mlp-down out [cap, NE]
@@ -397,10 +404,21 @@ struct PrefillScratch {
     res[1] = scratch_f32(cap * c.NE);
     h = scratch_f32(cap * c.NE);
     h2 = scratch_f32(cap * c.NE);
-    qkv = scratch_f32(cap * (c.NH + 2 * c.NKV) * c.HD);
+    qkv = scratch_f32(cap * std::max(c.attn_proj(), c.ssm_proj()));
     qkvh = scratch_f32((c.NH + 2 * c.NKV) * cap * c.HD);
     ah = scratch_f32(c.NH * cap * c.HD);
-    at = scratch_f32(cap * c.NH * c.HD);
+    at = scratch_f32(cap * std::max(c.NH * c.HD, c.SH * c.SDV));
+    if (c.attn_gate) {
+      gt = scratch_f32(cap * c.NH * c.HD);
+      gs = scratch_f32(cap * c.NH * c.HD);
+    }
+    if (c.hybrid()) {
+      conv = scratch_f32(cap * c.ssm_conv_ch());
+      zo = scratch_f32(2 * cap * c.SH * c.SDV);
+    }
+    zero = scratch_f32(1);
+    const float z0 = 0.0f;
+    gpu::upload(zero.native, &z0, 1);
     gu = scratch_f32(cap * 2 * c.FF);
     mb = scratch_f32(cap * c.FF);
     md = scratch_f32(cap * c.NE);
@@ -529,34 +547,66 @@ inline void prefill_chunk_(Model& M, int64_t T) {
   // same place, and kv_cache::prefill appends there, so rope reads it from the
   // same source rather than taking it as a parameter that could disagree.
   const int64_t pos0 = seq_cache(M).pos;
-  const int64_t QKVN = (c.NH + 2 * c.NKV) * c.HD;
+  const int64_t AP = c.attn_proj(), Q = c.NH * c.HD;
+  // A strided [T, n] block of rows `ld` apart, copied contiguous: the
+  // broadcast add of the one zero.
+  auto rows_out = [&](gpu::span src, int64_t ld, gpu::span dst, int64_t n) {
+    gpu::binary_bcast(gpu::kop::badd, src, ld, 1, sp(P.zero), 0, 0, dst, T, n, 1, 0);
+  };
   gpu::span x = sp(P.emb);
   gpu::rmsnorm(x, sp(M.layers[0].an), sp(P.h), c.NE, c.EPS, T);
   for (int64_t l = 0; l < c.NL; l++) {
     Layer& L = M.layers[l];
     const gpu::span ro = sp(P.res[l & 1]);
-    gpu::gemm_bf16_nt(sp(P.h), sp(L.wqkv), sp(P.qkv), T, QKVN, c.NE);
-    // split_heads turns the [T, q|k|v] output into head-major [H, T, D] and
-    // adds the bias — rope's own fused-bias form only indexes correctly at
-    // T == 1, so the bias rides along here instead. One pass over every head;
-    // k and v are views into its output.
-    gpu::split_heads(sp(P.qkv), sp(L.bqkv), sp(P.qkvh), T, QKVN, 0, c.NH + 2 * c.NKV,
-                     c.HD);
-    const gpu::span qh = sp(P.qkvh);
-    const gpu::span kh = at_f32(qh, c.NH * T * c.HD);
-    const gpu::span vh = at_f32(qh, (c.NH + c.NKV) * T * c.HD);
-    // Qwen3: every q / k head row (HD wide, one per h*T + t) is RMS-normalized
-    // in place, before rope. v is untouched.
-    if (c.qk_norm) {
-      gpu::rmsnorm(qh, sp(L.qn), qh, c.HD, c.EPS, c.NH * T);
-      gpu::rmsnorm(kh, sp(L.kn), kh, c.HD, c.EPS, c.NKV * T);
+    if (c.is_delta(l)) {
+      // Gated DeltaNet over the chunk: the projection as one GEMM, then the
+      // conv and the rule walk the tokens in order (each one launch). The
+      // rule's output lands in o, the second half of [z | o]; z is copied out
+      // of the projection rows into the first, so silu(z) * rmsnorm(o) is one
+      // swiglu over the flattened [T, V].
+      const int64_t C = c.ssm_conv_ch(), V = c.SH * c.SDV, PJ = c.ssm_proj();
+      const gpu::span z = sp(P.zo), o = at_f32(z, T * V);
+      gpu::gemm_bf16_nt(sp(P.h), sp(L.wssm), sp(P.qkv), T, PJ, c.NE);
+      gpu::ssm_conv(sp(P.qkv), PJ, sp(L.conv_state), sp(L.wconv), sp(P.conv), C,
+                    c.SCONV, T);
+      gpu::gated_delta(sp(P.conv), at_f32(sp(P.qkv), C), PJ, sp(L.adt),
+                       sp(L.ssm_state), o, c.SH, c.SDK, c.SDV, T, c.L2EPS);
+      gpu::rmsnorm(o, sp(L.sn), o, c.SDV, c.EPS, T * c.SH);
+      rows_out(at_f32(sp(P.qkv), C + 2 * c.SH), PJ, z, V);
+      gpu::swiglu(z, sp(P.at), T * V);
+      gpu::gemm_bf16_nt(sp(P.at), sp(L.wsout), ro, T, c.NE, V);
+    } else {
+      gpu::gemm_bf16_nt(sp(P.h), sp(L.wqkv), sp(P.qkv), T, AP, c.NE);
+      // split_heads turns the [T, q|k|v] output into head-major [H, T, D] and
+      // adds the bias — rope's own fused-bias form only indexes correctly at
+      // T == 1, so the bias rides along here instead. One pass over every head;
+      // k and v are views into its output.
+      gpu::split_heads(sp(P.qkv), sp(L.bqkv), sp(P.qkvh), T, AP, 0, c.NH + 2 * c.NKV,
+                       c.HD);
+      const gpu::span qh = sp(P.qkvh);
+      const gpu::span kh = at_f32(qh, c.NH * T * c.HD);
+      const gpu::span vh = at_f32(qh, (c.NH + c.NKV) * T * c.HD);
+      // Qwen3: every q / k head row (HD wide, one per h*T + t) is RMS-normalized
+      // in place, before rope. v is untouched.
+      if (c.qk_norm) {
+        gpu::rmsnorm(qh, sp(L.qn), qh, c.HD, c.EPS, c.NH * T);
+        gpu::rmsnorm(kh, sp(L.kn), kh, c.HD, c.EPS, c.NKV * T);
+      }
+      // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
+      gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
+      gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
+      L.cache.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale());
+      gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, c.HD);
+      // Qwen3.5: times sigmoid of the gate, the tail of each projection row.
+      gpu::span ao = sp(P.at);
+      if (c.attn_gate) {
+        rows_out(at_f32(sp(P.qkv), (c.NH + 2 * c.NKV) * c.HD), AP, sp(P.gt), Q);
+        gpu::unary(gpu::kop::sigmoid, sp(P.gt), sp(P.gs), T * Q, 1, 0);
+        gpu::binary(gpu::kop::mul, ao, sp(P.gs), sp(P.gt), T * Q, 1, 0);
+        ao = sp(P.gt);
+      }
+      gpu::gemm_bf16_nt(ao, sp(L.wo_row), ro, T, c.NE, Q);
     }
-    // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
-    gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
-    gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
-    L.cache.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale());
-    gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, c.HD);
-    gpu::gemm_bf16_nt(sp(P.at), sp(L.wo_row), ro, T, c.NE, c.NH * c.HD);
     gpu::rmsnorm_res(ro, x, sp(L.fn), ro, sp(P.h2), c.NE, c.EPS, T);
     gpu::gemm_bf16_nt(sp(P.h2), sp(L.wgu), sp(P.gu), T, 2 * c.FF, c.NE);
     gpu::swiglu(sp(P.gu), sp(P.mb), c.FF, T);
@@ -592,14 +642,12 @@ inline void stage_embed_rows_(Model& M, const std::vector<int>& ids, int64_t fro
 
 // Whether a prompt of `T` tokens should go through the batched prefill: the
 // backend must have the bf16-weight GEMM, the weights must be the row-major
-// ones it consumes, the model must have no DeltaNet layers (their batched form
-// is not written yet: a hybrid prompt runs token by token), the prompt must be
-// long enough to be worth a batched pass, and it must fit the cache. One place
-// answers it, so build(), begin() and
+// ones it consumes, the prompt must be long enough to be worth a batched pass,
+// and it must fit the cache. One place answers it, so build(), begin() and
 // prefill_batched() cannot disagree.
 inline bool can_prefill_batched(const Model& M, int64_t T) {
   return gpu::caps::bf16_gemm && M.row && !M.q4_mlp && !M.layers.empty() &&
-         !M.c.hybrid() && T >= PREFILL_MIN && seq_cache(M).pos + T <= M.c.MAXC;
+         T >= PREFILL_MIN && seq_cache(M).pos + T <= M.c.MAXC;
 }
 
 // Prefill a whole prompt in chunks and return the greedy next token. Leaves the
@@ -969,9 +1017,9 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
       const int64_t C = c.ssm_conv_ch(), V = c.SH * c.SDV;
       const gpu::span pj = sp(S.qkvb), o = at_f32(pj, c.ssm_proj());
       gv(L.wssm, sp(S.hb), pj, c.ssm_proj(), c.NE);
-      gpu::ssm_conv_step(pj, sp(L.conv_state), sp(L.wconv), sp(S.convb), C, c.SCONV);
-      gpu::gated_delta_step(sp(S.convb), at_f32(pj, C), sp(L.adt), sp(L.ssm_state), o,
-                            c.SH, c.SDK, c.SDV, c.L2EPS);
+      gpu::ssm_conv(pj, C, sp(L.conv_state), sp(L.wconv), sp(S.convb), C, c.SCONV);
+      gpu::gated_delta(sp(S.convb), at_f32(pj, C), 0, sp(L.adt), sp(L.ssm_state), o,
+                       c.SH, c.SDK, c.SDV, 1, c.L2EPS);
       gpu::rmsnorm(o, sp(L.sn), o, c.SDV, c.EPS, c.SH);
       gpu::swiglu(at_f32(pj, C + 2 * c.SH), sp(S.ab), V);
       gv(L.wsout, sp(S.ab), ro, c.NE, V);  // ro = mixer @ ssm_out
