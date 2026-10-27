@@ -569,6 +569,11 @@ struct context {
   CUfunction gemm_bf16_nt_sk_() {
     return cached_(gemm_bf16_nt_sk_fn, "tl_gemm_bf16_nt_sk");
   }
+  CUfunction gemm_bf16_nt_tc_fn = nullptr, gemm_bf16_nt_tc_s_fn = nullptr;
+  CUfunction gemm_bf16_nt_tc_(bool big) {
+    return big ? cached_(gemm_bf16_nt_tc_fn, "tl_gemm_bf16_nt_tc")
+               : cached_(gemm_bf16_nt_tc_s_fn, "tl_gemm_bf16_nt_tc_s");
+  }
 
   // M9 fused decode attention (single-pass + split-KV two-pass).
   // head_dim {64,128} variants (M9): each templated instantiation has its own
@@ -1605,6 +1610,15 @@ inline bool own::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
   float* pB = context::off_(B.buf, B.off);
   float* po = context::off_(out.buf, out.off);
   unsigned uM = (unsigned)m, uN = (unsigned)n, uK = (unsigned)k;
+  // The tensor cores read 16-byte vectors of both operands, so their rows must
+  // start on 16 bytes; the 128 tile when it fills the GPU, else the 64.
+  const bool aligned = ((uintptr_t)pa % 16 == 0) && ((uintptr_t)pB % 16 == 0);
+  if (aligned) {
+    const bool big_tc = ((n + 127) / 128) * ((m + 127) / 128) >= traits::fill_groups;
+    const unsigned tt = big_tc ? 128u : 64u;
+    return c.launch_(c.gemm_bf16_nt_tc_(big_tc), {(uN + tt - 1) / tt, (uM + tt - 1) / tt},
+                     {big_tc ? 512u : 128u}, 0, pa, pB, po, uM, uN, uK);
+  }
   // Tile choice by fill (big_tile_): a prefill chunk is only a few hundred
   // tokens, so a narrow projection (N=896, M=512) is 28 big blocks against 82
   // SMs and 112 small ones. The big tile needs K % 8 == 0, the small K % 16.

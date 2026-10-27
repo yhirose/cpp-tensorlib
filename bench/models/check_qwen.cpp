@@ -15,6 +15,8 @@
 #include "qwen3_oracle_data.h"
 #include "qwen_oracle_data.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -105,24 +107,30 @@ static bool check_hybrid(const qm::gg::model& m, const Oracle& O) {
   std::printf("\n  greedy %s\n", bf16_ok ? "MATCH" : "DIVERGE");
 
   // The chat's own decoder on the same weights: the prompt through begin() —
-  // batched as GEMMs where the backend can, whose sums run in another order —
-  // then step(). The logits are held to the imperative ones, after the prompt
-  // and after the first step: where the backend captures, its warm-up forward
-  // must leave the DeltaNet state as it found it, and a drift too small to
-  // move a short greedy run is a large one here (~2 where the rounding is
-  // ~1e-5).
+  // batched as GEMMs where the backend can, on the tensor cores with the
+  // activations rounded to bf16 — then step(). Its top-5 logits are held to
+  // the imperative ones, after the prompt and after the first step: where the
+  // backend captures, its warm-up forward must leave the DeltaNet state as it
+  // found it, and a drift too small to move a short greedy run is a large one
+  // here (~0.3, where the bf16 rounding is ~3e-3; over the whole vocabulary
+  // the rounding reaches ~0.1 in the tail, which is printed but not held).
   qm::reset_cache(B);
   qm::captured_decoder dec;
   std::vector<int> ids(O.prompt_ids, O.prompt_ids + NP);
   tok = dec.begin(B, ids);
-  const double pmr = maxrel(logits_of(B), imp_prompt.data(), B.c.VOCAB);
+  const std::vector<float> got_prompt = logits_of(B);
+  const double pmr = maxrel(got_prompt, imp_prompt.data(), B.c.VOCAB);
   const int64_t first = tok;
   const int64_t second = dec.step(B, first);
-  const double smr = maxrel(logits_of(B), imp_step.data(), B.c.VOCAB);
-  const bool logits_ok = pmr < 1e-3 && smr < 1e-3;
-  std::printf("\ndecoder (%s prefill) logits vs imperative: prompt maxrel %.2e, "
-              "first step %.2e %s", dec.batched ? "batched" : "token-by-token", pmr, smr,
-              logits_ok ? "OK" : "FAIL");
+  const std::vector<float> got_step = logits_of(B);
+  const double smr = maxrel(got_step, imp_step.data(), B.c.VOCAB);
+  const double p5 = qm::top5_maxrel(got_prompt.data(), imp_prompt.data(), B.c.VOCAB),
+               s5 = qm::top5_maxrel(got_step.data(), imp_step.data(), B.c.VOCAB);
+  const bool logits_ok = p5 < 1e-2 && s5 < 1e-2;
+  std::printf("\ndecoder (%s prefill) top-5 logits vs imperative: prompt maxrel %.2e, "
+              "first step %.2e %s (whole vocabulary %.2e, %.2e)",
+              dec.batched ? "batched" : "token-by-token", p5, s5, logits_ok ? "OK" : "FAIL",
+              pmr, smr);
   bool dec_ok = true;
   std::printf("\ndecoder (%s), greedy %lld:\n  cpp:", dec.ok() ? "graph capture" : "imperative",
               (long long)NB);

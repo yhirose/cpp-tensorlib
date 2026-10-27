@@ -3512,7 +3512,10 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       CHECK(same(y, a.dot(Wt), 1e-4f));
     }
     if (gpu::caps::bf16_gemm) {
-      array A = dev(random_array({M, K}, 942));
+      // The GEMM may round its activations to bf16 too (CUDA's runs on the
+      // tensor cores), so the oracle reads the rounded ones as well: exact
+      // inputs either way, and any gap left is the kernel's.
+      array A = dev(random_array({M, K}, 942).to_bf16().to_f32());
       array C = array::empty({M, N});
       REQUIRE(gpu::gemm_bf16_nt(A.device_span(), Wb.device_span(), C.device_span(), M, N, K));
       tl::gpu::flush();

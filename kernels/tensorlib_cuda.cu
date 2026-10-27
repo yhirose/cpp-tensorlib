@@ -18,6 +18,7 @@
 // tiled loop — the tuned cuBLAS-90% ladder is the stage-2 sprint (roadmap M6).
 
 #include <cuda_bf16.h>  // __nv_bfloat16 + __bfloat162float (M7 storage widen)
+#include <mma.h>        // nvcuda::wmma: the prefill GEMM's tensor-core tiles
 
 extern "C" {
 
@@ -1508,6 +1509,123 @@ extern "C" __global__ void tl_gemm_bf16_nt_sk(const float* __restrict__ A,
     const __nv_bfloat16* __restrict__ B, float* __restrict__ C, unsigned M,
     unsigned N, unsigned K, unsigned ksplit) {
   gemm_bf16_nt_core<64, true>(A, B, C, M, N, K, ksplit);
+}
+
+// The same product on the tensor cores: C[M,N] = A[M,K] . B[N,K]^T with A's
+// f32 activations rounded to bf16 as they are staged (bf16 for the range — an
+// activation outlier stays finite where f16 would overflow), B the bf16
+// weights as they are, and the sums f32. A BM x BN block tile in 32-deep K
+// slabs, a warp to each 32x32 of it (2x2 wmma 16x16x16 fragments). The next
+// slab is read into registers — 16-byte loads, so K % 8 == 0 and 16-byte
+// aligned rows — while the tensor cores run on the current one. Tails in M, N
+// or K are zero-filled as staged and masked as stored: a warp stores each
+// fragment to its own corner of shared memory and its lanes copy the cells
+// that fall inside C.
+template <int BM, int BN>
+__device__ __forceinline__ void gemm_bf16_nt_tc_core(const float* __restrict__ A,
+                                                     const __nv_bfloat16* __restrict__ B,
+                                                     float* __restrict__ C, unsigned M,
+                                                     unsigned N, unsigned K) {
+  using namespace nvcuda;
+  constexpr int BK = 32, LD = BK + 8;          // +8: rows stay 16-byte aligned
+  constexpr int NT = (BM / 32) * (BN / 32) * 32;
+  constexpr int AV = BM * BK / 4 / NT;         // float4s of A a thread stages
+  constexpr int BV = BN * BK / 8 / NT;         // uint4s (8 bf16) of B
+  static_assert(AV >= 1 && BV >= 1, "tile too small for its threads");
+  // One buffer: the two slabs while the K loop runs, the output's staging after.
+  __shared__ __align__(32) __nv_bfloat16 smem[(BM + BN) * LD];
+  auto As = reinterpret_cast<__nv_bfloat16(*)[LD]>(smem);
+  auto Bs = reinterpret_cast<__nv_bfloat16(*)[LD]>(smem + BM * LD);
+  const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const unsigned wm = (warp / (BN / 32)) * 32, wn = (warp % (BN / 32)) * 32;
+  const unsigned row0 = blockIdx.y * BM, col0 = blockIdx.x * BN;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+#pragma unroll
+  for (int i = 0; i < 2; i++)
+#pragma unroll
+    for (int j = 0; j < 2; j++) wmma::fill_fragment(acc[i][j], 0.0f);
+  float4 ra[AV];
+  uint4 rb[BV];
+  // Vector v of a thread: row v_id / (BK/w), column (v_id % (BK/w)) * w, for
+  // w elements a vector (4 floats, 8 bf16).
+  auto load = [&](unsigned k0) {
+#pragma unroll
+    for (int v = 0; v < AV; v++) {
+      const unsigned id = tid + v * NT, r = id / (BK / 4), c = (id % (BK / 4)) * 4;
+      const unsigned gr = row0 + r, gk = k0 + c;
+      ra[v] = gr < M && gk < K ? *reinterpret_cast<const float4*>(A + (size_t)gr * K + gk)
+                               : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+#pragma unroll
+    for (int v = 0; v < BV; v++) {
+      const unsigned id = tid + v * NT, r = id / (BK / 8), c = (id % (BK / 8)) * 8;
+      const unsigned gn = col0 + r, gk = k0 + c;
+      rb[v] = gn < N && gk < K ? *reinterpret_cast<const uint4*>(B + (size_t)gn * K + gk)
+                               : make_uint4(0u, 0u, 0u, 0u);
+    }
+  };
+  auto stage = [&]() {
+#pragma unroll
+    for (int v = 0; v < AV; v++) {
+      const unsigned id = tid + v * NT, r = id / (BK / 4), c = (id % (BK / 4)) * 4;
+      __nv_bfloat162 lo = __floats2bfloat162_rn(ra[v].x, ra[v].y);
+      __nv_bfloat162 hi = __floats2bfloat162_rn(ra[v].z, ra[v].w);
+      *reinterpret_cast<__nv_bfloat162*>(&As[r][c]) = lo;
+      *reinterpret_cast<__nv_bfloat162*>(&As[r][c + 2]) = hi;
+    }
+#pragma unroll
+    for (int v = 0; v < BV; v++) {
+      const unsigned id = tid + v * NT, r = id / (BK / 8), c = (id % (BK / 8)) * 8;
+      *reinterpret_cast<uint4*>(&Bs[r][c]) = rb[v];
+    }
+  };
+  load(0);
+  for (unsigned k0 = 0; k0 < K; k0 += BK) {
+    stage();
+    __syncthreads();
+    if (k0 + BK < K) load(k0 + BK);  // in flight while this slab multiplies
+#pragma unroll
+    for (int kk = 0; kk < BK; kk += 16) {
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> fa[2];
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> fb[2];
+#pragma unroll
+      for (int i = 0; i < 2; i++) wmma::load_matrix_sync(fa[i], &As[wm + 16 * i][kk], LD);
+#pragma unroll
+      for (int j = 0; j < 2; j++) wmma::load_matrix_sync(fb[j], &Bs[wn + 16 * j][kk], LD);
+#pragma unroll
+      for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 2; j++) wmma::mma_sync(acc[i][j], fa[i], fb[j], acc[i][j]);
+    }
+    __syncthreads();
+  }
+  // The slabs are free now: each warp takes 16x16 floats for its fragments.
+  static_assert((BM + BN) * LD * 2 >= NT / 32 * 16 * 16 * 4, "no room to stage the output");
+  float* cs = reinterpret_cast<float*>(smem) + warp * 256;
+#pragma unroll
+  for (int i = 0; i < 2; i++)
+#pragma unroll
+    for (int j = 0; j < 2; j++) {
+      wmma::store_matrix_sync(cs, acc[i][j], 16, wmma::mem_row_major);
+      __syncwarp();
+      const unsigned gr0 = row0 + wm + 16 * i, gc0 = col0 + wn + 16 * j;
+#pragma unroll
+      for (int e = lane; e < 256; e += 32) {
+        const unsigned gr = gr0 + e / 16, gc = gc0 + e % 16;
+        if (gr < M && gc < N) C[(size_t)gr * N + gc] = cs[e];
+      }
+      __syncwarp();
+    }
+}
+extern "C" __global__ void tl_gemm_bf16_nt_tc(const float* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B, float* __restrict__ C, unsigned M,
+    unsigned N, unsigned K) {
+  gemm_bf16_nt_tc_core<128, 128>(A, B, C, M, N, K);
+}
+extern "C" __global__ void tl_gemm_bf16_nt_tc_s(const float* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B, float* __restrict__ C, unsigned M,
+    unsigned N, unsigned K) {
+  gemm_bf16_nt_tc_core<64, 64>(A, B, C, M, N, K);
 }
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 
