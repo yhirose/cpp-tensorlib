@@ -325,9 +325,9 @@ lets `flush()` keep a synchronous signature.
 LLM inference
 -------------
 
-`bench/cuda/chat_qwen.cpp` is the end-to-end proof of the header-only,
-zero-dependency, cross-platform claims above: it loads a real
-Qwen2.5-Instruct GGUF model and chats, using nothing but this library's own
+`bench/models/chat_qwen.cpp` is the end-to-end proof of the header-only,
+zero-dependency, cross-platform claims above: it loads a real Qwen2.5,
+Qwen3 or Qwen3.5 GGUF model (F16 or BF16) and chats, using nothing but this library's own
 kernels — own GGUF v3 reader (`include/gguf.h`), own GPT-2-byte-BPE
 tokenizer (`include/tokenizer.h`), and own CUDA prefill/decode kernels. No
 GGML, no llama.cpp, no third-party inference runtime anywhere in the path.
@@ -348,9 +348,12 @@ On an RTX 3090, Qwen2.5-0.5B (F16 GGUF, bf16 weight storage):
 | prefill, 2048-token prompt | ~15200 |
 
 Decode started at 3.5 tok/s and reached ~430 by removing host-side graph
-construction, then per-launch overhead, then GEMV inefficiency — the last of
-which turned out to be the whole remaining gap to llama.cpp, which this box
-measured at 413 tok/s on the same model and shape.
+construction, then per-launch overhead, then GEMV inefficiency. Against
+llama.cpp on the same files and GPU, decode is at parity or ahead for
+Qwen2.5, Qwen3 and Qwen3.5 on a short context (Qwen2.5 trails by 18% with
+2048 tokens cached), and prefill is 2.6-6x behind:
+[docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md) has the numbers,
+what differs between the two runs, and how to reproduce them.
 
 Prefill is a different regime and was slower than decode for a long time,
 because the prompt was fed through the decode path one token at a time. Its
