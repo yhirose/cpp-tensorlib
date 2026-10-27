@@ -51,17 +51,19 @@ int main(int argc, char** argv) {
   double build_ms = ms_since(t_build);
 
   // Chat template, as each family's own jinja renders it. Qwen2.5 carries a
-  // default system prompt. Qwen3 has none, and thinks by default: the model opens
-  // a <think> block itself, which "nothink" (argv[5]) closes up front, exactly
-  // what the template's enable_thinking=false does.
-  const bool qwen3 = M.c.arch == "qwen3";
+  // default system prompt. Qwen3 and Qwen3.5 have none, and think by default:
+  // Qwen3 opens a <think> block itself, which "nothink" (argv[5]) closes up
+  // front, exactly what the template's enable_thinking=false does.
+  // Qwen3.5's template opens the <think> block itself.
+  const bool qwen3 = M.c.arch == "qwen3", qwen35 = M.c.arch == "qwen35";
   const bool nothink = argc > 5 && std::string(argv[5]) == "nothink";
   std::string templated =
-      std::string(qwen3 ? "" : "<|im_start|>system\nYou are Qwen, created by "
-                                 "Alibaba Cloud. You are a helpful "
-                                 "assistant.<|im_end|>\n") +
+      std::string(qwen3 || qwen35 ? "" : "<|im_start|>system\nYou are Qwen, created by "
+                                           "Alibaba Cloud. You are a helpful "
+                                           "assistant.<|im_end|>\n") +
       "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n" +
-      (qwen3 && nothink ? "<think>\n\n</think>\n\n" : "");
+      ((qwen3 || qwen35) && nothink ? "<think>\n\n</think>\n\n"
+                                    : qwen35 ? "<think>\n" : "");
   std::vector<int> ids = tok.encode(templated);
   std::printf("prompt: %s\n%zu prompt tokens; generating (greedy)...\n\n",
               user.c_str(), ids.size());
