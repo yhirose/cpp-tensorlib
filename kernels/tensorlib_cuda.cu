@@ -18,6 +18,7 @@
 // tiled loop — the tuned cuBLAS-90% ladder is the stage-2 sprint (roadmap M6).
 
 #include <cuda_bf16.h>  // __nv_bfloat16 + __bfloat162float (M7 storage widen)
+#include <cuda_fp16.h>  // __half: the prefill attention's tensor-core operands
 #include <mma.h>        // nvcuda::wmma: the prefill GEMM's tensor-core tiles
 
 extern "C" {
@@ -2394,6 +2395,180 @@ extern "C" __global__ void tl_attn_prefill_tiled_bf16_64(const float* q,
     unsigned kv_stride, unsigned group, float scale, unsigned pos0) {
   attn_prefill_tiled_core<64, 4, __nv_bfloat16>(q, K, V, out, T, kv_stride,
                                                 group, scale, pos0);
+}
+
+// ---- The causal prefill on the tensor cores: flash attention over
+// mma.sync.m16n8k16 with f16 operands and f32 accumulators. f16 rather than
+// the GEMM's bf16 because a score is an exponent: its 3 more mantissa bits
+// keep softmax weights ~8x closer, and q and k, normalized, sit far inside
+// f16's range. The cache stays f32; a block rounds what it stages.
+//
+// One block per (q head, 16*NW queries), a warp per 16 of them. Q, and a BK-
+// key tile of K and V at a time, are staged as f16 in shared memory. Each warp
+// computes its 16 x BK scores into registers, scales and causally masks them,
+// and keeps the online softmax per row in registers — the m16n8 accumulator's
+// layout is documented (row = lane/4 and lane/4 + 8, cols 2*(lane%4) + 0/1),
+// so a row's max and sum are a reduction across a lane quad and the output's
+// rescale a multiply per register. The probabilities then go straight into
+// P.V as the A operand: an m16n8 accumulator pair is an m16k16 A fragment.
+__device__ __forceinline__ unsigned h2_bits_(__half a, __half b) {
+  __half2 h = __halves2half2(a, b);
+  return *reinterpret_cast<unsigned*>(&h);
+}
+__device__ __forceinline__ void mma_f16_16816_(float* c, const unsigned* a,
+                                               const unsigned* b) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+template <int AD, int NW, int BK>
+__device__ void attn_prefill_tc_core(const float* __restrict__ q,
+                                     const float* __restrict__ K,
+                                     const float* __restrict__ V,
+                                     float* __restrict__ out, unsigned T,
+                                     unsigned kv_stride, unsigned group,
+                                     float scale, unsigned pos0) {
+  constexpr int BQ = 16 * NW, LD = AD + 8, NTH = 32 * NW;
+  constexpr int NS = BK / 8, NO = AD / 8;  // score / output m16n8 tiles
+  __shared__ __align__(16) __half Qs[BQ][LD];
+  __shared__ __align__(16) __half Ks[BK][LD];
+  __shared__ __align__(16) __half Vs[BK][LD];
+  const unsigned h = blockIdx.x, t0 = blockIdx.y * BQ, tid = threadIdx.x;
+  const unsigned warp = tid >> 5, lane = tid & 31, g = lane >> 2, tq = lane & 3;
+  const float* qh = q + (size_t)h * T * AD;
+  const float* Kh = K + (size_t)(h / group) * kv_stride;
+  const float* Vh = V + (size_t)(h / group) * kv_stride;
+  // Rows [t0, t0 + BQ) of the chunk need keys [0, kv_end): the cache through
+  // the last of them (causal), and never past what this chunk wrote.
+  const unsigned kv_end = pos0 + min(T, t0 + BQ);
+  auto stage = [&](__half (*dst)[LD], const float* src, unsigned rows, unsigned first,
+                   unsigned limit) {
+    for (unsigned e = tid * 4; e < rows * AD; e += NTH * 4) {
+      const unsigned r = e / AD, c = e % AD, row = first + r;
+      const float4 v = row < limit ? *reinterpret_cast<const float4*>(src + (size_t)row * AD + c)
+                                   : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      *reinterpret_cast<__half2*>(&dst[r][c]) = __floats2half2_rn(v.x, v.y);
+      *reinterpret_cast<__half2*>(&dst[r][c + 2]) = __floats2half2_rn(v.z, v.w);
+    }
+  };
+  stage(Qs, qh, BQ, t0, T);
+  const unsigned qr = warp * 16 + g;  // this thread's rows: qr and qr + 8
+  const unsigned pa = pos0 + t0 + qr, pb = pa + 8;
+  float o[NO][4];
+#pragma unroll
+  for (int d = 0; d < NO; d++) o[d][0] = o[d][1] = o[d][2] = o[d][3] = 0.0f;
+  float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
+  for (unsigned k0 = 0; k0 < kv_end; k0 += BK) {
+    __syncthreads();  // Q staged, or the previous tile's readers done
+    stage(Ks, Kh, BK, k0, kv_end);
+    stage(Vs, Vh, BK, k0, kv_end);
+    __syncthreads();
+    float s[NS][4];
+#pragma unroll
+    for (int n = 0; n < NS; n++) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+#pragma unroll
+    for (int kc = 0; kc < AD / 16; kc++) {
+      const unsigned c = kc * 16 + tq * 2;
+      const unsigned a[4] = {h2_bits_(Qs[qr][c], Qs[qr][c + 1]),
+                             h2_bits_(Qs[qr + 8][c], Qs[qr + 8][c + 1]),
+                             h2_bits_(Qs[qr][c + 8], Qs[qr][c + 9]),
+                             h2_bits_(Qs[qr + 8][c + 8], Qs[qr + 8][c + 9])};
+#pragma unroll
+      for (int n = 0; n < NS; n++) {
+        const unsigned b[2] = {h2_bits_(Ks[n * 8 + g][c], Ks[n * 8 + g][c + 1]),
+                               h2_bits_(Ks[n * 8 + g][c + 8], Ks[n * 8 + g][c + 9])};
+        mma_f16_16816_(s[n], a, b);
+      }
+    }
+    // Scale, mask (a key past the row's position, or past the chunk), and the
+    // tile's row max, the quad reducing what its four lanes hold.
+    float mx[2] = {m[0], m[1]};
+#pragma unroll
+    for (int n = 0; n < NS; n++)
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        const unsigned j = k0 + n * 8 + tq * 2 + (e & 1), pos = e < 2 ? pa : pb;
+        const float v = j <= pos && j < kv_end ? s[n][e] * scale : -INFINITY;
+        s[n][e] = v;
+        mx[e >> 1] = fmaxf(mx[e >> 1], v);
+      }
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+      mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 1));
+      mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 2));
+    }
+    float corr[2], rs[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (int r = 0; r < 2; r++) corr[r] = mx[r] == -INFINITY ? 1.0f : __expf(m[r] - mx[r]);
+#pragma unroll
+    for (int n = 0; n < NS; n++)
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        const int r = e >> 1;
+        const float p = mx[r] == -INFINITY ? 0.0f : __expf(s[n][e] - mx[r]);
+        s[n][e] = p;
+        rs[r] += p;
+      }
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+      rs[r] += __shfl_xor_sync(0xffffffffu, rs[r], 1);
+      rs[r] += __shfl_xor_sync(0xffffffffu, rs[r], 2);
+      l[r] = l[r] * corr[r] + rs[r];
+      m[r] = mx[r];
+    }
+#pragma unroll
+    for (int d = 0; d < NO; d++) {
+      o[d][0] *= corr[0];
+      o[d][1] *= corr[0];
+      o[d][2] *= corr[1];
+      o[d][3] *= corr[1];
+    }
+    // O += P V, a 16-key chunk at a time.
+#pragma unroll
+    for (int kc = 0; kc < BK / 16; kc++) {
+      const unsigned a[4] = {h2_bits_(__float2half(s[2 * kc][0]), __float2half(s[2 * kc][1])),
+                             h2_bits_(__float2half(s[2 * kc][2]), __float2half(s[2 * kc][3])),
+                             h2_bits_(__float2half(s[2 * kc + 1][0]), __float2half(s[2 * kc + 1][1])),
+                             h2_bits_(__float2half(s[2 * kc + 1][2]), __float2half(s[2 * kc + 1][3]))};
+      const unsigned kr = kc * 16 + tq * 2;
+#pragma unroll
+      for (int d = 0; d < NO; d++) {
+        const unsigned dc = d * 8 + g;
+        const unsigned b[2] = {h2_bits_(Vs[kr][dc], Vs[kr + 1][dc]),
+                               h2_bits_(Vs[kr + 8][dc], Vs[kr + 9][dc])};
+        mma_f16_16816_(o[d], a, b);
+      }
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < 2; r++) {
+    const unsigned t = t0 + qr + 8 * r;
+    if (t >= T) continue;
+    const float inv = 1.0f / l[r];
+    float* dst = out + ((size_t)h * T + t) * AD;
+#pragma unroll
+    for (int d = 0; d < NO; d++) {
+      dst[d * 8 + tq * 2] = o[d][2 * r] * inv;
+      dst[d * 8 + tq * 2 + 1] = o[d][2 * r + 1] * inv;
+    }
+  }
+}
+extern "C" __global__ void tl_attn_prefill_tc_64(const float* q, const float* K,
+    const float* V, float* out, unsigned T, unsigned kv_stride, unsigned group,
+    float scale, unsigned pos0) {
+  attn_prefill_tc_core<64, 4, 64>(q, K, V, out, T, kv_stride, group, scale, pos0);
+}
+extern "C" __global__ void tl_attn_prefill_tc_128(const float* q, const float* K,
+    const float* V, float* out, unsigned T, unsigned kv_stride, unsigned group,
+    float scale, unsigned pos0) {
+  attn_prefill_tc_core<128, 4, 32>(q, K, V, out, T, kv_stride, group, scale, pos0);
+}
+extern "C" __global__ void tl_attn_prefill_tc_256(const float* q, const float* K,
+    const float* V, float* out, unsigned T, unsigned kv_stride, unsigned group,
+    float scale, unsigned pos0) {
+  attn_prefill_tc_core<256, 2, 16>(q, K, V, out, T, kv_stride, group, scale, pos0);
 }
 
 // The query half of attn_prefill's pullback, and the row statistics the key/

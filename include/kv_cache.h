@@ -73,9 +73,10 @@ struct kv_cache {
     }
     const int64_t p0 = pos;
     pos += T;
-    return gpu::attn_prefill(q, K.device_span(), V.device_span(), out,
-                             n_q_heads, n_kv_heads, T, max_ctx, D, scale, kv_bf16,
-                             p0);
+    // A cache serves inference, so the attention may take the tensor cores.
+    return gpu::attn_prefill_f16(q, K.device_span(), V.device_span(), out,
+                                 n_q_heads, n_kv_heads, T, max_ctx, D, scale, kv_bf16,
+                                 p0);
   }
 
   // Graph-capture forms (f32 cache only): the position is *d_pos.

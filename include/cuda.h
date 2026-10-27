@@ -656,6 +656,13 @@ struct context {
   CUfunction attn_prefill_tiled_fn = nullptr, attn_prefill_tiled_64_fn = nullptr,
              attn_prefill_tiled_bf16_fn = nullptr,
              attn_prefill_tiled_bf16_64_fn = nullptr;
+  CUfunction attn_prefill_tc_64_fn = nullptr, attn_prefill_tc_128_fn = nullptr,
+             attn_prefill_tc_256_fn = nullptr;
+  CUfunction attn_prefill_tc_(int64_t D) {
+    return D == 64    ? cached_(attn_prefill_tc_64_fn, "tl_attn_prefill_tc_64")
+           : D == 128 ? cached_(attn_prefill_tc_128_fn, "tl_attn_prefill_tc_128")
+                      : cached_(attn_prefill_tc_256_fn, "tl_attn_prefill_tc_256");
+  }
   CUfunction attn_prefill_tiled_(int64_t D, bool bf16) {
     return bf16 ? (D == 64 ? cached_(attn_prefill_tiled_bf16_64_fn, "tl_attn_prefill_tiled_bf16_64")
                            : cached_(attn_prefill_tiled_bf16_fn, "tl_attn_prefill_tiled_bf16"))
@@ -886,6 +893,10 @@ struct own {
                            int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
                            int64_t kv_max, int64_t D, float scale,
                            bool kv_bf16 = false, int64_t pos0 = 0);
+  static bool attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V, gpu::span out,
+                               int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
+                               int64_t kv_max, int64_t D, float scale,
+                               bool kv_bf16 = false, int64_t pos0 = 0);
   static bool attn_prefill_dq(gpu::span q, gpu::span K, gpu::span V,
                               gpu::span dO, gpu::span O, gpu::span dq,
                               gpu::span stats, int64_t H, int64_t T, int64_t D,
@@ -1907,6 +1918,35 @@ inline bool own::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
                    {static_cast<unsigned>(n_q_heads), (uT + tile - 1) / tile},
                    {attn_tile_threads}, 0, pq, pk, pv, po, uT, kv_stride, group,
                    scale, up0);
+}
+
+// The same causal prefill on the tensor cores (tl_attn_prefill_tc_*), its
+// operands rounded to f16 as staged: an f32 cache at head width 64, 128 or
+// 256, operands on 16 bytes. Inference only (gpu::attn_prefill_f16).
+inline bool own::attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V,
+                                  gpu::span out, int64_t n_q_heads,
+                                  int64_t n_kv_heads, int64_t T, int64_t kv_max,
+                                  int64_t D, float scale, bool kv_bf16,
+                                  int64_t pos0) {
+  auto& c = context::get();
+  if (!c.ready || kv_bf16 || (D != 64 && D != 128 && D != 256)) return false;
+  if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
+  if (T <= 0 || T > 65535) return false;
+  float* pq = context::off_(q.buf, q.off);
+  float* pk = context::off_(K.buf, K.off);
+  float* pv = context::off_(V.buf, V.off);
+  float* po = context::off_(out.buf, out.off);
+  if ((uintptr_t)pq % 16 || (uintptr_t)pk % 16 || (uintptr_t)pv % 16) return false;
+  c.device_read_(q.buf);
+  c.device_read_(K.buf);
+  c.device_read_(V.buf);
+  c.device_write_(out.buf);
+  const unsigned uT = static_cast<unsigned>(T), bq = D == 256 ? 32u : 64u;  // 16 a warp
+  return c.launch_(c.attn_prefill_tc_(D),
+                   {static_cast<unsigned>(n_q_heads), (uT + bq - 1) / bq}, {bq * 2}, 0, pq,
+                   pk, pv, po, uT, static_cast<unsigned>(kv_max * D),
+                   static_cast<unsigned>(n_q_heads / n_kv_heads), scale,
+                   static_cast<unsigned>(pos0));
 }
 
 // The query half of causal prefill attention's pullback: q, K, V, dO, O and dq

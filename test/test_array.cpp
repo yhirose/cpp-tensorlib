@@ -3167,6 +3167,26 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     CHECK(same(pa, pb, 1e-4f));
   }
 
+  SUBCASE("the inference prefill (tensor cores, f16 operands) at each head width") {
+    // A chunk after cached rows, its length off every tile: the causal bound
+    // across the tile seams and the zero-filled tail. f16 operands hold it to
+    // ~1e-3 of the exact composition; a backend without the form runs the
+    // exact op itself.
+    for (int64_t D : {64, 128, 256}) {
+      const int64_t HKV = 2, HQ = 8, MAXC = 160, P0 = 37, T = 77;
+      const float scale = 1.0f / std::sqrt((float)D);
+      array Kc = dev(random_array({HKV, MAXC, D}, 1010)), Vc = dev(random_array({HKV, MAXC, D}, 1011));
+      array qp = dev(random_array({HQ, T, D}, 1012));
+      array pa = array::empty({HQ, T, D}), pb = array::empty({HQ, T, D});
+      REQUIRE(gpu::attn_prefill_f16(qp.device_span(), Kc.device_span(), Vc.device_span(),
+                                    pa.device_span(), HQ, HKV, T, MAXC, D, scale, false, P0));
+      REQUIRE(gen::attn_prefill(qp.device_span(), Kc.device_span(), Vc.device_span(),
+                                pb.device_span(), HQ, HKV, T, MAXC, D, scale, false, P0));
+      tl::gpu::flush();
+      CHECK(same(pa, pb, 2e-3f));
+    }
+  }
+
   SUBCASE("the cache at a head width no kernel has (Qwen3.5's 256)") {
     // The ops take the composition rather than declining: a decoder ignores
     // their bool, so a decline would leave the cache silently unwritten.

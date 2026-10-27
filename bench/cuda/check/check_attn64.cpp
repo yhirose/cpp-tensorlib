@@ -186,9 +186,11 @@ int main() {
         }
       }
     }
-    ok &= maxrel < 1e-4;
+    // The cache's prefill runs on the tensor cores where the backend has them,
+    // its operands rounded to f16: ~4e-4 against this f32 reference.
+    ok &= maxrel < 2e-3;
     std::printf("  causal prefill T=%lld — maxrel %.1e %s (cache pos %lld)\n",
-                (long long)T, maxrel, maxrel < 1e-4 ? "OK" : "FAIL", (long long)cache.pos);
+                (long long)T, maxrel, maxrel < 2e-3 ? "OK" : "FAIL", (long long)cache.pos);
 
     // decode handoff: append one token at pos=T, attend over 0..T.
     float *hkn = nullptr, *hvn = nullptr, *hq1 = nullptr, *ho1 = nullptr;

@@ -1068,6 +1068,26 @@ inline bool attn_prefill(span q, span K, span V, span o, int64_t n_q_heads,
                                scale, kv_bf16, pos0);
 }
 
+// The causal prefill for inference: a backend may round its operands to f16
+// for tensor cores (CUDA's attn_prefill_f16); one with no such form runs the
+// exact attn_prefill. Not for training, whose pullback recomputes the forward
+// in f32 and would meet a different softmax.
+TL_GPU_DETECT_OWN(attn_prefill_f16)
+template <class Own = own>
+inline bool attn_prefill_f16(span q, span K, span V, span o, int64_t n_q_heads,
+                             int64_t n_kv_heads, int64_t T, int64_t kv_max,
+                             int64_t D, float scale, bool kv_bf16 = false,
+                             int64_t pos0 = 0) {
+  if constexpr (detail::owns_attn_prefill_f16<Own>::value) {
+    if (detail::ran(Own::attn_prefill_f16(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D,
+                                          scale, kv_bf16, pos0))) {
+      return true;
+    }
+  }
+  return attn_prefill<Own>(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D, scale,
+                           kv_bf16, pos0);
+}
+
 // The causal prefill's pullback, query half then key/value half.
 TL_GPU_DETECT_OWN(attn_prefill_dq)
 template <class Own = own>

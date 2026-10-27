@@ -18,16 +18,16 @@ out).
 |---|---|---:|---:|---:|
 | Qwen2.5-0.5B-Instruct F16 | tg128 | 461 | 429-439 | 1.05-1.07 |
 | | tg128 @ d2048 | 423 | 407-430 | 0.98-1.04 |
-| | pp512 | 31,713 | 49,132 | 0.65 |
-| | pp512 @ d2048 | 17,075 | 41,106 | 0.42 |
+| | pp512 | 35,685 | 49,132 | 0.73 |
+| | pp512 @ d2048 | 30,773 | 41,106 | 0.75 |
 | Qwen3-0.6B F16 | tg128 | 400 | 351-373 | 1.07-1.14 |
 | | tg128 @ d2048 | 342 | 330-334 | 1.02-1.04 |
-| | pp512 | 20,207 | 38,881 | 0.52 |
-| | pp512 @ d2048 | 6,832 | 30,004 | 0.23 |
+| | pp512 | 25,682 | 38,881 | 0.66 |
+| | pp512 @ d2048 | 20,003 | 30,004 | 0.67 |
 | Qwen3.5-0.8B F16 | tg128 | 386 | 290-291 | 1.33 |
 | | tg128 @ d2048 | 376 | 289-292 | 1.29-1.30 |
-| | pp512 | 11,682 | 27,916 | 0.42 |
-| | pp512 @ d2048 | 10,312 | 27,401 | 0.38 |
+| | pp512 | 11,999 | 27,916 | 0.43 |
+| | pp512 @ d2048 | 10,544 | 27,401 | 0.38 |
 | Qwen3.5-0.8B BF16 | tg128 | 379 | 288 | 1.32 |
 | | tg128 @ d2048 | 372 | 288 | 1.29 |
 | | pp512 | 11,747 | 23,963 | 0.49 |
@@ -38,20 +38,22 @@ cached. Until the decode attention overlapped its key loads and split its
 keys finer (2026-10-27), Qwen2.5 trailed by 18% at depth: a block's warps
 walked ~64 keys each in series, one load at a time.
 
-Prefill is 1.5-4.4x behind. Its GEMM now runs on the tensor cores too, with
-the activations rounded to bf16 (it computed in f32 on the CUDA cores until
-2026-10-27, 2.6-5.6x behind). What is left is mostly attention at depth —
-Qwen3's pp512 drops 3x with 2048 tokens cached, llama.cpp's by a quarter —
-and Qwen3.5's DeltaNet layers, which run their recurrence token by token
-within each launch.
+Prefill is 1.3-2.6x behind. Its GEMM and its attention now run on the tensor
+cores too: the GEMM with the activations rounded to bf16, the attention with
+q, k and v rounded to f16 (both computed in f32 on the CUDA cores until
+2026-10-27, when prefill was 2.6-5.6x behind and Qwen3's dropped 3x at
+depth). The widest gap left is Qwen3.5's DeltaNet layers, which run their
+recurrence token by token within each launch.
 
 ## What differs between the two runs
 
-- **Prefill activations.** This library's prefill GEMM rounds them to bf16
-  for the tensor cores (bf16 rather than f16 for the range). The greedy tokens
-  and the chat output are unchanged; the top-5 logits of a prompt's last
-  token move by ~5e-3 against the f32 path, the low-probability tail by up to
-  ~0.2.
+- **Prefill precision.** This library's prefill GEMM rounds its activations
+  to bf16 for the tensor cores (bf16 for the range), and its attention rounds
+  q, k and v to f16 (f16 for the mantissa: a score is an exponent, and
+  normalized q and k sit far inside f16's range — Qwen2.5's largest is ~220).
+  Decode and the array API's attention stay f32. The greedy tokens and the
+  chat output are unchanged; the top-5 logits of a prompt's last token move
+  by ~5e-3 against the f32 path, the low-probability tail by up to ~0.2.
 - **Weights.** llama.cpp computes from the F16 (or BF16) weights as the file
   holds them; this library stores them as bf16. Both read two bytes a weight,
   so decode, which is bound by reading them, compares like for like. For the
