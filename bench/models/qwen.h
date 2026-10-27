@@ -164,7 +164,35 @@ inline const gg::tensor_info* need(const gg::model& m, const std::string& n) {
   return t;
 }
 
-// Fused weight load: widen several GGML [out,in] F16 tensors that share the same
+// Elements [first, first + n) of a tensor, widened to f32 into dst: the one
+// place that reads a weight's bytes, whatever 16- or 32-bit float the file
+// stored it as (an F16 GGUF, or a BF16 one). The type is dispatched once per
+// call, outside the element loop.
+inline void widen_(const gg::tensor_info* t, size_t first, size_t n, float* dst) {
+  switch (t->type) {
+    case gg::ggml_type::f32: {
+      const float* src = static_cast<const float*>(t->data) + first;
+      std::copy(src, src + n, dst);
+      return;
+    }
+    case gg::ggml_type::f16: {
+      const uint16_t* src = static_cast<const uint16_t*>(t->data) + first;
+      for (size_t i = 0; i < n; i++) dst[i] = f16_to_f32(src[i]);
+      return;
+    }
+    case gg::ggml_type::bf16: {
+      const uint16_t* src = static_cast<const uint16_t*>(t->data) + first;
+      for (size_t i = 0; i < n; i++) dst[i] = tl::bf16_to_f32(src[i]);
+      return;
+    }
+    default:
+      std::fprintf(stderr, "tensor %s: ggml type %u is not a float the loader reads\n",
+                   t->name.c_str(), static_cast<unsigned>(t->type));
+      std::exit(2);
+  }
+}
+
+// Fused weight load: widen several GGML [out,in] tensors that share the same
 // `in` (K) and stack them into ONE array, so a single GEMV/GEMM produces all
 // their outputs contiguously (q|k|v or gate|up). Block b occupies output slots
 // [base, base+out_b), and the fused output [Ntot] is q|k|v (or gate|up) laid end
@@ -196,21 +224,21 @@ inline array load_w_cat_(const gg::model& m, const std::vector<wpart>& parts,
                          int64_t in, tl::dtype wdt, bool row) {
   int64_t Ntot = 0;
   for (const auto& p : parts) Ntot += p.out;
-  std::vector<float> v((size_t)in * Ntot);
+  std::vector<float> v((size_t)in * Ntot), rowbuf(row ? 0 : (size_t)in);
   int64_t base = 0;
   for (const auto& p : parts) {
-    const auto* raw = reinterpret_cast<const uint16_t*>(need(m, p.name)->data);
+    const auto* t = need(m, p.name);
     const int64_t out = p.out;
-    // Split on the layout OUTSIDE the element loops: this runs over every weight
-    // byte in the model, so the destination index must stay branch-free.
-    if (row) {
-      for (int64_t o = 0; o < out; o++)
-        for (int64_t i = 0, so = p.src(o); i < in; i++)
-          v[(size_t)(base + o) * in + i] = f16_to_f32(raw[(size_t)so * in + i]);
-    } else {
-      for (int64_t o = 0; o < out; o++)
-        for (int64_t i = 0, so = p.src(o); i < in; i++)
-          v[(size_t)i * Ntot + (base + o)] = f16_to_f32(raw[(size_t)so * in + i]);
+    // A source row is contiguous in the file: widened straight into place in
+    // the row layout, through one row of scratch for the transposed one.
+    for (int64_t o = 0; o < out; o++) {
+      const size_t so = (size_t)p.src(o) * in;
+      if (row) {
+        widen_(t, so, in, &v[(size_t)(base + o) * in]);
+      } else {
+        widen_(t, so, in, rowbuf.data());
+        for (int64_t i = 0; i < in; i++) v[(size_t)i * Ntot + (base + o)] = rowbuf[i];
+      }
     }
     base += out;
   }
@@ -265,17 +293,18 @@ inline const float* host_read(const storage& s) {
   return s.ptr;
 }
 
-// Several F32 1-D tensors laid end to end -> array [1, sum(len)]. The q|k|v
-// biases in that order match the fused QKV projection's column layout, so the
-// batched path adds all of them in one pass over all heads.
-// F32 1-D tensors (norms and biases are stored F32 in the GGUF) -> array
-// [1, sum(len)]; load_f32 below is the single-tensor case.
+// Several 1-D tensors (norms, biases, gates' constants) laid end to end ->
+// array [1, sum(len)], f32 whatever the file stored them as. The q|k|v biases
+// in that order match the fused QKV projection's column layout, so the batched
+// path adds all of them in one pass over all heads. load_f32 below is the
+// single-tensor case.
 inline array load_f32_cat(const gg::model& m,
                           const std::vector<std::pair<std::string, int64_t>>& parts) {
   std::vector<float> v;
   for (const auto& p : parts) {
-    const auto* raw = reinterpret_cast<const float*>(need(m, p.first)->data);
-    v.insert(v.end(), raw, raw + p.second);
+    const size_t at = v.size();
+    v.resize(at + p.second);
+    widen_(need(m, p.first), 0, p.second, v.data() + at);
   }
   int64_t len = (int64_t)v.size();
   return array::from(std::move(v), {1, len});
@@ -428,7 +457,7 @@ struct PrefillScratch {
 
 struct Model {
   Config c;
-  const uint16_t* embed_f16;  // token_embd raw F16 [vocab, NE] (row-gather source)
+  const gg::tensor_info* embed;  // token_embd [vocab, NE] in the file (row-gather source)
   array outwT;                // logits weight [NE, VOCAB] (transposed output.weight)
   array onorm;                // final norm [1, NE]
   array outwT_q4;             // q4 lm_head (imperative, when q4_lmhead); outwT
@@ -620,14 +649,13 @@ inline void prefill_chunk_(Model& M, int64_t T) {
   // running the 272 MB lm_head here would waste a full GEMV per earlier chunk.
 }
 
-// Widen `n` token embedding rows (F16 in the GGUF) into `dst`. The one place
-// that knows the embedding's storage convention; both stagers go through it.
+// Widen `n` token embedding rows (whatever float the GGUF stored) into `dst`.
+// Both stagers go through it.
 inline void gather_embed_rows_(const Model& M, const int* ids, int64_t n,
                                float* dst) {
   const Config& c = M.c;
   for (int64_t i = 0; i < n; i++) {
-    const uint16_t* r = M.embed_f16 + (size_t)ids[i] * c.NE;
-    for (int64_t j = 0; j < c.NE; j++) dst[i * c.NE + j] = f16_to_f32(r[j]);
+    widen_(M.embed, (size_t)ids[i] * c.NE, c.NE, dst + i * c.NE);
   }
 }
 
@@ -703,8 +731,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
   const tl::dtype f32 = tl::dtype::f32;
   Model M{
       .c = c,
-      .embed_f16 =
-          reinterpret_cast<const uint16_t*>(need(m, "token_embd.weight")->data),
+      .embed = need(m, "token_embd.weight"),
       .outwT = load_w_T(m, c.output_name(), c.NE, c.VOCAB, wdt),  // stays [K,N]
       .onorm = load_f32(m, "output_norm.weight", c.NE),
       // q4 lm_head (imperative): quantize the f32 [K,VOCAB], keep only the q4.
@@ -758,10 +785,10 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
                      c.NE);
       L.wsout = row ? load_w_T_row(m, p + "ssm_out.weight", V, c.NE)
                     : load_w_T(m, p + "ssm_out.weight", V, c.NE, wdt);
-      // The conv taps are F32 [C][SCONV] in the GGUF; the op reads them
+      // The conv taps are [C][SCONV] in the GGUF; the op reads them
       // tap-major, so a transpose here.
-      const auto* cw = reinterpret_cast<const float*>(need(m, p + "ssm_conv1d.weight")->data);
-      std::vector<float> taps((size_t)c.SCONV * C);
+      std::vector<float> cw((size_t)c.SCONV * C), taps((size_t)c.SCONV * C);
+      widen_(need(m, p + "ssm_conv1d.weight"), 0, cw.size(), cw.data());
       for (int64_t ch = 0; ch < C; ch++)
         for (int64_t k = 0; k < c.SCONV; k++)
           taps[(size_t)k * C + ch] = cw[(size_t)ch * c.SCONV + k];

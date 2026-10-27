@@ -1,9 +1,12 @@
 #include "doctest.h"
 
+#include <gguf.h>
 #include <kv_cache.h>
 #include <tensorlib.h>
 
 #include <algorithm>
+#include <cstring>
+#include <fstream>
 #include <functional>
 #include <random>
 
@@ -2946,6 +2949,50 @@ TEST_CASE("policy: a split measures its groups against the device's fill") {
 
   // A part is never zero: the shortest k still rounds up to one granule.
   CHECK(split_chunk(1, 1, gemv) == 32);
+}
+
+// A BF16 tensor (ggml type 30, as BF16 GGUFs ship their weights) is read with
+// its size and bytes as the file has them. The smallest GGUF v3 that holds
+// one: no metadata, one 1-D tensor of four values, the data section aligned
+// to the default 32.
+TEST_CASE("gguf reads a BF16 tensor") {
+  std::string f;
+  auto put = [&](const void* p, size_t n) { f.append(static_cast<const char*>(p), n); };
+  auto u32 = [&](uint32_t v) { put(&v, 4); };
+  auto u64 = [&](uint64_t v) { put(&v, 8); };
+  put("GGUF", 4);
+  u32(3);  // version
+  u64(1);  // tensors
+  u64(0);  // metadata pairs
+  const std::string name = "w";
+  u64(name.size());
+  put(name.data(), name.size());
+  u32(1);   // dims
+  u64(4);   // ne[0]
+  u32(30);  // GGML_TYPE_BF16
+  u64(0);   // offset in the data section
+  f.resize((f.size() + 31) / 32 * 32, '\0');
+  // Exact in bf16, the last near the top of its range.
+  const float want[4] = {1.0f, -2.5f, 0.15625f, std::ldexp(1.0f, 127)};
+  uint16_t raw[4];
+  for (int i = 0; i < 4; i++) {
+    uint32_t bits;
+    std::memcpy(&bits, &want[i], 4);
+    raw[i] = static_cast<uint16_t>(bits >> 16);
+  }
+  put(raw, sizeof(raw));
+  const std::string path = "gguf_bf16_test.gguf";  // the test's working directory
+  { std::ofstream(path, std::ios::binary).write(f.data(), (std::streamsize)f.size()); }
+  {
+    tl::gguf::model m(path);
+    const auto* t = m.tensor("w");
+    REQUIRE(t != nullptr);
+    CHECK(t->type == tl::gguf::ggml_type::bf16);
+    CHECK(t->nbytes == 8);
+    const auto* got = static_cast<const uint16_t*>(t->data);
+    for (int i = 0; i < 4; i++) CHECK(tl::bf16_to_f32(got[i]) == want[i]);
+  }
+  std::remove(path.c_str());
 }
 
 // A replayed graph keeps the host mirrors in step as its launches would: what

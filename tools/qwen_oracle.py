@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tight numpy oracle for bench/models/check_qwen.cpp (Qwen2.5, Qwen3, Qwen3.5).
 
-Reads a Qwen2.5 / Qwen3 F16 GGUF with its own minimal parser and runs the decoder
+Reads a Qwen2.5 / Qwen3 / Qwen3.5 F16 (or BF16) GGUF with its own minimal parser and runs the decoder
 in float32 numpy on the SAME weights the C++ loads, so the two must agree to
 ~1e-4 at every checkpoint. (Not torch on the HF weights: those are bf16, the GGUF
 is F16, and the two drift apart within a few tokens.) Writes a C++ header with
@@ -76,10 +76,14 @@ def load_gguf(path):
     base = (r.o + align - 1) // align * align
     tensors = {}
     for name, dims, ty, off in infos:
-        assert ty in (0, 1), f"{name}: ggml type {ty} (F32/F16 only)"
-        dt = np.float32 if ty == 0 else np.float16
+        assert ty in (0, 1, 30), f"{name}: ggml type {ty} (F32/F16/BF16 only)"
         n = int(np.prod(dims))
-        a = np.frombuffer(buf, dtype=dt, count=n, offset=base + off)
+        if ty == 30:  # bf16: the high half of an f32
+            u = np.frombuffer(buf, dtype=np.uint16, count=n, offset=base + off)
+            a = (u.astype(np.uint32) << 16).view(np.float32)
+        else:
+            a = np.frombuffer(buf, dtype=np.float32 if ty == 0 else np.float16, count=n,
+                              offset=base + off)
         tensors[name] = a.reshape(dims[::-1]).astype(np.float32)  # GGML dims are reversed
     return kv, tensors
 
