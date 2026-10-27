@@ -82,18 +82,14 @@ static bool check_hybrid(const qm::gg::model& m, const Oracle& O) {
     std::printf("\n  greedy %s\n", greedy_ok ? "MATCH" : "DIVERGE");
     ok = fn_mr < 5e-3 && logit_mr < 5e-3 && top1 == O.top5_ids[0] && greedy_ok;
   }
-  // A backend without the bf16-weight kernels (bf16_gemm, as the non-hybrid
-  // check asks) has no reader for the bf16 lm_head either: skip as it does.
-  if (!qm::gpu::caps::bf16_gemm) {
-    std::printf("\nbf16 weights: backend has no bf16 weight GEMM — skipped\n");
-    return ok;
-  }
+  // A backend without the bf16 GEMV builds f32 instead (build()), and says so.
   const int64_t NB = 8;
   qm::Model B = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false);
   int64_t tok = 0, p = 0;
   for (int64_t i = 0; i < NP; i++) tok = qm::step_imperative(B, O.prompt_ids[i], p++);
   bool bf16_ok = true;
-  std::printf("\nbf16 weights, greedy %lld:\n  cpp:", (long long)NB);
+  std::printf("\nbf16 weights (built as %s), greedy %lld:\n  cpp:",
+              B.outwT.dt() == tl::dtype::bf16 ? "bf16" : "f32", (long long)NB);
   for (int64_t i = 0; i < NB; i++) {
     std::printf(" %lld", (long long)tok);
     if (tok != want[i]) bf16_ok = false;

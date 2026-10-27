@@ -601,6 +601,11 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
                    bool q4_mlp = false, bool q4_lmhead = false,
                    int64_t maxc = 4096, bool oracle = true) {
   const Config c = config_from_gguf(m, maxc);
+  // bf16 weights need the backend's bf16 [K,N] GEMV: the lm_head reads it in
+  // every mode, and so does every projection off the row path. It has no
+  // composition to fall back to, so a backend without it would leave the
+  // logits unwritten; it decodes from f32 weights instead.
+  if (wdt == tl::dtype::bf16 && !gpu::has_gemv_bf16) wdt = tl::dtype::f32;
   // Row-major [N,K] weights exist only to feed gemv_bf16_row and the prefill
   // GEMM; a backend without them decodes from the column-major [K,N] split-K
   // GEMV every dtype has, so the layout follows the cap, not just the dtype.

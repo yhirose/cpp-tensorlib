@@ -44,11 +44,12 @@ int main(int argc, char** argv) {
   std::string q4spec = argc > 4 ? argv[4] : "";
   bool q4_mlp = q4spec.find("mlp") != std::string::npos || q4spec == "all" || q4spec == "q4";
   bool q4_lm = q4spec.find("lm") != std::string::npos || q4spec == "all" || q4spec == "q4";
-  std::printf("weight storage: %s | q4: mlp=%d lm=%d\n",
-              wdt == tl::dtype::bf16 ? "bf16" : "f32", q4_mlp, q4_lm);
   auto t_build = clk::now();
   qm::Model M = qm::build(m, wdt, q4_mlp, q4_lm, /*maxc=*/4096, /*oracle=*/false);
   double build_ms = ms_since(t_build);
+  // What build() chose: a backend without the bf16 GEMV decodes from f32.
+  std::printf("weight storage: %s | q4: mlp=%d lm=%d\n",
+              M.outwT.dt() == tl::dtype::bf16 ? "bf16" : "f32", M.q4_mlp, M.q4_lmhead);
 
   // Chat template, as each family's own jinja renders it. Qwen2.5 carries a
   // default system prompt. Qwen3 and Qwen3.5 have none, and think by default:
