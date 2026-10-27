@@ -47,7 +47,10 @@ class tokenizer {
         specials_.emplace_back(tokens_[i], static_cast<int>(i));
 
     eos_id_ = static_cast<int>(m.kv("tokenizer.ggml.eos_token_id").as_u32());
-    bos_id_ = static_cast<int>(m.kv("tokenizer.ggml.bos_token_id").as_u32());
+    // Qwen3.5 has no BOS (the template never adds one); -1 marks "none".
+    bos_id_ = m.has("tokenizer.ggml.bos_token_id")
+                  ? static_cast<int>(m.kv("tokenizer.ggml.bos_token_id").as_u32())
+                  : -1;
 
     for (uint32_t b = 0; b < 256; b++)
       cp2byte_.emplace(tokdata::byte2cp[b], static_cast<uint8_t>(b));
