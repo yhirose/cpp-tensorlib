@@ -13,3 +13,6 @@ docs/_*
 
 # Downloaded MNIST cache for the convergence gate (bench/check_mnist.cpp)
 mnist-data/
+
+# GGUF weights (bench/models)
+/models/
