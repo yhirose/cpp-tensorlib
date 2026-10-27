@@ -2948,6 +2948,34 @@ TEST_CASE("policy: a split measures its groups against the device's fill") {
   CHECK(split_chunk(1, 1, gemv) == 32);
 }
 
+// A replayed graph keeps the host mirrors in step as its launches would: what
+// it writes is device-current afterwards, so a host read after each replay
+// sees that replay's result rather than the copy the previous read brought up.
+TEST_CASE("a graph replay leaves what it wrote device-current") {
+  namespace gpu = tl::gpu;
+  if (!tl::gpu_available() || !gpu::graph_available()) return;
+  auto prev = tl::device_;
+  tl::use_gpu();
+  tl::storage a = tl::storage::make(4), one = tl::storage::make(4), b = tl::storage::make(4);
+  const float zeros[4] = {0, 0, 0, 0}, ones[4] = {1, 1, 1, 1};
+  gpu::upload(a.native, zeros, 4);
+  gpu::upload(one.native, ones, 4);
+  // a += 1, through b (no launch writes what it reads).
+  REQUIRE(gpu::capture_begin());
+  gpu::binary(gpu::kop::add, a.device_span(), one.device_span(), b.device_span(), 4, 1, 0);
+  gpu::unary(gpu::kop::affine, b.device_span(), a.device_span(), 4, 1, 0);
+  gpu::graph_exec g = gpu::capture_end();
+  REQUIRE(g != nullptr);
+  for (int replay = 1; replay <= 2; replay++) {
+    REQUIRE(gpu::graph_launch(g));
+    gpu::cpu_barrier();
+    gpu::sync_to_host(a.native, false);
+    CHECK(a.ptr[0] == doctest::Approx((float)replay));
+  }
+  gpu::graph_destroy(g);
+  tl::device_ = prev;
+}
+
 // Partial RoPE (Qwen3.5: 64 of a 256-wide head) against a host reference: the
 // first `rot` dims of each row rotate as a half-split RoPE of width rot, the
 // rest pass through. Every backend takes the composition here, so the

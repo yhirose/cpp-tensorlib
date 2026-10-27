@@ -303,8 +303,17 @@ struct context {
   // mid-graph); the driver stages a pageable source during the call.
   void before_kernel_(void* native, gpu::access a) {
     mirror* m = mirror_(native);
-    if (m && m->live.before_kernel(a)) upload_(*m);
+    if (!m) return;
+    if (capturing) capture_touches.emplace_back(native, a);
+    if (m->live.before_kernel(a)) upload_(*m);
   }
+  // A replayed graph runs none of the launchers that keep the mirrors in step,
+  // so the capture records every touch its launches made, in order, and each
+  // replay makes them again before it runs (graph_launch): a buffer the graph
+  // writes is device-current after it, as it is after the launches themselves.
+  bool capturing = false;
+  std::vector<std::pair<void*, gpu::access>> capture_touches;
+  std::unordered_map<CUgraphExec, std::vector<std::pair<void*, gpu::access>>> graph_touches;
   // The three accesses by name, for the ops that state residency themselves.
   void device_read_(void* native) { before_kernel_(native, gpu::access::in); }
   void device_write_(void* native) { before_kernel_(native, gpu::access::out); }
@@ -1072,6 +1081,8 @@ inline bool capture_begin() {
   if (!c.cap_stream && c.d.StreamCreate(&c.cap_stream, 0) != 0) return false;
   if (c.d.StreamBeginCapture(c.cap_stream, 0 /*GLOBAL*/) != 0) return false;
   c.stream = c.cap_stream;
+  c.capturing = true;
+  c.capture_touches.clear();
   return true;
 }
 // End capture and instantiate an executable graph (nullptr on failure).
@@ -1081,10 +1092,13 @@ inline CUgraphExec capture_end() {
   CUgraph g = nullptr;
   CUresult r = c.d.StreamEndCapture(c.cap_stream, &g);
   c.stream = nullptr;
+  c.capturing = false;
   if (r != 0 || !g) return nullptr;
   CUgraphExec e = nullptr;
   if (c.d.GraphInstantiate(&e, g, 0) != 0) e = nullptr;
   c.d.GraphDestroy(g);
+  if (e) c.graph_touches[e] = std::move(c.capture_touches);
+  c.capture_touches.clear();
   return e;
 }
 // Replay a captured graph on the default stream (marks work pending; the caller
@@ -1092,12 +1106,16 @@ inline CUgraphExec capture_end() {
 inline bool graph_launch(CUgraphExec e) {
   auto& c = context::get();
   if (!c.ready || !e) return false;
+  if (auto it = c.graph_touches.find(e); it != c.graph_touches.end()) {
+    for (const auto& [native, a] : it->second) c.before_kernel_(native, a);
+  }
   if (c.d.GraphLaunch(e, nullptr) != 0) return false;
   c.pending = true;
   return true;
 }
 inline void graph_destroy(CUgraphExec e) {
   auto& c = context::get();
+  c.graph_touches.erase(e);
   if (e && c.d.GraphExecDestroy) c.d.GraphExecDestroy(e);
 }
 
