@@ -520,8 +520,8 @@ inline void prefill_chunk_(Model& M, int64_t T) {
       gpu::rmsnorm(kh, sp(L.kn), kh, c.HD, c.EPS, c.NKV * T);
     }
     // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
-    gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, c.ROPE_BASE);
-    gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, c.ROPE_BASE);
+    gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
+    gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
     L.cache.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale());
     gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, c.HD);
     gpu::gemm_bf16_nt(sp(P.at), sp(L.wo_row), ro, T, c.NE, c.NH * c.HD);
@@ -958,8 +958,8 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
         gpu::rmsnorm(kp, sp(L.kn), kp, c.HD, c.EPS, c.NKV);
       }
       if (cap) {
-        gpu::rope_dpos(qp, qp, c.NH, 1, c.HD, d_pos, c.ROPE_BASE, sp(L.bq));
-        gpu::rope_dpos(kp, kp, c.NKV, 1, c.HD, d_pos, c.ROPE_BASE, sp(L.bk));
+        gpu::rope_dpos(qp, qp, c.NH, 1, c.HD, d_pos, c.ROPE_BASE, sp(L.bq), c.ROT);
+        gpu::rope_dpos(kp, kp, c.NKV, 1, c.HD, d_pos, c.ROPE_BASE, sp(L.bk), c.ROT);
       } else {
         gpu::rope(qp, qp, c.NH, 1, c.HD, pos, c.ROPE_BASE, sp(L.bq), c.ROT);
         gpu::rope(kp, kp, c.NKV, 1, c.HD, pos, c.ROPE_BASE, sp(L.bk), c.ROT);

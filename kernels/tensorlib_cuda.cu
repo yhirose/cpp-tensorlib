@@ -2542,18 +2542,25 @@ extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 // (j, j+D/2) rotate by angle = position · base^(-2j/D). grid = rows, block = D/2.
 // An optional fused bias is added before the rotation: folding q/k's bias-add
 // into rope removes 2 elementwise launches per decode layer.
+// Rotates the first `rot` dims of each row (rot == D: all of it, the math
+// unchanged from before rot existed) and copies the rest through, bias added.
+// blockDim = D/2: thread j turns the pair (j, j + rot/2) when j < rot/2, and
+// strides the pass-through dims from rot + j.
 static __device__ __forceinline__ void rope_core(
     const float* __restrict__ x, const float* __restrict__ bias,
-    float* __restrict__ out, unsigned T, unsigned D, unsigned pos, float base) {
+    float* __restrict__ out, unsigned T, unsigned D, unsigned pos, float base,
+    unsigned rot) {
   const unsigned r = blockIdx.x, j = threadIdx.x;  // j in 0..D/2-1
-  const unsigned half = D >> 1;
+  const size_t bi = (size_t)r * D;
+  for (unsigned d = rot + j; d < D; d += blockDim.x)
+    out[bi + d] = bias ? x[bi + d] + bias[bi + d] : x[bi + d];
+  const unsigned half = rot >> 1;
   if (j >= half) return;
   const unsigned t = T ? (r % T) : 0u;
   const float position = (float)(pos + t);
-  const float theta = __powf(base, -2.0f * (float)j / (float)D);
+  const float theta = __powf(base, -2.0f * (float)j / (float)rot);
   const float ang = position * theta;
   const float c = __cosf(ang), s = __sinf(ang);
-  const size_t bi = (size_t)r * D;
   float x0 = x[bi + j];
   float x1 = x[bi + j + half];
   if (bias) {
@@ -2565,8 +2572,9 @@ static __device__ __forceinline__ void rope_core(
 }
 __global__ void tl_rope(const float* __restrict__ x,
                         const float* __restrict__ bias, float* __restrict__ out,
-                        unsigned T, unsigned D, unsigned pos, float base) {
-  rope_core(x, bias, out, T, D, pos, base);
+                        unsigned T, unsigned D, unsigned pos, float base,
+                        unsigned rot) {
+  rope_core(x, bias, out, T, D, pos, base, rot);
 }
 // Device-pos variant (CUDA-graph capture): reads the sequence position from a
 // device scalar `*d_pos` instead of a by-value host arg, so one instantiated
@@ -2575,8 +2583,9 @@ __global__ void tl_rope(const float* __restrict__ x,
 __global__ void tl_rope_dpos(const float* __restrict__ x,
                              const float* __restrict__ bias,
                              float* __restrict__ out, unsigned T, unsigned D,
-                             const unsigned* __restrict__ d_pos, float base) {
-  rope_core(x, bias, out, T, D, *d_pos, base);
+                             const unsigned* __restrict__ d_pos, float base,
+                             unsigned rot) {
+  rope_core(x, bias, out, T, D, *d_pos, base, rot);
 }
 
 // Device-scalar increment: *p += 1. Bumps the shared decode pos counter at the

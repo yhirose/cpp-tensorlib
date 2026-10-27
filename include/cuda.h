@@ -806,7 +806,7 @@ struct own {
   // step replays against an advancing cache row.
   static bool rope_dpos(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                         int64_t D, gpu::span d_pos, float base,
-                        gpu::span bias = {});
+                        gpu::span bias = {}, int64_t rot = 0);
   static bool kv_append_dpos(gpu::span Kc, gpu::span Vc, gpu::span k_new,
                              gpu::span v_new, gpu::span d_pos, int64_t kv_max,
                              int64_t n_kv_heads, int64_t D);
@@ -878,6 +878,10 @@ struct own {
                            int64_t n, int64_t k);
   static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                    int64_t D, int64_t pos, float base, gpu::span bias = {});
+  // rope over the first `rot` dims of each row only (Qwen3.5's partial RoPE).
+  static bool rope_partial(gpu::span x, gpu::span out, int64_t rows, int64_t T,
+                           int64_t D, int64_t pos, float base, gpu::span bias,
+                           int64_t rot);
   static bool layer_norm_bwd(gpu::span x, gpu::span g, gpu::span dy,
                              gpu::span dx, gpu::span dg, gpu::span db,
                              gpu::span stats, gpu::span partials, int64_t rows,
@@ -1719,12 +1723,13 @@ inline bool own::attn_decode(gpu::span q, gpu::span K, gpu::span V,
 // Grids are pos-independent throughout: attn_decode_dpos gets its split grid
 // from the cache CAPACITY (max_ctx) and lets the kernel bound the work by pos.
 
-// RoPE reading pos from *d_pos (else identical to rope()).
+// RoPE reading pos from *d_pos (else identical to rope_partial()).
 inline bool own::rope_dpos(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                            int64_t D, gpu::span d_pos, float base,
-                           gpu::span bias) {
+                           gpu::span bias, int64_t rot) {
   auto& c = context::get();
-  if (!c.ready || D <= 0 || (D & 1)) return false;
+  if (rot == 0) rot = D;
+  if (!c.ready || D <= 0 || (D & 1) || rot <= 0 || (rot & 1) || rot > D) return false;
   c.device_read_(x.buf);
   if (bias.buf) c.device_read_(bias.buf);
   c.device_write_(out.buf);
@@ -1733,9 +1738,9 @@ inline bool own::rope_dpos(gpu::span x, gpu::span out, int64_t rows, int64_t T,
   float* pbias = bias.buf ? context::off_(bias.buf, bias.off) : nullptr;
   float* po = context::off_(out.buf, out.off);
   float* pp = context::off_(d_pos.buf, d_pos.off);
-  unsigned uT = (unsigned)T, uD = (unsigned)D;
+  unsigned uT = (unsigned)T, uD = (unsigned)D, urot = (unsigned)rot;
   return c.launch_(c.rope_dpos_(), {(unsigned)rows}, {(unsigned)(D / 2)}, 0, px,
-                   pbias, po, uT, uD, pp, base);
+                   pbias, po, uT, uD, pp, base, urot);
 }
 
 // One-thread *d_pos += 1 (tail of a captured forward; advances the counter).
@@ -1909,8 +1914,13 @@ inline bool own::attn_prefill_dkv(gpu::span q, gpu::span K, gpu::span V,
 // pos + (r % T); half-split (GPT-NeoX / HF-llama) convention. D must be even.
 inline bool own::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                       int64_t D, int64_t pos, float base, gpu::span bias) {
+  return rope_partial(x, out, rows, T, D, pos, base, bias, D);
+}
+inline bool own::rope_partial(gpu::span x, gpu::span out, int64_t rows,
+                              int64_t T, int64_t D, int64_t pos, float base,
+                              gpu::span bias, int64_t rot) {
   auto& c = context::get();
-  if (!c.ready || D <= 0 || (D & 1)) return false;
+  if (!c.ready || D <= 0 || (D & 1) || rot <= 0 || (rot & 1) || rot > D) return false;
   c.device_read_(x.buf);
   if (bias.buf) c.device_read_(bias.buf);
   c.device_write_(out.buf);
@@ -1918,10 +1928,10 @@ inline bool own::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
   float* pbias = bias.buf ? context::off_(bias.buf, bias.off) : nullptr;
   float* po = context::off_(out.buf, out.off);
   unsigned uT = static_cast<unsigned>(T), uD = static_cast<unsigned>(D),
-           upos = static_cast<unsigned>(pos);
+           upos = static_cast<unsigned>(pos), urot = static_cast<unsigned>(rot);
   return c.launch_(c.rope_(), {static_cast<unsigned>(rows)},
                    {static_cast<unsigned>(D / 2)}, 0, px, pbias, po, uT, uD,
-                   upos, base);
+                   upos, base, urot);
 }
 
 // ---- Row-wise fused RMSNorm / SwiGLU. `rows` defaults to 1 (a decode step); a

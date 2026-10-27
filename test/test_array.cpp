@@ -3167,6 +3167,14 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     REQUIRE(gen::rope(x.device_span(), rb.device_span(), H * T, T, D, 37, 1e6f, {}, D));
     tl::gpu::flush();
     CHECK(same(ra, rb, 1e-4f));
+    // Partial (a quarter of the row, as Qwen3.5), with the bias riding along
+    // the pass-through dims too.
+    REQUIRE(gpu::rope(x.device_span(), ra.device_span(), H * T, T, D, 37, 1e6f,
+                      b.device_span(), D / 4));
+    REQUIRE(gen::rope(x.device_span(), rb.device_span(), H * T, T, D, 37, 1e6f,
+                      b.device_span(), D / 4));
+    tl::gpu::flush();
+    CHECK(same(ra, rb, 1e-4f));
 
     array src = dev(random_array({T, ld}, 972)), bias = dev(random_array({H, D}, 973));
     array sa = array::empty({H, T, D}), sb = array::empty({H, T, D});

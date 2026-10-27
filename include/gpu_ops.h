@@ -949,9 +949,10 @@ inline bool argmax(span a, int64_t n, int64_t* out_idx) {
 
 // Rotary embedding over [rows, T, D] at position `pos`, adding the optional
 // per-row bias first. `rot` (0: all of D) rotates only the first rot dims of
-// each row, the partial RoPE of Qwen3.5; the backends' own kernels rotate the
-// whole row, so a partial one takes the composition.
+// each row, the partial RoPE of Qwen3.5: a backend's own `rope` turns the
+// whole row, and one that also has `rope_partial` takes the rest.
 TL_GPU_DETECT_OWN(rope)
+TL_GPU_DETECT_OWN(rope_partial)
 template <class Own = own>
 inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
                  int64_t pos, float base, span bias = {}, int64_t rot = 0) {
@@ -959,6 +960,12 @@ inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
   if constexpr (detail::owns_rope<Own>::value) {
     if (rot == D &&
         detail::ran(Own::rope(x, o, rows, T, D, pos, base, bias))) {
+      return true;
+    }
+  }
+  if constexpr (detail::owns_rope_partial<Own>::value) {
+    if (rot != D &&
+        detail::ran(Own::rope_partial(x, o, rows, T, D, pos, base, bias, rot))) {
       return true;
     }
   }
@@ -1093,9 +1100,9 @@ inline bool adam_step(span p, span m, span v, span g, int64_t n, float beta1,
 TL_GPU_DETECT_OWN(rope_dpos)
 template <class Own = own>
 inline bool rope_dpos(span x, span o, int64_t rows, int64_t T, int64_t D,
-                      span d_pos, float base, span bias = {}) {
+                      span d_pos, float base, span bias = {}, int64_t rot = 0) {
   if constexpr (detail::owns_rope_dpos<Own>::value) {
-    return detail::ran(Own::rope_dpos(x, o, rows, T, D, d_pos, base, bias));
+    return detail::ran(Own::rope_dpos(x, o, rows, T, D, d_pos, base, bias, rot));
   } else {
     return false;
   }
