@@ -1,13 +1,13 @@
-// M9 "actually chat" — the real thing. Load a Qwen2.5-0.5B-Instruct GGUF, tokenize
-// a prompt with the Qwen2 chat template (tl::tokenizer), run the decoder
-// (qwen2.h) greedily, and detokenize the generated ids back to text. This is
+// M9 "actually chat" — the real thing. Load a Qwen2.5 / Qwen3 GGUF, tokenize
+// a prompt with the family's chat template (tl::tokenizer), run the decoder
+// (qwen.h) greedily, and detokenize the generated ids back to text. This is
 // the end-to-end proof: prompt string in, generated text out, on this repo's own
 // GPU kernels + own GGUF loader + own BPE tokenizer, zero third-party runtime deps.
 //
-// Usage: chat_qwen [model.gguf] ["your prompt"]
+// Usage: chat_qwen [model.gguf] ["your prompt"] [f32|bf16] [q4 spec] [nothink]
 // Greedy decoding (deterministic); stops at <|im_end|> or the token budget.
 
-#include "qwen2.h"
+#include "qwen.h"
 #include "tokenizer.h"
 
 #include <chrono>
@@ -35,10 +35,6 @@ int main(int argc, char** argv) {
   std::printf("loading %s\n", path.c_str());
   tl::tokenizer tok(path);
   qm::gg::model m(path);
-  if (!qm::check_config(m)) {
-    std::printf("config mismatch — hard-coded for Qwen2.5-0.5B\n");
-    return 2;
-  }
   tl::use_gpu();
   // bf16 weight storage: ~1GB (under the WSL2 2GB sysmem cliff), decode GEMV
   // consumes it natively. Pass "f32" as argv[3] to force exact F32 (~2GB).
@@ -51,14 +47,21 @@ int main(int argc, char** argv) {
   std::printf("weight storage: %s | q4: mlp=%d lm=%d\n",
               wdt == tl::dtype::bf16 ? "bf16" : "f32", q4_mlp, q4_lm);
   auto t_build = clk::now();
-  qm::Model M = qm::build(m, wdt, q4_mlp, q4_lm);
+  qm::Model M = qm::build(m, wdt, q4_mlp, q4_lm, /*maxc=*/4096, /*oracle=*/false);
   double build_ms = ms_since(t_build);
 
-  // Qwen2 chat template (matches the model's default system prompt).
+  // Chat template, as each family's own jinja renders it. Qwen2.5 carries a
+  // default system prompt. Qwen3 has none, and thinks by default: the model opens
+  // a <think> block itself, which "nothink" (argv[5]) closes up front, exactly
+  // what the template's enable_thinking=false does.
+  const bool qwen3 = M.c.arch == "qwen3";
+  const bool nothink = argc > 5 && std::string(argv[5]) == "nothink";
   std::string templated =
-      "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a "
-      "helpful assistant.<|im_end|>\n<|im_start|>user\n" +
-      user + "<|im_end|>\n<|im_start|>assistant\n";
+      std::string(qwen3 ? "" : "<|im_start|>system\nYou are Qwen, created by "
+                                 "Alibaba Cloud. You are a helpful "
+                                 "assistant.<|im_end|>\n") +
+      "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n" +
+      (qwen3 && nothink ? "<think>\n\n</think>\n\n" : "");
   std::vector<int> ids = tok.encode(templated);
   std::printf("prompt: %s\n%zu prompt tokens; generating (greedy)...\n\n",
               user.c_str(), ids.size());

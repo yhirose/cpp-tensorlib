@@ -21,7 +21,7 @@
 // Usage: bench_qwen_ctx [model.gguf] [max_ctx] [bucket]
 //   e.g. bench_qwen_ctx ~/models/qwen2.5-0.5b-instruct-fp16.gguf 2048 256
 
-#include "../../models/qwen2.h"
+#include "../../models/qwen.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -93,9 +93,9 @@ int main(int argc, char** argv) {
   int64_t bucket = argc > 3 ? std::atoll(argv[3]) : 256;
 
   qm::gg::model m(path);
-  if (!qm::check_config(m)) { std::printf("config mismatch\n"); return 2; }
   tl::use_gpu();
   qm::Model M = qm::build(m, tl::dtype::bf16);
+  const qm::Config& C = M.c;
   std::printf("model %s | bf16 row | decode to ctx %lld, bucket %lld\n\n",
               path.c_str(), (long long)max_ctx, (long long)bucket);
 
@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
   // (a MemFree sync + realloc) as S steps up across ctx 256..max, and those
   // reallocs would otherwise land inside timed tokens of the imperative curve.
   qm::set_cache_pos(M, max_ctx);
-  M.layers[0].cache.attn(M.scratch.qb.device_span(), M.scratch.ab.device_span(), qm::NH, qm::SCALE);
+  M.layers[0].cache.attn(M.scratch.qb.device_span(), M.scratch.ab.device_span(), C.NH, C.scale());
   cu::flush();
 
   // ---- 1. per-position decode curve.
@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
   // ---- 2. attention attribution. The cache now holds `max_ctx` real tokens
   // from the run above (no uninitialized KV), so we can replay the 24 per-layer
   // attn calls at any pos <= that and time them in isolation.
-  std::printf("=== isolated attention: 24 layers x 1 decode step ===\n");
+  std::printf("=== isolated attention: %lld layers x 1 decode step ===\n", (long long)C.NL);
   std::printf("  (host = split-KV when ctx>=256; dpos = capacity-static split grid)\n");
   void* d_pos = cu::alloc(4, nullptr);
   // Value guard alongside the timing: at each ctx, layer 0's host-path output
@@ -123,8 +123,8 @@ int main(int argc, char** argv) {
   // long-ctx complement to bench_qwen_decode's dpos-vs-hostpos check (pos 32,
   // which never leaves the S=1 regime).
   float *ref_host = nullptr, *got_host = nullptr;
-  void* refb = cu::alloc(qm::NH * qm::HD * 4, &ref_host);
-  void* gotb = cu::alloc(qm::NH * qm::HD * 4, &got_host);
+  void* refb = cu::alloc(C.NH * C.HD * 4, &ref_host);
+  void* gotb = cu::alloc(C.NH * C.HD * 4, &got_host);
   const int REPS = 50;
   bool fail = false;
   std::printf("  %6s  %10s  %10s  %8s  %s\n", "ctx", "host(ms)", "dpos(ms)",
@@ -136,11 +136,11 @@ int main(int argc, char** argv) {
     // attn() reads ctx = pos; attn_dpos() reads ctx = *d_pos + 1. Same ctx.
     cu::upload_u32(d_pos, (unsigned)(ctx - 1));
     auto& L0 = M.layers[0];
-    L0.cache.attn(M.scratch.qb.device_span(), {refb, 0}, qm::NH, qm::SCALE);
+    L0.cache.attn(M.scratch.qb.device_span(), {refb, 0}, C.NH, C.scale());
     cu::sync_to_host(refb, false);
-    L0.cache.attn_dpos(M.scratch.qb.device_span(), {gotb, 0}, qm::NH, {d_pos, 0}, qm::SCALE);
+    L0.cache.attn_dpos(M.scratch.qb.device_span(), {gotb, 0}, C.NH, {d_pos, 0}, C.scale());
     cu::sync_to_host(gotb, false);
-    bool bit_eq = std::memcmp(ref_host, got_host, qm::NH * qm::HD * 4) == 0;
+    bool bit_eq = std::memcmp(ref_host, got_host, C.NH * C.HD * 4) == 0;
     auto time_24x = [&](auto&& attn1) {  // REPS x 24-layer attn -> ms per rep
       double t = now_ms();
       for (int i = 0; i < REPS; i++)
@@ -149,10 +149,10 @@ int main(int argc, char** argv) {
       return (now_ms() - t) / REPS;
     };
     auto host1 = [&](qm::Layer& L) {
-      L.cache.attn(M.scratch.qb.device_span(), M.scratch.ab.device_span(), qm::NH, qm::SCALE);
+      L.cache.attn(M.scratch.qb.device_span(), M.scratch.ab.device_span(), C.NH, C.scale());
     };
     auto dpos1 = [&](qm::Layer& L) {
-      L.cache.attn_dpos(M.scratch.qb.device_span(), M.scratch.ab.device_span(), qm::NH, {d_pos, 0}, qm::SCALE);
+      L.cache.attn_dpos(M.scratch.qb.device_span(), M.scratch.ab.device_span(), C.NH, {d_pos, 0}, C.scale());
     };
     double host_ms = 1e30, dpos_ms = 1e30;
     for (int r = 0; r < 3; r++) {  // min of 3, host/dpos interleaved (WSL2 noise)

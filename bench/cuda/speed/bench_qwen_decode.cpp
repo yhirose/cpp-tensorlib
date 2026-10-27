@@ -8,7 +8,7 @@
 //   Reports ms/token and the embed / qkv-eval(sync) / x2-eval(sync) /
 //   logits-eval / logits-D2H / host-argmax split, plus tok/s.
 
-#include "../../models/qwen2.h"
+#include "../../models/qwen.h"
 
 #include <algorithm>
 #include <chrono>
@@ -41,13 +41,13 @@ int main(int argc, char** argv) {
                q4spec == "all" || q4spec == "q4";
 
   qm::gg::model m(path);
-  if (!qm::check_config(m)) { std::printf("config mismatch\n"); return 2; }
   tl::use_gpu();
   const bool q4on = q4_mlp || q4_lm;
   std::printf("model %s | weights %s | q4: mlp=%d lm=%d | %lld decode steps\n",
               path.c_str(), wdt == tl::dtype::bf16 ? "bf16" : "f32", q4_mlp, q4_lm,
               (long long)n_dec);
   qm::Model M = qm::build(m, wdt, q4_mlp, q4_lm);
+  const qm::Config& C = M.c;
 
   // Short deterministic prefill so the cache/pos are realistic, then time a
   // fixed run of decode steps. A few warmup steps first (module load, fn cache,
@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
       for (size_t j = 0; j < M.layers.size(); j++) M.layers[j].cache.pos = saved[j];
       // imperative logits (q4 when enabled) from identical cache state
       const float* imp = qm::imperative_logits(M, nx, p);
-      int64_t tb = qm::argmax(std::vector<float>(imp, imp + qm::VOCAB));
+      int64_t tb = qm::argmax(std::vector<float>(imp, imp + C.VOCAB));
       if (ta != tb) mism++;
       double denom = 1.0 + std::fabs((double)bf16_logits[ta]);
       maxrel = std::max(maxrel, std::fabs((double)imp[ta] - bf16_logits[ta]) / denom);
@@ -140,7 +140,7 @@ int main(int argc, char** argv) {
     qm::set_cache_pos(M, P);
     qm::run_layers_(M, qm::sp(M.scratch.embed), P);
     cu::sync_to_host(M.scratch.logits.native, false);
-    std::vector<float> ref(M.scratch.logits.ptr, M.scratch.logits.ptr + qm::VOCAB);
+    std::vector<float> ref(M.scratch.logits.ptr, M.scratch.logits.ptr + C.VOCAB);
     qm::set_cache_pos(M, P);
     cu::upload_u32(d_pos, (unsigned)P);
     qm::run_layers_(M, qm::sp(M.scratch.embed), P, qm::sp(cap.d_pos));
@@ -148,14 +148,14 @@ int main(int argc, char** argv) {
     const float* got = M.scratch.logits.ptr;
     int mism = 0;
     double maxrel = 0.0;
-    for (int64_t i = 0; i < qm::VOCAB; i++) {
+    for (int64_t i = 0; i < C.VOCAB; i++) {
       if (ref[i] != got[i]) mism++;
       double denom = 1.0 + std::fabs((double)ref[i]);
       maxrel = std::max(maxrel, std::fabs((double)got[i] - ref[i]) / denom);
     }
     int64_t ref_arg = qm::argmax(ref);
     std::printf("dpos-vs-hostpos logits at pos %lld: %d/%d differ, maxrel %.2e %s\n",
-                (long long)P, mism, (int)qm::VOCAB, maxrel,
+                (long long)P, mism, (int)C.VOCAB, maxrel,
                 (maxrel < 1e-5 ? "(OK — lm_head split-K atomicAdd noise)"
                                : "(!! dpos error)"));
 
@@ -165,7 +165,7 @@ int main(int argc, char** argv) {
     cu::graph_launch(cap.exec);
     cu::sync_to_host(M.scratch.logits.native, false);
     int64_t cap_arg = qm::argmax(std::vector<float>(
-        M.scratch.logits.ptr, M.scratch.logits.ptr + qm::VOCAB));
+        M.scratch.logits.ptr, M.scratch.logits.ptr + C.VOCAB));
     std::printf("captured-replay argmax: graph=%lld ref=%lld %s\n",
                 (long long)cap_arg, (long long)ref_arg,
                 cap_arg == ref_arg ? "(MATCH)" : "(!! stale/incomplete graph)");
@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
     double raw_min = bench([&](int64_t) { cu::graph_launch(cap.exec); });
     double ra_min = bench([&](int64_t) {
       cu::graph_launch(cap.exec);
-      tl::gpu::argmax({M.scratch.logits.native, 0}, qm::VOCAB, &di);
+      tl::gpu::argmax({M.scratch.logits.native, 0}, C.VOCAB, &di);
     });
     double cap_min = bench([&](int64_t) { idx = cap.step(M, idx); });
     std::printf("=== correct captured decode (device-pos) ===\n");

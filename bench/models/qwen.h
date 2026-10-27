@@ -1,11 +1,12 @@
 #pragma once
-// Qwen2.5-0.5B-Instruct model: GGUF (F16) weight loading + decoder forward, shared
-// by check_qwen (numeric validation) and chat_qwen (real text generation). The
+// Qwen2.5 / Qwen3 decoder: GGUF (F16) weight loading + forward, shared by
+// check_qwen (numeric validation) and chat_qwen (real text generation). The
 // weights are loaded F32 (exact F16 widen), linear weights transposed from GGML's
-// [out,in] to our dot's [K,N]. Structure: RMSNorm(eps=1e-6) -> QKV proj + bias ->
-// RoPE(base=1e6, half-split) -> GQA(14q/2kv) attn via tl::kv_cache -> o proj ->
-// res -> RMSNorm -> SwiGLU MLP -> res, x24, then final RMSNorm -> logits
-// (output.weight).
+// [out,in] to our dot's [K,N]. Structure: RMSNorm -> QKV proj (+ bias in Qwen2)
+// -> per-head q/k RMSNorm (Qwen3 only) -> RoPE(half-split) -> GQA attn via
+// tl::kv_cache -> o proj -> res -> RMSNorm -> SwiGLU MLP -> res, x NL, then final
+// RMSNorm -> logits (output.weight, or the embedding when tied). The dims and the
+// three Qwen2/Qwen3 switches are a runtime Config read from the GGUF.
 //
 // Backend-neutral: every device call goes through tl::gpu (the facade gpu.h
 // picks), every scratch buffer is a tl::storage (the backend's pool reclaims
@@ -27,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -37,18 +39,66 @@ using tl::storage;
 namespace gg = tl::gguf;
 namespace gpu = tl::gpu;
 
-constexpr int64_t NL = 24, NE = 896, NH = 14, NKV = 2, HD = 64, FF = 4864;
-constexpr int64_t VOCAB = 151936, MAXC = 4096;
-// Prompt tokens per batched prefill pass. Sets the PrefillScratch size (linear:
-// ~47 MiB here, which with the ~1.6 GiB of weights stays under the WSL2 ~2 GB
-// sysmem-fallback cliff) and how well the projections fill the GPU — the GEMMs
+// The shape of one Qwen decoder, read from the GGUF metadata (Config::from_gguf)
+// rather than compiled in, so Qwen2.5 and Qwen3 — and every size of each — share
+// one forward. Everything that differs between those families is a field here:
+// the dims, the norm eps / rope base, and the three structural switches below.
+struct Config {
+  std::string arch;  // "qwen2" | "qwen3": the family, for drivers (template, oracle)
+  int64_t NL = 0, NE = 0, NH = 0, NKV = 0, HD = 0, FF = 0, VOCAB = 0;
+  int64_t MAXC = 4096;  // KV capacity per layer (f32): NKV*MAXC*HD*8 B per layer
+  float EPS = 1e-6f, ROPE_BASE = 1e6f;
+  // Qwen2 puts a bias on the q/k/v projections; Qwen3 drops it.
+  bool qkv_bias = false;
+  // Qwen3 RMS-normalizes each q and k head (weight [HD]) before RoPE.
+  bool qk_norm = false;
+  // Small Qwen3 ties the lm_head to the embedding: no output.weight tensor.
+  bool tied_output = false;
+  float scale() const { return 1.0f / std::sqrt((float)HD); }
+  std::string output_name() const {
+    return tied_output ? "token_embd.weight" : "output.weight";
+  }
+};
+
+// Read a Config from the GGUF: architecture-prefixed metadata for the dims, and
+// the presence of the optional tensors for the structural switches (so a file
+// that has them is run with them). Throws on an
+// architecture this forward does not implement.
+inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
+  const std::string& arch = m.kv("general.architecture").as_str();
+  if (arch != "qwen2" && arch != "qwen3")
+    throw std::runtime_error("qwen: unsupported architecture " + arch);
+  auto u32 = [&](const char* k) { return (int64_t)m.kv(arch + "." + k).as_u32(); };
+  Config c;
+  c.arch = arch;
+  c.NL = u32("block_count");
+  c.NE = u32("embedding_length");
+  c.NH = u32("attention.head_count");
+  c.NKV = u32("attention.head_count_kv");
+  c.FF = u32("feed_forward_length");
+  // Qwen3 states head_dim (key_length); Qwen2 derives it from the width.
+  c.HD = m.has(arch + ".attention.key_length") ? u32("attention.key_length")
+                                               : c.NE / c.NH;
+  c.EPS = m.kv(arch + ".attention.layer_norm_rms_epsilon").as_f32();
+  c.ROPE_BASE = m.kv(arch + ".rope.freq_base").as_f32();
+  c.MAXC = maxc;
+  const auto* emb = m.tensor("token_embd.weight");
+  if (!emb) throw std::runtime_error("qwen: token_embd.weight missing");
+  c.VOCAB = (int64_t)emb->dims[1];
+  c.qkv_bias = m.tensor("blk.0.attn_q.bias") != nullptr;
+  c.qk_norm = m.tensor("blk.0.attn_q_norm.weight") != nullptr;
+  c.tied_output = m.tensor("output.weight") == nullptr;
+  return c;
+}
+// Prompt tokens per batched prefill pass. Sets the PrefillScratch size (linear in
+// it: ~47 MiB for Qwen2.5-0.5B, dominated by the fused gate|up buffer) and how
+// well the projections fill the GPU — the GEMMs
 // are still latency-bound at 256 (3.20 us/token) and reach 2.60 at 512.
 constexpr int64_t PREFILL_CHUNK = 512;
 // Below this the prompt is not worth a batched pass: the GEMM path only pays off
 // once a chunk has enough rows to fill the SMs, and short prompts are dominated
 // by the fixed per-chunk staging anyway.
 constexpr int64_t PREFILL_MIN = 4;
-constexpr float EPS = 1e-6f, SCALE = 1.0f / 8.0f /* 1/sqrt(64) */, ROPE_BASE = 1e6f;
 
 // IEEE half -> float (GGUF F16 tensors). Handles subnormals/inf/nan.
 inline float f16_to_f32(uint16_t h) {
@@ -124,8 +174,8 @@ inline array load_w_cat_(const gg::model& m,
 }
 
 // The four named entry points: {single, concatenated} x {[K,N], [N,K]}. The
-// [K,N] pair takes the storage dtype — f32 (exact, ~2GB total -> WSL2 cliff) or
-// bf16 (~1GB, stays under it; the decode GEMV consumes bf16 natively). The [N,K]
+// [K,N] pair takes the storage dtype — f32 (exact, 4 B/weight) or bf16 (2 B/weight;
+// the decode GEMV consumes bf16 natively). The [N,K]
 // pair does not: row-major weights exist only to feed the warp-per-row GEMV and
 // the prefill GEMM, and both are bf16-only.
 inline array load_w_T_cat(const gg::model& m,
@@ -192,6 +242,9 @@ inline array load_f32(const gg::model& m, const std::string& n, int64_t len) {
 
 struct Layer {
   array wq, bq, wk, bk, wv, bv, wo, wg, wu, wd, an, fn;
+  // Qwen3's per-head q / k RMSNorm weights, [1, HD] (empty when !Config::qk_norm).
+  // bq/bk/bv above are likewise empty when !Config::qkv_bias.
+  array qn, kn;
   // Fused decode weights (imperative path only): wqkv = [wq|wk|wv], wgu = [wg|wu]
   // concatenated. One GEMV each instead of 3/2, amortizing the per-launch floor.
   // The separate wq/.../wu stay resident as the array-path oracle.
@@ -236,30 +289,30 @@ struct Scratch {
                         // effects (capture warm-up)
   storage embed;        // staged embedding row [NE] (the step's input)
   std::vector<float> embed_stage;  // host gather target, uploaded into embed
-  void init() {
-    embed = scratch_f32(NE);
-    embed_stage.assign(NE, 0.0f);
-    logits = scratch_f32(VOCAB);
-    res[0] = scratch_f32(NE);
-    res[1] = scratch_f32(NE);
-    hb = scratch_f32(NE);
-    h2b = scratch_f32(NE);
-    qb = scratch_f32(NH * HD);
-    qkvb = scratch_f32((NH + 2 * NKV) * HD);
-    ab = scratch_f32(NH * HD);
-    mb = scratch_f32(FF);
-    gub = scratch_f32(2 * FF);
-    mdb = scratch_f32(NE);
-    logits_sink = scratch_f32(VOCAB);
+  void init(const Config& c) {
+    embed = scratch_f32(c.NE);
+    embed_stage.assign(c.NE, 0.0f);
+    logits = scratch_f32(c.VOCAB);
+    res[0] = scratch_f32(c.NE);
+    res[1] = scratch_f32(c.NE);
+    hb = scratch_f32(c.NE);
+    h2b = scratch_f32(c.NE);
+    qb = scratch_f32(c.NH * c.HD);
+    qkvb = scratch_f32((c.NH + 2 * c.NKV) * c.HD);
+    ab = scratch_f32(c.NH * c.HD);
+    mb = scratch_f32(c.FF);
+    gub = scratch_f32(2 * c.FF);
+    mdb = scratch_f32(c.NE);
+    logits_sink = scratch_f32(c.VOCAB);
   }
 };
 
 // Device scratch for the BATCHED prefill (M9): the same per-token intermediates
 // as Scratch, but `cap` rows wide, so a chunk of prompt tokens flows through the
 // forward as one [T, n] matrix. Sized once for the chunk and reused across
-// chunks and across prompts. ~47 MiB at PREFILL_CHUNK, dominated by the fused
-// gate|up buffer (cap x 2*FF) — which is why a long prompt is chunked at all
-// rather than run in one [T_prompt, ...] pass under the WSL2 ~2 GB cliff.
+// chunks and across prompts. Dominated by the fused gate|up buffer (cap x 2*FF),
+// which is why a long prompt is chunked at all rather than run in one
+// [T_prompt, ...] pass.
 struct PrefillScratch {
   int64_t cap = 0;
   storage emb;     // embedding rows [cap, NE]
@@ -277,27 +330,28 @@ struct PrefillScratch {
   storage md;  // mlp-down out [cap, NE]
   std::vector<float> emb_stage;  // host gather target, uploaded into emb
 
-  bool init(int64_t chunk) {
+  bool init(const Config& c, int64_t chunk) {
     if (cap >= chunk) return true;  // already big enough
     cap = chunk;
-    emb = scratch_f32(cap * NE);
-    emb_stage.assign((size_t)cap * NE, 0.0f);
-    res[0] = scratch_f32(cap * NE);
-    res[1] = scratch_f32(cap * NE);
-    h = scratch_f32(cap * NE);
-    h2 = scratch_f32(cap * NE);
-    qkv = scratch_f32(cap * (NH + 2 * NKV) * HD);
-    qkvh = scratch_f32((NH + 2 * NKV) * cap * HD);
-    ah = scratch_f32(NH * cap * HD);
-    at = scratch_f32(cap * NH * HD);
-    gu = scratch_f32(cap * 2 * FF);
-    mb = scratch_f32(cap * FF);
-    md = scratch_f32(cap * NE);
+    emb = scratch_f32(cap * c.NE);
+    emb_stage.assign((size_t)cap * c.NE, 0.0f);
+    res[0] = scratch_f32(cap * c.NE);
+    res[1] = scratch_f32(cap * c.NE);
+    h = scratch_f32(cap * c.NE);
+    h2 = scratch_f32(cap * c.NE);
+    qkv = scratch_f32(cap * (c.NH + 2 * c.NKV) * c.HD);
+    qkvh = scratch_f32((c.NH + 2 * c.NKV) * cap * c.HD);
+    ah = scratch_f32(c.NH * cap * c.HD);
+    at = scratch_f32(cap * c.NH * c.HD);
+    gu = scratch_f32(cap * 2 * c.FF);
+    mb = scratch_f32(cap * c.FF);
+    md = scratch_f32(cap * c.NE);
     return md.native != nullptr;
   }
 };
 
 struct Model {
+  Config c;
   const uint16_t* embed_f16;  // token_embd raw F16 [vocab, NE] (row-gather source)
   array outwT;                // logits weight [NE, VOCAB] (transposed output.weight)
   array onorm;                // final norm [1, NE]
@@ -321,8 +375,9 @@ inline bool gemv_w(const array& W, gpu::span a, gpu::span y, int64_t n,
 // Greedy token from the logits the most recent forward left in scratch (the one
 // terminal sync of a step lives inside gpu::argmax).
 inline int64_t argmax_logits(Model& M) {
+  const Config& c = M.c;
   int64_t idx = 0;
-  gpu::argmax(sp(M.scratch.logits), VOCAB, &idx);
+  gpu::argmax(sp(M.scratch.logits), c.VOCAB, &idx);
   return idx;
 }
 
@@ -359,39 +414,46 @@ inline void set_cache_pos(Model& M, int64_t p) {
 // bf16 row-major weights only (the layout gemm_bf16_nt shares with the decode
 // GEMV); callers check Model.row and fall back to token-by-token otherwise.
 inline void prefill_chunk_(Model& M, int64_t T) {
+  const Config& c = M.c;
   PrefillScratch& P = M.pscratch;
   // Absolute position of this chunk's first token — the caches are all at the
   // same place, and kv_cache::prefill appends there, so rope reads it from the
   // same source rather than taking it as a parameter that could disagree.
   const int64_t pos0 = M.layers[0].cache.pos;
-  constexpr int64_t QKVN = (NH + 2 * NKV) * HD;
+  const int64_t QKVN = (c.NH + 2 * c.NKV) * c.HD;
   gpu::span x = sp(P.emb);
-  gpu::rmsnorm(x, sp(M.layers[0].an), sp(P.h), NE, EPS, T);
-  for (int64_t l = 0; l < NL; l++) {
+  gpu::rmsnorm(x, sp(M.layers[0].an), sp(P.h), c.NE, c.EPS, T);
+  for (int64_t l = 0; l < c.NL; l++) {
     Layer& L = M.layers[l];
     const gpu::span ro = sp(P.res[l & 1]);
-    gpu::gemm_bf16_nt(sp(P.h), sp(L.wqkv), sp(P.qkv), T, QKVN, NE);
+    gpu::gemm_bf16_nt(sp(P.h), sp(L.wqkv), sp(P.qkv), T, QKVN, c.NE);
     // split_heads turns the [T, q|k|v] output into head-major [H, T, D] and
     // adds the bias — rope's own fused-bias form only indexes correctly at
     // T == 1, so the bias rides along here instead. One pass over every head;
     // k and v are views into its output.
-    gpu::split_heads(sp(P.qkv), sp(L.bqkv), sp(P.qkvh), T, QKVN, 0, NH + 2 * NKV,
-                     HD);
+    gpu::split_heads(sp(P.qkv), sp(L.bqkv), sp(P.qkvh), T, QKVN, 0, c.NH + 2 * c.NKV,
+                     c.HD);
     const gpu::span qh = sp(P.qkvh);
-    const gpu::span kh = at_f32(qh, NH * T * HD);
-    const gpu::span vh = at_f32(qh, (NH + NKV) * T * HD);
+    const gpu::span kh = at_f32(qh, c.NH * T * c.HD);
+    const gpu::span vh = at_f32(qh, (c.NH + c.NKV) * T * c.HD);
+    // Qwen3: every q / k head row (HD wide, one per h*T + t) is RMS-normalized
+    // in place, before rope. v is untouched.
+    if (c.qk_norm) {
+      gpu::rmsnorm(qh, sp(L.qn), qh, c.HD, c.EPS, c.NH * T);
+      gpu::rmsnorm(kh, sp(L.kn), kh, c.HD, c.EPS, c.NKV * T);
+    }
     // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
-    gpu::rope(qh, qh, NH * T, T, HD, pos0, ROPE_BASE);
-    gpu::rope(kh, kh, NKV * T, T, HD, pos0, ROPE_BASE);
-    L.cache.prefill(qh, kh, vh, sp(P.ah), T, NH, SCALE);
-    gpu::merge_heads(sp(P.ah), sp(P.at), T, NH, HD);
-    gpu::gemm_bf16_nt(sp(P.at), sp(L.wo_row), ro, T, NE, NH * HD);
-    gpu::rmsnorm_res(ro, x, sp(L.fn), ro, sp(P.h2), NE, EPS, T);
-    gpu::gemm_bf16_nt(sp(P.h2), sp(L.wgu), sp(P.gu), T, 2 * FF, NE);
-    gpu::swiglu(sp(P.gu), sp(P.mb), FF, T);
-    gpu::gemm_bf16_nt(sp(P.mb), sp(L.wd_row), sp(P.md), T, NE, FF);
-    const gpu::span nextw = sp((l + 1 < NL) ? M.layers[l + 1].an : M.onorm);
-    gpu::rmsnorm_res(ro, sp(P.md), nextw, ro, sp(P.h), NE, EPS, T);
+    gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, c.ROPE_BASE);
+    gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, c.ROPE_BASE);
+    L.cache.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale());
+    gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, c.HD);
+    gpu::gemm_bf16_nt(sp(P.at), sp(L.wo_row), ro, T, c.NE, c.NH * c.HD);
+    gpu::rmsnorm_res(ro, x, sp(L.fn), ro, sp(P.h2), c.NE, c.EPS, T);
+    gpu::gemm_bf16_nt(sp(P.h2), sp(L.wgu), sp(P.gu), T, 2 * c.FF, c.NE);
+    gpu::swiglu(sp(P.gu), sp(P.mb), c.FF, T);
+    gpu::gemm_bf16_nt(sp(P.mb), sp(L.wd_row), sp(P.md), T, c.NE, c.FF);
+    const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
+    gpu::rmsnorm_res(ro, sp(P.md), nextw, ro, sp(P.h), c.NE, c.EPS, T);
     x = ro;
   }
   // Leaves P.h holding the final RMSNorm for every row of the chunk. Logits are
@@ -403,18 +465,20 @@ inline void prefill_chunk_(Model& M, int64_t T) {
 // that knows the embedding's storage convention; both stagers go through it.
 inline void gather_embed_rows_(const Model& M, const int* ids, int64_t n,
                                float* dst) {
+  const Config& c = M.c;
   for (int64_t i = 0; i < n; i++) {
-    const uint16_t* r = M.embed_f16 + (size_t)ids[i] * NE;
-    for (int64_t j = 0; j < NE; j++) dst[i * NE + j] = f16_to_f32(r[j]);
+    const uint16_t* r = M.embed_f16 + (size_t)ids[i] * c.NE;
+    for (int64_t j = 0; j < c.NE; j++) dst[i * c.NE + j] = f16_to_f32(r[j]);
   }
 }
 
 // Stage `n` prompt embeddings starting at ids[from] into the batched scratch.
 inline void stage_embed_rows_(Model& M, const std::vector<int>& ids, int64_t from,
                               int64_t n) {
+  const Config& c = M.c;
   float* v = M.pscratch.emb_stage.data();
   gather_embed_rows_(M, ids.data() + from, n, v);
-  gpu::upload(M.pscratch.emb.native, v, n * NE);
+  gpu::upload(M.pscratch.emb.native, v, n * c.NE);
 }
 
 // Whether a prompt of `T` tokens should go through the batched prefill: the
@@ -424,7 +488,7 @@ inline void stage_embed_rows_(Model& M, const std::vector<int>& ids, int64_t fro
 // prefill_batched() cannot disagree.
 inline bool can_prefill_batched(const Model& M, int64_t T) {
   return gpu::caps::bf16_gemm && M.row && !M.q4_mlp && !M.layers.empty() &&
-         T >= PREFILL_MIN && M.layers[0].cache.pos + T <= MAXC;
+         T >= PREFILL_MIN && M.layers[0].cache.pos + T <= M.c.MAXC;
 }
 
 // Prefill a whole prompt in chunks and return the greedy next token. Leaves the
@@ -433,8 +497,9 @@ inline bool can_prefill_batched(const Model& M, int64_t T) {
 // not fit the cache.
 inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
                                int64_t chunk = PREFILL_CHUNK) {
+  const Config& c = M.c;
   const int64_t T = (int64_t)ids.size();
-  if (!can_prefill_batched(M, T) || !M.pscratch.init(chunk)) return -1;
+  if (!can_prefill_batched(M, T) || !M.pscratch.init(c, chunk)) return -1;
   int64_t last = 0;
   for (int64_t s = 0; s < T; s += chunk) {
     last = std::min(chunk, T - s);
@@ -443,90 +508,111 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
   }
   // Only the final row of the final chunk needs logits — one GEMV for the whole
   // prompt rather than one per chunk, read in place as a view of that row.
-  gemv_w(M.outwT, at_f32(sp(M.pscratch.h), (last - 1) * NE), sp(M.scratch.logits),
-         VOCAB, NE);
+  gemv_w(M.outwT, at_f32(sp(M.pscratch.h), (last - 1) * c.NE), sp(M.scratch.logits),
+         c.VOCAB, c.NE);
   return argmax_logits(M);
 }
 
-// wdt = the linear-weight storage dtype (f32 exact, or bf16 for the <2GB/decode
+// wdt = the linear-weight storage dtype (f32 exact, or bf16 for the decode
 // path). Biases, norms and the embedding stay F32 (elementwise / row-gather).
 // q4_mlp / q4_lmhead quantize the large bandwidth-bound gemvs to group-int4 in
 // the imperative decode path (bf16 base only). Lossy — greedy diverges from the
 // F16 oracle; validated by coherence + divergence, not greedy-exact.
 inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
-                   bool q4_mlp = false, bool q4_lmhead = false) {
+                   bool q4_mlp = false, bool q4_lmhead = false,
+                   int64_t maxc = 4096, bool oracle = true) {
+  const Config c = config_from_gguf(m, maxc);
   // Row-major [N,K] weights exist only to feed gemv_bf16_row and the prefill
   // GEMM; a backend without them decodes from the column-major [K,N] split-K
   // GEMV every dtype has, so the layout follows the cap, not just the dtype.
   const bool row = (wdt == tl::dtype::bf16) && gpu::caps::row_gemv;
   const bool q4m = q4_mlp && row;             // q4 requires the bf16/row base
   const bool q4lm = q4_lmhead && row;
+  // The array path's separate [K,N] weights duplicate what the fused/row copies
+  // hold (≈2x the weight memory). Only forward()/step() read them, so a caller
+  // that decodes through the imperative path alone can skip them (oracle=false).
+  // Without row weights the imperative path still reads wo/wd from there, so
+  // they stay.
+  const bool arr = oracle || !row;
   const tl::dtype f32 = tl::dtype::f32;
   Model M{
+      .c = c,
       .embed_f16 =
           reinterpret_cast<const uint16_t*>(need(m, "token_embd.weight")->data),
-      .outwT = load_w_T(m, "output.weight", NE, VOCAB, wdt),  // stays [K,N]
-      .onorm = load_f32(m, "output_norm.weight", NE),
+      .outwT = load_w_T(m, c.output_name(), c.NE, c.VOCAB, wdt),  // stays [K,N]
+      .onorm = load_f32(m, "output_norm.weight", c.NE),
       // q4 lm_head (imperative): quantize the f32 [K,VOCAB], keep only the q4.
       .outwT_q4 =
-          q4lm ? load_w_T(m, "output.weight", NE, VOCAB, f32).to_q4() : array{},
+          q4lm ? load_w_T(m, c.output_name(), c.NE, c.VOCAB, f32).to_q4() : array{},
       .row = row,
       .q4_mlp = q4m,
       .q4_lmhead = q4lm};
-  for (int64_t l = 0; l < NL; l++) {
+  for (int64_t l = 0; l < c.NL; l++) {
     std::string p = "blk." + std::to_string(l) + ".";
     // Named per field: the ternaries below decide LAYOUT, and a positional list
     // of 17 same-typed arrays is one transposed line away from a silent
     // wrong-weight bug that only shows up as slightly-off logits.
     const std::vector<std::pair<std::string, int64_t>> qkv_parts = {
-        {p + "attn_q.weight", NH * HD},
-        {p + "attn_k.weight", NKV * HD},
-        {p + "attn_v.weight", NKV * HD}};
+        {p + "attn_q.weight", c.NH * c.HD},
+        {p + "attn_k.weight", c.NKV * c.HD},
+        {p + "attn_v.weight", c.NKV * c.HD}};
     const std::vector<std::pair<std::string, int64_t>> gu_parts = {
-        {p + "ffn_gate.weight", FF}, {p + "ffn_up.weight", FF}};
+        {p + "ffn_gate.weight", c.FF}, {p + "ffn_up.weight", c.FF}};
+    // The array path's [K,N] weights; empty when build() skips the oracle copies.
+    auto W = [&](const char* n, int64_t in, int64_t out) {
+      return arr ? load_w_T(m, p + n, in, out, wdt) : array{};
+    };
+    auto bias = [&](const char* n, int64_t len) {
+      return c.qkv_bias ? load_f32(m, p + n, len) : array{};
+    };
+    auto qk_norm = [&](const char* n) {
+      return c.qk_norm ? load_f32(m, p + n, c.HD) : array{};
+    };
     Layer L{
         // The array path's own weights ([K,N], the .dot() layout) — the oracle.
-        .wq = load_w_T(m, p + "attn_q.weight", NE, NH * HD, wdt),
-        .bq = load_f32(m, p + "attn_q.bias", NH * HD),
-        .wk = load_w_T(m, p + "attn_k.weight", NE, NKV * HD, wdt),
-        .bk = load_f32(m, p + "attn_k.bias", NKV * HD),
-        .wv = load_w_T(m, p + "attn_v.weight", NE, NKV * HD, wdt),
-        .bv = load_f32(m, p + "attn_v.bias", NKV * HD),
-        .wo = load_w_T(m, p + "attn_output.weight", NH * HD, NE, wdt),
-        .wg = load_w_T(m, p + "ffn_gate.weight", NE, FF, wdt),
-        .wu = load_w_T(m, p + "ffn_up.weight", NE, FF, wdt),
-        .wd = load_w_T(m, p + "ffn_down.weight", FF, NE, wdt),
-        .an = load_f32(m, p + "attn_norm.weight", NE),
-        .fn = load_f32(m, p + "ffn_norm.weight", NE),
+        .wq = W("attn_q.weight", c.NE, c.NH * c.HD),
+        .bq = bias("attn_q.bias", c.NH * c.HD),
+        .wk = W("attn_k.weight", c.NE, c.NKV * c.HD),
+        .bk = bias("attn_k.bias", c.NKV * c.HD),
+        .wv = W("attn_v.weight", c.NE, c.NKV * c.HD),
+        .bv = bias("attn_v.bias", c.NKV * c.HD),
+        .wo = W("attn_output.weight", c.NH * c.HD, c.NE),
+        .wg = W("ffn_gate.weight", c.NE, c.FF),
+        .wu = W("ffn_up.weight", c.NE, c.FF),
+        .wd = W("ffn_down.weight", c.FF, c.NE),
+        .an = load_f32(m, p + "attn_norm.weight", c.NE),
+        .fn = load_f32(m, p + "ffn_norm.weight", c.NE),
+        .qn = qk_norm("attn_q_norm.weight"),
+        .kn = qk_norm("attn_k_norm.weight"),
         // Fused QKV and gate|up (imperative decode path). In bf16 mode: ROW
         // [N,K] for the warp-per-row gemv (lever A). In f32: column [K,N] for
-        // split-K. +466MB over 24 layers either way. wo_row/wd_row (bf16 only)
-        // are the row copies of the two shared weights (+247MB), keeping the
-        // total under the WSL2 ~2GB cliff (lm_head deliberately not copied).
-        .wqkv = row ? load_w_T_cat_row(m, qkv_parts, NE)
-                    : load_w_T_cat(m, qkv_parts, NE, wdt),
+        // split-K. wo_row/wd_row (bf16 only) are the row copies of the two
+        // shared weights (lm_head deliberately not copied).
+        .wqkv = row ? load_w_T_cat_row(m, qkv_parts, c.NE)
+                    : load_w_T_cat(m, qkv_parts, c.NE, wdt),
         // wgu: bf16-row when row & !q4m; column [K,N] in f32; empty when q4m
         // (replaced by wgu_q4). wd_row likewise.
-        .wgu = row ? (q4m ? array{} : load_w_T_cat_row(m, gu_parts, NE))
-                   : load_w_T_cat(m, gu_parts, NE, wdt),
+        .wgu = row ? (q4m ? array{} : load_w_T_cat_row(m, gu_parts, c.NE))
+                   : load_w_T_cat(m, gu_parts, c.NE, wdt),
         // bqkv = [bq|bk|bv], matching wqkv's column order (batched path).
-        .bqkv = row ? load_f32_cat(m, {{p + "attn_q.bias", NH * HD},
-                                       {p + "attn_k.bias", NKV * HD},
-                                       {p + "attn_v.bias", NKV * HD}})
+        .bqkv = (row && c.qkv_bias)
+                    ? load_f32_cat(m, {{p + "attn_q.bias", c.NH * c.HD},
+                                       {p + "attn_k.bias", c.NKV * c.HD},
+                                       {p + "attn_v.bias", c.NKV * c.HD}})
                     : array{},
         .wo_row =
-            row ? load_w_T_row(m, p + "attn_output.weight", NH * HD, NE) : array{},
+            row ? load_w_T_row(m, p + "attn_output.weight", c.NH * c.HD, c.NE) : array{},
         .wd_row = row ? (q4m ? array{}
-                             : load_w_T_row(m, p + "ffn_down.weight", FF, NE))
+                             : load_w_T_row(m, p + "ffn_down.weight", c.FF, c.NE))
                       : array{},
         // q4 MLP (imperative, when q4m): quantize the f32 [K,N] fused/down.
-        .wgu_q4 = q4m ? load_w_T_cat(m, gu_parts, NE, f32).to_q4() : array{},
+        .wgu_q4 = q4m ? load_w_T_cat(m, gu_parts, c.NE, f32).to_q4() : array{},
         .wd_q4 =
-            q4m ? load_w_T(m, p + "ffn_down.weight", FF, NE, f32).to_q4() : array{}};
-    L.cache.init(NKV, MAXC, HD);
+            q4m ? load_w_T(m, p + "ffn_down.weight", c.FF, c.NE, f32).to_q4() : array{}};
+    L.cache.init(c.NKV, c.MAXC, c.HD);
     M.layers.push_back(std::move(L));
   }
-  M.scratch.init();  // persistent imperative-step buffers (GPU must be active)
+  M.scratch.init(M.c);  // persistent imperative-step buffers (GPU must be active)
   // Pre-size AND warm the batched-prefill path. CUDA loads a kernel lazily on
   // first use, so without this the first prompt pays the module load plus the
   // scratch allocation — ~90 ms, several times its own compute. Both are fixed
@@ -546,10 +632,11 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
 }
 
 inline array embed_row(const Model& M, int64_t id) {
-  std::vector<float> v(NE);
+  const Config& c = M.c;
+  std::vector<float> v(c.NE);
   const int one = (int)id;
   gather_embed_rows_(M, &one, 1, v.data());
-  return array::from(std::move(v), {1, NE});
+  return array::from(std::move(v), {1, c.NE});
 }
 
 // Per-region decode-step profile (roadmap M9 overhead census). Accumulates
@@ -569,7 +656,7 @@ struct StepProf {
   }
 };
 
-// Embed + 24 decoder layers + final RMSNorm, returning the unevaluated logits
+// Embed + NL decoder layers + final RMSNorm, returning the unevaluated logits
 // array [1, VOCAB]. Shared by step() (host D2H, the numeric-oracle path) and
 // step_greedy() (GPU argmax, the generation path). Optional out-params record
 // the layer-0 residual / final-norm for checkpointing; `prof` accumulates the
@@ -577,16 +664,27 @@ struct StepProf {
 inline array forward(Model& M, int64_t id, int64_t pos,
                      std::vector<float>* l0_out, std::vector<float>* fnorm_out,
                      StepProf* prof) {
+  const Config& c = M.c;
+  if (!M.layers[0].wq.defined())
+    throw std::logic_error("qwen: the array path needs build(..., oracle=true)");
   double t = prof ? StepProf::now_ms() : 0.0;
   array x = embed_row(M, id);
   if (prof) { prof->embed += StepProf::now_ms() - t; }
-  for (int64_t l = 0; l < NL; l++) {
+  for (int64_t l = 0; l < c.NL; l++) {
     Layer& L = M.layers[l];
     if (prof) t = StepProf::now_ms();
-    array h = array::rmsnorm(x, L.an, EPS);
-    array q = array::rope((h.dot(L.wq) + L.bq).reshape({NH, HD}), pos, ROPE_BASE);
-    array k = array::rope((h.dot(L.wk) + L.bk).reshape({NKV, HD}), pos, ROPE_BASE);
-    array v = h.dot(L.wv) + L.bv;  // [1, NKV*HD]
+    array h = array::rmsnorm(x, L.an, c.EPS);
+    array qp = h.dot(L.wq), kp = h.dot(L.wk), v = h.dot(L.wv);
+    if (c.qkv_bias) { qp = qp + L.bq; kp = kp + L.bk; v = v + L.bv; }
+    qp = qp.reshape({c.NH, c.HD});
+    kp = kp.reshape({c.NKV, c.HD});
+    if (c.qk_norm) {  // per-head RMSNorm over HD, before rope
+      qp = array::rmsnorm(qp, L.qn, c.EPS);
+      kp = array::rmsnorm(kp, L.kn, c.EPS);
+    }
+    array q = array::rope(qp, pos, c.ROPE_BASE);
+    array k = array::rope(kp, pos, c.ROPE_BASE);
+    // v: [1, NKV*HD]
     if (prof) { prof->construct += StepProf::now_ms() - t; t = StepProf::now_ms(); }
     // realize() (not eval()): launch q/k/v on the null stream WITHOUT syncing;
     // the kv_cache append/attn kernels are stream-ordered after them, so they
@@ -594,11 +692,11 @@ inline array forward(Model& M, int64_t id, int64_t pos,
     q.realize(); k.realize(); v.realize();
     if (prof) { prof->qkv_eval += StepProf::now_ms() - t; t = StepProf::now_ms(); }
     L.cache.append(sp(k), sp(v));
-    array a_out = array::empty({NH, HD});
-    L.cache.attn(sp(q), sp(a_out), NH, SCALE);
+    array a_out = array::empty({c.NH, c.HD});
+    L.cache.attn(sp(q), sp(a_out), c.NH, c.scale());
     if (prof) { prof->cache += StepProf::now_ms() - t; t = StepProf::now_ms(); }
-    array x1 = x + a_out.reshape({1, NE}).dot(L.wo);
-    array h2 = array::rmsnorm(x1, L.fn, EPS);
+    array x1 = x + a_out.reshape({1, c.NH * c.HD}).dot(L.wo);
+    array h2 = array::rmsnorm(x1, L.fn, c.EPS);
     array mlp = array::swiglu(h2.dot(L.wg), h2.dot(L.wu)).dot(L.wd);
     array x2 = x1 + mlp;
     if (prof) { prof->construct += StepProf::now_ms() - t; t = StepProf::now_ms(); }
@@ -607,11 +705,11 @@ inline array forward(Model& M, int64_t id, int64_t pos,
     // the 4th CtxSynchronize/layer; the whole step drains at the logits tail.
     x2.realize();
     if (prof) { prof->x2_eval += StepProf::now_ms() - t; }
-    if (l == 0 && l0_out) { const float* p = x2.raw(); l0_out->assign(p, p + NE); }
+    if (l == 0 && l0_out) { const float* p = x2.raw(); l0_out->assign(p, p + c.NE); }
     x = x2;
   }
-  array xf = array::rmsnorm(x, M.onorm, EPS);
-  if (fnorm_out) { xf.eval(); const float* p = xf.raw(); fnorm_out->assign(p, p + NE); }
+  array xf = array::rmsnorm(x, M.onorm, c.EPS);
+  if (fnorm_out) { xf.eval(); const float* p = xf.raw(); fnorm_out->assign(p, p + c.NE); }
   return xf.dot(M.outwT);
 }
 
@@ -621,12 +719,13 @@ inline std::vector<float> step(Model& M, int64_t id, int64_t pos,
                                std::vector<float>* l0_out = nullptr,
                                std::vector<float>* fnorm_out = nullptr,
                                StepProf* prof = nullptr) {
+  const Config& c = M.c;
   array logits = forward(M, id, pos, l0_out, fnorm_out, prof);
   double t = prof ? StepProf::now_ms() : 0.0;
   logits.eval();
   if (prof) { prof->logits_eval += StepProf::now_ms() - t; t = StepProf::now_ms(); }
   const float* p = logits.raw();
-  std::vector<float> out(p, p + VOCAB);
+  std::vector<float> out(p, p + c.VOCAB);
   if (prof) { prof->logits_d2h += StepProf::now_ms() - t; prof->n++; }
   return out;
 }
@@ -638,6 +737,7 @@ inline std::vector<float> step(Model& M, int64_t id, int64_t pos,
 // GPU argmax is unavailable (non-CUDA build).
 inline int64_t step_greedy(Model& M, int64_t id, int64_t pos,
                            StepProf* prof = nullptr) {
+  const Config& c = M.c;
   array logits = forward(M, id, pos, nullptr, nullptr, prof);
   double t = prof ? StepProf::now_ms() : 0.0;
   // realize() (not eval()): the lm_head gemv launches without syncing; the
@@ -646,10 +746,10 @@ inline int64_t step_greedy(Model& M, int64_t id, int64_t pos,
   logits.realize();
   if (prof) { prof->logits_eval += StepProf::now_ms() - t; t = StepProf::now_ms(); }
   int64_t idx = 0;
-  if (!gpu::argmax(sp(logits), VOCAB, &idx)) {
+  if (!gpu::argmax(sp(logits), c.VOCAB, &idx)) {
     const float* p = logits.raw();
     idx = 0;
-    for (int64_t i = 1; i < VOCAB; i++)
+    for (int64_t i = 1; i < c.VOCAB; i++)
       if (p[i] > p[idx]) idx = i;
   }
   if (prof) { prof->logits_d2h += StepProf::now_ms() - t; prof->n++; }
@@ -672,7 +772,7 @@ inline bool gemv_q4_w(const array& Wq, gpu::span a, gpu::span y) {
   return gpu::gemv_q4(a, qw, qw.at(N * K / 2), y, N, K, tl::kQ4Group);
 }
 
-// The 24 decoder layers + final RMSNorm + lm_head gemv as direct gpu:: calls
+// The NL decoder layers + final RMSNorm + lm_head gemv as direct gpu:: calls
 // on the Scratch buffers, reading layer-0 residual from x0 and writing logits
 // to S.logits. NO array nodes, NO host sync / blocking copy — so this region
 // is graph-capturable where a backend has capture (embed staging + argmax stay
@@ -690,6 +790,7 @@ inline bool gemv_q4_w(const array& Wq, gpu::span a, gpu::span y) {
 // layer is at the same sequence position). A null d_pos = the normal host path.
 inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
                         gpu::span d_pos = {}, gpu::span logits_out = {}) {
+  const Config& c = M.c;
   const bool cap = static_cast<bool>(d_pos);
   Scratch& S = M.scratch;
   // Fused seams (kills 4 elementwise launches/layer): q/k bias folds into rope
@@ -708,51 +809,56 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
     else gemv_w(W, a, y, n, k);
   };
   gpu::span x = x0;
-  gpu::rmsnorm(x, sp(M.layers[0].an), sp(S.hb), NE, EPS);
-  for (int64_t l = 0; l < NL; l++) {
+  gpu::rmsnorm(x, sp(M.layers[0].an), sp(S.hb), c.NE, c.EPS);
+  for (int64_t l = 0; l < c.NL; l++) {
     Layer& L = M.layers[l];
     const gpu::span ro = sp(S.res[l & 1]);  // res_out (x1 then x2), ping-pong
     // Fused QKV: one GEMV -> [q(NH*HD) | k(NKV*HD) | v(NKV*HD)] in S.qkvb, then
     // q, k and v are views of it: rope q & k in place, bias-add v. Same
     // per-column split-K as the separate wq/wk/wv GEMVs (bx=1, chunk=32), so
     // bit-identical per column.
-    gv(L.wqkv, sp(S.hb), sp(S.qkvb), (NH + 2 * NKV) * HD, NE);
+    gv(L.wqkv, sp(S.hb), sp(S.qkvb), (c.NH + 2 * c.NKV) * c.HD, c.NE);
     const gpu::span qp = sp(S.qkvb);
-    const gpu::span kp = at_f32(qp, NH * HD);
-    const gpu::span vp = at_f32(qp, (NH + NKV) * HD);
-    if (cap) {
-      gpu::rope_dpos(qp, qp, NH, 1, HD, d_pos, ROPE_BASE, sp(L.bq));
-      gpu::rope_dpos(kp, kp, NKV, 1, HD, d_pos, ROPE_BASE, sp(L.bk));
-    } else {
-      gpu::rope(qp, qp, NH, 1, HD, pos, ROPE_BASE, sp(L.bq));
-      gpu::rope(kp, kp, NKV, 1, HD, pos, ROPE_BASE, sp(L.bk));
+    const gpu::span kp = at_f32(qp, c.NH * c.HD);
+    const gpu::span vp = at_f32(qp, (c.NH + c.NKV) * c.HD);
+    // Qwen3: RMSNorm every q / k head (one row of HD each) in place, before rope.
+    if (c.qk_norm) {
+      gpu::rmsnorm(qp, sp(L.qn), qp, c.HD, c.EPS, c.NH);
+      gpu::rmsnorm(kp, sp(L.kn), kp, c.HD, c.EPS, c.NKV);
     }
-    gpu::binary(gpu::kop::add, vp, sp(L.bv), vp, NKV * HD, 1, 0);
+    if (cap) {
+      gpu::rope_dpos(qp, qp, c.NH, 1, c.HD, d_pos, c.ROPE_BASE, sp(L.bq));
+      gpu::rope_dpos(kp, kp, c.NKV, 1, c.HD, d_pos, c.ROPE_BASE, sp(L.bk));
+    } else {
+      gpu::rope(qp, qp, c.NH, 1, c.HD, pos, c.ROPE_BASE, sp(L.bq));
+      gpu::rope(kp, kp, c.NKV, 1, c.HD, pos, c.ROPE_BASE, sp(L.bk));
+    }
+    if (c.qkv_bias) gpu::binary(gpu::kop::add, vp, sp(L.bv), vp, c.NKV * c.HD, 1, 0);
     if (cap) {
       L.cache.append_dpos(kp, vp, d_pos);
-      L.cache.attn_dpos(qp, sp(S.ab), NH, d_pos, SCALE);
+      L.cache.attn_dpos(qp, sp(S.ab), c.NH, d_pos, c.scale());
     } else {
       L.cache.append(kp, vp);
-      L.cache.attn(qp, sp(S.ab), NH, SCALE);
+      L.cache.attn(qp, sp(S.ab), c.NH, c.scale());
     }
-    gv(row ? L.wo_row : L.wo, sp(S.ab), ro, NE, NH * HD);  // ro = attn @ wo
+    gv(row ? L.wo_row : L.wo, sp(S.ab), ro, c.NE, c.NH * c.HD);  // ro = attn @ wo
     // x1 = x + (attn@wo); h2 = rmsnorm(x1, fn) — fused.
-    gpu::rmsnorm_res(ro, x, sp(L.fn), ro, sp(S.h2b), NE, EPS);
+    gpu::rmsnorm_res(ro, x, sp(L.fn), ro, sp(S.h2b), c.NE, c.EPS);
     // Fused gate|up: one GEMV -> [gate(FF) | up(FF)] in S.gub; swiglu reads both.
     if (M.q4_mlp) gemv_q4_w(L.wgu_q4, sp(S.h2b), sp(S.gub));  // [NE, 2*FF]
-    else gv(L.wgu, sp(S.h2b), sp(S.gub), 2 * FF, NE);
-    gpu::swiglu(sp(S.gub), sp(S.mb), FF);
+    else gv(L.wgu, sp(S.h2b), sp(S.gub), 2 * c.FF, c.NE);
+    gpu::swiglu(sp(S.gub), sp(S.mb), c.FF);
     if (M.q4_mlp) gemv_q4_w(L.wd_q4, sp(S.mb), sp(S.mdb));  // [FF, NE]
-    else gv(row ? L.wd_row : L.wd, sp(S.mb), sp(S.mdb), NE, FF);
+    else gv(row ? L.wd_row : L.wd, sp(S.mb), sp(S.mdb), c.NE, c.FF);
     // x2 = x1 + mlp; next input norm = rmsnorm(x2, next an | final onorm) — fused.
-    const gpu::span nextw = sp((l + 1 < NL) ? M.layers[l + 1].an : M.onorm);
-    gpu::rmsnorm_res(ro, sp(S.mdb), nextw, ro, sp(S.hb), NE, EPS);
+    const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
+    gpu::rmsnorm_res(ro, sp(S.mdb), nextw, ro, sp(S.hb), c.NE, c.EPS);
     x = ro;
   }
   // hb now holds the final RMSNorm output (folded into the last layer's seam).
   const gpu::span logits = logits_out ? logits_out : sp(S.logits);
   if (M.q4_lmhead) gemv_q4_w(M.outwT_q4, sp(S.hb), logits);  // [NE, VOCAB]
-  else gemv_w(M.outwT, sp(S.hb), logits, VOCAB, NE);
+  else gemv_w(M.outwT, sp(S.hb), logits, c.VOCAB, c.NE);
   // Tail of the captured region: advance the shared device pos so the next
   // graph replay reads pos+1 (lm_head is pos-independent, so order vs it is free).
   if (cap) gpu::incr_u32(d_pos);
@@ -784,9 +890,10 @@ inline const float* imperative_logits(Model& M, int64_t id, int64_t pos) {
 // (host gather + blocking upload; marks it device-current). Kept out of a
 // captured region since it involves a host gather + blocking copy.
 inline void stage_embed(Model& M, int64_t id) {
+  const Config& c = M.c;
   const int one = (int)id;
   gather_embed_rows_(M, &one, 1, M.scratch.embed_stage.data());
-  gpu::upload(M.scratch.embed.native, M.scratch.embed_stage.data(), NE);
+  gpu::upload(M.scratch.embed.native, M.scratch.embed_stage.data(), c.NE);
 }
 
 // CUDA-graph-captured greedy decoder (A-min). Captures the device-pos forward
@@ -927,14 +1034,5 @@ inline std::string default_path() {
 // Deterministic short-prefill fixture shared by the decode benches (arbitrary
 // valid token ids — enough to make the cache/pos realistic without a tokenizer).
 constexpr int PREFILL_IDS[4] = {40, 2610, 264, 3974};
-
-// Assert the GGUF metadata matches our compile-time constants (this driver is
-// hard-coded for Qwen2.5-0.5B). Returns false on mismatch.
-inline bool check_config(const gg::model& m) {
-  return m.kv("qwen2.block_count").as_u32() == NL &&
-         m.kv("qwen2.embedding_length").as_u32() == NE &&
-         m.kv("qwen2.attention.head_count").as_u32() == NH &&
-         m.kv("qwen2.attention.head_count_kv").as_u32() == NKV;
-}
 
 }  // namespace qwenmodel

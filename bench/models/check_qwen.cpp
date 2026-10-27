@@ -1,6 +1,7 @@
-// M9 "actually chat" — numeric proof. Load a real Qwen2.5-0.5B-Instruct GGUF (F16
-// weights) and run the decoder end to end, verified against a tight numpy
-// reference that reads the SAME F16 weights (qwen_oracle_data.h here). Identical
+// M9 "actually chat" — numeric proof. Load a real Qwen2.5-0.5B-Instruct or Qwen3
+// GGUF (F16 weights) and run the decoder end to end, verified against a tight
+// numpy reference that reads the SAME F16 weights (tools/qwen_oracle.py wrote
+// qwen_oracle_data.h / qwen3_oracle_data.h; the model's arch picks one). Identical
 // weights => the C++ forward must match the reference to ~1e-4 at every checkpoint
 // (embedding, layer-0 residual, final norm, top-5 logits) AND reproduce the greedy
 // token sequence exactly. Proves weight loading + GGML->our layout transpose +
@@ -8,13 +9,27 @@
 // gpu:: resolves to. Tokenizer/sampling are
 // separate (see chat_qwen). Model path: argv[1] or ~/models/...fp16.gguf.
 
-#include "qwen2.h"
+#include "qwen.h"
+#include "qwen3_oracle_data.h"
 #include "qwen_oracle_data.h"
 
 #include <cstdio>
 #include <vector>
 
 namespace qm = qwenmodel;
+
+// One model's checkpoints, whichever generated header they came from.
+struct Oracle {
+  const float *emb_last, *l0_last, *fnorm_last, *top5_vals;
+  const int *top5_ids, *greedy30, *prompt_ids;
+  size_t n_greedy, n_prompt;
+};
+#define TL_ORACLE(ns)                                                       \
+  Oracle {                                                                  \
+    ns::emb_last, ns::l0_last, ns::fnorm_last, ns::top5_vals, ns::top5_ids, \
+        ns::greedy30, ns::prompt_ids, sizeof(ns::greedy30) / sizeof(int),   \
+        sizeof(ns::prompt_ids) / sizeof(int)                                \
+  }
 
 static double maxrel(const std::vector<float>& a, const float* b, int64_t n) {
   double mr = 0;
@@ -31,43 +46,47 @@ int main(int argc, char** argv) {
   std::string path = argc > 1 ? argv[1] : qm::default_path();
   std::printf("loading %s\n", path.c_str());
   qm::gg::model m(path);
-  if (!qm::check_config(m)) {
-    std::printf("config mismatch — this driver is hard-coded for Qwen2.5-0.5B\n");
+  const qm::Config C = qm::config_from_gguf(m);
+  // Checkpoints exist for Qwen2.5-0.5B (24 layers) and Qwen3-0.6B (28).
+  const bool q3 = C.arch == "qwen3";
+  if ((q3 && (C.NL != 28 || C.NE != 1024)) || (!q3 && (C.NL != 24 || C.NE != 896))) {
+    std::printf("config mismatch — no oracle for this model\n");
     return 2;
   }
+  const Oracle O = q3 ? TL_ORACLE(qwen3oracle) : TL_ORACLE(qwenoracle);
   tl::use_gpu();
   std::printf("building model (F32, transposing linear weights)...\n");
-  const int64_t NP = sizeof(qwenoracle::prompt_ids) / sizeof(int);
+  const int64_t NP = (int64_t)O.n_prompt;
   bool imp_ok = true, bf16_ok = true, ok_f32 = false;
   {  // scoped so the F32 weights are back in the pool before the bf16 build
   qm::Model M = qm::build(m);
   std::printf("model built — %lld layers, GQA %lldq/%lldkv, head_dim=%lld\n",
-              (long long)qm::NL, (long long)qm::NH, (long long)qm::NKV, (long long)qm::HD);
+              (long long)C.NL, (long long)C.NH, (long long)C.NKV, (long long)C.HD);
 
   std::vector<float> l0, fnorm, last_logits;
   int64_t pos = 0;
   for (int64_t i = 0; i < NP; i++) {
     bool last = (i == NP - 1);
-    last_logits = qm::step(M, qwenoracle::prompt_ids[i], pos,
+    last_logits = qm::step(M, O.prompt_ids[i], pos,
                            last ? &l0 : nullptr, last ? &fnorm : nullptr);
     pos++;
   }
-  tl::array el = qm::embed_row(M, qwenoracle::prompt_ids[NP - 1]);
+  tl::array el = qm::embed_row(M, O.prompt_ids[NP - 1]);
   el.eval();
-  double emb_mr = maxrel(std::vector<float>(el.raw(), el.raw() + qm::NE),
-                         qwenoracle::emb_last, qm::NE);
-  double l0_mr = maxrel(l0, qwenoracle::l0_last, qm::NE);
-  double fn_mr = maxrel(fnorm, qwenoracle::fnorm_last, qm::NE);
+  double emb_mr = maxrel(std::vector<float>(el.raw(), el.raw() + C.NE),
+                         O.emb_last, C.NE);
+  double l0_mr = maxrel(l0, O.l0_last, C.NE);
+  double fn_mr = maxrel(fnorm, O.fnorm_last, C.NE);
 
   std::vector<int64_t> top5;
   { std::vector<float> lg = last_logits;
     for (int t = 0; t < 5; t++) { int64_t bi = qm::argmax(lg); top5.push_back(bi); lg[bi] = -1e30f; } }
-  bool top1_ok = top5[0] == qwenoracle::top5_ids[0];
+  bool top1_ok = top5[0] == O.top5_ids[0];
   double logit_mr = 0;
   for (int t = 0; t < 5; t++) {
-    int64_t id = qwenoracle::top5_ids[t];
-    logit_mr = std::max(logit_mr, std::fabs((double)last_logits[id] - qwenoracle::top5_vals[t]) /
-                                      (1.0 + std::fabs((double)qwenoracle::top5_vals[t])));
+    int64_t id = O.top5_ids[t];
+    logit_mr = std::max(logit_mr, std::fabs((double)last_logits[id] - O.top5_vals[t]) /
+                                      (1.0 + std::fabs((double)O.top5_vals[t])));
   }
 
   std::printf("\ncheckpoints vs numpy-on-same-F16-weights (expect ~1e-4):\n");
@@ -76,9 +95,9 @@ int main(int argc, char** argv) {
   std::printf("  final norm maxrel %.2e %s\n", fn_mr, fn_mr < 5e-3 ? "OK" : "FAIL");
   std::printf("  top5 logit maxrel %.2e %s\n", logit_mr, logit_mr < 5e-3 ? "OK" : "FAIL");
   std::printf("  argmax id  cpp=%lld ref=%d %s\n", (long long)top5[0],
-              qwenoracle::top5_ids[0], top1_ok ? "OK" : "FAIL");
+              O.top5_ids[0], top1_ok ? "OK" : "FAIL");
 
-  const int64_t NG = sizeof(qwenoracle::greedy30) / sizeof(int);
+  const int64_t NG = (int64_t)O.n_greedy;
   std::vector<int64_t> gen;
   int64_t next = qm::argmax(last_logits);
   for (int64_t i = 0; i < NG; i++) {
@@ -88,11 +107,11 @@ int main(int argc, char** argv) {
     next = qm::argmax(lg);
   }
   bool greedy_ok = true;
-  for (int64_t i = 0; i < NG; i++) if (gen[i] != qwenoracle::greedy30[i]) greedy_ok = false;
+  for (int64_t i = 0; i < NG; i++) if (gen[i] != O.greedy30[i]) greedy_ok = false;
   std::printf("\ngreedy %lld tokens:\n  cpp:", (long long)NG);
   for (auto t : gen) std::printf(" %lld", (long long)t);
   std::printf("\n  ref:");
-  for (int64_t i = 0; i < NG; i++) std::printf(" %d", qwenoracle::greedy30[i]);
+  for (int64_t i = 0; i < NG; i++) std::printf(" %d", O.greedy30[i]);
   std::printf("\n  greedy %s\n", greedy_ok ? "MATCH" : "DIVERGE");
 
   // The same sequence again, on the imperative path: the fused model-path
@@ -105,11 +124,11 @@ int main(int argc, char** argv) {
   {
     qm::reset_cache(M);
     int64_t p = 0, tok = 0;
-    for (int64_t i = 0; i < NP; i++) tok = qm::step_imperative(M, qwenoracle::prompt_ids[i], p++);
+    for (int64_t i = 0; i < NP; i++) tok = qm::step_imperative(M, O.prompt_ids[i], p++);
     std::printf("\nimperative path (same weights, fused kernels):\n  cpp:");
     for (int64_t i = 0; i < NG; i++) {
       std::printf(" %lld", (long long)tok);
-      if (tok != qwenoracle::greedy30[i]) imp_ok = false;
+      if (tok != O.greedy30[i]) imp_ok = false;
       tok = qm::step_imperative(M, tok, p++);
     }
     std::printf("\n  greedy %s\n", imp_ok ? "MATCH" : "DIVERGE");
@@ -133,7 +152,7 @@ int main(int argc, char** argv) {
   {
     std::printf("\nbf16 weights (row GEMV + batched prefill) vs this model's array path:\n");
     qm::Model B = qm::build(m, tl::dtype::bf16);
-    std::vector<int> ids(qwenoracle::prompt_ids, qwenoracle::prompt_ids + NP);
+    std::vector<int> ids(O.prompt_ids, O.prompt_ids + NP);
     if (!qm::can_prefill_batched(B, NP)) {
       std::printf("  backend has no bf16 weight GEMM — skipped\n");
     } else {

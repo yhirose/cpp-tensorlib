@@ -293,7 +293,7 @@ add_executable(tensorlib_check_llm_block bench/shared/check/check_llm_block.cpp)
 target_link_libraries(tensorlib_check_llm_block PRIVATE tensorlib)
 add_test(NAME llm_block COMMAND tensorlib_check_llm_block)
 
-# The Qwen2.5-0.5B driver (bench/models/qwen2.h): backend-neutral, so both of
+# The Qwen2.5-0.5B driver (bench/models/qwen.h): backend-neutral, so both of
 # these build wherever tensorlib does and run on whatever gpu:: resolves to.
 # Neither is a ctest — they need the ~1.2 GB GGUF, which lives outside the repo.
 #   check_qwen: the decoder end to end vs a numpy reference on the same weights.

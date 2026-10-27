@@ -18,7 +18,7 @@
 //
 // Usage: bench_qwen_prefill [model.gguf] [max_T]
 
-#include "../../models/qwen2.h"
+#include "../../models/qwen.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -108,9 +108,9 @@ int main(int argc, char** argv) {
   int64_t max_T = argc > 2 ? std::atoll(argv[2]) : 2048;
 
   qm::gg::model m(path);
-  if (!qm::check_config(m)) { std::printf("config mismatch\n"); return 2; }
   tl::use_gpu();
   qm::Model M = qm::build(m, tl::dtype::bf16);
+  const qm::Config& C = M.c;
   std::printf("model %s | bf16 row | prompt lengths up to %lld\n\n", path.c_str(),
               (long long)max_T);
 
@@ -139,7 +139,7 @@ int main(int argc, char** argv) {
       cu::sync_to_host(M.scratch.logits.native, false);
       const float* got = M.scratch.logits.ptr;
       double maxrel = 0;
-      for (int64_t i = 0; i < qm::VOCAB; i++)
+      for (int64_t i = 0; i < C.VOCAB; i++)
         maxrel = std::max(maxrel, (double)std::fabs(got[i] - ref[(size_t)i]) /
                                       (1.0 + std::fabs(ref[(size_t)i])));
       bool tok_ok = got_tok == ref_tok, rel_ok = maxrel < MAXREL_BOUND;
@@ -162,7 +162,7 @@ int main(int argc, char** argv) {
     // forces it: exec stays null, so every token takes the imperative path.
     qm::reset_cache(M);
     qm::captured_decoder fb;
-    fb.max_ctx = qm::MAXC;
+    fb.max_ctx = C.MAXC;
     for (size_t i = 0; i + 1 < ids.size(); i++) fb.feed(M, ids[i]);
     ok &= compare("fallback", fb.step(M, ids.back()));
     fb.destroy();
@@ -216,10 +216,10 @@ int main(int argc, char** argv) {
   struct Shape { const char* name; int64_t K, N; const tl::array* w; };
   qm::Layer& L0 = M.layers[0];
   const Shape shapes[] = {
-      {"QKV.fused", qm::NE, (qm::NH + 2 * qm::NKV) * qm::HD, &L0.wqkv},
-      {"wo", qm::NH * qm::HD, qm::NE, &L0.wo_row},
-      {"gateup.fused", qm::NE, 2 * qm::FF, &L0.wgu},
-      {"wd", qm::FF, qm::NE, &L0.wd_row},
+      {"QKV.fused", C.NE, (C.NH + 2 * C.NKV) * C.HD, &L0.wqkv},
+      {"wo", C.NH * C.HD, C.NE, &L0.wo_row},
+      {"gateup.fused", C.NE, 2 * C.FF, &L0.wgu},
+      {"wd", C.FF, C.NE, &L0.wd_row},
   };
   int64_t maxK = 0, maxN = 0;
   for (const Shape& s : shapes) {
@@ -288,11 +288,11 @@ int main(int argc, char** argv) {
   for (int64_t T : {(int64_t)128, (int64_t)512, (int64_t)2048}) {
     if (T > max_T) break;
     tl::kv_cache c;
-    if (!c.init(qm::NKV, qm::MAXC, qm::HD)) { std::printf("  cache init failed\n"); return 1; }
-    void* ks = zeros(qm::NKV * T * qm::HD);
-    void* vs = zeros(qm::NKV * T * qm::HD);
-    void* qs = zeros(qm::NH * T * qm::HD);
-    void* os = zeros(qm::NH * T * qm::HD);
+    if (!c.init(C.NKV, C.MAXC, C.HD)) { std::printf("  cache init failed\n"); return 1; }
+    void* ks = zeros(C.NKV * T * C.HD);
+    void* vs = zeros(C.NKV * T * C.HD);
+    void* qs = zeros(C.NH * T * C.HD);
+    void* os = zeros(C.NH * T * C.HD);
     if (!ks || !vs || !qs || !os) { std::printf("  alloc failed\n"); return 1; }
 
     // Per-token: append + attend at every position 0..T-1 (ctx grows).
@@ -300,13 +300,13 @@ int main(int argc, char** argv) {
       c.pos = 0;
       for (int64_t i = 0; i < T; i++) {
         c.append({ks, 0}, {vs, 0});  // same row values each step; only the cost matters
-        c.attn({qs, 0}, {os, 0}, qm::NH, qm::SCALE);
+        c.attn({qs, 0}, {os, 0}, C.NH, C.scale());
       }
     });
     // Batched: bulk kv_fill + one causal tiled attn_prefill.
     double batched = min_ms(3, 1, [&] {
       c.pos = 0;
-      c.prefill({qs, 0}, {ks, 0}, {vs, 0}, {os, 0}, T, qm::NH, qm::SCALE);
+      c.prefill({qs, 0}, {ks, 0}, {vs, 0}, {os, 0}, T, C.NH, C.scale());
     });
     std::printf("  %6lld  %14.3f  %14.3f  %7.1fx\n", (long long)T, per_tok,
                 batched, per_tok / batched);
