@@ -454,6 +454,38 @@ inline void zero_state_(const Config& c, Layer& L) {
   gpu::upload(L.ssm_state.native, z.data(), nssm);
 }
 
+// A copy of every DeltaNet layer's recurrent state, for a forward run only for
+// its side effects (the capture's warm-up) to put back. A KV row such a run
+// writes is rewritten by the next real step at the same position; the state is
+// advanced in place, so nothing would undo it.
+struct delta_snapshot {
+  std::vector<storage> conv, ssm;
+  static void copy_(gpu::span from, gpu::span to, int64_t n) {
+    gpu::unary(gpu::kop::affine, from, to, n, 1.0f, 0.0f);
+  }
+  void save(Model& M) {
+    const Config& c = M.c;
+    const int64_t nconv = (c.SCONV - 1) * c.ssm_conv_ch(), nssm = c.SH * c.SDK * c.SDV;
+    for (int64_t l = 0; l < c.NL; l++) {
+      if (!c.is_delta(l)) continue;
+      conv.push_back(scratch_f32(nconv));
+      ssm.push_back(scratch_f32(nssm));
+      copy_(sp(M.layers[l].conv_state), sp(conv.back()), nconv);
+      copy_(sp(M.layers[l].ssm_state), sp(ssm.back()), nssm);
+    }
+  }
+  void restore(Model& M) const {
+    const Config& c = M.c;
+    const int64_t nconv = (c.SCONV - 1) * c.ssm_conv_ch(), nssm = c.SH * c.SDK * c.SDV;
+    for (int64_t l = 0, i = 0; l < c.NL; l++) {
+      if (!c.is_delta(l)) continue;
+      copy_(sp(conv[i]), sp(M.layers[l].conv_state), nconv);
+      copy_(sp(ssm[i]), sp(M.layers[l].ssm_state), nssm);
+      i++;
+    }
+  }
+};
+
 // Reset the sequence to position 0 (replay from a fresh prefill): every KV
 // cache, and every DeltaNet layer's state. Used by the bench's
 // array-vs-imperative greedy-equivalence check.
@@ -1076,18 +1108,19 @@ struct captured_decoder {
     if (M.layers.empty()) return;
     max_ctx = seq_cache(M).max_ctx;  // bound applies to the fallback too
     cur_pos = pos;
-    // The captured forms of a hybrid model's position-dependent ops — partial
-    // rope, head_dim 256 attention — are not written yet, so it decodes
-    // uncaptured.
-    if (!gpu::graph_available() || M.c.hybrid()) return;
+    if (!gpu::graph_available()) return;
     d_pos = storage::make(1);
     if (!d_pos.native) return;
     const gpu::span dp = sp(d_pos);
     stage_embed(M, first_id);
     gpu::upload_u32(d_pos.native, (unsigned)pos);
     // Warm run: real launches, but its logits go to the throwaway sink so a
-    // prompt's logits (already in scratch when begin() batched) survive.
+    // prompt's logits (already in scratch when begin() batched) survive, and
+    // a hybrid's DeltaNet state is put back after it (delta_snapshot).
+    delta_snapshot before;
+    before.save(M);
     run_layers_(M, sp(M.scratch.embed), pos, dp, sp(M.scratch.logits_sink));
+    before.restore(M);
     gpu::flush();
     gpu::upload_u32(d_pos.native, (unsigned)pos);  // reset after warm
     if (!gpu::capture_begin()) return;

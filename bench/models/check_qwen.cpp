@@ -87,6 +87,8 @@ static bool check_hybrid(const qm::gg::model& m, const Oracle& O) {
   qm::Model B = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false);
   int64_t tok = 0, p = 0;
   for (int64_t i = 0; i < NP; i++) tok = qm::step_imperative(B, O.prompt_ids[i], p++);
+  const float* lb = qm::host_read(B.scratch.logits);
+  const std::vector<float> imp_logits(lb, lb + B.c.VOCAB);  // the last prompt token's
   bool bf16_ok = true;
   std::printf("\nbf16 weights (built as %s), greedy %lld:\n  cpp:",
               B.outwT.dt() == tl::dtype::bf16 ? "bf16" : "f32", (long long)NB);
@@ -96,7 +98,31 @@ static bool check_hybrid(const qm::gg::model& m, const Oracle& O) {
     tok = qm::step_imperative(B, tok, p++);
   }
   std::printf("\n  greedy %s\n", bf16_ok ? "MATCH" : "DIVERGE");
-  return ok && bf16_ok;
+
+  // The chat's own decoder on the same weights: the prompt through begin(),
+  // then step(). Where the backend captures, its warm-up forward must leave
+  // the DeltaNet state as it found it, or everything after it drifts — by too
+  // little to move a short greedy run, so the last prompt token's logits are
+  // held to the imperative ones the same kernels produced.
+  qm::reset_cache(B);
+  qm::captured_decoder dec;
+  std::vector<int> ids(O.prompt_ids, O.prompt_ids + NP);
+  tok = dec.begin(B, ids);
+  const float* ld = qm::host_read(B.scratch.logits);
+  const double dec_mr = maxrel(std::vector<float>(ld, ld + B.c.VOCAB), imp_logits.data(), B.c.VOCAB);
+  const bool logits_ok = dec_mr < 1e-5;
+  std::printf("\ndecoder logits vs imperative maxrel %.2e %s", dec_mr, logits_ok ? "OK" : "FAIL");
+  bool dec_ok = true;
+  std::printf("\ndecoder (%s), greedy %lld:\n  cpp:", dec.ok() ? "graph capture" : "imperative",
+              (long long)NB);
+  for (int64_t i = 0; i < NB; i++) {
+    std::printf(" %lld", (long long)tok);
+    if (tok != want[i]) dec_ok = false;
+    tok = dec.step(B, tok);
+  }
+  dec.destroy();
+  std::printf("\n  greedy %s\n", dec_ok ? "MATCH" : "DIVERGE");
+  return ok && bf16_ok && logits_ok && dec_ok;
 }
 
 int main(int argc, char** argv) {
