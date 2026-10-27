@@ -24,23 +24,24 @@ out).
 | | tg128 @ d2048 | 342 | 330-334 | 1.02-1.04 |
 | | pp512 | 11,743 | 38,881 | 0.30 |
 | | pp512 @ d2048 | 5,303 | 30,004 | 0.18 |
-| Qwen3.5-0.8B F16 | tg128 | 327 | 290-291 | 1.12 |
-| | tg128 @ d2048 | 323 | 289-292 | 1.11-1.12 |
-| | pp512 | 4,537 | 27,916 | 0.16 |
-| | pp512 @ d2048 | 4,280 | 27,401 | 0.16 |
-| Qwen3.5-0.8B BF16 | tg128 | 325 | 288 | 1.13 |
-| | tg128 @ d2048 | 322 | 288 | 1.12 |
-| | pp512 | 4,507 | 23,963 | 0.19 |
-| | pp512 @ d2048 | 4,224 | 23,208 | 0.18 |
+| Qwen3.5-0.8B F16 | tg128 | 386 | 290-291 | 1.33 |
+| | tg128 @ d2048 | 376 | 289-292 | 1.29-1.30 |
+| | pp512 | 8,315 | 27,916 | 0.30 |
+| | pp512 @ d2048 | 7,574 | 27,401 | 0.28 |
+| Qwen3.5-0.8B BF16 | tg128 | 379 | 288 | 1.32 |
+| | tg128 @ d2048 | 372 | 288 | 1.29 |
+| | pp512 | 8,025 | 23,963 | 0.33 |
+| | pp512 @ d2048 | 7,499 | 23,208 | 0.32 |
 
 Decode is at parity or ahead on every model, with or without 2048 tokens
 cached. Until the decode attention overlapped its key loads and split its
 keys finer (2026-10-27), Qwen2.5 trailed by 18% at depth: a block's warps
 walked ~64 keys each in series, one load at a time.
 
-Prefill is 2.6-6x behind: this library's prefill GEMM computes in f32 on the
-CUDA cores, where llama.cpp's uses the tensor cores, and Qwen3.5's DeltaNet
-layers run their recurrence token by token within each launch.
+Prefill is 2.6-5.6x behind: this library's prefill GEMM computes in f32 on
+the CUDA cores, where llama.cpp's uses the tensor cores, and Qwen3.5's DeltaNet
+layers run their recurrence token by token within each launch (a third of
+that model's prefill, since the rule's state moved into registers).
 
 ## What differs between the two runs
 

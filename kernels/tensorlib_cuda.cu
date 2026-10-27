@@ -509,13 +509,13 @@ extern "C" __global__ void tl_ssm_conv(const float* __restrict__ x,
 }
 
 // The gated delta rule over T tokens (gpu_ops.h gated_delta has the math).
-// grid = (ceil(dv/64), H), 64 threads, and each thread owns one column j of
-// its head's state S [dk, dv] across every token: a token stages its q and k
-// in shared memory and L2-normalizes them, then each thread makes two passes
-// down its column, the first for k.S, the second rewriting it and
-// accumulating q.S. Consecutive threads read consecutive j, so every pass is
-// coalesced; the state stays in place, cached in L2 between tokens. Dynamic
-// shared memory: (2*dk + 2*blockDim) floats; blockDim a power of two.
+// grid = (ceil(dv/32), H), blockDim = dk (a power of two, 32 to 1024): a block
+// owns 32 columns of its head's state S [dk, dv], and warp w the 32 rows from
+// 32w of them, so each thread holds a 32-row slice of one column in registers
+// for the whole call — read once before the first token, written once after
+// the last. A token stages its q and k (a thread an element), L2-normalizes
+// them through one tree, and reduces k.S and q.S over the warps' slices in
+// shared memory. Dynamic shared memory: 6*dk floats.
 extern "C" __global__ void tl_gated_delta(const float* __restrict__ qkv,
                                           const float* __restrict__ ab,
                                           const float* __restrict__ adt,
@@ -523,49 +523,58 @@ extern "C" __global__ void tl_gated_delta(const float* __restrict__ qkv,
                                           float* __restrict__ out, unsigned H,
                                           unsigned dk, unsigned dv, unsigned T,
                                           unsigned ab_ld, float eps) {
+  constexpr int R = 32;  // rows a warp holds
   extern __shared__ float sm[];
-  float *qs = sm, *ks = sm + dk, *red = sm + 2 * dk;
-  const unsigned h = blockIdx.y, t = threadIdx.x, NT = blockDim.x;
-  const unsigned j = blockIdx.x * NT + t;
+  float *qs = sm, *ks = sm + dk, *red = sm + 2 * dk;  // red: 2*dk, the tree's
+  float *pk = sm + 4 * dk, *po = sm + 5 * dk;         // [warps][32] partials
+  const unsigned t = threadIdx.x, lane = t & 31u, w = t >> 5, NW = dk >> 5;
+  const unsigned h = blockIdx.y, j = blockIdx.x * 32u + lane, i0 = w * R;
+  const bool live = j < dv;
   const size_t nq = (size_t)H * dk, C = 2 * nq + (size_t)H * dv;
   const float A = adt[h], dt = adt[H + h];
-  float* S = state + (size_t)h * dk * dv + j;
+  float* S = state + (size_t)h * dk * dv;
+  float Sr[R];
+#pragma unroll
+  for (int r = 0; r < R; r++) Sr[r] = live ? S[(size_t)(i0 + r) * dv + j] : 0.0f;
   for (unsigned tok = 0; tok < T; tok++) {
     const float* row = qkv + tok * C;
-    const float* qh = row + (size_t)h * dk;
-    const float* kh = row + nq + (size_t)h * dk;
-    float sq = 0.0f, sk = 0.0f;
+    const float a = row[(size_t)h * dk + t], b = row[nq + (size_t)h * dk + t];
     __syncthreads();  // the previous token is done reading qs / ks
-    for (unsigned i = t; i < dk; i += NT) {
-      const float a = qh[i], b = kh[i];
-      qs[i] = a;
-      ks[i] = b;
-      sq += a * a;
-      sk += b * b;
-    }
-    const float2 sums = tl_tree_sum2_(red, t, NT, sq, sk);
-    const float qn = 1.0f / sqrtf(sums.x + eps) / sqrtf((float)dk);
-    const float kn = 1.0f / sqrtf(sums.y + eps);
-    for (unsigned i = t; i < dk; i += NT) {
-      qs[i] *= qn;
-      ks[i] *= kn;
-    }
+    qs[t] = a;
+    ks[t] = b;
+    const float2 sums = tl_tree_sum2_(red, t, dk, a * a, b * b);
+    qs[t] = a * (1.0f / sqrtf(sums.x + eps) / sqrtf((float)dk));
+    ks[t] = b * (1.0f / sqrtf(sums.y + eps));
     __syncthreads();
-    if (j >= dv) continue;  // past the head's columns, but still at the syncs
     const float* abt = ab + (size_t)tok * ab_ld;
     const float x = abt[h] + dt;
     const float decay = expf(A * (x > 20.0f ? x : log1pf(expf(x))));
     const float beta = 1.0f / (1.0f + expf(-abt[H + h]));
     float kv = 0.0f;
-    for (unsigned i = 0; i < dk; i++) kv += S[(size_t)i * dv] * ks[i];
-    const float delta = (row[2 * nq + (size_t)h * dv + j] - decay * kv) * beta;
+#pragma unroll
+    for (int r = 0; r < R; r++) kv += Sr[r] * ks[i0 + r];
+    pk[w * 32u + lane] = kv;
+    __syncthreads();
+    kv = 0.0f;
+    for (unsigned ww = 0; ww < NW; ww++) kv += pk[ww * 32u + lane];
+    const float delta = live ? (row[2 * nq + (size_t)h * dv + j] - decay * kv) * beta : 0.0f;
     float o = 0.0f;
-    for (unsigned i = 0; i < dk; i++) {
-      const float v = S[(size_t)i * dv] * decay + ks[i] * delta;
-      S[(size_t)i * dv] = v;
-      o += v * qs[i];
+#pragma unroll
+    for (int r = 0; r < R; r++) {
+      Sr[r] = Sr[r] * decay + ks[i0 + r] * delta;
+      o += Sr[r] * qs[i0 + r];
     }
-    out[(size_t)tok * H * dv + (size_t)h * dv + j] = o;
+    po[w * 32u + lane] = o;
+    __syncthreads();
+    if (w == 0 && live) {
+      o = 0.0f;
+      for (unsigned ww = 0; ww < NW; ww++) o += po[ww * 32u + lane];
+      out[(size_t)tok * H * dv + (size_t)h * dv + j] = o;
+    }
+  }
+  if (live) {
+#pragma unroll
+    for (int r = 0; r < R; r++) S[(size_t)(i0 + r) * dv + j] = Sr[r];
   }
 }
 

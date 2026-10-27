@@ -864,16 +864,18 @@ inline bool gated_delta(span qkv, span ab, int64_t ab_ld, span adt, span state,
                         span o, int64_t H, int64_t dk, int64_t dv, int64_t T,
                         float eps) {
   if (H <= 0 || dk <= 0 || dv <= 0 || T <= 0) return false;
-  constexpr uint32_t threads = 64;
-  const grid g{static_cast<uint32_t>((dv + threads - 1) / threads),
-               static_cast<uint32_t>(H), 1, threads, 1, 1,
-               static_cast<uint32_t>((2 * dk + 2 * threads) * sizeof(float))};
-  return launch(kop::gated_delta_,
+  // The kernels run a block of dk threads over 32 columns of a head's state,
+  // each warp holding 32 of its rows: dk a power of two a group can be.
+  const bool shape = dk >= 32 && dk <= policy::max_group_threads && (dk & (dk - 1)) == 0;
+  const grid g{static_cast<uint32_t>((dv + 31) / 32), static_cast<uint32_t>(H), 1,
+               static_cast<uint32_t>(dk), 1, 1,
+               static_cast<uint32_t>(6 * dk * sizeof(float))};
+  return (shape && launch(kop::gated_delta_,
                 {in(qkv), in(ab), in(adt), inout(state), out(o)},
                 gated_delta_params{static_cast<uint32_t>(H), static_cast<uint32_t>(dk),
                                    static_cast<uint32_t>(dv), static_cast<uint32_t>(T),
                                    static_cast<uint32_t>(ab_ld), eps},
-                g) ||
+                g)) ||
          generic::gated_delta(qkv, ab, ab_ld, adt, state, o, H, dk, dv, T, eps);
 }
 
