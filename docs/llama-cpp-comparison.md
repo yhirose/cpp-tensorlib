@@ -7,51 +7,51 @@ already cached when the test started.
 
 ## Results
 
-RTX 3090, driver 610.88, WSL2; tensorlib `982a1e3`, llama.cpp `19cce6919` (2026-10-27), built with
+RTX 3090, driver 610.88, WSL2; tensorlib `a0a0d43`, llama.cpp `19cce6919` (2026-10-27), built with
 `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86`. tok/s; this library's column
 is the median of 5 runs, llama.cpp's the mean of 5 (what `llama-bench` prints).
-llama.cpp was run twice per row and the range is given: its decode moved by
-up to 5% between invocations here, its prefill by up to 10% (the deep-context
-prefill ratios are soft for that reason).
+Each row is two runs of each engine, alternated, and the range is given: llama.cpp's
+decode moved by up to 5% between invocations here and its prefill by up to 10%
+(Qwen2.5's pp512 has an sd of 9-11% within a run), so the ratios there are soft.
 
 | model (GGUF) | test | tensorlib | llama.cpp | ratio |
 |---|---|---:|---:|---:|
-| Qwen2.5-0.5B-Instruct F16 | tg128 | 482 | 442-445 | 1.08 |
-|  | tg128 @ d2048 | 436 | 437-442 | 0.99-1.00 |
-|  | pp512 | 52,867 | 50,825-51,209 | 1.03-1.04 |
-|  | pp512 @ d2048 | 43,750 | 43,865-44,494 | 0.98-1.00 |
-| Qwen3-0.6B F16 | tg128 | 418 | 383-385 | 1.09 |
-|  | tg128 @ d2048 | 329 | 329-351 | 0.94-1.00 |
-|  | pp512 | 37,672 | 38,825-39,766 | 0.95-0.97 |
-|  | pp512 @ d2048 | 23,199 | 28,892-31,436 | 0.74-0.80 |
-| Qwen3.5-0.8B F16 | tg128 | 392 | 306-308 | 1.27-1.28 |
-|  | tg128 @ d2048 | 381 | 295-301 | 1.27-1.29 |
-|  | pp512 | 26,989 | 29,356-29,815 | 0.91-0.92 |
-|  | pp512 @ d2048 | 21,583 | 25,157-28,194 | 0.77-0.86 |
-| Qwen3.5-0.8B BF16 | tg128 | 384 | 283-295 | 1.30-1.36 |
-|  | tg128 @ d2048 | 382 | 296-298 | 1.28-1.29 |
-|  | pp512 | 25,284 | 21,805-25,139 | 1.01-1.16 |
-|  | pp512 @ d2048 | 21,765 | 24,250-24,410 | 0.89-0.90 |
+| Qwen2.5-0.5B-Instruct F16 | tg128 | 486 | 462-464 | 1.05 |
+|  | tg128 @ d2048 | 444 | 455-456 | 0.97-0.98 |
+|  | pp512 | 58,924-59,535 | 51,289-51,560 | 1.14-1.16 |
+|  | pp512 @ d2048 | 47,164-47,713 | 43,366-43,982 | 1.08-1.10 |
+| Qwen3-0.6B F16 | tg128 | 418 | 378-385 | 1.09-1.11 |
+|  | tg128 @ d2048 | 352 | 344 | 1.03 |
+|  | pp512 | 40,442-40,573 | 39,014-40,046 | 1.01-1.04 |
+|  | pp512 @ d2048 | 28,324-28,447 | 31,012-31,324 | 0.90-0.92 |
+| Qwen3.5-0.8B F16 | tg128 | 393 | 310 | 1.27 |
+|  | tg128 @ d2048 | 383 | 294-310 | 1.24-1.30 |
+|  | pp512 | 27,836-29,641 | 28,780-29,943 | 0.97-0.99 |
+|  | pp512 @ d2048 | 26,802-27,111 | 28,074-28,133 | 0.95-0.97 |
+| Qwen3.5-0.8B BF16 | tg128 | 388 | 296 | 1.31 |
+|  | tg128 @ d2048 | 379-383 | 304-308 | 1.24-1.26 |
+|  | pp512 | 29,025-29,903 | 25,181-25,248 | 1.15-1.19 |
+|  | pp512 @ d2048 | 27,219-27,467 | 24,341-24,412 | 1.12-1.13 |
 
 Decode is at parity or ahead on every model, with or without 2048 tokens
 cached. Until the decode attention overlapped its key loads and split its
 keys finer (2026-10-27), Qwen2.5 trailed by 18% at depth: a block's warps
 walked ~64 keys each in series, one load at a time.
 
-Prefill is at parity at 512 tokens on Qwen2.5 and within 5-9% on Qwen3 and
-Qwen3.5 F16, and 1.1-1.35x behind with 2048 tokens cached. Like llama.cpp, it
-sums the GEMMs in f16 by default (below). Its GEMM and its attention run on the tensor
-cores: the GEMM over `mma.sync` and `ldmatrix` with two shared-memory stages
-(two blocks share an SM, which beat deeper pipelines), the weights converted
-to f16 as a block stages them, and the activation rounded to f16 once, by the
-norm, SwiGLU or head merge that writes it, rather than by every block that
-reads it; the attention with q, k and v rounded to f16. Qwen3.5's DeltaNet
-layers run the gated delta rule in 32-token chunks (as small matrix
-products, f32). What is left at short context is those layers: ~7 ms of a 512-token
-prompt against ~3 ms for llama.cpp's fused tensor-core kernel (the scan runs
-on 16 warps a block, since it is bound by a chain of ~8 barriers per chunk,
-and the prep is not on the tensor cores). At depth the attention over the
-cached keys is the next suspect; it has not been profiled yet.
+Prefill is ahead on Qwen2.5 and the BF16 Qwen3.5 file, level at 512 tokens on
+Qwen3 and Qwen3.5 F16, and 3-10% behind with 2048 tokens cached on Qwen3 and
+Qwen3.5 F16. Like llama.cpp, it sums the GEMMs in f16 by default (below). Its
+GEMM and its attention run on the tensor cores. The GEMM is `mma.sync` over
+`ldmatrix` with two shared-memory stages (two blocks share an SM, which beat
+deeper pipelines); the weights are converted to f16 as a block stages them, and
+the activation is rounded to f16 once, by the norm, SwiGLU or head merge that
+writes it, rather than by every block that reads it. The attention keeps a
+warp's q in registers (shared memory at head width 256), reads k and v with
+`ldmatrix` from a double buffer, and rounds q, k and v to f16. Qwen3.5's
+DeltaNet layers run the gated delta rule in 32-token chunks (as small matrix
+products, f32); what is left there is the chunk prep, ~2.5 ms of a 512-token
+prompt, which is not on the tensor cores, and the scan, bound by a chain of
+~8 barriers per chunk.
 
 ## Accumulation precision
 
