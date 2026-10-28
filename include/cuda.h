@@ -118,6 +118,7 @@ struct driver {
   CUresult (*MemcpyHtoD)(CUdeviceptr, const void*, size_t) = nullptr;
   CUresult (*MemcpyDtoH)(void*, CUdeviceptr, size_t) = nullptr;
   CUresult (*MemsetD8)(CUdeviceptr, unsigned char, size_t) = nullptr;
+  CUresult (*MemcpyDtoDAsync)(CUdeviceptr, CUdeviceptr, size_t, CUstream) = nullptr;
   CUresult (*MemsetD8Async)(CUdeviceptr, unsigned char, size_t, CUstream) =
       nullptr;
   // CUDA-graph capture (M9 C1-2). Optional: dlsym'd best-effort; graph_ok()
@@ -384,6 +385,8 @@ struct context {
     // CUDA-graph symbols (optional; graph_ok() gates their use).
     d.MemsetD8Async = (CUresult(*)(CUdeviceptr, unsigned char, size_t,
                                    CUstream))S("cuMemsetD8Async");
+    d.MemcpyDtoDAsync = (CUresult(*)(CUdeviceptr, CUdeviceptr, size_t,
+                                     CUstream))S("cuMemcpyDtoDAsync_v2");
     d.MemcpyHtoDAsync = (CUresult(*)(CUdeviceptr, const void*, size_t,
                                      CUstream))S("cuMemcpyHtoDAsync_v2");
     if (!d.MemcpyHtoDAsync)
@@ -890,6 +893,9 @@ struct own {
                           int64_t T, int64_t ld, int64_t off, int64_t H,
                           int64_t D);
   static bool argmax(gpu::span a, int64_t n, int64_t* out_idx);
+  // n floats copied device to device on the launch stream (a copy engine's job,
+  // not a kernel's).
+  static bool copy_f32(gpu::span from, gpu::span to, int64_t n);
   // The f16 prefill GEMM reading an activation that is already f16, and the
   // producers that round it where it is made (see their definitions).
   static bool gemm_bf16_nt_f16acc_a16(gpu::span a, gpu::span B, gpu::span C,
@@ -1794,6 +1800,16 @@ inline bool own::gemm_bf16_nt_f16acc(gpu::span a, gpu::span B, gpu::span out, in
 inline bool own::gemm_bf16_nt_f16acc_a16(gpu::span a, gpu::span B, gpu::span out, int64_t m,
                                          int64_t n, int64_t k) {
   return f16acc_run_(context::tc_form::f16h, a, B, out, m, n, k);
+}
+
+inline bool own::copy_f32(gpu::span from, gpu::span to, int64_t n) {
+  auto& c = context::get();
+  if (!c.ready || !c.d.MemcpyDtoDAsync || n <= 0) return false;
+  c.device_read_(from.buf);
+  c.device_write_(to.buf);
+  return c.d.MemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(context::off_(to.buf, to.off)),
+                             reinterpret_cast<CUdeviceptr>(context::off_(from.buf, from.off)),
+                             static_cast<size_t>(n) * sizeof(float), c.stream) == 0;
 }
 
 // ---- The f16 activation: producers that write what the f16 GEMM reads, so it

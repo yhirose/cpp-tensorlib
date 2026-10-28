@@ -1066,6 +1066,17 @@ inline bool gemm_bf16_nt_f16acc(span A, span B, span C, int64_t M, int64_t N,
   return gemm_bf16_nt<Own>(A, B, C, M, N, K);
 }
 
+// n floats copied from one buffer to another: the backend's copy where it has
+// one, else an affine pass.
+TL_GPU_DETECT_OWN(copy_f32)
+template <class Own = own>
+inline bool copy_f32(span from, span to, int64_t n) {
+  if constexpr (detail::owns_copy_f32<Own>::value) {
+    if (detail::ran(Own::copy_f32(from, to, n))) return true;
+  }
+  return unary(kop::affine, from, to, n, 1.0f, 0.0f);
+}
+
 // The f16 prefill's activations, rounded where they are made so the GEMM does
 // not round them again in every block that reads them (CUDA only: a backend
 // without them answers false, and `f16_activations` says which). The norms

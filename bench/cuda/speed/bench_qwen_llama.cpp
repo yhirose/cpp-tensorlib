@@ -97,6 +97,6 @@ int main(int argc, char** argv) {
   std::printf("| test     |       t/s (mean ± sd) |   t/s (med) |\n");
   const std::string pp = "pp" + std::to_string(P), tg = "tg" + std::to_string(N);
   row(pp.c_str(), P, reps, [&] { return pp_ms(M, P, d); });
-  row(tg.c_str(), N, reps, [&] { return tg_ms(M, N, d); });
+  if (N > 0) row(tg.c_str(), N, reps, [&] { return tg_ms(M, N, d); });  // N=0: prefill only
   return 0;
 }

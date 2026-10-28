@@ -535,9 +535,7 @@ struct delta_snapshot {
     storage conv, ssm;
   };
   std::vector<saved> layers;
-  static void copy_(gpu::span from, gpu::span to, int64_t n) {
-    gpu::unary(gpu::kop::affine, from, to, n, 1.0f, 0.0f);
-  }
+  static void copy_(gpu::span from, gpu::span to, int64_t n) { gpu::copy_f32(from, to, n); }
   void save(Model& M) {
     const Config& c = M.c;
     for (int64_t l = 0; l < c.NL; l++) {
