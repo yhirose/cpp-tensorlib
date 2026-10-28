@@ -664,6 +664,7 @@ extern "C" __global__ void tl_gated_delta(const float* __restrict__ qkv,
 // (head, 32 columns of the state): a few small matrix products a chunk where
 // the per-token kernel had a dependent step a token. All f32.
 #define TL_GDC 32  // tokens a chunk
+#define TL_GDC_SCAN_R 8  // state rows a lane holds in the scan (cuda.h repeats it)
 extern "C" __global__ void tl_gated_delta_chunk_prep(
     const float* __restrict__ qkv, const float* __restrict__ ab,
     const float* __restrict__ adt, float* __restrict__ Qn, float* __restrict__ Kn,
@@ -773,21 +774,28 @@ extern "C" __global__ void tl_gated_delta_chunk_prep(
     U[(hb + t0 + t) * dv + d] = u;
   }
 }
-// The chunks in order, a block a (head, 32 state columns): 4 warps, warp w
-// holding rows 32w.. of its lane's column in registers as the decode kernel
+// The chunks in order, a block a (head, 32 state columns): DK/R warps, warp w
+// holding rows R*w.. of its lane's column in registers as the decode kernel
 // does, and each chunk's W, q and k rows staged in turn through one buffer.
+// Each chunk is a chain of dependent steps with a barrier between, so the time
+// is the chain's latency, not the arithmetic: R = 8 puts 16 warps on the SM's
+// four schedulers where R = 32 left one each (the scan took 260 us against 170
+// at T = 512). The tile is dynamic shared memory, TL_GDC_SCAN_SMEM bytes; the
+// launcher (own::gated_delta_chunked) must raise the limit and match R.
 extern "C" __global__ void tl_gated_delta_chunk_scan(
     const float* __restrict__ Qn, const float* __restrict__ Kn,
     const float* __restrict__ W, const float* __restrict__ U,
     const float* __restrict__ P, const float* __restrict__ G,
     float* __restrict__ state, float* __restrict__ out, unsigned H, unsigned dv,
     unsigned T) {
-  constexpr int C = TL_GDC, DK = 128, R = 32;
-  __shared__ __align__(16) float Buf[C][DK];
-  __shared__ float red[DK / R][C][32];
-  __shared__ float Dl[C][32];
-  __shared__ float Pc[C][C + 1];
-  __shared__ float gc[C], ed[C];
+  constexpr int C = TL_GDC, DK = 128, R = TL_GDC_SCAN_R, NW = DK / R, NT = NW * 32;
+  extern __shared__ __align__(16) float smx[];
+  float(*Buf)[DK] = reinterpret_cast<float(*)[DK]>(smx);
+  float(*red)[C][32] = reinterpret_cast<float(*)[C][32]>(smx + C * DK);
+  float(*Dl)[32] = reinterpret_cast<float(*)[32]>(smx + C * DK + NW * C * 32);
+  float(*Pc)[C + 1] = reinterpret_cast<float(*)[C + 1]>(smx + C * DK + NW * C * 32 + C * 32);
+  float* gc = smx + C * DK + NW * C * 32 + C * 32 + C * (C + 1);
+  float* ed = gc + C;
   const unsigned h = blockIdx.y, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
   const unsigned j = blockIdx.x * 32 + lane, i0 = w * R;
   const size_t hb = (size_t)h * T;
@@ -797,13 +805,13 @@ extern "C" __global__ void tl_gated_delta_chunk_scan(
 #pragma unroll
   for (int r = 0; r < R; r++) Sr[r] = S[(size_t)(i0 + r) * dv + j];
   // A chunk's rows of W, q and k reach Buf in turn, but are all read into
-  // registers at the chunk's start, 16 bytes a load: with 4 warps an SM there
-  // is no other work to hide a load behind, so the three latencies overlap.
-  constexpr int NV = C * DK / 4 / 128;  // float4s a thread a matrix (128 threads)
+  // registers at the chunk's start, 16 bytes a load, so the three latencies
+  // overlap.
+  constexpr int NV = C * DK / 4 / NT;  // float4s a thread a matrix
   auto load = [&](const float* src, unsigned t0, unsigned n, float4* v) {
 #pragma unroll
     for (int k = 0; k < NV; k++) {
-      const unsigned e = (tid + k * 128) * 4, t = e / DK, d = e % DK;
+      const unsigned e = (tid + k * NT) * 4, t = e / DK, d = e % DK;
       v[k] = t < n ? *reinterpret_cast<const float4*>(src + (hb + t0 + t) * DK + d)
                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     }
@@ -811,7 +819,7 @@ extern "C" __global__ void tl_gated_delta_chunk_scan(
   auto put = [&](const float4* v) {
 #pragma unroll
     for (int k = 0; k < NV; k++) {
-      const unsigned e = (tid + k * 128) * 4, t = e / DK, d = e % DK;
+      const unsigned e = (tid + k * NT) * 4, t = e / DK, d = e % DK;
       *reinterpret_cast<float4*>(&Buf[t][d]) = v[k];
     }
   };
@@ -845,7 +853,7 @@ extern "C" __global__ void tl_gated_delta_chunk_scan(
     partial();
     __syncthreads();
     // D = U - W h; each warp finishes C/4 of the chunk's tokens.
-    for (unsigned t = w * (C / 4); t < (w + 1) * (C / 4); t++) {
+    for (unsigned t = w * (C / NW); t < (w + 1) * (C / NW); t++) {
       float wh = 0.0f;
 #pragma unroll
       for (int ww = 0; ww < DK / R; ww++) wh += red[ww][t][lane];
@@ -857,7 +865,7 @@ extern "C" __global__ void tl_gated_delta_chunk_scan(
     partial();
     __syncthreads();
     // o_t = e^(g_t) q_t h + sum_{s<=t} P[t][s] d_s.
-    for (unsigned t = w * (C / 4); t < (w + 1) * (C / 4) && t < n; t++) {
+    for (unsigned t = w * (C / NW); t < (w + 1) * (C / NW) && t < n; t++) {
       float qh = 0.0f;
 #pragma unroll
       for (int ww = 0; ww < DK / R; ww++) qh += red[ww][t][lane];

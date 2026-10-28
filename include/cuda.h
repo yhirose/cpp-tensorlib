@@ -578,7 +578,21 @@ struct context {
   CUfunction conv_state_() { return cached_(conv_state_fn, "tl_ssm_conv_state"); }
   CUfunction gdc_prep_fn = nullptr, gdc_scan_fn = nullptr;  // the chunked delta rule
   CUfunction gdc_prep_() { return cached_(gdc_prep_fn, "tl_gated_delta_chunk_prep"); }
-  CUfunction gdc_scan_() { return cached_(gdc_scan_fn, "tl_gated_delta_chunk_scan"); }
+  // The scan's tile is dynamic shared memory (past the static 48 KB), raised on
+  // first lookup. R and the footprint repeat TL_GDC_SCAN_R and the kernel's
+  // carve-up in tensorlib_cuda.cu: Buf [C][128], red [128/R][C][32], Dl [C][32],
+  // Pc [C][C+1], gc and ed [C], in floats.
+  static constexpr unsigned gdc_scan_r = 8;
+  static constexpr unsigned gdc_scan_threads = 128 / gdc_scan_r * 32;
+  static constexpr unsigned gdc_scan_smem =
+      (32 * 128 + 128 / gdc_scan_r * 32 * 32 + 32 * 32 + 32 * 33 + 2 * 32) * 4;
+  CUfunction gdc_scan_() {
+    const bool fresh = !gdc_scan_fn;
+    CUfunction f = cached_(gdc_scan_fn, "tl_gated_delta_chunk_scan");
+    if (fresh && f && d.FuncSetAttribute)
+      d.FuncSetAttribute(f, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, static_cast<int>(gdc_scan_smem));
+    return f;
+  }
   // The prefill's tensor-core GEMM: tile (L 128x128, M 64x128, S 64x64) x sums
   // (f32 / f16), each a kernel of its own. The tiles stage through dynamic
   // shared memory (tl_gemm_nt_tc), so a function is raised to its footprint
@@ -2174,8 +2188,8 @@ inline bool own::gated_delta_chunked(gpu::span qkv, gpu::span ab, int64_t ab_ld,
                  uld = (unsigned)ab_ld;
   return c.launch_(c.gdc_prep_(), {(unsigned)nch, uH}, {256}, 0, pqkv, pab, padt, Qn,
                    Kn, W, U, P, G, uH, udv, uT, uld, eps) &&
-         c.launch_(c.gdc_scan_(), {udv / 32, uH}, {128}, 0, Qn, Kn, W, U, P, G, pst,
-                   po, uH, udv, uT);
+         c.launch_(c.gdc_scan_(), {udv / 32, uH}, {context::gdc_scan_threads},
+                   context::gdc_scan_smem, Qn, Kn, W, U, P, G, pst, po, uH, udv, uT);
 }
 
 // The query half of causal prefill attention's pullback: q, K, V, dO, O and dq
