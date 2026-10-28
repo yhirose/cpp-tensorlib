@@ -602,18 +602,19 @@ struct context {
   // (f32 / f16), each a kernel of its own. The tiles stage through dynamic
   // shared memory (tl_gemm_nt_tc), so a function is raised to its footprint
   // when it is first looked up.
-  enum class tc_tile { l, m, s };
+  enum class tc_tile { l, m, s, xl };  // xl: the f16 weight's long-K tile only
   // The form is the operands and sums: bf16 operands with f32 sums, f16 with f16
   // sums, and f16 sums reading the activation already f16 (no rounding stage).
   enum class tc_form { f32, f16, f16h };
   // The weight it reads: bf16 [N][K], or the rows of block-quantized blocks (Q4_K, Q6_K);
   // the quantized ones have the f32 and f16h forms only.
   enum class tc_weight { bf16, q4k, q6k, q80, f16w };
-  CUfunction gemm_tc_fn[5][3][3] = {};  // [weight][form][tile]
+  CUfunction gemm_tc_fn[5][3][4] = {};  // [weight][form][tile]
   CUfunction gemm_tc_(tc_form f, tc_tile t, tc_weight w = tc_weight::bf16) {
     static const char* const forms[3] = {"f32", "f16", "f16h"};
     static const char* const weights[5] = {"", "_q4k", "_q6k", "_q80", "_f16w"};
-    static const char tiles[3] = {'l', 'm', 's'};
+    static const char* const tiles[4] = {"l", "m", "s", "xl"};
+    if (t == tc_tile::xl && (w != tc_weight::f16w || f != tc_form::f16h)) return nullptr;
     if (w != tc_weight::bf16 && f == tc_form::f16) return nullptr;
     if (w == tc_weight::f16w && f != tc_form::f16h) return nullptr;
     CUfunction& slot = gemm_tc_fn[static_cast<int>(w)][static_cast<int>(f)][static_cast<int>(t)];
@@ -628,16 +629,17 @@ struct context {
     return slot;
   }
   // The tiles' shapes: tl_gemm_tc_*_{l,m,s} in tensorlib_cuda.cu spell the same
-  // numbers (BM, BN, BK, threads); change them together. smem is two stages of
+  // numbers (BM, BN, BK, threads, stages); change them together. smem is the stages of
   // (BM+BN) rows of (BK+8) 2-byte elements.
   struct tc_shape {
-    unsigned rows, cols, bk, threads;
-    constexpr unsigned smem() const { return (rows + cols) * (bk + 8) * 2 * 2; }
+    unsigned rows, cols, bk, threads, stages;
+    constexpr unsigned smem() const { return (rows + cols) * (bk + 8) * 2 * stages; }
   };
   static constexpr tc_shape gemm_tc_shape(tc_tile t) {
-    return t == tc_tile::l ? tc_shape{128, 128, 32, 128}
-         : t == tc_tile::m ? tc_shape{64, 128, 64, 256}
-                           : tc_shape{64, 64, 64, 128};
+    return t == tc_tile::l ? tc_shape{128, 128, 32, 128, 2}
+         : t == tc_tile::m ? tc_shape{64, 128, 64, 256, 2}
+         : t == tc_tile::s ? tc_shape{64, 64, 64, 128, 2}
+                           : tc_shape{256, 128, 32, 512, 3};
   }
 
   // M9 fused decode attention (single-pass + split-KV two-pass).
@@ -1771,7 +1773,15 @@ inline bool gemm_tc_run_(context& c, context::tc_form form, void* pa, void* pB, 
     return std::pair<unsigned, unsigned>{(n + sh.cols - 1) / sh.cols, (m + sh.rows - 1) / sh.rows};
   };
   auto blocks = [&](tile t) { return (int64_t)grid(t).first * grid(t).second; };
-  const tile t = blocks(tile::l) >= busy   ? tile::l
+  // The f16 weight's long-K tile (a big model's projections): one block a SM, so it
+  // wants a grid that is nearly whole waves (the 6144 x 5120 at 96 blocks is 59% of
+  // two waves and loses to the 128-row tile), and K = 1024 shapes lose to the others.
+  constexpr int64_t sms = traits::fill_groups / 2;
+  const int64_t bx = blocks(tile::xl), waves = (bx + sms - 1) / sms;
+  const bool xl = w == context::tc_weight::f16w && form == context::tc_form::f16h && k >= 3072 &&
+                  bx >= sms - 2 && bx * 4 >= waves * sms * 3;
+  const tile t = xl                        ? tile::xl
+                 : blocks(tile::l) >= busy ? tile::l
                  : blocks(tile::m) >= busy ? tile::m
                                            : tile::s;
   const auto sh = context::gemm_tc_shape(t);
@@ -1887,7 +1897,9 @@ inline bool own::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::s
   // same, so the product is the same bits.
   // Bytes a row of k weights takes: Q4_K 144 per 256, Q6_K 210 per 256, Q8_0 34 per 32.
   const size_t row_bytes = type == 12 ? (size_t)k / 256 * 144 : type == 14 ? (size_t)k / 256 * 210 : (size_t)k / 32 * 34;
-  constexpr size_t slab_bytes = 128u << 20;
+  // 192 MB: a 27B's largest projection (down, 5120 x 17408) in one slab. Split in two it left
+  // each GEMM too few blocks for the long-K tile (pp512 1027 -> 1140 tok/s on the 27B).
+  constexpr size_t slab_bytes = 192u << 20;
   const int64_t slab = std::max<int64_t>(128, (int64_t)(slab_bytes / ((size_t)k * 2)) / 128 * 128);
   CUfunction& fn = c.dequant_fn[type == 12 ? 0 : type == 14 ? 1 : 2];
   if (!fn) fn = c.load_(type == 12 ? "tl_dequant_f16_q4k" : type == 14 ? "tl_dequant_f16_q6k" : "tl_dequant_f16_q80");

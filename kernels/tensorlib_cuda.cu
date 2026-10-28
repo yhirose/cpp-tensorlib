@@ -2130,6 +2130,105 @@ TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q80, true, true, 3)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_f16w, true, true, 4)
 #undef TL_GEMM_TC_TILES
 
+// The f16 weight's fourth tile, for the long-K GEMMs of a big model (a 27B's
+// projections, K >= 3072): 256x128, BK 32, three cp.async stages, 16 warps of
+// 64x32. A 256-row block reads each weight tile from L2 half as often as the
+// 128-row ones, and the copies go straight from global to shared memory with
+// no registers in between: 86 TFLOPS at the 27B's shapes against 63 for the
+// tile above (K = 1024 shapes lose a little, which is why gemm_tc_run_ picks it).
+// Both operands are f16 already, so there is no conversion to stage.
+__device__ __forceinline__ void tc_cp16_(void* s, const void* g, bool ok) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+               :: "r"((unsigned)__cvta_generic_to_shared(s)), "l"(g), "r"(ok ? 16 : 0));
+}
+template <int BM, int BN, int BK, int WM, int WN, int STG>
+__device__ __forceinline__ void gemm_nt_tc_cp_core(const __half* __restrict__ A,
+                                                   const __half* __restrict__ B,
+                                                   float* __restrict__ C, unsigned M,
+                                                   unsigned N, unsigned K, unsigned ldc) {
+  constexpr int LD = BK + 8;
+  constexpr int NT = (BM / WM) * (BN / WN) * 32;
+  constexpr int FM = WM / 16, FN = WN / 8;
+  constexpr int AV = BM * BK / 8 / NT, BV = BN * BK / 8 / NT;
+  static_assert(AV >= 1 && BV >= 1 && FN % 2 == 0, "tile too small for its threads");
+  extern __shared__ __align__(16) unsigned char tc_smem[];
+  __half* sm = reinterpret_cast<__half*>(tc_smem);
+  auto As = [&](int s) { return sm + s * (BM + BN) * LD; };
+  auto Bs = [&](int s) { return sm + s * (BM + BN) * LD + BM * LD; };
+  const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const unsigned wm = (warp / (BN / WN)) * WM, wn = (warp % (BN / WN)) * WN;
+  const unsigned row0 = blockIdx.y * BM, col0 = blockIdx.x * BN;
+  unsigned acc[FM][FN][2];
+#pragma unroll
+  for (int i = 0; i < FM; i++)
+#pragma unroll
+    for (int j = 0; j < FN; j++) acc[i][j][0] = acc[i][j][1] = 0;
+  // A slab to stage s; out-of-range vectors copy zero bytes (src-size 0).
+  auto issue = [&](int s, unsigned k0) {
+#pragma unroll
+    for (int v = 0; v < AV; v++) {
+      const unsigned id = tid + v * NT, r = id / (BK / 8), c = (id % (BK / 8)) * 8;
+      const unsigned gr = row0 + r, gk = k0 + c;
+      const bool ok = gr < M && gk < K;
+      tc_cp16_(As(s) + r * LD + c, A + (size_t)(ok ? gr : 0) * K + (ok ? gk : 0), ok);
+    }
+#pragma unroll
+    for (int v = 0; v < BV; v++) {
+      const unsigned id = tid + v * NT, r = id / (BK / 8), c = (id % (BK / 8)) * 8;
+      const unsigned gn = col0 + r, gk = k0 + c;
+      const bool ok = gn < N && gk < K;
+      tc_cp16_(Bs(s) + r * LD + c, B + (size_t)(ok ? gn : 0) * K + (ok ? gk : 0), ok);
+    }
+  };
+  const unsigned la_r = lane & 15, la_c = (lane >> 4) * 8;
+  const unsigned lb_r = (lane & 7) + ((lane >> 4) << 3), lb_c = ((lane >> 3) & 1) * 8;
+  const unsigned nk = (K + BK - 1) / BK;
+#pragma unroll
+  for (int s = 0; s < STG - 1; s++) {
+    if (s < (int)nk) issue(s, s * BK);
+    asm volatile("cp.async.commit_group;\n");
+  }
+  for (unsigned kt = 0; kt < nk; kt++) {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(STG - 2));
+    __syncthreads();  // slab kt landed for everyone, and slab kt-1's readers are done
+    const unsigned nx = kt + STG - 1;
+    if (nx < nk) issue(nx % STG, nx * BK);
+    asm volatile("cp.async.commit_group;\n");
+    const __half* a = As(kt % STG);
+    const __half* b = Bs(kt % STG);
+#pragma unroll
+    for (int kk = 0; kk < BK; kk += 16) {
+      unsigned fa[FM][4], fb[FN][2];
+#pragma unroll
+      for (int i = 0; i < FM; i++)
+        tc_ldsm4_(fa[i][0], fa[i][1], fa[i][2], fa[i][3], a + (wm + 16 * i + la_r) * LD + kk + la_c);
+#pragma unroll
+      for (int j = 0; j < FN; j += 2)
+        tc_ldsm4_(fb[j][0], fb[j][1], fb[j + 1][0], fb[j + 1][1], b + (wn + 8 * j + lb_r) * LD + kk + lb_c);
+#pragma unroll
+      for (int i = 0; i < FM; i++)
+#pragma unroll
+        for (int j = 0; j < FN; j++) tc_mma_(acc[i][j], fa[i], fb[j][0], fb[j][1], __half());
+    }
+  }
+  const unsigned g = lane >> 2, t = lane & 3;
+#pragma unroll
+  for (int i = 0; i < FM; i++)
+#pragma unroll
+    for (int j = 0; j < FN; j++) {
+      const unsigned gr = row0 + wm + 16 * i + g, gc = col0 + wn + 8 * j + 2 * t;
+      if (gc >= N) continue;
+      if (gr < M) *reinterpret_cast<float2*>(C + (size_t)gr * ldc + gc) = tc_pair_(acc[i][j], 0);
+      if (gr + 8 < M) *reinterpret_cast<float2*>(C + (size_t)(gr + 8) * ldc + gc) = tc_pair_(acc[i][j], 1);
+    }
+}
+extern "C" __global__ void tl_gemm_tc_f16h_f16w_xl(const void* __restrict__ A,
+    const void* __restrict__ B, float* __restrict__ C, unsigned M, unsigned N, unsigned K,
+    unsigned ldc) {
+  gemm_nt_tc_cp_core<256, 128, 32, 64, 32, 3>(static_cast<const __half*>(A),
+                                              static_cast<const __half*>(B), C, M, N, K, ldc);
+}
+
 // A block-quantized weight run (rows x K) dequantized to f16 [rows][K], a thread eight
 // weights: the prefill does it once per projection per chunk instead of in every
 // row block's staging of the GEMM, which then reads plain f16 (72 against 45 TFLOPS).
