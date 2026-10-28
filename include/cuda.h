@@ -141,6 +141,7 @@ struct driver {
   CUresult (*EventRecord)(CUevent, CUstream) = nullptr;
   CUresult (*EventSynchronize)(CUevent) = nullptr;
   CUresult (*EventElapsedTime)(float*, CUevent, CUevent) = nullptr;
+  CUresult (*FuncSetAttribute)(CUfunction, int, int) = nullptr;
 
   bool ok() const {
     return Init && DeviceGet && DevicePrimaryCtxRetain && CtxSetCurrent &&
@@ -411,6 +412,7 @@ struct context {
     d.EventSynchronize = (CUresult(*)(CUevent))S("cuEventSynchronize");
     d.EventElapsedTime =
         (CUresult(*)(float*, CUevent, CUevent))S("cuEventElapsedTime");
+    d.FuncSetAttribute = (CUresult(*)(CUfunction, int, int))S("cuFuncSetAttribute");
     if (!d.ok()) return;
 
     if (d.Init(0) != 0) return;
@@ -569,20 +571,48 @@ struct context {
   CUfunction gemm_bf16_nt_sk_() {
     return cached_(gemm_bf16_nt_sk_fn, "tl_gemm_bf16_nt_sk");
   }
+  CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, swiglu_h16_fn = nullptr,
+             merge_heads_h16_fn = nullptr, cvt_h16_fn = nullptr;  // the f16 activation's producers
   CUfunction conv_tok_fn = nullptr, conv_state_fn = nullptr;  // a prefill's conv
   CUfunction conv_tok_() { return cached_(conv_tok_fn, "tl_ssm_conv_tokens"); }
   CUfunction conv_state_() { return cached_(conv_state_fn, "tl_ssm_conv_state"); }
   CUfunction gdc_prep_fn = nullptr, gdc_scan_fn = nullptr;  // the chunked delta rule
   CUfunction gdc_prep_() { return cached_(gdc_prep_fn, "tl_gated_delta_chunk_prep"); }
   CUfunction gdc_scan_() { return cached_(gdc_scan_fn, "tl_gated_delta_chunk_scan"); }
-  CUfunction gemm_bf16_nt_tc_fn = nullptr, gemm_bf16_nt_tc_s_fn = nullptr,
-             gemm_f16acc_tc_fn = nullptr, gemm_f16acc_tc_s_fn = nullptr;
-  CUfunction gemm_bf16_nt_tc_(bool big, bool f16acc = false) {
-    if (f16acc)
-      return big ? cached_(gemm_f16acc_tc_fn, "tl_gemm_f16acc_tc")
-                 : cached_(gemm_f16acc_tc_s_fn, "tl_gemm_f16acc_tc_s");
-    return big ? cached_(gemm_bf16_nt_tc_fn, "tl_gemm_bf16_nt_tc")
-               : cached_(gemm_bf16_nt_tc_s_fn, "tl_gemm_bf16_nt_tc_s");
+  // The prefill's tensor-core GEMM: tile (L 128x128, M 64x128, S 64x64) x sums
+  // (f32 / f16), each a kernel of its own. The tiles stage through dynamic
+  // shared memory (tl_gemm_nt_tc), so a function is raised to its footprint
+  // when it is first looked up.
+  enum class tc_tile { l, m, s };
+  // The form is the operands and sums: bf16 operands with f32 sums, f16 with f16
+  // sums, and f16 sums reading the activation already f16 (no rounding stage).
+  enum class tc_form { f32, f16, f16h };
+  CUfunction gemm_tc_fn[3][3] = {};
+  CUfunction gemm_tc_(tc_form f, tc_tile t) {
+    static const char* const names[3][3] = {
+        {"tl_gemm_tc_f32_l", "tl_gemm_tc_f32_m", "tl_gemm_tc_f32_s"},
+        {"tl_gemm_tc_f16_l", "tl_gemm_tc_f16_m", "tl_gemm_tc_f16_s"},
+        {"tl_gemm_tc_f16h_l", "tl_gemm_tc_f16h_m", "tl_gemm_tc_f16h_s"}};
+    CUfunction& slot = gemm_tc_fn[static_cast<int>(f)][static_cast<int>(t)];
+    if (!slot) {
+      slot = load_(names[static_cast<int>(f)][static_cast<int>(t)]);
+      if (slot && d.FuncSetAttribute)
+        d.FuncSetAttribute(slot, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */,
+                           static_cast<int>(gemm_tc_shape(t).smem()));
+    }
+    return slot;
+  }
+  // The tiles' shapes: tl_gemm_tc_*_{l,m,s} in tensorlib_cuda.cu spell the same
+  // numbers (BM, BN, BK, threads); change them together. smem is two stages of
+  // (BM+BN) rows of (BK+8) 2-byte elements.
+  struct tc_shape {
+    unsigned rows, cols, bk, threads;
+    constexpr unsigned smem() const { return (rows + cols) * (bk + 8) * 2 * 2; }
+  };
+  static constexpr tc_shape gemm_tc_shape(tc_tile t) {
+    return t == tc_tile::l ? tc_shape{128, 128, 32, 128}
+         : t == tc_tile::m ? tc_shape{64, 128, 64, 256}
+                           : tc_shape{64, 64, 64, 128};
   }
 
   // M9 fused decode attention (single-pass + split-KV two-pass).
@@ -846,6 +876,19 @@ struct own {
                           int64_t T, int64_t ld, int64_t off, int64_t H,
                           int64_t D);
   static bool argmax(gpu::span a, int64_t n, int64_t* out_idx);
+  // The f16 prefill GEMM reading an activation that is already f16, and the
+  // producers that round it where it is made (see their definitions).
+  static bool gemm_bf16_nt_f16acc_a16(gpu::span a, gpu::span B, gpu::span C,
+                                      int64_t M, int64_t N, int64_t K);
+  static bool rmsnorm_h16(gpu::span x, gpu::span w, gpu::span o, gpu::span o16,
+                          int64_t n, float eps, int64_t rows);
+  static bool rmsnorm_res_h16(gpu::span x, gpu::span delta, gpu::span w,
+                              gpu::span xout, gpu::span hout, gpu::span hout16,
+                              int64_t n, float eps, int64_t rows);
+  static bool swiglu_h16(gpu::span gu, gpu::span o16, int64_t ff, int64_t rows);
+  static bool merge_heads_h16(gpu::span src, gpu::span dst16, int64_t T, int64_t H,
+                              int64_t D);
+  static bool cvt_h16(gpu::span src, gpu::span dst16, int64_t n);
   // The graph-capture forms: the position is a device scalar, so a captured
   // step replays against an advancing cache row.
   static bool rope_dpos(gpu::span x, gpu::span out, int64_t rows, int64_t T,
@@ -1562,7 +1605,7 @@ inline bool own::scatter_to_axis(gpu::span idx, gpu::span values, gpu::span out,
 // bandwidth-bound rather than occupancy-bound. gridDim.y==1 stores directly.
 // The kernel's rule: no split under K=512, and a part is a multiple of its
 // 32-wide K step.
-inline bool gemv_run_(CUfunction f, float* pa, float* pB, float* py,
+inline bool gemv_run_(CUfunction f, void* pa, float* pB, float* py,
                       unsigned un, unsigned uk, unsigned vcols = 1) {
   auto& c = context::get();
   unsigned per = 256u * vcols;  // output columns covered by one block
@@ -1634,6 +1677,29 @@ inline unsigned gemv_row_smem(unsigned block) {
   return block > 32 ? (block >> 5) * (unsigned)sizeof(float) : 0u;
 }
 
+// The tensor-core GEMM's launch: the widest tile whose grid still keeps most of
+// the SMs busy. A prefill chunk is a few hundred rows against a projection that
+// is often narrow (wo, down: N ~ 1K), so the 128x128 tile is 32 blocks of work
+// there; the 64x128 doubles that and the 64x64 doubles it again. "Busy" is
+// two thirds of a block per SM (a third of fill_groups, which counts two):
+// the tiles share an SM two at a time, and the threshold was swept at M=512.
+inline bool gemm_tc_run_(context& c, context::tc_form form, void* pa, float* pB, float* po,
+                         unsigned m, unsigned n, unsigned k) {
+  using tile = context::tc_tile;
+  constexpr int64_t busy = traits::fill_groups / 3;
+  auto grid = [&](tile t) {
+    const auto sh = context::gemm_tc_shape(t);
+    return std::pair<unsigned, unsigned>{(n + sh.cols - 1) / sh.cols, (m + sh.rows - 1) / sh.rows};
+  };
+  auto blocks = [&](tile t) { return (int64_t)grid(t).first * grid(t).second; };
+  const tile t = blocks(tile::l) >= busy   ? tile::l
+                 : blocks(tile::m) >= busy ? tile::m
+                                           : tile::s;
+  const auto sh = context::gemm_tc_shape(t);
+  return c.launch_(c.gemm_tc_(form, t), {grid(t).first, grid(t).second}, {sh.threads}, sh.smem(),
+                   pa, pB, po, m, n, k);
+}
+
 // M9 batched-prefill GEMM: C(M,N) = A(M,K) @ W[N,K]^T, W the same row-major
 // bf16 weight gemv_bf16_row consumes — so a batched prompt reuses the decode
 // weights as-is. Requires K % 8 == 0. See tl_gemm_bf16_nt.
@@ -1649,14 +1715,9 @@ inline bool own::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
   float* po = context::off_(out.buf, out.off);
   unsigned uM = (unsigned)m, uN = (unsigned)n, uK = (unsigned)k;
   // The tensor cores read 16-byte vectors of both operands, so their rows must
-  // start on 16 bytes; the 128 tile when it fills the GPU, else the 64.
-  const bool aligned = ((uintptr_t)pa % 16 == 0) && ((uintptr_t)pB % 16 == 0);
-  if (aligned) {
-    const bool big_tc = ((n + 127) / 128) * ((m + 127) / 128) >= traits::fill_groups;
-    const unsigned tt = big_tc ? 128u : 64u;
-    return c.launch_(c.gemm_bf16_nt_tc_(big_tc), {(uN + tt - 1) / tt, (uM + tt - 1) / tt},
-                     {big_tc ? 512u : 128u}, 0, pa, pB, po, uM, uN, uK);
-  }
+  // start on 16 bytes (and N be even: a thread stores two columns at once).
+  const bool aligned = ((uintptr_t)pa % 16 == 0) && ((uintptr_t)pB % 16 == 0) && n % 2 == 0;
+  if (aligned) return gemm_tc_run_(c, context::tc_form::f32, pa, pB, po, uM, uN, uK);
   // Tile choice by fill (big_tile_): a prefill chunk is only a few hundred
   // tokens, so a narrow projection (N=896, M=512) is 28 big blocks against 82
   // SMs and 112 small ones. The big tile needs K % 8 == 0, the small K % 16.
@@ -1691,25 +1752,85 @@ inline bool own::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
                    uK);
 }
 
-// The prefill GEMM summed in f16 (tl_gemm_f16acc_tc*, the tensor-core tiles'
+// The prefill GEMM summed in f16 (tl_gemm_tc_f16*, the tensor-core tiles'
 // f16 form): operands on 16 bytes and K % 8 == 0, as there; otherwise the
 // caller's f32 GEMM.
-inline bool own::gemm_bf16_nt_f16acc(gpu::span a, gpu::span B, gpu::span out,
-                                     int64_t m, int64_t n, int64_t k) {
+// Both f16-sum forms: operands on 16 bytes, K % 8 == 0 and N even, else false
+// (the caller's f32 GEMM, or for an f16 activation nothing: it must be sized
+// for these, see prefill_chunk_).
+inline bool f16acc_run_(context::tc_form form, gpu::span a, gpu::span B, gpu::span out,
+                        int64_t m, int64_t n, int64_t k) {
   auto& c = context::get();
   if (!c.ready || (k % 8) != 0 || m <= 0 || n <= 0) return false;
   float* pa = context::off_(a.buf, a.off);
   float* pB = context::off_(B.buf, B.off);
   float* po = context::off_(out.buf, out.off);
-  if ((uintptr_t)pa % 16 || (uintptr_t)pB % 16) return false;
+  if ((uintptr_t)pa % 16 || (uintptr_t)pB % 16 || n % 2) return false;
   c.device_read_(a.buf);
   c.device_read_(B.buf);
   c.device_write_(out.buf);
-  const unsigned uM = (unsigned)m, uN = (unsigned)n, uK = (unsigned)k;
-  const bool big = ((n + 127) / 128) * ((m + 127) / 128) >= traits::fill_groups;
-  const unsigned tt = big ? 128u : 64u;
-  return c.launch_(c.gemm_bf16_nt_tc_(big, true), {(uN + tt - 1) / tt, (uM + tt - 1) / tt},
-                   {big ? 512u : 128u}, 0, pa, pB, po, uM, uN, uK);
+  return gemm_tc_run_(c, form, pa, pB, po, (unsigned)m, (unsigned)n, (unsigned)k);
+}
+inline bool own::gemm_bf16_nt_f16acc(gpu::span a, gpu::span B, gpu::span out, int64_t m,
+                                     int64_t n, int64_t k) {
+  return f16acc_run_(context::tc_form::f16, a, B, out, m, n, k);
+}
+// The same with the activation already f16 (rounded by the producer that wrote
+// it: own::rmsnorm_h16 and its kin), which `a` holds as 2-byte elements.
+inline bool own::gemm_bf16_nt_f16acc_a16(gpu::span a, gpu::span B, gpu::span out, int64_t m,
+                                         int64_t n, int64_t k) {
+  return f16acc_run_(context::tc_form::f16h, a, B, out, m, n, k);
+}
+
+// ---- The f16 activation: producers that write what the f16 GEMM reads, so it
+// is rounded once where it is made rather than by every block that stages it.
+// Each is the plain op's kernel with an f16 output (the norms write it beside
+// the f32 one: the residual and the logits still read that). ----
+inline bool own::rmsnorm_h16(gpu::span x, gpu::span w, gpu::span o, gpu::span o16,
+                             int64_t n, float eps, int64_t rows) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  const gpu::rmsnorm_params p{static_cast<uint32_t>(n), eps};
+  const gpu::arg args[] = {gpu::in(x), gpu::in(w), gpu::out(o), gpu::out(o16)};
+  return c.dispatch_(c.cached_(c.rmsnorm_h16_fn, "tl_rmsnorm_h16"), args, 4, &p, sizeof(p),
+                     gpu::policy::one_group_per_row(rows));
+}
+inline bool own::rmsnorm_res_h16(gpu::span x, gpu::span delta, gpu::span w,
+                                 gpu::span xout, gpu::span hout, gpu::span hout16,
+                                 int64_t n, float eps, int64_t rows) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  const gpu::rmsnorm_params p{static_cast<uint32_t>(n), eps};
+  const gpu::arg args[] = {gpu::in(x),    gpu::in(delta), gpu::in(w),
+                           gpu::out(xout), gpu::out(hout), gpu::out(hout16)};
+  return c.dispatch_(c.cached_(c.add_rmsnorm_h16_fn, "tl_add_rmsnorm_h16"), args, 6, &p,
+                     sizeof(p), gpu::policy::one_group_per_row(rows));
+}
+inline bool own::swiglu_h16(gpu::span gu, gpu::span o16, int64_t ff, int64_t rows) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  const gpu::swiglu_params p{static_cast<uint32_t>(ff)};
+  const gpu::arg args[] = {gpu::in(gu), gpu::out(o16)};
+  return c.dispatch_(c.cached_(c.swiglu_h16_fn, "tl_swiglu_h16"), args, 2, &p, sizeof(p),
+                     gpu::policy::flat_rows(ff, rows));
+}
+inline bool own::merge_heads_h16(gpu::span src, gpu::span dst16, int64_t T, int64_t H,
+                                 int64_t D) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  const gpu::merge_heads_params p{static_cast<uint32_t>(T), static_cast<uint32_t>(H),
+                                  static_cast<uint32_t>(D)};
+  const gpu::arg args[] = {gpu::in(src), gpu::out(dst16)};
+  return c.dispatch_(c.cached_(c.merge_heads_h16_fn, "tl_merge_heads_h16"), args, 2, &p,
+                     sizeof(p), gpu::policy::per_head(H, T, D));
+}
+inline bool own::cvt_h16(gpu::span src, gpu::span dst16, int64_t n) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  const uint32_t p = static_cast<uint32_t>(n);
+  const gpu::arg args[] = {gpu::in(src), gpu::out(dst16)};
+  return c.dispatch_(c.cached_(c.cvt_h16_fn, "tl_cvt_h16"), args, 2, &p, sizeof(p),
+                     gpu::policy::flat(n));
 }
 
 // ---- M9 batched-prefill layout moves between token-major projections and

@@ -430,6 +430,9 @@ struct PrefillScratch {
   storage gu;  // fused gate|up [cap, 2*FF]
   storage mb;  // swiglu out [cap, FF]
   storage md;  // mlp-down out [cap, NE]
+  // The f16 copies the f16-sum GEMMs read (a half-size buffer each, in floats):
+  // the two norms' outputs, and the activations only a GEMM reads.
+  storage h16, h216, at16, mb16;
   std::vector<float> emb_stage;  // host gather target, uploaded into emb
 
   bool init(const Config& c, int64_t chunk) {
@@ -459,6 +462,13 @@ struct PrefillScratch {
     gu = scratch_f32(cap * 2 * c.FF);
     mb = scratch_f32(cap * c.FF);
     md = scratch_f32(cap * c.NE);
+    if constexpr (gpu::f16_activations) {
+      auto half = [](int64_t n) { return scratch_f32((n + 1) / 2); };
+      h16 = half(cap * c.NE);
+      h216 = half(cap * c.NE);
+      at16 = half(cap * std::max(c.NH * c.HD, c.ssm_v()));
+      mb16 = half(cap * c.FF);
+    }
     return md.native != nullptr;
   }
 };
@@ -592,16 +602,36 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
   // same source rather than taking it as a parameter that could disagree.
   const int64_t pos0 = seq_cache(M).pos;
   const int64_t AP = c.attn_proj(), Q = c.NH * c.HD;
-  auto gemm = [&](gpu::span a, const array& w, gpu::span y, int64_t n, int64_t k) {
-    if (M.f16_acc && !exact) gpu::gemm_bf16_nt_f16acc(a, sp(w), y, T, n, k);
+  // The f16-sum GEMMs read their activation as f16 when the backend has the
+  // producers that write it there (a16); `a16s` is that copy of `a`.
+  const bool a16 = M.f16_acc && !exact && gpu::f16_activations;
+  auto gemm = [&](gpu::span a, gpu::span a16s, const array& w, gpu::span y, int64_t n, int64_t k) {
+    // No f32 copy of an f16 activation exists to fall back on, so a refusal
+    // (misaligned buffer, odd n, k % 8) is an error, not a slower path.
+    if (a16) {
+      if (!gpu::gemm_bf16_nt_f16acc_a16(a16s, sp(w), y, T, n, k))
+        throw std::logic_error("qwen: the f16 prefill GEMM refused its operands");
+    } else if (M.f16_acc && !exact) gpu::gemm_bf16_nt_f16acc(a, sp(w), y, T, n, k);
     else gpu::gemm_bf16_nt(a, sp(w), y, T, n, k);
+  };
+  // The norm that feeds a GEMM, and the residual-adding one: with a16 each
+  // leaves the f16 copy the GEMM reads, and the f32 one only where something
+  // else reads it (`keep`; the layer's own norm output is read by nothing).
+  auto norm = [&](gpu::span in, gpu::span w, gpu::span o, gpu::span o16, bool keep) {
+    if (a16) gpu::rmsnorm_h16(in, w, keep ? o : gpu::span{}, o16, c.NE, c.EPS, T);
+    else gpu::rmsnorm(in, w, o, c.NE, c.EPS, T);
+  };
+  auto norm_res = [&](gpu::span xin, gpu::span delta, gpu::span w, gpu::span xo, gpu::span o,
+                      gpu::span o16, bool keep) {
+    if (a16) gpu::rmsnorm_res_h16(xin, delta, w, xo, keep ? o : gpu::span{}, o16, c.NE, c.EPS, T);
+    else gpu::rmsnorm_res(xin, delta, w, xo, o, c.NE, c.EPS, T);
   };
   // A strided [T, n] block of rows `ld` apart, copied contiguous.
   auto rows_out = [&](gpu::span src, int64_t ld, gpu::span dst, int64_t n) {
     gpu::generic::copy_2d(src, ld, 1, sp(P.zero), dst, T, n);
   };
   gpu::span x = sp(P.emb);
-  gpu::rmsnorm(x, sp(M.layers[0].an), sp(P.h), c.NE, c.EPS, T);
+  norm(x, sp(M.layers[0].an), sp(P.h), sp(P.h16), false);
   for (int64_t l = 0; l < c.NL; l++) {
     Layer& L = M.layers[l];
     const gpu::span ro = sp(P.res[l & 1]);
@@ -613,17 +643,18 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       // swiglu over the flattened [T, V].
       const int64_t C = c.ssm_conv_ch(), V = c.ssm_v(), PJ = c.ssm_proj();
       const gpu::span z = sp(P.zo), o = at_f32(z, T * V);
-      gemm(sp(P.h), L.wssm, sp(P.qkv), PJ, c.NE);
+      gemm(sp(P.h), sp(P.h16), L.wssm, sp(P.qkv), PJ, c.NE);
       gpu::ssm_conv(sp(P.qkv), PJ, sp(L.conv_state), sp(L.wconv), sp(P.conv), C,
                     c.SCONV, T);
       gpu::gated_delta(sp(P.conv), at_f32(sp(P.qkv), C), PJ, sp(L.adt),
                        sp(L.ssm_state), o, c.SH, c.SDK, c.SDV, T, c.L2EPS);
       gpu::rmsnorm(o, sp(L.sn), o, c.SDV, c.EPS, T * c.SH);
       rows_out(at_f32(sp(P.qkv), C + 2 * c.SH), PJ, z, V);
-      gpu::swiglu(z, sp(P.at), T * V);
-      gemm(sp(P.at), L.wsout, ro, c.NE, V);
+      if (a16) gpu::swiglu_h16(z, sp(P.at16), T * V, 1);
+      else gpu::swiglu(z, sp(P.at), T * V);
+      gemm(sp(P.at), sp(P.at16), L.wsout, ro, c.NE, V);
     } else {
-      gemm(sp(P.h), L.wqkv, sp(P.qkv), AP, c.NE);
+      gemm(sp(P.h), sp(P.h16), L.wqkv, sp(P.qkv), AP, c.NE);
       // split_heads turns the [T, q|k|v] output into head-major [H, T, D] and
       // adds the bias — rope's own fused-bias form only indexes correctly at
       // T == 1, so the bias rides along here instead. One pass over every head;
@@ -643,23 +674,30 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
       gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
       L.cache.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale(), exact);
-      gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, c.HD);
-      // Qwen3.5: times sigmoid of the gate, the tail of each projection row.
+      // Qwen3.5: times sigmoid of the gate, the tail of each projection row —
+      // an f32 product, so only the plain form is rounded where it is made.
       gpu::span ao = sp(P.at);
       if (c.attn_gate) {
+        gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, c.HD);
         rows_out(at_f32(sp(P.qkv), (c.NH + 2 * c.NKV) * c.HD), AP, sp(P.gt), Q);
         gpu::unary(gpu::kop::sigmoid, sp(P.gt), sp(P.gs), T * Q, 1, 0);
         gpu::binary(gpu::kop::mul, ao, sp(P.gs), sp(P.gt), T * Q, 1, 0);
         ao = sp(P.gt);
+        if (a16) gpu::cvt_h16(ao, sp(P.at16), T * Q);
+      } else if (a16) {
+        gpu::merge_heads_h16(sp(P.ah), sp(P.at16), T, c.NH, c.HD);
+      } else {
+        gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, c.HD);
       }
-      gemm(ao, L.wo_row, ro, c.NE, Q);
+      gemm(ao, sp(P.at16), L.wo_row, ro, c.NE, Q);
     }
-    gpu::rmsnorm_res(ro, x, sp(L.fn), ro, sp(P.h2), c.NE, c.EPS, T);
-    gemm(sp(P.h2), L.wgu, sp(P.gu), 2 * c.FF, c.NE);
-    gpu::swiglu(sp(P.gu), sp(P.mb), c.FF, T);
-    gemm(sp(P.mb), L.wd_row, sp(P.md), c.NE, c.FF);
+    norm_res(ro, x, sp(L.fn), ro, sp(P.h2), sp(P.h216), false);
+    gemm(sp(P.h2), sp(P.h216), L.wgu, sp(P.gu), 2 * c.FF, c.NE);
+    if (a16) gpu::swiglu_h16(sp(P.gu), sp(P.mb16), c.FF, T);
+    else gpu::swiglu(sp(P.gu), sp(P.mb), c.FF, T);
+    gemm(sp(P.mb), sp(P.mb16), L.wd_row, sp(P.md), c.NE, c.FF);
     const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
-    gpu::rmsnorm_res(ro, sp(P.md), nextw, ro, sp(P.h), c.NE, c.EPS, T);
+    norm_res(ro, sp(P.md), nextw, ro, sp(P.h), sp(P.h16), l + 1 == c.NL);  // the logits read the last
     x = ro;
   }
   // Leaves P.h holding the final RMSNorm for every row of the chunk. Logits are

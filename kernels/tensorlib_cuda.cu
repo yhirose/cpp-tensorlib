@@ -20,7 +20,6 @@
 #include <cuda_bf16.h>  // __nv_bfloat16 + __bfloat162float (M7 storage widen)
 #include <cuda_fp16.h>
 #include <type_traits>  // __half: the prefill attention's tensor-core operands
-#include <mma.h>        // nvcuda::wmma: the prefill GEMM's tensor-core tiles
 
 extern "C" {
 
@@ -400,7 +399,7 @@ template <bool ADD>
 __device__ __forceinline__ void rmsnorm_core(
     const float* __restrict__ a, const float* __restrict__ b,
     const float* __restrict__ w, float* __restrict__ xout,
-    float* __restrict__ hout, unsigned n, float eps) {
+    float* __restrict__ hout, unsigned n, float eps, __half* __restrict__ h16 = nullptr) {
   extern __shared__ float sm[];
   const size_t base = (size_t)blockIdx.x * n;
   unsigned t = threadIdx.x, T = blockDim.x;
@@ -420,8 +419,11 @@ __device__ __forceinline__ void rmsnorm_core(
     __syncthreads();
   }
   float inv = 1.0f / sqrtf(sm[0] / (float)n + eps);
-  for (unsigned i = t; i < n; i += T)
-    hout[base + i] = (ADD ? xout[base + i] : a[base + i]) * inv * w[i];
+  for (unsigned i = t; i < n; i += T) {
+    const float h = (ADD ? xout[base + i] : a[base + i]) * inv * w[i];
+    if (hout) hout[base + i] = h;  // null: only the f16 copy is read
+    if (h16) h16[base + i] = __float2half(h);  // the f16 GEMM's operand
+  }
 }
 extern "C" __global__ void tl_rmsnorm(const float* __restrict__ x,
                                       const float* __restrict__ w,
@@ -437,6 +439,25 @@ extern "C" __global__ void tl_add_rmsnorm(const float* __restrict__ a,
                                           float eps) {
   rmsnorm_core<true>(a, b, w, xout, hout, n, eps);
 }
+// The same norms writing an f16 copy of their output beside it (or instead of
+// it, when the f32 pointer is null), for the GEMM that reads the activation as
+// f16 (own::gemm_bf16_nt_f16acc_a16).
+extern "C" __global__ void tl_rmsnorm_h16(const float* __restrict__ x,
+                                          const float* __restrict__ w,
+                                          float* __restrict__ out,
+                                          __half* __restrict__ out16, unsigned n,
+                                          float eps) {
+  rmsnorm_core<false>(x, nullptr, w, nullptr, out, n, eps, out16);
+}
+extern "C" __global__ void tl_add_rmsnorm_h16(const float* __restrict__ a,
+                                              const float* __restrict__ b,
+                                              const float* __restrict__ w,
+                                              float* __restrict__ xout,
+                                              float* __restrict__ hout,
+                                              __half* __restrict__ hout16,
+                                              unsigned n, float eps) {
+  rmsnorm_core<true>(a, b, w, xout, hout, n, eps, hout16);
+}
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 
 // SwiGLU straight out of the FUSED gate|up projection: gu is [rows, 2*ff] (row r
@@ -450,6 +471,21 @@ extern "C" __global__ void tl_swiglu(const float* __restrict__ gu,
   const size_t src = (size_t)blockIdx.y * 2u * ff + f;
   float g = gu[src];
   out[(size_t)blockIdx.y * ff + f] = (g / (1.0f + expf(-g))) * gu[src + ff];
+}
+// tl_swiglu writing only f16: the activation only the down GEMM reads.
+extern "C" __global__ void tl_swiglu_h16(const float* __restrict__ gu,
+                                         __half* __restrict__ out, unsigned ff) {
+  unsigned f = blockIdx.x * blockDim.x + threadIdx.x;
+  if (f >= ff) return;
+  const size_t src = (size_t)blockIdx.y * 2u * ff + f;
+  float g = gu[src];
+  out[(size_t)blockIdx.y * ff + f] = __float2half((g / (1.0f + expf(-g))) * gu[src + ff]);
+}
+// f32 -> f16, for an activation no fused producer rounds.
+extern "C" __global__ void tl_cvt_h16(const float* __restrict__ src,
+                                      __half* __restrict__ dst, unsigned n) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] = __float2half(src[i]);
 }
 
 // Tree-sum one value per thread through the block's shared `s`, handing every
@@ -871,6 +907,12 @@ extern "C" __global__ void tl_merge_heads(const float* __restrict__ src,
                                           unsigned H, unsigned D) {
   const unsigned h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
   dst[(size_t)t * H * D + h * D + d] = src[((size_t)h * T + t) * D + d];
+}
+extern "C" __global__ void tl_merge_heads_h16(const float* __restrict__ src,
+                                              __half* __restrict__ dst, unsigned T,
+                                              unsigned H, unsigned D) {
+  const unsigned h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+  dst[(size_t)t * H * D + h * D + d] = __float2half(src[((size_t)h * T + t) * D + d]);
 }
 
 // tl_pad/tl_fold's per-call shape/stride metadata is uploaded to a scratch
@@ -1779,150 +1821,200 @@ extern "C" __global__ void tl_gemm_bf16_nt_sk(const float* __restrict__ A,
   gemm_bf16_nt_core<64, true>(A, B, C, M, N, K, ksplit);
 }
 
-// The same product on the tensor cores: C[M,N] = A[M,K] . B[N,K]^T with A's
-// f32 activations rounded to bf16 as they are staged (bf16 for the range — an
-// activation outlier stays finite where f16 would overflow), B the bf16
-// weights as they are, and the sums f32. A BM x BN block tile in 32-deep K
-// slabs, a warp to each 32x32 of it (2x2 wmma 16x16x16 fragments). The next
-// slab is read into registers — 16-byte loads, so K % 8 == 0 and 16-byte
-// aligned rows — while the tensor cores run on the current one. Tails in M, N
-// or K are zero-filled as staged and masked as stored: a warp stores each
-// fragment to its own corner of shared memory and its lanes copy the cells
-// that fall inside C.
+// The same product on the tensor cores: C[M,N] = A[M,K] . B[N,K]^T over
+// mma.sync.m16n8k16, the operands read from shared memory with ldmatrix.
 //
-// F16 is the fast form: both operands rounded to f16 as staged (a bf16 weight
-// that came from an F16 file round-trips exactly) and the sums f16, which the
-// tensor cores here run at twice the f32 rate. f16's range is the price: an
+// A's f32 activations are rounded as they are staged, B is the bf16 weights.
+// F16 is the fast form: both operands rounded to f16 (a bf16 weight that came
+// from an F16 file round-trips exactly) and the sums f16, which the tensor
+// cores here run at twice the f32 rate; f16's range is the price: an
 // activation or a partial sum past 65504 becomes inf (own::gemm_bf16_nt_f16acc).
-template <int BM, int BN, bool F16>
-__device__ __forceinline__ void gemm_bf16_nt_tc_core(const float* __restrict__ A,
-                                                     const __nv_bfloat16* __restrict__ B,
-                                                     float* __restrict__ C, unsigned M,
-                                                     unsigned N, unsigned K) {
-  using namespace nvcuda;
-  using T = typename std::conditional<F16, __half, __nv_bfloat16>::type;   // operands
-  using ACC = typename std::conditional<F16, __half, float>::type;         // sums
-  constexpr int BK = 32, LD = BK + 8;          // +8: rows stay 16-byte aligned
-  constexpr int NT = (BM / 32) * (BN / 32) * 32;
-  constexpr int AV = BM * BK / 4 / NT;         // float4s of A a thread stages
-  constexpr int BV = BN * BK / 8 / NT;         // uint4s (8 bf16) of B
-  static_assert(AV >= 1 && BV >= 1, "tile too small for its threads");
-  // One buffer: the two slabs while the K loop runs, the output's staging after.
-  __shared__ __align__(32) T smem[(BM + BN) * LD];
-  auto As = reinterpret_cast<T(*)[LD]>(smem);
-  auto Bs = reinterpret_cast<T(*)[LD]>(smem + BM * LD);
+// Otherwise the operands are bf16 (the range an outlier needs) and the sums f32.
+//
+// A BM x BN block tile in BK-deep slabs, a warp to each WM x WN of it. Two
+// slabs live in shared memory, and the next one is read into registers (16-byte
+// loads, so K % 8 == 0 and 16-byte aligned rows) while the tensor cores run on
+// the current one: the conversion happens once per block as the slab is stored,
+// not once per warp as it is read. Two stages rather than three: the smaller
+// footprint lets two blocks share an SM, which was worth more than the depth
+// (QKV at M=512: 58 us against 83 for four stages of the same tile). Tails in
+// M, N or K are zero-filled as staged and masked as stored; N is even, as a
+// thread stores its two adjacent columns together.
+__device__ __forceinline__ void tc_ldsm4_(unsigned& r0, unsigned& r1, unsigned& r2,
+                                          unsigned& r3, const void* p) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "r"((unsigned)__cvta_generic_to_shared(p)));
+}
+// One m16n8k16 step, per operand type and accumulator.
+__device__ __forceinline__ void tc_mma_(unsigned* c, const unsigned* a, unsigned b0,
+                                        unsigned b1, __half) {  // f16 operands, f16 sums
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, "
+      "{%0,%1};\n"
+      : "+r"(c[0]), "+r"(c[1])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void tc_mma_(float* c, const unsigned* a, unsigned b0,
+                                        unsigned b1, __nv_bfloat16) {  // bf16 operands, f32 sums
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+      "{%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+// An accumulator's two adjacent columns of one row, as f32.
+__device__ __forceinline__ float2 tc_pair_(const unsigned* c, int row_half) {
+  return __half22float2(*reinterpret_cast<const __half2*>(&c[row_half]));
+}
+__device__ __forceinline__ float2 tc_pair_(const float* c, int row_half) {
+  return make_float2(c[2 * row_half], c[2 * row_half + 1]);
+}
+template <int BM, int BN, int BK, int WM, int WN, bool F16, bool AH = false>
+__device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
+                                                const __nv_bfloat16* __restrict__ B,
+                                                float* __restrict__ C, unsigned M,
+                                                unsigned N, unsigned K) {
+  static_assert(!AH || F16, "an f16 activation feeds the f16 form");
+  using T = typename std::conditional<F16, __half, __nv_bfloat16>::type;     // operands
+  using ACC = typename std::conditional<F16, unsigned, float>::type;         // sums
+  const float* A = static_cast<const float*>(Av);          // AH: really __half
+  const __half* Ah = static_cast<const __half*>(Av);
+  constexpr int LD = BK + 8;                    // +8: rows stay 16-byte aligned and
+                                                // ldmatrix reads hit distinct banks
+  constexpr int NT = (BM / WM) * (BN / WN) * 32;
+  constexpr int FM = WM / 16, FN = WN / 8, NA = F16 ? 2 : 4;
+  constexpr int AV = BM * BK / 8 / NT;          // 8-element vectors a thread stages
+  constexpr int BV = BN * BK / 8 / NT;
+  static_assert(AV >= 1 && BV >= 1 && FN % 2 == 0, "tile too small for its threads");
+  extern __shared__ __align__(16) unsigned char tc_smem[];
+  T* sm = reinterpret_cast<T*>(tc_smem);
+  auto As = [&](int s) { return sm + s * (BM + BN) * LD; };
+  auto Bs = [&](int s) { return sm + s * (BM + BN) * LD + BM * LD; };
   const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-  const unsigned wm = (warp / (BN / 32)) * 32, wn = (warp % (BN / 32)) * 32;
+  const unsigned wm = (warp / (BN / WN)) * WM, wn = (warp % (BN / WN)) * WN;
   const unsigned row0 = blockIdx.y * BM, col0 = blockIdx.x * BN;
-  wmma::fragment<wmma::accumulator, 16, 16, 16, ACC> acc[2][2];
+  ACC acc[FM][FN][NA];
 #pragma unroll
-  for (int i = 0; i < 2; i++)
+  for (int i = 0; i < FM; i++)
 #pragma unroll
-    for (int j = 0; j < 2; j++) wmma::fill_fragment(acc[i][j], ACC(0.0f));
-  float4 ra[AV];
+    for (int j = 0; j < FN; j++)
+#pragma unroll
+      for (int e = 0; e < NA; e++) acc[i][j][e] = ACC(0);
+  float4 ra[AV][AH ? 1 : 2];  // 8 values a vector: 2 float4s, or 8 halves in one
   uint4 rb[BV];
-  // Vector v of a thread: row v_id / (BK/w), column (v_id % (BK/w)) * w, for
-  // w elements a vector (4 floats, 8 bf16).
+  // Vector id of a thread: row id / (BK/8), column (id % (BK/8)) * 8.
   auto load = [&](unsigned k0) {
 #pragma unroll
     for (int v = 0; v < AV; v++) {
-      const unsigned id = tid + v * NT, r = id / (BK / 4), c = (id % (BK / 4)) * 4;
-      const unsigned gr = row0 + r, gk = k0 + c;
-      ra[v] = gr < M && gk < K ? *reinterpret_cast<const float4*>(A + (size_t)gr * K + gk)
-                               : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      const unsigned id = tid + v * NT, gr = row0 + id / (BK / 8), gk = k0 + (id % (BK / 8)) * 8;
+      const bool ok = gr < M && gk < K;
+      if constexpr (AH) {  // 8 halves in the first 16 bytes
+        ra[v][0] = ok ? *reinterpret_cast<const float4*>(Ah + (size_t)gr * K + gk)
+                      : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      } else {
+        const float4* p = reinterpret_cast<const float4*>(A + (size_t)gr * K + gk);
+        ra[v][0] = ok ? p[0] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        ra[v][1] = ok ? p[1] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      }
     }
 #pragma unroll
     for (int v = 0; v < BV; v++) {
-      const unsigned id = tid + v * NT, r = id / (BK / 8), c = (id % (BK / 8)) * 8;
-      const unsigned gn = col0 + r, gk = k0 + c;
+      const unsigned id = tid + v * NT, gn = col0 + id / (BK / 8), gk = k0 + (id % (BK / 8)) * 8;
       rb[v] = gn < N && gk < K ? *reinterpret_cast<const uint4*>(B + (size_t)gn * K + gk)
                                : make_uint4(0u, 0u, 0u, 0u);
     }
   };
-  auto stage = [&]() {
+  auto stage = [&](int s) {
 #pragma unroll
     for (int v = 0; v < AV; v++) {
-      const unsigned id = tid + v * NT, r = id / (BK / 4), c = (id % (BK / 4)) * 4;
-      if constexpr (F16) {
-        *reinterpret_cast<__half2*>(&As[r][c]) = __floats2half2_rn(ra[v].x, ra[v].y);
-        *reinterpret_cast<__half2*>(&As[r][c + 2]) = __floats2half2_rn(ra[v].z, ra[v].w);
+      const unsigned id = tid + v * NT;
+      T* d = As(s) + (id / (BK / 8)) * LD + (id % (BK / 8)) * 8;
+      if constexpr (AH) {
+        *reinterpret_cast<float4*>(d) = ra[v][0];
       } else {
-        *reinterpret_cast<__nv_bfloat162*>(&As[r][c]) = __floats2bfloat162_rn(ra[v].x, ra[v].y);
-        *reinterpret_cast<__nv_bfloat162*>(&As[r][c + 2]) = __floats2bfloat162_rn(ra[v].z, ra[v].w);
+        const float* f = reinterpret_cast<const float*>(&ra[v][0]);
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+          if constexpr (F16) *reinterpret_cast<__half2*>(d + 2 * q) = __floats2half2_rn(f[2 * q], f[2 * q + 1]);
+          else *reinterpret_cast<__nv_bfloat162*>(d + 2 * q) = __floats2bfloat162_rn(f[2 * q], f[2 * q + 1]);
+        }
       }
     }
 #pragma unroll
     for (int v = 0; v < BV; v++) {
-      const unsigned id = tid + v * NT, r = id / (BK / 8), c = (id % (BK / 8)) * 8;
+      const unsigned id = tid + v * NT;
+      T* d = Bs(s) + (id / (BK / 8)) * LD + (id % (BK / 8)) * 8;
       if constexpr (F16) {
         const __nv_bfloat162* w = reinterpret_cast<const __nv_bfloat162*>(&rb[v]);
 #pragma unroll
         for (int q = 0; q < 4; q++)
-          *reinterpret_cast<__half2*>(&Bs[r][c + 2 * q]) = __float22half2_rn(__bfloat1622float2(w[q]));
+          *reinterpret_cast<__half2*>(d + 2 * q) = __float22half2_rn(__bfloat1622float2(w[q]));
       } else {
-        *reinterpret_cast<uint4*>(&Bs[r][c]) = rb[v];
+        *reinterpret_cast<uint4*>(d) = rb[v];
       }
     }
   };
+  // ldmatrix lanes: A is a 16x16 tile (lane -> row lane%16, column half lane/16);
+  // B ([n][k]) two n8 blocks by two k halves.
+  const unsigned la_r = lane & 15, la_c = (lane >> 4) * 8;
+  const unsigned lb_r = (lane & 7) + ((lane >> 4) << 3), lb_c = ((lane >> 3) & 1) * 8;
+  const unsigned nk = (K + BK - 1) / BK;
   load(0);
-  for (unsigned k0 = 0; k0 < K; k0 += BK) {
-    stage();
-    __syncthreads();
-    if (k0 + BK < K) load(k0 + BK);  // in flight while this slab multiplies
+  stage(0);
+  __syncthreads();
+  for (unsigned kt = 0; kt < nk; kt++) {
+    if (kt + 1 < nk) load((kt + 1) * BK);  // in flight while this slab multiplies
+    const T* a = As(kt & 1);
+    const T* b = Bs(kt & 1);
 #pragma unroll
     for (int kk = 0; kk < BK; kk += 16) {
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, T, wmma::row_major> fa[2];
-      wmma::fragment<wmma::matrix_b, 16, 16, 16, T, wmma::col_major> fb[2];
+      unsigned fa[FM][4], fb[FN][2];
 #pragma unroll
-      for (int i = 0; i < 2; i++) wmma::load_matrix_sync(fa[i], &As[wm + 16 * i][kk], LD);
+      for (int i = 0; i < FM; i++)
+        tc_ldsm4_(fa[i][0], fa[i][1], fa[i][2], fa[i][3], a + (wm + 16 * i + la_r) * LD + kk + la_c);
 #pragma unroll
-      for (int j = 0; j < 2; j++) wmma::load_matrix_sync(fb[j], &Bs[wn + 16 * j][kk], LD);
+      for (int j = 0; j < FN; j += 2)
+        tc_ldsm4_(fb[j][0], fb[j][1], fb[j + 1][0], fb[j + 1][1], b + (wn + 8 * j + lb_r) * LD + kk + lb_c);
 #pragma unroll
-      for (int i = 0; i < 2; i++)
+      for (int i = 0; i < FM; i++)
 #pragma unroll
-        for (int j = 0; j < 2; j++) wmma::mma_sync(acc[i][j], fa[i], fb[j], acc[i][j]);
+        for (int j = 0; j < FN; j++) tc_mma_(acc[i][j], fa[i], fb[j][0], fb[j][1], T());
     }
+    if (kt + 1 < nk) stage((kt + 1) & 1);  // the other buffer: nobody reads it now
     __syncthreads();
   }
-  // The slabs are free now: each warp takes 16x16 sums for its fragments.
-  static_assert((BM + BN) * LD * sizeof(T) >= NT / 32 * 16 * 16 * sizeof(ACC),
-                "no room to stage the output");
-  ACC* cs = reinterpret_cast<ACC*>(smem) + warp * 256;
+  // m16n8 accumulator: row lane/4 (+8), columns 2*(lane%4) + 0/1.
+  const unsigned g = lane >> 2, t = lane & 3;
 #pragma unroll
-  for (int i = 0; i < 2; i++)
+  for (int i = 0; i < FM; i++)
 #pragma unroll
-    for (int j = 0; j < 2; j++) {
-      wmma::store_matrix_sync(cs, acc[i][j], 16, wmma::mem_row_major);
-      __syncwarp();
-      const unsigned gr0 = row0 + wm + 16 * i, gc0 = col0 + wn + 16 * j;
-#pragma unroll
-      for (int e = lane; e < 256; e += 32) {
-        const unsigned gr = gr0 + e / 16, gc = gc0 + e % 16;
-        if (gr < M && gc < N) C[(size_t)gr * N + gc] = static_cast<float>(cs[e]);
-      }
-      __syncwarp();
+    for (int j = 0; j < FN; j++) {
+      const unsigned gr = row0 + wm + 16 * i + g, gc = col0 + wn + 8 * j + 2 * t;
+      if (gc >= N) continue;
+      if (gr < M) *reinterpret_cast<float2*>(C + (size_t)gr * N + gc) = tc_pair_(acc[i][j], 0);
+      if (gr + 8 < M) *reinterpret_cast<float2*>(C + (size_t)(gr + 8) * N + gc) = tc_pair_(acc[i][j], 1);
     }
 }
-extern "C" __global__ void tl_gemm_bf16_nt_tc(const float* __restrict__ A,
-    const __nv_bfloat16* __restrict__ B, float* __restrict__ C, unsigned M,
-    unsigned N, unsigned K) {
-  gemm_bf16_nt_tc_core<128, 128, false>(A, B, C, M, N, K);
-}
-extern "C" __global__ void tl_gemm_bf16_nt_tc_s(const float* __restrict__ A,
-    const __nv_bfloat16* __restrict__ B, float* __restrict__ C, unsigned M,
-    unsigned N, unsigned K) {
-  gemm_bf16_nt_tc_core<64, 64, false>(A, B, C, M, N, K);
-}
-extern "C" __global__ void tl_gemm_f16acc_tc(const float* __restrict__ A,
-    const __nv_bfloat16* __restrict__ B, float* __restrict__ C, unsigned M,
-    unsigned N, unsigned K) {
-  gemm_bf16_nt_tc_core<128, 128, true>(A, B, C, M, N, K);
-}
-extern "C" __global__ void tl_gemm_f16acc_tc_s(const float* __restrict__ A,
-    const __nv_bfloat16* __restrict__ B, float* __restrict__ C, unsigned M,
-    unsigned N, unsigned K) {
-  gemm_bf16_nt_tc_core<64, 64, true>(A, B, C, M, N, K);
-}
+// Three tiles, picked by how well the grid fills the GPU (own::gemm_tc_tile_):
+// L 128x128 for wide outputs, M 64x128 and S 64x64 for narrow ones. Dynamic
+// shared memory, (BM+BN)*(BK+8)*2 stages*2 bytes: 40/55/37 KB.
+#define TL_GEMM_TC(NAME, BM, BN, BK, WM, WN, F16, AH)                                \
+  extern "C" __global__ void NAME(const void* __restrict__ A,                        \
+      const __nv_bfloat16* __restrict__ B, float* __restrict__ C, unsigned M,        \
+      unsigned N, unsigned K) {                                                      \
+    gemm_nt_tc_core<BM, BN, BK, WM, WN, F16, AH>(A, B, C, M, N, K);                      \
+  }
+TL_GEMM_TC(tl_gemm_tc_f32_l, 128, 128, 32, 64, 64, false, false)
+TL_GEMM_TC(tl_gemm_tc_f32_m, 64, 128, 64, 32, 32, false, false)
+TL_GEMM_TC(tl_gemm_tc_f32_s, 64, 64, 64, 32, 32, false, false)
+TL_GEMM_TC(tl_gemm_tc_f16_l, 128, 128, 32, 64, 64, true, false)
+TL_GEMM_TC(tl_gemm_tc_f16_m, 64, 128, 64, 32, 32, true, false)
+TL_GEMM_TC(tl_gemm_tc_f16_s, 64, 64, 64, 32, 32, true, false)
+TL_GEMM_TC(tl_gemm_tc_f16h_l, 128, 128, 32, 64, 64, true, true)
+TL_GEMM_TC(tl_gemm_tc_f16h_m, 64, 128, 64, 32, 32, true, true)
+TL_GEMM_TC(tl_gemm_tc_f16h_s, 64, 64, 64, 32, 32, true, true)
+#undef TL_GEMM_TC
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 
 // ---- M7 decode GEMV: y[n] = sum_k a[k] * B[k,n], F32 accumulate ----

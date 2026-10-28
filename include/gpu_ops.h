@@ -1066,6 +1066,42 @@ inline bool gemm_bf16_nt_f16acc(span A, span B, span C, int64_t M, int64_t N,
   return gemm_bf16_nt<Own>(A, B, C, M, N, K);
 }
 
+// The f16 prefill's activations, rounded where they are made so the GEMM does
+// not round them again in every block that reads them (CUDA only: a backend
+// without them answers false, and `f16_activations` says which). The norms
+// write the f16 copy beside the f32 output; swiglu and merge_heads write only
+// f16, their f32 form being read by nothing else. Spans of an f16 buffer are
+// byte offsets like any other; the buffer is sized in floats, half as many.
+TL_GPU_DETECT_OWN(gemm_bf16_nt_f16acc_a16)
+TL_GPU_DETECT_OWN(rmsnorm_h16)
+TL_GPU_DETECT_OWN(rmsnorm_res_h16)
+TL_GPU_DETECT_OWN(swiglu_h16)
+TL_GPU_DETECT_OWN(merge_heads_h16)
+TL_GPU_DETECT_OWN(cvt_h16)
+inline constexpr bool f16_activations = has_gemm_bf16_nt_f16acc_a16;
+#define TL_GPU_F16_OP(NAME, SIG, CALL)                                  \
+  template <class Own = own>                                            \
+  inline bool NAME SIG {                                                \
+    if constexpr (detail::owns_##NAME<Own>::value) {                    \
+      return detail::ran(Own::NAME CALL);                               \
+    } else {                                                            \
+      return false;                                                     \
+    }                                                                   \
+  }
+TL_GPU_F16_OP(gemm_bf16_nt_f16acc_a16, (span A, span B, span C, int64_t M, int64_t N, int64_t K),
+              (A, B, C, M, N, K))
+TL_GPU_F16_OP(rmsnorm_h16, (span x, span w, span o, span o16, int64_t n, float eps, int64_t rows),
+              (x, w, o, o16, n, eps, rows))
+TL_GPU_F16_OP(rmsnorm_res_h16,
+              (span x, span delta, span w, span xout, span hout, span hout16, int64_t n, float eps,
+               int64_t rows),
+              (x, delta, w, xout, hout, hout16, n, eps, rows))
+TL_GPU_F16_OP(swiglu_h16, (span gu, span o16, int64_t ff, int64_t rows), (gu, o16, ff, rows))
+TL_GPU_F16_OP(merge_heads_h16, (span src, span dst16, int64_t T, int64_t H, int64_t D),
+              (src, dst16, T, H, D))
+TL_GPU_F16_OP(cvt_h16, (span src, span dst16, int64_t n), (src, dst16, n))
+#undef TL_GPU_F16_OP
+
 // One decode step: q [n_q_heads, D] against a [n_kv_heads, kv_max, D] cache
 // read over [0, ctx). GQA by the head ratio; the cache is f32 or bf16.
 TL_GPU_DETECT_OWN(attn_decode)
