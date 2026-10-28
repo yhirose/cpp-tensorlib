@@ -90,11 +90,17 @@ int main(int argc, char** argv) {
   qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false, !f32acc,
                            /*quant=*/qm::quant_file(m) && !std::getenv("TL_DEQUANT"));
   const auto* t = m.tensor("blk.0.ffn_up.weight");
+  const char* file = !t                                          ? "?"
+                     : t->type == qm::gg::ggml_type::bf16        ? "BF16"
+                     : t->type == qm::gg::ggml_type::f16         ? "F16"
+                     : t->type == qm::gg::ggml_type::q4_k        ? "Q4_K"
+                     : t->type == qm::gg::ggml_type::q6_k        ? "Q6_K"
+                     : t->type == qm::gg::ggml_type::q8_0        ? "Q8_0"
+                                                                 : "other";
   std::printf("%s | %s | %lld layers | weights %s (file %s) | depth %lld | prefill sums %s\n",
               argv[1], M.c.arch.c_str(), (long long)M.c.NL,
-              M.outwT.dt() == tl::dtype::bf16 ? "bf16" : "f32",
-              t && t->type == qm::gg::ggml_type::bf16 ? "BF16" : "F16", (long long)d,
-              M.f16_acc ? "f16" : "f32");
+              M.quant ? "quantized blocks" : M.outwT.dt() == tl::dtype::bf16 ? "bf16" : "f32", file,
+              (long long)d, M.f16_acc ? "f16" : "f32");
   std::printf("| test     |       t/s (mean ± sd) |   t/s (med) |\n");
   const std::string pp = "pp" + std::to_string(P), tg = "tg" + std::to_string(N);
   row(pp.c_str(), P, reps, [&] { return pp_ms(M, P, d); });

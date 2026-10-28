@@ -327,7 +327,9 @@ LLM inference
 
 `bench/models/chat_qwen.cpp` is the end-to-end proof of the header-only,
 zero-dependency, cross-platform claims above: it loads a real Qwen2.5,
-Qwen3 or Qwen3.5 GGUF model (F16 or BF16) and chats, using nothing but this library's own
+Qwen3 or Qwen3.5 GGUF model (F16, BF16, or quantized as Q4_K / Q6_K / Q8_0 blocks,
+which stay quantized on the device: Qwen3.8-27B Q4_K_M, 17.7 GiB, runs on a 24 GB
+RTX 3090) and chats, using nothing but this library's own
 kernels — own GGUF v3 reader (`include/gguf.h`), own GPT-2-byte-BPE
 tokenizer (`include/tokenizer.h`), and own CUDA prefill/decode kernels. No
 GGML, no llama.cpp, no third-party inference runtime anywhere in the path.
@@ -351,7 +353,8 @@ Decode started at 3.5 tok/s and reached ~460 by removing host-side graph
 construction, then per-launch overhead, then GEMV inefficiency. Against
 llama.cpp on the same files and GPU, decode is at parity or ahead for
 Qwen2.5, Qwen3 and Qwen3.5, with or without 2048 tokens cached, and prefill
-is 1.1-1.5x behind (both now sum the prefill's products in f16 by default):
+is at parity at 512 tokens and up to 1.3x behind with 2048 cached (both sum the
+prefill's products in f16 by default):
 [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md) has the numbers,
 what differs between the two runs, and how to reproduce them.
 

@@ -53,6 +53,35 @@ products, f32); what is left there is the chunk prep, ~2.5 ms of a 512-token
 prompt, which is not on the tensor cores, and the scan, bound by a chain of
 ~8 barriers per chunk.
 
+## Quantized files
+
+A GGUF whose projections are Q4_K, Q6_K or Q8_0 blocks keeps them as blocks on
+the device (uploaded from the file's mapping, never through a host copy): the
+decode GEMVs and the prefill GEMM's B staging dequantize as they read, as ggml
+does (bit for bit, checked over every quantized value of Qwen3.8-27B's file). The
+decode is bound by the bytes it reads, so this is what lets a 27B model's 17.7 GiB
+sit on a 24 GB card. Each row is one invocation of each engine (3 rounds), not
+alternated, so a few percent of noise is in the ratios.
+
+| model (GGUF) | test | tensorlib | llama.cpp | ratio |
+|---|---|---:|---:|---:|
+| Qwen3-0.6B Q4_K_M | tg128 | 448 | 528 | 0.85 |
+| | pp512 | 23,700 | 28,900 | 0.82 |
+| Qwen3.5-0.8B Q4_K_M | tg128 | 432 | 439 | 0.98 |
+| | pp512 | 18,200 | 25,900 | 0.70 |
+| Qwen3.5-0.8B Q8_0 | tg128 | 469 | 389 | 1.20 |
+| | pp512 | 20,200 | 28,300 | 0.71 |
+| Qwen3.8-27B Q4_K_M | tg128 | 24.9 | 38.1 | 0.65 |
+| | pp512 | 789 | 1,564 | 0.50 |
+
+Qwen3.8-27B is a Qwen3.5 architecture: 64 layers, 48 of them Gated DeltaNet with
+16 q / k heads for 48 value heads (value head h reads key head h % 16, the order
+the GGUF conversion stores them in), attention with 24 q / 4 kv heads of 256.
+Its Q4_K_M holds the MLP in Q4_K, `attn_output` and `output` in Q6_K and every
+other projection in Q8_0. At 25 tok/s it reads ~470 GB/s of the card's ~890;
+llama.cpp reaches ~720. The prefill dequantizes in the GEMM's staging, so each
+weight tile is dequantized once per row block of the activation rather than once.
+
 ## Accumulation precision
 
 **This was most of the prefill gap.** llama.cpp multiplies F16 weights
