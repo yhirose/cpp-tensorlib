@@ -65,22 +65,29 @@ alternated, so a few percent of noise is in the ratios.
 
 | model (GGUF) | test | tensorlib | llama.cpp | ratio |
 |---|---|---:|---:|---:|
-| Qwen3-0.6B Q4_K_M | tg128 | 448 | 528 | 0.85 |
+| Qwen3-0.6B Q4_K_M | tg128 | 519 | 528 | 0.98 |
 | | pp512 | 23,700 | 28,900 | 0.82 |
-| Qwen3.5-0.8B Q4_K_M | tg128 | 432 | 439 | 0.98 |
+| Qwen3.5-0.8B Q4_K_M | tg128 | 500 | 439 | 1.14 |
 | | pp512 | 18,200 | 25,900 | 0.70 |
 | Qwen3.5-0.8B Q8_0 | tg128 | 469 | 389 | 1.20 |
 | | pp512 | 20,200 | 28,300 | 0.71 |
-| Qwen3.8-27B Q4_K_M | tg128 | 24.9 | 38.1 | 0.65 |
+| Qwen3.8-27B Q4_K_M | tg128 | 35.6 | 38.1 | 0.93 |
 | | pp512 | 789 | 1,564 | 0.50 |
 
 Qwen3.8-27B is a Qwen3.5 architecture: 64 layers, 48 of them Gated DeltaNet with
 16 q / k heads for 48 value heads (value head h reads key head h % 16, the order
 the GGUF conversion stores them in), attention with 24 q / 4 kv heads of 256.
 Its Q4_K_M holds the MLP in Q4_K, `attn_output` and `output` in Q6_K and every
-other projection in Q8_0. At 25 tok/s it reads ~470 GB/s of the card's ~890;
-llama.cpp reaches ~720. The prefill dequantizes in the GEMM's staging, so each
-weight tile is dequantized once per row block of the activation rather than once.
+other projection in Q8_0. The Q4_K GEMV (the MLP, half the bytes) reads the
+activation as int8, as llama.cpp's does: quantized once per call to 8 bits per
+32 values, then `dp4a`. With the activation as float that GEMV ran at ~450 GB/s,
+held back by the activation loads (8 `float4` a lane for every 32 weights), where
+the weights alone stream at ~850; on int8 it runs at ~750 and the 27B's decode
+goes from 24.9 to 35.6 tok/s. The price is the 8-bit rounding of the activation
+(`TL_NO_Q8ACT=1` turns it off; `check_quant` bounds both against the dequantized
+oracle). The Q8_0 and Q6_K GEMVs already ran at 700-850 GB/s on float activations
+and are unchanged. The prefill dequantizes in the GEMM's staging, so each weight
+tile is dequantized once per row block of the activation rather than once.
 
 ## Accumulation precision
 

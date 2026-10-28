@@ -575,7 +575,7 @@ struct context {
     return cached_(gemm_bf16_nt_sk_fn, "tl_gemm_bf16_nt_sk");
   }
   CUfunction rmsnorm_rope_fn = nullptr, gemv_q4k_fn = nullptr, gemv_q6k_fn = nullptr,
-             gemv_q80_fn = nullptr;
+             gemv_q80_fn = nullptr, quant_act_fn = nullptr, gemv_q4k_q8_fn = nullptr;
   CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, swiglu_h16_fn = nullptr,
              merge_heads_h16_fn = nullptr, cvt_h16_fn = nullptr;  // the f16 activation's producers
   CUfunction conv_tok_fn = nullptr, conv_state_fn = nullptr;  // a prefill's conv
@@ -915,6 +915,11 @@ struct own {
   // x[rows, D] RMS-normalized by w and then rotated, in place (rows = heads * T).
   static bool rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T, int64_t D,
                            int64_t pos, float base, int64_t rot, float eps);
+  // The activation a[K] quantized to int8 blocks of 32 (K int8, then K/32 float2 of
+  // scale and sum) into qa, and Q4_K rows dotted with it (dp4a): the Q4_K GEMV
+  // with the activation's bytes cut four-fold. K % 256 == 0.
+  static bool quantize_act_q8(gpu::span a, gpu::span qa, int64_t k);
+  static bool gemv_q4k_q8(gpu::span qa, gpu::span W, gpu::span y, int64_t n, int64_t k);
   // C[m, ldc-strided n columns] = A[m,K] . W[n,K]^T over GGUF block-quantized rows (type 12
   // Q4_K, 14 Q6_K, 8 Q8_0). a16: A is f16 and the sums f16, else A is f32 and the sums f32
   // (the exact form). K % 256 == 0, n even.
@@ -1864,6 +1869,37 @@ inline bool own::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::s
                       (unsigned)m, (unsigned)n, (unsigned)k, (unsigned)ldc,
                       type == 12 ? context::tc_weight::q4k
                       : type == 14 ? context::tc_weight::q6k : context::tc_weight::q80);
+}
+
+inline bool own::quantize_act_q8(gpu::span a, gpu::span qa, int64_t k) {
+  auto& c = context::get();
+  if (!c.ready || k <= 0 || k % 256) return false;
+  float* pa = context::off_(a.buf, a.off);
+  float* pq = context::off_(qa.buf, qa.off);
+  if ((uintptr_t)pa % 16 || (uintptr_t)pq % 16) return false;
+  c.device_read_(a.buf);
+  c.device_write_(qa.buf);
+  const unsigned nblk = (unsigned)(k / 32);
+  return c.launch_(c.cached_(c.quant_act_fn, "tl_quant_act_q8"), {(nblk + 7) / 8}, {256}, 0, pa,
+                   reinterpret_cast<signed char*>(pq),
+                   reinterpret_cast<void*>(reinterpret_cast<char*>(pq) + k), nblk);
+}
+
+inline bool own::gemv_q4k_q8(gpu::span qa, gpu::span W, gpu::span y, int64_t n, int64_t k) {
+  auto& c = context::get();
+  if (!c.ready || n <= 0 || k <= 0 || k % 256) return false;
+  float* pq = context::off_(qa.buf, qa.off);
+  if ((uintptr_t)pq % 16) return false;
+  c.device_read_(qa.buf);
+  c.device_read_(W.buf);
+  c.device_write_(y.buf);
+  constexpr unsigned rows_per_block = 4;
+  return c.launch_(c.cached_(c.gemv_q4k_q8_fn, "tl_gemv_q4k_q8_row"),
+                   {((unsigned)n + rows_per_block - 1) / rows_per_block}, {rows_per_block * 32}, 0,
+                   reinterpret_cast<signed char*>(pq),
+                   reinterpret_cast<void*>(reinterpret_cast<char*>(pq) + k),
+                   reinterpret_cast<unsigned char*>(context::off_(W.buf, W.off)),
+                   context::off_(y.buf, y.off), (unsigned)n, (unsigned)k);
 }
 
 inline bool own::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n,

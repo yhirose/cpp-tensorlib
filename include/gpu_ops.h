@@ -1085,6 +1085,28 @@ inline bool gemm_quant(int type, bool a16, span A, span W, span C, int64_t m, in
   }
 }
 
+// The activation quantized to int8 blocks (see own::quantize_act_q8 in cuda.h) and
+// the Q4_K GEMV that reads it; false where the backend has no such pair.
+TL_GPU_DETECT_OWN(quantize_act_q8)
+TL_GPU_DETECT_OWN(gemv_q4k_q8)
+template <class Own = own>
+inline bool quantize_act_q8(span a, span qa, int64_t k) {
+  if constexpr (detail::owns_quantize_act_q8<Own>::value) {
+    return detail::ran(Own::quantize_act_q8(a, qa, k));
+  } else {
+    return false;
+  }
+}
+template <class Own = own>
+inline bool gemv_q4k_q8(span qa, span W, span y, int64_t n, int64_t k) {
+  if constexpr (detail::owns_gemv_q4k_q8<Own>::value) {
+    return detail::ran(Own::gemv_q4k_q8(qa, W, y, n, k));
+  } else {
+    return false;
+  }
+}
+inline constexpr bool int8_activations = has_gemv_q4k_q8 && has_quantize_act_q8;
+
 // y[n] = W[n,K] . a with W the rows of a GGUF block-quantized weight (type = ggml_type
 // code: 12 Q4_K, 14 Q6_K, 8 Q8_0), read as quantized. False where the backend has no
 // such kernel; the caller dequantizes instead.

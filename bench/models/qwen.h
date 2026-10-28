@@ -356,10 +356,20 @@ struct qmat {
   explicit operator bool() const { return !parts.empty(); }
 };
 
-// y = Q . a, a GEMV a run.
-inline void gemv_q(const qmat& Q, gpu::span a, gpu::span y) {
-  for (const auto& p : Q.parts)
-    gpu::gemv_quant(p.type, a, sp(Q.raw).at(p.byte_off), y.at(p.row_off * 4), p.rows, Q.K);
+// y = Q . a, a GEMV a run. With `qa` (scratch for the int8-quantized activation, K
+// bytes + K/8) the Q4_K runs read the activation as int8 (quantized once for the
+// call), which is what makes them run at the weights' bandwidth rather than the
+// float activation loads'; the other formats read it as float.
+inline void gemv_q(const qmat& Q, gpu::span a, gpu::span y, gpu::span qa = {}) {
+  bool quantized = false;
+  for (const auto& p : Q.parts) {
+    const gpu::span w = sp(Q.raw).at(p.byte_off), out = y.at(p.row_off * 4);
+    if (p.type == 12 && qa.buf && (quantized || gpu::quantize_act_q8(a, qa, Q.K))) {
+      quantized = true;
+      if (gpu::gemv_q4k_q8(qa, w, out, p.rows, Q.K)) continue;
+    }
+    gpu::gemv_quant(p.type, a, w, out, p.rows, Q.K);
+  }
 }
 
 // Whether every tensor of the parts is a block-quantized whose rows (in) are whole blocks.
@@ -470,6 +480,7 @@ struct Layer {
 // (qkvb, gub).
 struct Scratch {
   storage res[2];       // residual ping-pong [NE]
+  storage qact;         // the int8-quantized activation of a Q4_K GEMV (K bytes + K/8)
   storage hb;           // input-norm out [NE]
   storage h2b;          // post-attn norm out [NE]
   storage qb;           // [NH*HD] query fixture (bench_qwen_ctx's isolated-
@@ -489,6 +500,10 @@ struct Scratch {
   storage embed;        // staged embedding row [NE] (the step's input)
   std::vector<float> embed_stage;  // host gather target, uploaded into embed
   void init(const Config& c) {
+    {  // the widest input of a Q4_K GEMV: K int8, then K/32 (scale, sum) pairs
+      const int64_t k = std::max(c.NE, c.FF);
+      qact = scratch_f32((k + k / 32 * 8 + 3) / 4);
+    }
     embed = scratch_f32(c.NE);
     embed_stage.assign(c.NE, 0.0f);
     logits = scratch_f32(c.VOCAB);
@@ -588,6 +603,7 @@ struct Model {
   array outwT_q4;             // q4 lm_head (imperative, when q4_lmhead); outwT
                               // stays bf16 as the array-path oracle
   qmat qout;                  // the lm_head as block-quantized blocks (Model.quant); outwT is empty
+  bool q8act = false;         // Q4_K GEMVs read the activation as int8 (dp4a); else float
   bool quant = false;         // the projections are block-quantized blocks, read as such
   std::vector<Layer> layers;
   Scratch scratch;
@@ -951,6 +967,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
       .outwT_q4 =
           q4lm ? load_w_T(m, c.output_name(), c.NE, c.VOCAB, f32).to_q4() : array{},
       .qout = nat ? load_q_cat(m, {{c.output_name(), c.VOCAB}}, c.NE) : qmat{},
+      .q8act = nat && gpu::int8_activations && !std::getenv("TL_NO_Q8ACT"),
       .quant = nat,
       .row = row,
       .q4_mlp = q4m,
@@ -1274,8 +1291,9 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
   // layout is identical either way (contiguous [n]), so the fused-output slices
   // below are unchanged.
   const bool row = M.row;
+  const bool q8act = M.q8act;
   auto gv = [&](const array& W, const qmat& Q, gpu::span a, gpu::span y, int64_t n, int64_t k) {
-    if (Q) gemv_q(Q, a, y);
+    if (Q) gemv_q(Q, a, y, q8act ? sp(S.qact) : gpu::span{});
     else if (row) gpu::gemv_bf16_row(a, sp(W), y, n, k);
     else gemv_w(W, a, y, n, k);
   };

@@ -3469,6 +3469,41 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     }
   }
 
+  SUBCASE("Q4_K GEMV on int8 activations against the float one") {
+    // The activation rounded to 8 bits per 32 values (llama.cpp's q8_1): the
+    // result differs from the float kernel's by that rounding, ~0.5% of the
+    // result's rms on random data, and not by more.
+    const int64_t N = 41, K = 2048, nb = K / 256, bb = 144;
+    std::mt19937 rng(77);
+    std::vector<unsigned char> bytes((size_t)N * nb * bb);
+    for (auto& b : bytes) b = (unsigned char)rng();
+    for (int64_t i = 0; i < N * nb; i++)
+      for (size_t at : {(size_t)i * bb, (size_t)i * bb + 2}) {
+        const uint16_t h = (uint16_t)(0x2800 + (rng() & 0x3ff));
+        std::memcpy(&bytes[at], &h, 2);
+      }
+    std::vector<float> packed((bytes.size() + 3) / 4);
+    std::memcpy(packed.data(), bytes.data(), bytes.size());
+    array W = dev(array::from(std::move(packed), {(int64_t)((bytes.size() + 3) / 4)}));
+    array a = dev(random_array({K}, 1077));
+    array qa = array::empty({K / 4 + K / 32 * 2});  // K int8, then K/32 (scale, sum)
+    array yf = array::empty({N}), yq = array::empty({N});
+    REQUIRE(gpu::gemv_quant(12, a.device_span(), W.device_span(), yf.device_span(), N, K));
+    REQUIRE(gpu::quantize_act_q8(a.device_span(), qa.device_span(), K));
+    REQUIRE(gpu::gemv_q4k_q8(qa.device_span(), W.device_span(), yq.device_span(), N, K));
+    tl::gpu::flush();
+    yf.eval();
+    yq.eval();
+    double sq = 0, ref = 0;
+    for (int64_t n = 0; n < N; n++) {
+      const double d = yq.raw()[n] - yf.raw()[n];
+      sq += d * d;
+      ref += (double)yf.raw()[n] * yf.raw()[n];
+    }
+    CHECK(std::sqrt(sq / ref) < 2e-2);
+    CHECK(std::sqrt(sq / ref) > 0);  // it is a different computation, not a copy
+  }
+
   SUBCASE("rope, split_heads, merge_heads and argmax") {
     const int64_t H = 14, T = 5, D = 64, ld = H * D;
     array x = dev(random_array({H * T, D}, 970)), b = dev(random_array({H * T, D}, 971));

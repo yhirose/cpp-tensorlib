@@ -2281,6 +2281,81 @@ __global__ void tl_gemv_q4k_row(const float* __restrict__ a, const unsigned char
   gemv_row_block_store(acc, lane, warp, nwarps, y + n);
 }
 
+// ---- Q4_K . int8 activations (llama.cpp's q8_1 scheme, and what its Q4_K GEMV does).
+// The float kernel above spends its time on the activation loads: 8 float4 for
+// every 32 weights, each instruction spread over several cache lines (a Q4_K
+// GEMV at ~450 GB/s where the weights alone stream at ~850). Quantizing the
+// activation once per call to int8 (a scale d = max|x| / 127 per 32 values, and
+// the sum of the original 32, which the K-quants' min terms multiply) cuts those
+// bytes four-fold and turns the multiplies into dp4a, 4 a lane-instruction:
+// ~750 GB/s. The price is the rounding of the activation to 8 bits, as in
+// llama.cpp: ~0.5% relative error on a random matvec.
+// Layout of the quantized activation: K int8, then K/32 float2 (d, sum).
+__global__ void tl_quant_act_q8(const float* __restrict__ a, signed char* __restrict__ qs,
+                                float2* __restrict__ ds, unsigned nblk) {
+  const unsigned lane = threadIdx.x & 31u;
+  const unsigned blk = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (blk >= nblk) return;
+  const float x = a[(size_t)blk * 32u + lane];
+  float amax = fabsf(x), sum = x;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    sum += __shfl_xor_sync(0xffffffffu, sum, off);
+  }
+  const float d = amax / 127.0f;
+  qs[(size_t)blk * 32u + lane] = (signed char)(d == 0.0f ? 0 : __float2int_rn(x / d));
+  if (lane == 0) ds[blk] = make_float2(d, sum);
+}
+
+// A warp a row, four rows a block; lane = 8 * superblock + 2 * pair + half reads 16
+// bytes of its superblock (16 low-nibble weights of group 2*pair and 16 high of
+// group 2*pair+1, positions 16*half..) and the 16 + 16 int8 activations they meet.
+// The group's min term (dmin * m * sum of the group) is taken by the half-0 lane.
+__global__ void tl_gemv_q4k_q8_row(const signed char* __restrict__ qa, const float2* __restrict__ ds,
+                                   const unsigned char* __restrict__ W, float* __restrict__ y,
+                                   unsigned N, unsigned K) {
+  const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+  const unsigned n = blockIdx.x * (blockDim.x >> 5) + warp;
+  if (n >= N) return;
+  const unsigned nb = K / 256u, sbl = lane >> 3, p = (lane & 7u) >> 1, hf = lane & 1u;
+  const unsigned char* row = W + (size_t)n * nb * 144u;
+  float acc = 0.0f;
+  for (unsigned ib = sbl; ib < nb; ib += 4) {
+    const unsigned char* b = row + (size_t)ib * 144u;
+    const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(b));  // d, dmin
+    unsigned char sm[12];
+    {
+      const uint3 sw = *reinterpret_cast<const uint3*>(b + 4);
+      memcpy(sm, &sw, 12);
+    }
+    const uint4 q = *reinterpret_cast<const uint4*>(b + 16 + 32 * p + 16 * hf);
+    const signed char* ap = qa + (size_t)ib * 256u + 64u * p + 16u * hf;
+    const uint4 al = *reinterpret_cast<const uint4*>(ap), ah = *reinterpret_cast<const uint4*>(ap + 32);
+    int sl = 0, sh = 0;
+    sl = __dp4a((int)(q.x & 0x0F0F0F0Fu), (int)al.x, sl);
+    sl = __dp4a((int)(q.y & 0x0F0F0F0Fu), (int)al.y, sl);
+    sl = __dp4a((int)(q.z & 0x0F0F0F0Fu), (int)al.z, sl);
+    sl = __dp4a((int)(q.w & 0x0F0F0F0Fu), (int)al.w, sl);
+    sh = __dp4a((int)((q.x >> 4) & 0x0F0F0F0Fu), (int)ah.x, sh);
+    sh = __dp4a((int)((q.y >> 4) & 0x0F0F0F0Fu), (int)ah.y, sh);
+    sh = __dp4a((int)((q.z >> 4) & 0x0F0F0F0Fu), (int)ah.z, sh);
+    sh = __dp4a((int)((q.w >> 4) & 0x0F0F0F0Fu), (int)ah.w, sh);
+    const int g0 = 2 * (int)p, g1 = g0 + 1;  // scale / min of groups 2p, 2p+1 (get_scale_min_k4)
+    const int s0 = g0 < 4 ? (sm[g0] & 63) : ((sm[g0 + 4] & 0xF) | ((sm[g0 - 4] >> 6) << 4));
+    const int m0 = g0 < 4 ? (sm[g0 + 4] & 63) : ((sm[g0 + 4] >> 4) | ((sm[g0] >> 6) << 4));
+    const int s1 = g1 < 4 ? (sm[g1] & 63) : ((sm[g1 + 4] & 0xF) | ((sm[g1 - 4] >> 6) << 4));
+    const int m1 = g1 < 4 ? (sm[g1 + 4] & 63) : ((sm[g1 + 4] >> 4) | ((sm[g1] >> 6) << 4));
+    const float2 d0 = ds[ib * 8u + g0], d1 = ds[ib * 8u + g1];
+    float t = dd.x * (d0.x * (float)(s0 * sl) + d1.x * (float)(s1 * sh));
+    if (hf == 0) t -= dd.y * (d0.y * (float)m0 + d1.y * (float)m1);
+    acc += t;
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+  if (lane == 0) y[n] = acc;
+}
+
 // Q8_0, 34 bytes a block of 32 (2-byte aligned only): a warp takes eight blocks
 // at a time, lane = 4 * which + j reading the 8 bytes 8j.. of its block and the
 // 8 activations they multiply. y_n = sum d * q * a.
