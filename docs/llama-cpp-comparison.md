@@ -7,49 +7,51 @@ already cached when the test started.
 
 ## Results
 
-RTX 3090, driver 610.88, WSL2; llama.cpp `19cce6919` (2026-10-27), built with
+RTX 3090, driver 610.88, WSL2; tensorlib `982a1e3`, llama.cpp `19cce6919` (2026-10-27), built with
 `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86`. tok/s; this library's column
 is the median of 5 runs, llama.cpp's the mean of 5 (what `llama-bench` prints).
-Where llama.cpp was measured more than once the range is given: its decode
-moved by up to 5% between invocations here (one Qwen3 run, ± 139, is left
-out).
+llama.cpp was run twice per row and the range is given: its decode moved by
+up to 5% between invocations here, its prefill by up to 10% (the deep-context
+prefill ratios are soft for that reason).
 
 | model (GGUF) | test | tensorlib | llama.cpp | ratio |
 |---|---|---:|---:|---:|
-| Qwen2.5-0.5B-Instruct F16 | tg128 | 461 | 429-439 | 1.05-1.07 |
-| | tg128 @ d2048 | 423 | 407-430 | 0.98-1.04 |
-| | pp512 | 56,417 | 49,132 | 1.15 |
-| | pp512 @ d2048 | 42,721 | 41,106 | 1.04 |
-| Qwen3-0.6B F16 | tg128 | 400 | 351-373 | 1.07-1.14 |
-| | tg128 @ d2048 | 342 | 330-334 | 1.02-1.04 |
-| | pp512 | 36,966 | 38,881 | 0.95 |
-| | pp512 @ d2048 | 24,510 | 30,004 | 0.82 |
-| Qwen3.5-0.8B F16 | tg128 | 386 | 290-291 | 1.33 |
-| | tg128 @ d2048 | 376 | 289-292 | 1.29-1.30 |
-| | pp512 | 24,996 | 27,916 | 0.90 |
-| | pp512 @ d2048 | 19,745 | 27,401 | 0.72 |
-| Qwen3.5-0.8B BF16 | tg128 | 379 | 288 | 1.32 |
-| | tg128 @ d2048 | 372 | 288 | 1.29 |
-| | pp512 | 25,485 | 23,963 | 1.06 |
-| | pp512 @ d2048 | 21,058 | 23,208 | 0.91 |
+| Qwen2.5-0.5B-Instruct F16 | tg128 | 482 | 442-445 | 1.08 |
+|  | tg128 @ d2048 | 436 | 437-442 | 0.99-1.00 |
+|  | pp512 | 52,867 | 50,825-51,209 | 1.03-1.04 |
+|  | pp512 @ d2048 | 43,750 | 43,865-44,494 | 0.98-1.00 |
+| Qwen3-0.6B F16 | tg128 | 418 | 383-385 | 1.09 |
+|  | tg128 @ d2048 | 329 | 329-351 | 0.94-1.00 |
+|  | pp512 | 37,672 | 38,825-39,766 | 0.95-0.97 |
+|  | pp512 @ d2048 | 23,199 | 28,892-31,436 | 0.74-0.80 |
+| Qwen3.5-0.8B F16 | tg128 | 392 | 306-308 | 1.27-1.28 |
+|  | tg128 @ d2048 | 381 | 295-301 | 1.27-1.29 |
+|  | pp512 | 26,989 | 29,356-29,815 | 0.91-0.92 |
+|  | pp512 @ d2048 | 21,583 | 25,157-28,194 | 0.77-0.86 |
+| Qwen3.5-0.8B BF16 | tg128 | 384 | 283-295 | 1.30-1.36 |
+|  | tg128 @ d2048 | 382 | 296-298 | 1.28-1.29 |
+|  | pp512 | 25,284 | 21,805-25,139 | 1.01-1.16 |
+|  | pp512 @ d2048 | 21,765 | 24,250-24,410 | 0.89-0.90 |
 
 Decode is at parity or ahead on every model, with or without 2048 tokens
 cached. Until the decode attention overlapped its key loads and split its
 keys finer (2026-10-27), Qwen2.5 trailed by 18% at depth: a block's warps
 walked ~64 keys each in series, one load at a time.
 
-Prefill is between 1.15x ahead and 1.4x behind. Like llama.cpp, it sums the
-GEMMs in f16 by default (below). Its GEMM and its attention run on the tensor
+Prefill is at parity at 512 tokens on Qwen2.5 and within 5-9% on Qwen3 and
+Qwen3.5 F16, and 1.1-1.35x behind with 2048 tokens cached. Like llama.cpp, it
+sums the GEMMs in f16 by default (below). Its GEMM and its attention run on the tensor
 cores: the GEMM over `mma.sync` and `ldmatrix` with two shared-memory stages
 (two blocks share an SM, which beat deeper pipelines), the weights converted
 to f16 as a block stages them, and the activation rounded to f16 once, by the
 norm, SwiGLU or head merge that writes it, rather than by every block that
 reads it; the attention with q, k and v rounded to f16. Qwen3.5's DeltaNet
 layers run the gated delta rule in 32-token chunks (as small matrix
-products, f32). What is left of the gap is those layers: ~8 ms of a 512-token
-prompt against ~3 ms for llama.cpp's fused tensor-core kernel, the scan being
-bound by a serial chain of ~8 barriers per chunk. The llama.cpp column was
-measured before the GEMM change and not repeated.
+products, f32). What is left at short context is those layers: ~7 ms of a 512-token
+prompt against ~3 ms for llama.cpp's fused tensor-core kernel (the scan runs
+on 16 warps a block, since it is bound by a chain of ~8 barriers per chunk,
+and the prep is not on the tensor cores). At depth the attention over the
+cached keys is the next suspect; it has not been profiled yet.
 
 ## Accumulation precision
 
