@@ -51,6 +51,33 @@ int main(int argc, char** argv) {
     if (!M.quant) { std::printf("native K-quant path unavailable\n"); return 1; }
     run(M, steps, lb, &fed);
   }
+  // The batched prefill over the same blocks: a prompt through GEMMs that
+  // dequantize as they stage, against the bf16 weights' prefill, in the fast
+  // form (f16 sums) and the exact one a non-finite prompt is redone in.
+  bool prefill_ok = true;
+  for (bool exact : {false, true}) {
+    std::vector<float> pa_, pb_;
+    int64_t ta0 = -1, tb0 = -1;
+    const std::vector<int> ids = qm::fixture_ids(200);
+    for (int pass = 0; pass < 2; pass++) {
+      qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, false, true, /*quant=*/pass == 1);
+      qm::reset_cache(M);
+      const int64_t t = qm::prefill_batched(M, ids, qm::PREFILL_CHUNK, exact);
+      const float* lg = qm::host_read(M.scratch.logits);
+      (pass ? pb_ : pa_).assign(lg, lg + M.c.VOCAB);
+      (pass ? tb0 : ta0) = t;
+    }
+    double pmx = 0, pref = 0;
+    for (size_t i = 0; i < pa_.size(); i++) {
+      pmx = std::max(pmx, (double)std::fabs(pa_[i] - pb_[i]));
+      pref = std::max(pref, (double)std::fabs(pa_[i]));
+    }
+    const double err = pmx / (1.0 + pref);
+    const bool ok = err < 2e-2 && (ta0 == tb0 || pa_[ta0] - pa_[tb0] < 4e-2 * (1.0 + pref));
+    prefill_ok = prefill_ok && ok;
+    std::printf("prefill 200 tokens (%s) | first token %lld vs %lld | logits worst |d|/(1+max) %.2e %s\n",
+                exact ? "exact" : "f16 sums", (long long)ta0, (long long)tb0, err, ok ? "OK" : "FAIL");
+  }
   double worst = 0;
   int agree = 0, tie_flips = 0, bad = 0;
   for (int s = 0; s < steps; s++) {
@@ -69,5 +96,5 @@ int main(int argc, char** argv) {
   }
   std::printf("%d steps | top-1 agrees %d, near-tie flips %d, real misses %d | logits worst |d|/(1+max) %.2e\n",
               steps, agree, tie_flips, bad, worst);
-  return bad == 0 && worst < 2e-2 ? 0 : 1;
+  return bad == 0 && worst < 2e-2 && prefill_ok ? 0 : 1;
 }

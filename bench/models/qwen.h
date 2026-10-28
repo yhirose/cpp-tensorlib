@@ -707,7 +707,16 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
   // The f16-sum GEMMs read their activation as f16 when the backend has the
   // producers that write it there (a16); `a16s` is that copy of `a`.
   const bool a16 = M.f16_acc && !exact && gpu::f16_activations;
-  auto gemm = [&](gpu::span a, gpu::span a16s, const array& w, gpu::span y, int64_t n, int64_t k) {
+  auto gemm = [&](gpu::span a, gpu::span a16s, const array& w, const qmat& q, gpu::span y,
+                  int64_t n, int64_t k) {
+    if (q) {  // K-quant blocks: a GEMM a run of one format, each into its columns of y
+      for (const auto& p : q.parts) {
+        if (!gpu::gemm_kquant(p.type, a16, a16 ? a16s : a, sp(q.raw).at(p.byte_off),
+                              y.at(p.row_off * 4), T, p.rows, k, n))
+          throw std::logic_error("qwen: the K-quant prefill GEMM refused its operands");
+      }
+      return;
+    }
     // No f32 copy of an f16 activation exists to fall back on, so a refusal
     // (misaligned buffer, odd n, k % 8) is an error, not a slower path.
     if (a16) {
@@ -745,7 +754,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       // swiglu over the flattened [T, V].
       const int64_t C = c.ssm_conv_ch(), V = c.ssm_v(), PJ = c.ssm_proj();
       const gpu::span z = sp(P.zo), o = at_f32(z, T * V);
-      gemm(sp(P.h), sp(P.h16), L.wssm, sp(P.qkv), PJ, c.NE);
+      gemm(sp(P.h), sp(P.h16), L.wssm, L.qssm, sp(P.qkv), PJ, c.NE);
       gpu::ssm_conv(sp(P.qkv), PJ, sp(L.conv_state), sp(L.wconv), sp(P.conv), C,
                     c.SCONV, T);
       gpu::gated_delta(sp(P.conv), at_f32(sp(P.qkv), C), PJ, sp(L.adt),
@@ -754,9 +763,9 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       rows_out(at_f32(sp(P.qkv), C + 2 * c.SH), PJ, z, V);
       if (a16) gpu::swiglu_h16(z, sp(P.at16), T * V, 1);
       else gpu::swiglu(z, sp(P.at), T * V);
-      gemm(sp(P.at), sp(P.at16), L.wsout, ro, c.NE, V);
+      gemm(sp(P.at), sp(P.at16), L.wsout, L.qsout, ro, c.NE, V);
     } else {
-      gemm(sp(P.h), sp(P.h16), L.wqkv, sp(P.qkv), AP, c.NE);
+      gemm(sp(P.h), sp(P.h16), L.wqkv, L.qqkv, sp(P.qkv), AP, c.NE);
       // split_heads turns the [T, q|k|v] output into head-major [H, T, D] and
       // adds the bias — rope's own fused-bias form only indexes correctly at
       // T == 1, so the bias rides along here instead. One pass over every head;
@@ -792,13 +801,13 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       } else {
         gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, c.HD);
       }
-      gemm(ao, sp(P.at16), L.wo_row, ro, c.NE, Q);
+      gemm(ao, sp(P.at16), L.wo_row, L.qo, ro, c.NE, Q);
     }
     norm_res(ro, x, sp(L.fn), ro, sp(P.h2), sp(P.h216), false);
-    gemm(sp(P.h2), sp(P.h216), L.wgu, sp(P.gu), 2 * c.FF, c.NE);
+    gemm(sp(P.h2), sp(P.h216), L.wgu, L.qgu, sp(P.gu), 2 * c.FF, c.NE);
     if (a16) gpu::swiglu_h16(sp(P.gu), sp(P.mb16), c.FF, T);
     else gpu::swiglu(sp(P.gu), sp(P.mb), c.FF, T);
-    gemm(sp(P.mb), sp(P.mb16), L.wd_row, sp(P.md), c.NE, c.FF);
+    gemm(sp(P.mb), sp(P.mb16), L.wd_row, L.qd, sp(P.md), c.NE, c.FF);
     const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
     norm_res(ro, sp(P.md), nextw, ro, sp(P.h), sp(P.h16), l + 1 == c.NL);  // the logits read the last
     x = ro;
@@ -833,7 +842,8 @@ inline void stage_embed_rows_(Model& M, const std::vector<int>& ids, int64_t fro
 // and it must fit the cache. One place answers it, so build(), begin() and
 // prefill_batched() cannot disagree.
 inline bool can_prefill_batched(const Model& M, int64_t T) {
-  return gpu::caps::bf16_gemm && M.row && !M.q4_mlp && !M.quant && !M.layers.empty() &&
+  return gpu::caps::bf16_gemm && M.row && !M.q4_mlp && (!M.quant || gpu::has_gemm_kquant) &&
+         !M.layers.empty() &&
          T >= PREFILL_MIN && seq_cache(M).pos + T <= M.c.MAXC;
 }
 

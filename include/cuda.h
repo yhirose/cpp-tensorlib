@@ -605,15 +605,20 @@ struct context {
   // The form is the operands and sums: bf16 operands with f32 sums, f16 with f16
   // sums, and f16 sums reading the activation already f16 (no rounding stage).
   enum class tc_form { f32, f16, f16h };
-  CUfunction gemm_tc_fn[3][3] = {};
-  CUfunction gemm_tc_(tc_form f, tc_tile t) {
-    static const char* const names[3][3] = {
-        {"tl_gemm_tc_f32_l", "tl_gemm_tc_f32_m", "tl_gemm_tc_f32_s"},
-        {"tl_gemm_tc_f16_l", "tl_gemm_tc_f16_m", "tl_gemm_tc_f16_s"},
-        {"tl_gemm_tc_f16h_l", "tl_gemm_tc_f16h_m", "tl_gemm_tc_f16h_s"}};
-    CUfunction& slot = gemm_tc_fn[static_cast<int>(f)][static_cast<int>(t)];
+  // The weight it reads: bf16 [N][K], or the rows of K-quant blocks (Q4_K, Q6_K);
+  // the quantized ones have the f32 and f16h forms only.
+  enum class tc_weight { bf16, q4k, q6k };
+  CUfunction gemm_tc_fn[3][3][3] = {};  // [weight][form][tile]
+  CUfunction gemm_tc_(tc_form f, tc_tile t, tc_weight w = tc_weight::bf16) {
+    static const char* const forms[3] = {"f32", "f16", "f16h"};
+    static const char* const weights[3] = {"", "_q4k", "_q6k"};
+    static const char tiles[3] = {'l', 'm', 's'};
+    if (w != tc_weight::bf16 && f == tc_form::f16) return nullptr;
+    CUfunction& slot = gemm_tc_fn[static_cast<int>(w)][static_cast<int>(f)][static_cast<int>(t)];
     if (!slot) {
-      slot = load_(names[static_cast<int>(f)][static_cast<int>(t)]);
+      const std::string name = std::string("tl_gemm_tc_") + forms[static_cast<int>(f)] +
+                               weights[static_cast<int>(w)] + "_" + tiles[static_cast<int>(t)];
+      slot = load_(name.c_str());
       if (slot && d.FuncSetAttribute)
         d.FuncSetAttribute(slot, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */,
                            static_cast<int>(gemm_tc_shape(t).smem()));
@@ -909,6 +914,11 @@ struct own {
   // x[rows, D] RMS-normalized by w and then rotated, in place (rows = heads * T).
   static bool rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T, int64_t D,
                            int64_t pos, float base, int64_t rot, float eps);
+  // C[m, ldc-strided n columns] = A[m,K] . W[n,K]^T over GGUF K-quant rows (type 12
+  // Q4_K, 14 Q6_K). a16: A is f16 and the sums f16, else A is f32 and the sums f32
+  // (the exact form). K % 256 == 0, n even.
+  static bool gemm_kquant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
+                          int64_t n, int64_t k, int64_t ldc);
   // y[n] = W[n,K] . a over GGUF K-quant rows (type: the ggml_type code, 12 Q4_K
   // or 14 Q6_K), the blocks read where they lie. K % 256 == 0.
   static bool gemv_kquant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n, int64_t k);
@@ -1735,8 +1745,9 @@ inline unsigned gemv_row_smem(unsigned block) {
 // there; the 64x128 doubles that and the 64x64 doubles it again. "Busy" is
 // two thirds of a block per SM (a third of fill_groups, which counts two):
 // the tiles share an SM two at a time, and the threshold was swept at M=512.
-inline bool gemm_tc_run_(context& c, context::tc_form form, void* pa, float* pB, float* po,
-                         unsigned m, unsigned n, unsigned k) {
+inline bool gemm_tc_run_(context& c, context::tc_form form, void* pa, void* pB, float* po,
+                         unsigned m, unsigned n, unsigned k, unsigned ldc,
+                         context::tc_weight w = context::tc_weight::bf16) {
   using tile = context::tc_tile;
   constexpr int64_t busy = traits::fill_groups / 3;
   auto grid = [&](tile t) {
@@ -1748,8 +1759,8 @@ inline bool gemm_tc_run_(context& c, context::tc_form form, void* pa, float* pB,
                  : blocks(tile::m) >= busy ? tile::m
                                            : tile::s;
   const auto sh = context::gemm_tc_shape(t);
-  return c.launch_(c.gemm_tc_(form, t), {grid(t).first, grid(t).second}, {sh.threads}, sh.smem(),
-                   pa, pB, po, m, n, k);
+  return c.launch_(c.gemm_tc_(form, t, w), {grid(t).first, grid(t).second}, {sh.threads}, sh.smem(),
+                   pa, pB, po, m, n, k, ldc);
 }
 
 // M9 batched-prefill GEMM: C(M,N) = A(M,K) @ W[N,K]^T, W the same row-major
@@ -1769,7 +1780,7 @@ inline bool own::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
   // The tensor cores read 16-byte vectors of both operands, so their rows must
   // start on 16 bytes (and N be even: a thread stores two columns at once).
   const bool aligned = ((uintptr_t)pa % 16 == 0) && ((uintptr_t)pB % 16 == 0) && n % 2 == 0;
-  if (aligned) return gemm_tc_run_(c, context::tc_form::f32, pa, pB, po, uM, uN, uK);
+  if (aligned) return gemm_tc_run_(c, context::tc_form::f32, pa, pB, po, uM, uN, uK, uN);
   // Tile choice by fill (big_tile_): a prefill chunk is only a few hundred
   // tokens, so a narrow projection (N=896, M=512) is 28 big blocks against 82
   // SMs and 112 small ones. The big tile needs K % 8 == 0, the small K % 16.
@@ -1821,7 +1832,7 @@ inline bool f16acc_run_(context::tc_form form, gpu::span a, gpu::span B, gpu::sp
   c.device_read_(a.buf);
   c.device_read_(B.buf);
   c.device_write_(out.buf);
-  return gemm_tc_run_(c, form, pa, pB, po, (unsigned)m, (unsigned)n, (unsigned)k);
+  return gemm_tc_run_(c, form, pa, pB, po, (unsigned)m, (unsigned)n, (unsigned)k, (unsigned)n);
 }
 inline bool own::gemm_bf16_nt_f16acc(gpu::span a, gpu::span B, gpu::span out, int64_t m,
                                      int64_t n, int64_t k) {
@@ -1832,6 +1843,25 @@ inline bool own::gemm_bf16_nt_f16acc(gpu::span a, gpu::span B, gpu::span out, in
 inline bool own::gemm_bf16_nt_f16acc_a16(gpu::span a, gpu::span B, gpu::span out, int64_t m,
                                          int64_t n, int64_t k) {
   return f16acc_run_(context::tc_form::f16h, a, B, out, m, n, k);
+}
+
+inline bool own::gemm_kquant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
+                             int64_t n, int64_t k, int64_t ldc) {
+  auto& c = context::get();
+  if (!c.ready || m <= 0 || n <= 0 || k % 256 || n % 2 || ldc % 2 || ldc < n ||
+      (type != 12 && type != 14)) {
+    return false;
+  }
+  float* pa = context::off_(A.buf, A.off);
+  float* pw = context::off_(W.buf, W.off);
+  float* pc = context::off_(C.buf, C.off);
+  if ((uintptr_t)pa % 16 || (uintptr_t)pw % 16) return false;
+  c.device_read_(A.buf);
+  c.device_read_(W.buf);
+  c.device_rmw_(C.buf);  // a part writes some columns of a shared output
+  return gemm_tc_run_(c, a16 ? context::tc_form::f16h : context::tc_form::f32, pa, pw, pc,
+                      (unsigned)m, (unsigned)n, (unsigned)k, (unsigned)ldc,
+                      type == 12 ? context::tc_weight::q4k : context::tc_weight::q6k);
 }
 
 inline bool own::gemv_kquant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n,

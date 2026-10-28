@@ -1072,6 +1072,19 @@ inline bool gemm_bf16_nt_f16acc(span A, span B, span C, int64_t M, int64_t N,
   return gemm_bf16_nt<Own>(A, B, C, M, N, K);
 }
 
+// The prefill's GEMM over K-quant rows (see own::gemm_kquant in cuda.h): C columns
+// [0, n) of rows ldc apart, A f16 (a16) or f32. False where the backend has none.
+TL_GPU_DETECT_OWN(gemm_kquant)
+template <class Own = own>
+inline bool gemm_kquant(int type, bool a16, span A, span W, span C, int64_t m, int64_t n,
+                        int64_t k, int64_t ldc) {
+  if constexpr (detail::owns_gemm_kquant<Own>::value) {
+    return detail::ran(Own::gemm_kquant(type, a16, A, W, C, m, n, k, ldc));
+  } else {
+    return false;
+  }
+}
+
 // y[n] = W[n,K] . a with W the rows of a GGUF K-quant weight (type = ggml_type
 // code: 12 Q4_K, 14 Q6_K), read as quantized. False where the backend has no
 // such kernel; the caller dequantizes instead.
