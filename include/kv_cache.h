@@ -64,8 +64,10 @@ struct kv_cache {
   // T tokens at once: k_src/v_src [n_kv_heads, T, D] appended at `pos`, and
   // the causal attention of q/out [n_q_heads, T, D] over everything cached
   // before them. Leaves pos advanced by T.
+  // `exact` takes the f32 attention instead of the inference form a backend
+  // may round to f16 (gpu::attn_prefill_f16).
   bool prefill(gpu::span q, gpu::span k_src, gpu::span v_src, gpu::span out,
-               int64_t T, int64_t n_q_heads, float scale) {
+               int64_t T, int64_t n_q_heads, float scale, bool exact = false) {
     if (T <= 0 || pos + T > max_ctx) return false;
     if (!gpu::kv_fill(K.device_span(), V.device_span(), k_src, v_src, T, max_ctx,
                       n_kv_heads, D, kv_bf16, pos)) {
@@ -74,6 +76,10 @@ struct kv_cache {
     const int64_t p0 = pos;
     pos += T;
     // A cache serves inference, so the attention may take the tensor cores.
+    if (exact) {
+      return gpu::attn_prefill(q, K.device_span(), V.device_span(), out, n_q_heads,
+                               n_kv_heads, T, max_ctx, D, scale, kv_bf16, p0);
+    }
     return gpu::attn_prefill_f16(q, K.device_span(), V.device_span(), out,
                                  n_q_heads, n_kv_heads, T, max_ctx, D, scale, kv_bf16,
                                  p0);

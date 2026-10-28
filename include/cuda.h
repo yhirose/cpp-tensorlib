@@ -575,8 +575,12 @@ struct context {
   CUfunction gdc_prep_fn = nullptr, gdc_scan_fn = nullptr;  // the chunked delta rule
   CUfunction gdc_prep_() { return cached_(gdc_prep_fn, "tl_gated_delta_chunk_prep"); }
   CUfunction gdc_scan_() { return cached_(gdc_scan_fn, "tl_gated_delta_chunk_scan"); }
-  CUfunction gemm_bf16_nt_tc_fn = nullptr, gemm_bf16_nt_tc_s_fn = nullptr;
-  CUfunction gemm_bf16_nt_tc_(bool big) {
+  CUfunction gemm_bf16_nt_tc_fn = nullptr, gemm_bf16_nt_tc_s_fn = nullptr,
+             gemm_f16acc_tc_fn = nullptr, gemm_f16acc_tc_s_fn = nullptr;
+  CUfunction gemm_bf16_nt_tc_(bool big, bool f16acc = false) {
+    if (f16acc)
+      return big ? cached_(gemm_f16acc_tc_fn, "tl_gemm_f16acc_tc")
+                 : cached_(gemm_f16acc_tc_s_fn, "tl_gemm_f16acc_tc_s");
     return big ? cached_(gemm_bf16_nt_tc_fn, "tl_gemm_bf16_nt_tc")
                : cached_(gemm_bf16_nt_tc_s_fn, "tl_gemm_bf16_nt_tc_s");
   }
@@ -928,6 +932,8 @@ struct own {
                                float scale);
   static bool gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out, int64_t m,
                            int64_t n, int64_t k);
+  static bool gemm_bf16_nt_f16acc(gpu::span a, gpu::span B, gpu::span out, int64_t m,
+                                  int64_t n, int64_t k);
   static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                    int64_t D, int64_t pos, float base, gpu::span bias = {});
   // rope over the first `rot` dims of each row only (Qwen3.5's partial RoPE).
@@ -1683,6 +1689,27 @@ inline bool own::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
   }
   return c.launch_(c.gemm_bf16_nt_(big), {gx, gy}, {256}, 0, pa, pB, po, uM, uN,
                    uK);
+}
+
+// The prefill GEMM summed in f16 (tl_gemm_f16acc_tc*, the tensor-core tiles'
+// f16 form): operands on 16 bytes and K % 8 == 0, as there; otherwise the
+// caller's f32 GEMM.
+inline bool own::gemm_bf16_nt_f16acc(gpu::span a, gpu::span B, gpu::span out,
+                                     int64_t m, int64_t n, int64_t k) {
+  auto& c = context::get();
+  if (!c.ready || (k % 8) != 0 || m <= 0 || n <= 0) return false;
+  float* pa = context::off_(a.buf, a.off);
+  float* pB = context::off_(B.buf, B.off);
+  float* po = context::off_(out.buf, out.off);
+  if ((uintptr_t)pa % 16 || (uintptr_t)pB % 16) return false;
+  c.device_read_(a.buf);
+  c.device_read_(B.buf);
+  c.device_write_(out.buf);
+  const unsigned uM = (unsigned)m, uN = (unsigned)n, uK = (unsigned)k;
+  const bool big = ((n + 127) / 128) * ((m + 127) / 128) >= traits::fill_groups;
+  const unsigned tt = big ? 128u : 64u;
+  return c.launch_(c.gemm_bf16_nt_tc_(big, true), {(uN + tt - 1) / tt, (uM + tt - 1) / tt},
+                   {big ? 512u : 128u}, 0, pa, pB, po, uM, uN, uK);
 }
 
 // ---- M9 batched-prefill layout moves between token-major projections and

@@ -13,7 +13,7 @@
 // is the steadier figure on WSL2. Token ids are a fixed cycle: nothing here
 // depends on their values.
 //
-// Usage: bench_qwen_llama model.gguf [P=512] [N=128] [reps=5] [d=0]
+// Usage: bench_qwen_llama model.gguf [P=512] [N=128] [reps=5] [d=0] [f32acc]
 
 #include "../../models/qwen.h"
 
@@ -72,7 +72,8 @@ static void row(const char* test, int64_t tokens, int reps, F run) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: %s model.gguf [P=512] [N=128] [reps=5] [d=0]\n", argv[0]);
+    std::fprintf(stderr, "usage: %s model.gguf [P=512] [N=128] [reps=5] [d=0] [f32acc]\n",
+                 argv[0]);
     return 2;
   }
   if (!tl::gpu_available()) {
@@ -83,14 +84,16 @@ int main(int argc, char** argv) {
   const int64_t N = argc > 3 ? std::atoll(argv[3]) : 128;
   const int reps = argc > 4 ? std::atoi(argv[4]) : 5;
   const int64_t d = argc > 5 ? std::atoll(argv[5]) : 0;
+  const bool f32acc = argc > 6 && std::string(argv[6]) == "f32acc";
   qm::gg::model m(argv[1]);
   tl::use_gpu();
-  qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false);
+  qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false, !f32acc);
   const auto* t = m.tensor("blk.0.ffn_up.weight");
-  std::printf("%s | %s | %lld layers | weights %s (file %s) | depth %lld\n", argv[1],
-              M.c.arch.c_str(), (long long)M.c.NL,
+  std::printf("%s | %s | %lld layers | weights %s (file %s) | depth %lld | prefill sums %s\n",
+              argv[1], M.c.arch.c_str(), (long long)M.c.NL,
               M.outwT.dt() == tl::dtype::bf16 ? "bf16" : "f32",
-              t && t->type == qm::gg::ggml_type::bf16 ? "BF16" : "F16", (long long)d);
+              t && t->type == qm::gg::ggml_type::bf16 ? "BF16" : "F16", (long long)d,
+              M.f16_acc ? "f16" : "f32");
   std::printf("| test     |       t/s (mean ± sd) |   t/s (med) |\n");
   const std::string pp = "pp" + std::to_string(P), tg = "tg" + std::to_string(N);
   row(pp.c_str(), P, reps, [&] { return pp_ms(M, P, d); });

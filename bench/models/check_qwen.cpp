@@ -42,6 +42,51 @@ static double maxrel(const std::vector<float>& a, const float* b, int64_t n) {
   return mr;
 }
 
+// The batched prefill's f16 sums (the default where the backend has them),
+// against `ref`, an f32 forward's logits for the same prompt: the top-5
+// logits to 2e-2 and the same greedy token. Then the safety net: with the
+// first layer's FFN norm scaled by 1e5 the f16 sums overflow (the MLP's input
+// passes f16's range), and the prompt must be redone once, exactly, from the
+// state it started at — an exact prefill of the same model, to the lm_head's
+// split-K rounding (its atomic sums land in any order; a missed restore would
+// be off by far more).
+static bool check_f16_sums(qm::Model& B, const std::vector<int>& ids,
+                           const std::vector<float>& ref) {
+  auto logits = [&] {
+    const float* l = qm::host_read(B.scratch.logits);
+    return std::vector<float>(l, l + B.c.VOCAB);
+  };
+  const bool was = B.f16_acc;
+  B.f16_acc = true;
+  qm::reset_cache(B);
+  const int64_t tok = qm::prefill_batched(B, ids);
+  const double t5 = qm::top5_maxrel(logits().data(), ref.data(), B.c.VOCAB);
+  const bool close = t5 < 2e-2 && tok == qm::argmax(ref);
+  std::printf("\nf16 sums: top-5 logits maxrel %.2e vs f32, token %lld %s\n", t5, (long long)tok,
+              close ? "OK" : "FAIL");
+  const tl::array fn = B.layers[0].fn;
+  B.layers[0].fn = (fn * 1e5f).clone();
+  B.layers[0].fn.eval();
+  const int64_t retries = B.f16_retries;
+  qm::reset_cache(B);
+  qm::prefill_batched(B, ids);
+  const std::vector<float> redone = logits();
+  qm::reset_cache(B);
+  qm::prefill_batched(B, ids, qm::PREFILL_CHUNK, /*exact=*/true);
+  const std::vector<float> f32 = logits();
+  B.layers[0].fn = fn;
+  B.f16_acc = was;
+  // Both finite first: a NaN compares unequal to nothing, so it would pass
+  // the maxrel below.
+  bool finite = true;
+  for (size_t i = 0; i < f32.size(); i++) finite &= std::isfinite(f32[i]) && std::isfinite(redone[i]);
+  const double rmr = maxrel(redone, f32.data(), B.c.VOCAB);
+  const bool net = B.f16_retries == retries + 1 && finite && rmr < 1e-5;
+  std::printf("f16 overflow: %lld retry, logits maxrel %.2e vs the exact prefill %s\n",
+              (long long)(B.f16_retries - retries), rmr, net ? "OK" : "FAIL");
+  return close && net;
+}
+
 // A hybrid model (Qwen3.5) has no array path, so its checkpoints are read off
 // the imperative forward: the final norm the last layer's seam leaves in
 // scratch, the logits, and the greedy continuation, at F32 against the oracle.
@@ -86,7 +131,10 @@ static bool check_hybrid(const qm::gg::model& m, const Oracle& O) {
   }
   // A backend without the bf16 GEMV builds f32 instead (build()), and says so.
   const int64_t NB = 8;
-  qm::Model B = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false);
+  // The structural checks below run the f32 sums, so their bounds stay tight;
+  // check_f16_sums holds the default f16 ones to the same prompts after.
+  qm::Model B = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false,
+                          /*f16_acc=*/false);
   int64_t tok = 0, p = 0;
   auto logits_of = [&](qm::Model& X) {
     const float* l = qm::host_read(X.scratch.logits);
@@ -159,7 +207,9 @@ static bool check_hybrid(const qm::gg::model& m, const Oracle& O) {
     std::printf("\n96-token prompt, batched vs imperative: top-5 logits maxrel %.2e %s\n", l5,
                 long_ok ? "OK" : "FAIL");
   }
-  return ok && bf16_ok && logits_ok && dec_ok && long_ok;
+  const bool f16_ok = !qm::can_prefill_batched(B, (int64_t)longp.size()) ||
+                      check_f16_sums(B, longp, imp_long);
+  return ok && bf16_ok && logits_ok && dec_ok && long_ok && f16_ok;
 }
 
 int main(int argc, char** argv) {
@@ -284,17 +334,19 @@ int main(int argc, char** argv) {
   const int64_t NB = 8;
   {
     std::printf("\nbf16 weights (row GEMV + batched prefill) vs this model's array path:\n");
-    qm::Model B = qm::build(m, tl::dtype::bf16);
+    qm::Model B = qm::build(m, tl::dtype::bf16, false, false, 4096, true, /*f16_acc=*/false);
     std::vector<int> ids(O.prompt_ids, O.prompt_ids + NP);
     if (!qm::can_prefill_batched(B, NP)) {
       std::printf("  backend has no bf16 weight GEMM — skipped\n");
     } else {
       std::vector<int64_t> want, got;
+      std::vector<float> array_prompt;  // the f32 array path's last-prompt logits
       {
         qm::reset_cache(B);
         int64_t p = 0;
         std::vector<float> lg;
         for (int64_t i = 0; i < NP; i++) lg = qm::step(B, ids[i], p++);
+        array_prompt = lg;
         int64_t next = qm::argmax(lg);
         for (int64_t i = 0; i < NB; i++) {
           want.push_back(next);
@@ -315,6 +367,7 @@ int main(int argc, char** argv) {
       for (auto t : got) std::printf(" %lld", (long long)t);
       bf16_ok = got == want;
       std::printf("\n  greedy %s\n", bf16_ok ? "MATCH" : "DIVERGE");
+      bf16_ok &= check_f16_sums(B, ids, array_prompt);
     }
   }
 

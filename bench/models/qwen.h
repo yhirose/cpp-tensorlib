@@ -378,6 +378,7 @@ struct Scratch {
   storage logits;       // [VOCAB]
   storage logits_sink;  // [VOCAB] sink for forwards run only for their side
                         // effects (capture warm-up)
+  storage logit_sum;    // [1] the logits' sum: non-finite iff any logit is
   storage embed;        // staged embedding row [NE] (the step's input)
   std::vector<float> embed_stage;  // host gather target, uploaded into embed
   void init(const Config& c) {
@@ -397,6 +398,7 @@ struct Scratch {
     gub = scratch_f32(2 * c.FF);
     mdb = scratch_f32(c.NE);
     logits_sink = scratch_f32(c.VOCAB);
+    logit_sum = scratch_f32(1);
   }
 };
 
@@ -474,6 +476,13 @@ struct Model {
   bool row = false;  // imperative gemvs use warp-per-row [N,K] (bf16 only)
   bool q4_mlp = false;     // imperative MLP gemvs (wgu, wd) use q4
   bool q4_lmhead = false;  // imperative lm_head gemv uses q4
+  // The batched prefill's GEMMs sum in f16 where the backend can (twice the
+  // tensor-core rate here, at a small cost in precision). A prompt whose
+  // logits come out non-finite — an f16 overflow, in these sums or in the
+  // attention's f16 operands — is redone exactly (prefill_batched), and
+  // counted in f16_retries.
+  bool f16_acc = false;
+  int64_t f16_retries = 0;
 };
 
 // Decode GEMV picking the weight-dtype kernel: y(n) = a(1,k) @ W[k,n].
@@ -573,7 +582,9 @@ inline void set_cache_pos(Model& M, int64_t p) {
 //
 // bf16 row-major weights only (the layout gemm_bf16_nt shares with the decode
 // GEMV); callers check Model.row and fall back to token-by-token otherwise.
-inline void prefill_chunk_(Model& M, int64_t T) {
+// `exact` runs the chunk at full precision — the GEMMs' sums in f32 and the
+// attention's operands f32 — as the retry after an f16 overflow does.
+inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
   const Config& c = M.c;
   PrefillScratch& P = M.pscratch;
   // Absolute position of this chunk's first token — the caches are all at the
@@ -581,6 +592,10 @@ inline void prefill_chunk_(Model& M, int64_t T) {
   // same source rather than taking it as a parameter that could disagree.
   const int64_t pos0 = seq_cache(M).pos;
   const int64_t AP = c.attn_proj(), Q = c.NH * c.HD;
+  auto gemm = [&](gpu::span a, const array& w, gpu::span y, int64_t n, int64_t k) {
+    if (M.f16_acc && !exact) gpu::gemm_bf16_nt_f16acc(a, sp(w), y, T, n, k);
+    else gpu::gemm_bf16_nt(a, sp(w), y, T, n, k);
+  };
   // A strided [T, n] block of rows `ld` apart, copied contiguous.
   auto rows_out = [&](gpu::span src, int64_t ld, gpu::span dst, int64_t n) {
     gpu::generic::copy_2d(src, ld, 1, sp(P.zero), dst, T, n);
@@ -598,7 +613,7 @@ inline void prefill_chunk_(Model& M, int64_t T) {
       // swiglu over the flattened [T, V].
       const int64_t C = c.ssm_conv_ch(), V = c.ssm_v(), PJ = c.ssm_proj();
       const gpu::span z = sp(P.zo), o = at_f32(z, T * V);
-      gpu::gemm_bf16_nt(sp(P.h), sp(L.wssm), sp(P.qkv), T, PJ, c.NE);
+      gemm(sp(P.h), L.wssm, sp(P.qkv), PJ, c.NE);
       gpu::ssm_conv(sp(P.qkv), PJ, sp(L.conv_state), sp(L.wconv), sp(P.conv), C,
                     c.SCONV, T);
       gpu::gated_delta(sp(P.conv), at_f32(sp(P.qkv), C), PJ, sp(L.adt),
@@ -606,9 +621,9 @@ inline void prefill_chunk_(Model& M, int64_t T) {
       gpu::rmsnorm(o, sp(L.sn), o, c.SDV, c.EPS, T * c.SH);
       rows_out(at_f32(sp(P.qkv), C + 2 * c.SH), PJ, z, V);
       gpu::swiglu(z, sp(P.at), T * V);
-      gpu::gemm_bf16_nt(sp(P.at), sp(L.wsout), ro, T, c.NE, V);
+      gemm(sp(P.at), L.wsout, ro, c.NE, V);
     } else {
-      gpu::gemm_bf16_nt(sp(P.h), sp(L.wqkv), sp(P.qkv), T, AP, c.NE);
+      gemm(sp(P.h), L.wqkv, sp(P.qkv), AP, c.NE);
       // split_heads turns the [T, q|k|v] output into head-major [H, T, D] and
       // adds the bias — rope's own fused-bias form only indexes correctly at
       // T == 1, so the bias rides along here instead. One pass over every head;
@@ -627,7 +642,7 @@ inline void prefill_chunk_(Model& M, int64_t T) {
       // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
       gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
       gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
-      L.cache.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale());
+      L.cache.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale(), exact);
       gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, c.HD);
       // Qwen3.5: times sigmoid of the gate, the tail of each projection row.
       gpu::span ao = sp(P.at);
@@ -637,12 +652,12 @@ inline void prefill_chunk_(Model& M, int64_t T) {
         gpu::binary(gpu::kop::mul, ao, sp(P.gs), sp(P.gt), T * Q, 1, 0);
         ao = sp(P.gt);
       }
-      gpu::gemm_bf16_nt(ao, sp(L.wo_row), ro, T, c.NE, Q);
+      gemm(ao, L.wo_row, ro, c.NE, Q);
     }
     gpu::rmsnorm_res(ro, x, sp(L.fn), ro, sp(P.h2), c.NE, c.EPS, T);
-    gpu::gemm_bf16_nt(sp(P.h2), sp(L.wgu), sp(P.gu), T, 2 * c.FF, c.NE);
+    gemm(sp(P.h2), L.wgu, sp(P.gu), 2 * c.FF, c.NE);
     gpu::swiglu(sp(P.gu), sp(P.mb), c.FF, T);
-    gpu::gemm_bf16_nt(sp(P.mb), sp(L.wd_row), sp(P.md), T, c.NE, c.FF);
+    gemm(sp(P.mb), L.wd_row, sp(P.md), c.NE, c.FF);
     const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
     gpu::rmsnorm_res(ro, sp(P.md), nextw, ro, sp(P.h), c.NE, c.EPS, T);
     x = ro;
@@ -686,20 +701,44 @@ inline bool can_prefill_batched(const Model& M, int64_t T) {
 // from there. Returns -1 if the batched path is unavailable or the prompt does
 // not fit the cache.
 inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
-                               int64_t chunk = PREFILL_CHUNK) {
+                               int64_t chunk = PREFILL_CHUNK, bool exact = false) {
   const Config& c = M.c;
   const int64_t T = (int64_t)ids.size();
   if (!can_prefill_batched(M, T) || !M.pscratch.init(c, chunk)) return -1;
-  int64_t last = 0;
-  for (int64_t s = 0; s < T; s += chunk) {
-    last = std::min(chunk, T - s);
-    stage_embed_rows_(M, ids, s, last);
-    prefill_chunk_(M, last);
+  auto run = [&](bool full) {
+    int64_t last = 0;
+    for (int64_t s = 0; s < T; s += chunk) {
+      last = std::min(chunk, T - s);
+      stage_embed_rows_(M, ids, s, last);
+      prefill_chunk_(M, last, full);
+    }
+    // Only the final row of the final chunk needs logits — one GEMV for the
+    // whole prompt rather than one per chunk, read in place as a view of it.
+    gemv_w(M.outwT, at_f32(sp(M.pscratch.h), (last - 1) * c.NE), sp(M.scratch.logits),
+           c.VOCAB, c.NE);
+  };
+  if (exact) {
+    run(true);
+    return argmax_logits(M);
   }
-  // Only the final row of the final chunk needs logits — one GEMV for the whole
-  // prompt rather than one per chunk, read in place as a view of that row.
-  gemv_w(M.outwT, at_f32(sp(M.pscratch.h), (last - 1) * c.NE), sp(M.scratch.logits),
-         c.VOCAB, c.NE);
+  // f16 operands can overflow — the attention's always, the GEMMs' sums under
+  // f16_acc — and an inf anywhere reaches every logit as NaN through the next
+  // RMSNorm, so a non-finite logit sum is the test. The retry is exact, so it
+  // cannot overflow the same way; first the sequence goes back to where it
+  // started: the caches' position, and a DeltaNet layer's state, which the
+  // prompt advanced.
+  const int64_t pos_before = seq_cache(M).pos;
+  delta_snapshot before;
+  if (c.hybrid()) before.save(M);
+  run(false);
+  gpu::row_op(gpu::kop::row_sum, sp(M.scratch.logits), sp(M.scratch.logit_sum), 1, c.VOCAB, 1,
+              0);
+  if (!std::isfinite(host_read(M.scratch.logit_sum)[0])) {
+    set_cache_pos(M, pos_before);
+    if (c.hybrid()) before.restore(M.c);
+    run(true);
+    M.f16_retries++;
+  }
   return argmax_logits(M);
 }
 
@@ -710,7 +749,7 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
 // F16 oracle; validated by coherence + divergence, not greedy-exact.
 inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
                    bool q4_mlp = false, bool q4_lmhead = false,
-                   int64_t maxc = 4096, bool oracle = true) {
+                   int64_t maxc = 4096, bool oracle = true, bool f16_acc = true) {
   const Config c = config_from_gguf(m, maxc);
   // bf16 weights need the backend's bf16 [K,N] GEMV: the lm_head reads it in
   // every mode, and so does every projection off the row path. It has no
@@ -742,7 +781,8 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
           q4lm ? load_w_T(m, c.output_name(), c.NE, c.VOCAB, f32).to_q4() : array{},
       .row = row,
       .q4_mlp = q4m,
-      .q4_lmhead = q4lm};
+      .q4_lmhead = q4lm,
+      .f16_acc = f16_acc};
   for (int64_t l = 0; l < c.NL; l++) {
     std::string p = "blk." + std::to_string(l) + ".";
     // Named per field: the ternaries below decide LAYOUT, and a positional list

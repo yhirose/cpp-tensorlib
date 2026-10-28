@@ -4,7 +4,7 @@
 // the end-to-end proof: prompt string in, generated text out, on this repo's own
 // GPU kernels + own GGUF loader + own BPE tokenizer, zero third-party runtime deps.
 //
-// Usage: chat_qwen [model.gguf] ["your prompt"] [f32|bf16] [q4 spec] [nothink]
+// Usage: chat_qwen [model.gguf] ["your prompt"] [f32|bf16] [q4 spec] [nothink] [f32acc]
 // Greedy decoding (deterministic); stops at <|im_end|> or the token budget.
 
 #include "qwen.h"
@@ -45,7 +45,11 @@ int main(int argc, char** argv) {
   bool q4_mlp = q4spec.find("mlp") != std::string::npos || q4spec == "all" || q4spec == "q4";
   bool q4_lm = q4spec.find("lm") != std::string::npos || q4spec == "all" || q4spec == "q4";
   auto t_build = clk::now();
-  qm::Model M = qm::build(m, wdt, q4_mlp, q4_lm, /*maxc=*/4096, /*oracle=*/false);
+  // "f32acc" (argv[5] or later) keeps the prefill's GEMM sums in f32; by
+  // default they are f16 where the backend can, redone exactly on overflow.
+  bool f32acc = false;
+  for (int i = 5; i < argc; i++) f32acc |= std::string(argv[i]) == "f32acc";
+  qm::Model M = qm::build(m, wdt, q4_mlp, q4_lm, /*maxc=*/4096, /*oracle=*/false, !f32acc);
   double build_ms = ms_since(t_build);
   // What build() chose: a backend without the bf16 GEMV decodes from f32.
   std::printf("weight storage: %s | q4: mlp=%d lm=%d\n",
@@ -57,7 +61,8 @@ int main(int argc, char** argv) {
   // front, exactly what the template's enable_thinking=false does.
   // Qwen3.5's template opens the <think> block itself.
   const bool qwen3 = M.c.arch == "qwen3", qwen35 = M.c.arch == "qwen35";
-  const bool nothink = argc > 5 && std::string(argv[5]) == "nothink";
+  bool nothink = false;
+  for (int i = 5; i < argc; i++) nothink |= std::string(argv[i]) == "nothink";
   std::string templated =
       std::string(qwen3 || qwen35 ? "" : "<|im_start|>system\nYou are Qwen, created by "
                                            "Alibaba Cloud. You are a helpful "

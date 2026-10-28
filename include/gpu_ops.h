@@ -1051,6 +1051,21 @@ inline bool gemm_bf16_nt(span A, span B, span C, int64_t M, int64_t N,
   }
 }
 
+// The same product summed in f16, for an inference prefill that takes the
+// trade: f16 sums run at twice the f32 rate on tensor cores that have them
+// (CUDA's gemm_bf16_nt_f16acc), at a small cost in precision and with f16's
+// range — an activation or partial sum past 65504 turns to inf, which the
+// caller must check for. A backend without the form sums in f32.
+TL_GPU_DETECT_OWN(gemm_bf16_nt_f16acc)
+template <class Own = own>
+inline bool gemm_bf16_nt_f16acc(span A, span B, span C, int64_t M, int64_t N,
+                                int64_t K) {
+  if constexpr (detail::owns_gemm_bf16_nt_f16acc<Own>::value) {
+    if (detail::ran(Own::gemm_bf16_nt_f16acc(A, B, C, M, N, K))) return true;
+  }
+  return gemm_bf16_nt<Own>(A, B, C, M, N, K);
+}
+
 // One decode step: q [n_q_heads, D] against a [n_kv_heads, kv_max, D] cache
 // read over [0, ctx). GQA by the head ratio; the cache is f32 or bf16.
 TL_GPU_DETECT_OWN(attn_decode)

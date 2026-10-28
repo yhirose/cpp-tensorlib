@@ -3581,6 +3581,14 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       REQUIRE(gpu::gemm_bf16_nt(A.device_span(), Wb.device_span(), C.device_span(), M, N, K));
       tl::gpu::flush();
       CHECK(same(C, A.dot(Wt), 1e-4f));
+      // The f16-sum form: the same exact inputs (bf16 values sit inside f16),
+      // so only the f16 sums' rounding is left. A backend without the form
+      // sums in f32 and passes trivially.
+      array C16 = array::empty({M, N});
+      REQUIRE(gpu::gemm_bf16_nt_f16acc(A.device_span(), Wb.device_span(), C16.device_span(), M,
+                                       N, K));
+      tl::gpu::flush();
+      CHECK(same(C16, A.dot(Wt), 1e-2f));
       // Row m of the GEMM is the GEMV of row m — the prefill and the decode
       // paths have to agree on the same weight, which is what makes a
       // prompt's last token continue into generation.
