@@ -1000,7 +1000,7 @@ struct own {
   static bool gated_delta_chunked(gpu::span qkv, gpu::span ab, int64_t ab_ld,
                                   gpu::span adt, gpu::span state, gpu::span o,
                                   int64_t H, int64_t dk, int64_t dv, int64_t T,
-                                  float eps);
+                                  float eps, int64_t Hk);
   static bool attn_prefill_dq(gpu::span q, gpu::span K, gpu::span V,
                               gpu::span dO, gpu::span O, gpu::span dq,
                               gpu::span stats, int64_t H, int64_t T, int64_t D,
@@ -2204,10 +2204,10 @@ inline bool own::ssm_conv_tokens(gpu::span x, int64_t ld, gpu::span state,
 inline bool own::gated_delta_chunked(gpu::span qkv, gpu::span ab, int64_t ab_ld,
                                      gpu::span adt, gpu::span state, gpu::span o,
                                      int64_t H, int64_t dk, int64_t dv, int64_t T,
-                                     float eps) {
+                                     float eps, int64_t Hk) {
   constexpr int64_t C = 32;
   auto& c = context::get();
-  if (!c.ready || dk != 128 || dv % 32 || dv > 128 || T < C) return false;
+  if (!c.ready || dk != 128 || dv % 32 || dv > 128 || T < C || Hk <= 0 || H % Hk) return false;
   const int64_t nch = (T + C - 1) / C;
   const size_t rows = (size_t)H * T;
   const size_t floats = rows * (3 * dk + dv + 1) + (size_t)H * nch * C * C;
@@ -2232,7 +2232,7 @@ inline bool own::gated_delta_chunked(gpu::span qkv, gpu::span ab, int64_t ab_ld,
   const unsigned uH = (unsigned)H, udv = (unsigned)dv, uT = (unsigned)T,
                  uld = (unsigned)ab_ld;
   return c.launch_(c.gdc_prep_(), {(unsigned)nch, uH}, {256}, 0, pqkv, pab, padt, Qn,
-                   Kn, W, U, P, G, uH, udv, uT, uld, eps) &&
+                   Kn, W, U, P, G, uH, udv, uT, uld, eps, (unsigned)Hk) &&
          c.launch_(c.gdc_scan_(), {udv / 32, uH}, {context::gdc_scan_threads},
                    context::gdc_scan_smem, Qn, Kn, W, U, P, G, pst, po, uH, udv, uT);
 }

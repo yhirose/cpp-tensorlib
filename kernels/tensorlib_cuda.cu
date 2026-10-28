@@ -595,7 +595,7 @@ extern "C" __global__ void tl_gated_delta(const float* __restrict__ qkv,
                                           float* __restrict__ state,
                                           float* __restrict__ out, unsigned H,
                                           unsigned dk, unsigned dv, unsigned T,
-                                          unsigned ab_ld, float eps) {
+                                          unsigned ab_ld, float eps, unsigned Hk) {
   constexpr int R = 32;  // rows a warp holds
   extern __shared__ float sm[];
   float *qs = sm, *ks = sm + dk, *red = sm + 2 * dk;  // red: 2*dk, the tree's
@@ -603,7 +603,8 @@ extern "C" __global__ void tl_gated_delta(const float* __restrict__ qkv,
   const unsigned t = threadIdx.x, lane = t & 31u, w = t >> 5, NW = dk >> 5;
   const unsigned h = blockIdx.y, j = blockIdx.x * 32u + lane, i0 = w * R;
   const bool live = j < dv;
-  const size_t nq = (size_t)H * dk, C = 2 * nq + (size_t)H * dv;
+  const unsigned hk = h % Hk;  // the key head this value head reads
+  const size_t nq = (size_t)Hk * dk, C = 2 * nq + (size_t)H * dv;
   const float A = adt[h], dt = adt[H + h];
   float* S = state + (size_t)h * dk * dv;
   float Sr[R];
@@ -611,7 +612,7 @@ extern "C" __global__ void tl_gated_delta(const float* __restrict__ qkv,
   for (int r = 0; r < R; r++) Sr[r] = live ? S[(size_t)(i0 + r) * dv + j] : 0.0f;
   for (unsigned tok = 0; tok < T; tok++) {
     const float* row = qkv + tok * C;
-    const float a = row[(size_t)h * dk + t], b = row[nq + (size_t)h * dk + t];
+    const float a = row[(size_t)hk * dk + t], b = row[nq + (size_t)hk * dk + t];
     __syncthreads();  // the previous token is done reading qs / ks
     qs[t] = a;
     ks[t] = b;
@@ -670,7 +671,7 @@ extern "C" __global__ void tl_gated_delta_chunk_prep(
     const float* __restrict__ adt, float* __restrict__ Qn, float* __restrict__ Kn,
     float* __restrict__ W, float* __restrict__ U, float* __restrict__ P,
     float* __restrict__ G, unsigned H, unsigned dv, unsigned T, unsigned ab_ld,
-    float eps) {
+    float eps, unsigned Hk) {
   constexpr int C = TL_GDC, DK = 128;
   __shared__ float Qs[C][DK], Ks[C][DK];  // Qs later holds V
   __shared__ float Am[C][C + 1], Tm[C][C + 1];
@@ -678,7 +679,8 @@ extern "C" __global__ void tl_gated_delta_chunk_prep(
   const unsigned c = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, NTH = blockDim.x;
   const unsigned warp = tid >> 5, lane = tid & 31, NW = NTH >> 5;
   const unsigned t0 = c * C, n = min((unsigned)C, T - t0);
-  const size_t nq = (size_t)H * DK, Cq = 2 * nq + (size_t)H * dv;
+  const size_t nq = (size_t)Hk * DK, Cq = 2 * nq + (size_t)H * dv;
+  const size_t hk = h % Hk;         // the key head this value head reads
   const size_t hb = (size_t)h * T;  // this head's first row in the scratch
   // q and k, L2-normalized (q also over sqrt(DK)); rows past the chunk zero.
   for (unsigned t = warp; t < C; t += NW) {
@@ -686,8 +688,8 @@ extern "C" __global__ void tl_gated_delta_chunk_prep(
 #pragma unroll
     for (int r = 0; r < DK / 32; r++) {
       const unsigned d = lane + 32 * r;
-      a[r] = t < n ? qkv[(t0 + t) * Cq + (size_t)h * DK + d] : 0.0f;
-      b[r] = t < n ? qkv[(t0 + t) * Cq + nq + (size_t)h * DK + d] : 0.0f;
+      a[r] = t < n ? qkv[(t0 + t) * Cq + hk * DK + d] : 0.0f;
+      b[r] = t < n ? qkv[(t0 + t) * Cq + nq + hk * DK + d] : 0.0f;
       sq += a[r] * a[r];
       sk += b[r] * b[r];
     }

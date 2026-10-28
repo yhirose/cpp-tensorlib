@@ -3308,6 +3308,56 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     CHECK(same(Sa, Sb, 1e-4f));
   }
 
+  SUBCASE("the gated delta rule with fewer key heads than value heads") {
+    // Qwen3.8-27B: 16 key heads for 48 value heads, value head h reading key
+    // head h % Hk. The reference expands q and k to a head each (the layout
+    // the rule was built for) and runs the equal-heads path, per token and
+    // chunked; the key-head form must agree, on the backend and in the composition.
+    const int64_t H = 6, Hk = 2, dk = 128, dv = 128, T = 77;
+    const int64_t C = 2 * Hk * dk + H * dv, Cf = 2 * H * dk + H * dv, ld = 2 * H + 5;
+    array r = random_array({2 * H}, 1030);
+    r.eval();
+    std::vector<float> adt_h(r.raw(), r.raw() + 2 * H);
+    for (int64_t h = 0; h < H; h++) adt_h[h] = -std::fabs(adt_h[h]) - 0.1f;  // A < 0
+    array adt = dev(array::from(std::move(adt_h), {2 * H}));
+    array qkv = random_array({T, C}, 1031), ab = dev(random_array({T, ld}, 1032));
+    qkv.eval();
+    std::vector<float> full((size_t)T * Cf);
+    for (int64_t t = 0; t < T; t++) {
+      const float* src = qkv.raw() + t * C;
+      float* dst = full.data() + t * Cf;
+      for (int64_t h = 0; h < H; h++) {  // q, then k, a copy of key head h % Hk
+        std::copy(src + (h % Hk) * dk, src + (h % Hk + 1) * dk, dst + h * dk);
+        std::copy(src + Hk * dk + (h % Hk) * dk, src + Hk * dk + (h % Hk + 1) * dk,
+                  dst + H * dk + h * dk);
+      }
+      std::copy(src + 2 * Hk * dk, src + C, dst + 2 * H * dk);
+    }
+    array qkv_d = dev(qkv), full_d = dev(array::from(std::move(full), {T, Cf}));
+    array S0 = dev(random_array({H, dk, dv}, 1033) * 0.1f);
+    array Sref = dev(S0), Sa = dev(S0), Sb = dev(S0), Sc = dev(S0);
+    array oref = array::empty({T, H * dv}), oa = array::empty({T, H * dv}),
+          ob = array::empty({T, H * dv}), oc = array::empty({T, H * dv});
+    REQUIRE(gpu::gated_delta(full_d.device_span(), ab.device_span(), ld, adt.device_span(),
+                             Sref.device_span(), oref.device_span(), H, dk, dv, T, 1e-6f));
+    REQUIRE(gpu::gated_delta(qkv_d.device_span(), ab.device_span(), ld, adt.device_span(),
+                             Sa.device_span(), oa.device_span(), H, dk, dv, T, 1e-6f, Hk));
+    for (int64_t t = 0; t < T; t++) {  // one token at a time: the token kernel
+      REQUIRE(gpu::gated_delta(qkv_d.device_span().at(t * C * 4), ab.device_span().at(t * ld * 4),
+                               0, adt.device_span(), Sb.device_span(),
+                               ob.device_span().at(t * H * dv * 4), H, dk, dv, 1, 1e-6f, Hk));
+    }
+    REQUIRE(gen::gated_delta(qkv_d.device_span(), ab.device_span(), ld, adt.device_span(),
+                             Sc.device_span(), oc.device_span(), H, dk, dv, T, 1e-6f, Hk));
+    tl::gpu::flush();
+    CHECK(same(oa, oref, 1e-4f));
+    CHECK(same(Sa, Sref, 1e-4f));
+    CHECK(same(ob, oref, 1e-4f));
+    CHECK(same(Sb, Sref, 1e-4f));
+    CHECK(same(oc, oref, 1e-4f));
+    CHECK(same(Sc, Sref, 1e-4f));
+  }
+
   SUBCASE("rope, split_heads, merge_heads and argmax") {
     const int64_t H = 14, T = 5, D = 64, ld = H * D;
     array x = dev(random_array({H * T, D}, 970)), b = dev(random_array({H * T, D}, 971));

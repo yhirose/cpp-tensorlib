@@ -295,6 +295,7 @@ struct ssm_conv_params {  // C channels, a K-tap causal window, T tokens
 struct gated_delta_params {  // H heads, a [dk, dv] state each, T tokens
   uint32_t H, dk, dv, T, ab_ld;  // ab_ld: elements between alpha|beta rows
   float eps;                     // of the q / k L2 norms
+  uint32_t Hk;                   // q / k heads: head h reads key head h % Hk
 };
 
 // The launch record. Every kernel launch on every backend is one row under

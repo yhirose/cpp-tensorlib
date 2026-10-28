@@ -257,14 +257,15 @@ inline bool gated_delta(const gpu::arg* v, const void* params) {
   const auto& p = as<gpu::gated_delta_params>(params);
   const float* adt = at<const float>(v[2]);
   float* state = at<float>(v[3]);
-  const size_t nq = size_t(p.H) * p.dk, C = 2 * nq + size_t(p.H) * p.dv;
+  const size_t nq = size_t(p.Hk) * p.dk, C = 2 * nq + size_t(p.H) * p.dv;
   std::vector<float> q(p.dk), k(p.dk), kv(p.dv);
   for (uint32_t tok = 0; tok < p.T; tok++) {
     const float* qkv = at<const float>(v[0]) + tok * C;
     const float* ab = at<const float>(v[1]) + size_t(tok) * p.ab_ld;
     float* o = at<float>(v[4]) + size_t(tok) * p.H * p.dv;
     for (uint32_t h = 0; h < p.H; h++) {
-      const float *qh = qkv + size_t(h) * p.dk, *kh = qkv + nq + size_t(h) * p.dk,
+      const size_t hk = h % p.Hk;  // the key head this value head reads
+      const float *qh = qkv + hk * p.dk, *kh = qkv + nq + hk * p.dk,
                   *vh = qkv + 2 * nq + size_t(h) * p.dv;
       double sq = 0, sk = 0;
       for (uint32_t i = 0; i < p.dk; i++) sq += double(qh[i]) * qh[i], sk += double(kh[i]) * kh[i];

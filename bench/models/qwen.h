@@ -61,7 +61,9 @@ struct Config {
   // Qwen3.5 is hybrid: every INTERVAL-th layer is full attention and the rest
   // are Gated DeltaNet (INTERVAL 1: all attention). A DeltaNet layer has SH
   // heads with a [SDK, SDV] state each and a SCONV-tap causal conv.
-  int64_t INTERVAL = 1, SH = 0, SDK = 0, SDV = 0, SCONV = 0;
+  // SK key heads (q and k) serve the SH value heads, value head h reading key
+  // head h % SK (the order GGUF files store the value heads in).
+  int64_t INTERVAL = 1, SH = 0, SK = 0, SDK = 0, SDV = 0, SCONV = 0;
   std::string ffn_norm = "ffn_norm.weight";  // Qwen3.5: post_attention_norm
   float L2EPS = 1e-6f;  // DeltaNet's q / k L2 norms (the reference's constant)
   float scale() const { return 1.0f / std::sqrt((float)HD); }
@@ -69,7 +71,7 @@ struct Config {
   bool is_delta(int64_t l) const { return hybrid() && (l + 1) % INTERVAL != 0; }
   // Output widths of the fused projections (and so of the scratch they land in).
   int64_t attn_proj() const { return (NH + 2 * NKV) * HD + (attn_gate ? NH * HD : 0); }
-  int64_t ssm_conv_ch() const { return 2 * SH * SDK + SH * SDV; }  // q|k|v
+  int64_t ssm_conv_ch() const { return 2 * SK * SDK + SH * SDV; }  // q|k|v
   int64_t ssm_v() const { return SH * SDV; }                        // the rule's out
   // q|k|v | alpha | beta | z. The decode scratch puts the rule's output right
   // after z, so the gated norm's silu(z) * o reads them as one gate|up buffer.
@@ -116,10 +118,12 @@ inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
     c.SDK = u32("ssm.state_size");
     c.SDV = u32("ssm.inner_size") / c.SH;
     c.SCONV = u32("ssm.conv_kernel");
-    // Fewer key heads than value heads repeats them, in an order the GGUF
-    // conversion has its own convention for; nothing here implements that.
-    if (u32("ssm.group_count") != c.SH)
-      throw std::runtime_error("qwen: DeltaNet key heads != value heads");
+    // Fewer key heads than value heads are shared (Qwen3.8-27B: 16 for 48).
+    // GGUF conversion reorders the value heads so that head h reads key head
+    // h % SK, as llama.cpp's ggml_repeat does; the rule's kernels take SK.
+    c.SK = u32("ssm.group_count");
+    if (c.SK <= 0 || c.SH % c.SK)
+      throw std::runtime_error("qwen: DeltaNet value heads not a multiple of key heads");
   }
   // The switches are read off the first attention layer (layer 0 may be DeltaNet).
   const std::string a0 = "blk." + std::to_string(c.first_attn()) + ".";
@@ -645,7 +649,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       gpu::ssm_conv(sp(P.qkv), PJ, sp(L.conv_state), sp(L.wconv), sp(P.conv), C,
                     c.SCONV, T);
       gpu::gated_delta(sp(P.conv), at_f32(sp(P.qkv), C), PJ, sp(L.adt),
-                       sp(L.ssm_state), o, c.SH, c.SDK, c.SDV, T, c.L2EPS);
+                       sp(L.ssm_state), o, c.SH, c.SDK, c.SDV, T, c.L2EPS, c.SK);
       gpu::rmsnorm(o, sp(L.sn), o, c.SDV, c.EPS, T * c.SH);
       rows_out(at_f32(sp(P.qkv), C + 2 * c.SH), PJ, z, V);
       if (a16) gpu::swiglu_h16(z, sp(P.at16), T * V, 1);
@@ -1143,7 +1147,7 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
       gv(L.wssm, sp(S.hb), pj, c.ssm_proj(), c.NE);
       gpu::ssm_conv(pj, C, sp(L.conv_state), sp(L.wconv), sp(S.convb), C, c.SCONV);
       gpu::gated_delta(sp(S.convb), at_f32(pj, C), 0, sp(L.adt), sp(L.ssm_state), o,
-                       c.SH, c.SDK, c.SDV, 1, c.L2EPS);
+                       c.SH, c.SDK, c.SDV, 1, c.L2EPS, c.SK);
       gpu::rmsnorm(o, sp(L.sn), o, c.SDV, c.EPS, c.SH);
       gpu::swiglu(at_f32(pj, C + 2 * c.SH), sp(S.ab), V);
       gv(L.wsout, sp(S.ab), ro, c.NE, V);  // ro = mixer @ ssm_out

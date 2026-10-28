@@ -724,10 +724,11 @@ inline bool ssm_conv(span x, int64_t ld, span state, span w, span o, int64_t C,
 // One token of the gated delta rule (see the shared op below): the L2 norms
 // as a row reduction and two broadcasts, the gates elementwise, and per head
 // three GEMVs (the state read by k, the rank-1 update, the state read by q).
+// Hk q / k heads serve the H value heads, head h reading key head h % Hk.
 inline bool gated_delta_token_(span qkv, span ab, span adt, span state, span o,
-                               int64_t H, int64_t dk, int64_t dv, float eps) {
-  const int64_t nq = H * dk, S = dk * dv;
-  scratch sq(2 * nq), ss(2 * H), inv(2 * H), qk(2 * nq), t(H), e(H), e1(H),
+                               int64_t H, int64_t Hk, int64_t dk, int64_t dv, float eps) {
+  const int64_t nq = Hk * dk, S = dk * dv;
+  scratch sq(2 * nq), ss(2 * Hk), inv(2 * Hk), qk(2 * nq), t(H), e(H), e1(H),
       sp(H), g(H), decay(H), beta(H), S2(H * S), kvm(H * dv), d1(H * dv),
       d2(H * dv), up(S);
   if (!sq || !ss || !inv || !qk || !t || !e || !e1 || !sp || !g || !decay ||
@@ -737,12 +738,12 @@ inline bool gated_delta_token_(span qkv, span ab, span adt, span state, span o,
   const span qn = qk, kn = qn.at(nq * 4);
   // q and k rows over 1 / sqrt(sum(x^2) + eps), q also over sqrt(dk).
   if (!binary(kop::mul, qkv, qkv, sq, 2 * nq, 1.0f, 0.0f) ||
-      !row_op(kop::row_sum, sq, ss, 2 * H, dk, 1.0f, eps) ||
-      !scalar_binary(scalar_op::pow, ss, inv, 2 * H, -0.5f, 1.0f, 0.0f) ||
-      !binary_bcast(kop::bmul, qkv, dk, 1, inv, 1, 0, qn, H, dk,
+      !row_op(kop::row_sum, sq, ss, 2 * Hk, dk, 1.0f, eps) ||
+      !scalar_binary(scalar_op::pow, ss, inv, 2 * Hk, -0.5f, 1.0f, 0.0f) ||
+      !binary_bcast(kop::bmul, qkv, dk, 1, inv, 1, 0, qn, Hk, dk,
                     1.0f / std::sqrt(static_cast<float>(dk)), 0.0f) ||
-      !binary_bcast(kop::bmul, qkv.at(nq * 4), dk, 1, span(inv).at(H * 4), 1,
-                    0, kn, H, dk, 1.0f, 0.0f)) {
+      !binary_bcast(kop::bmul, qkv.at(nq * 4), dk, 1, span(inv).at(Hk * 4), 1,
+                    0, kn, Hk, dk, 1.0f, 0.0f)) {
     return false;
   }
   // decay = exp(A * softplus(alpha + dt)), beta = sigmoid(beta).
@@ -758,7 +759,7 @@ inline bool gated_delta_token_(span qkv, span ab, span adt, span state, span o,
   }
   const span S2v = S2;
   for (int64_t h = 0; h < H; h++) {  // kv memory = k . S
-    if (!gemm(kn.at(h * dk * 4), dk, false, S2v.at(h * S * 4), dv, false,
+    if (!gemm(kn.at((h % Hk) * dk * 4), dk, false, S2v.at(h * S * 4), dv, false,
               span(kvm).at(h * dv * 4), 1, dv, dk, 1.0f, 0.0f)) {
       return false;
     }
@@ -769,10 +770,10 @@ inline bool gated_delta_token_(span qkv, span ab, span adt, span state, span o,
   }
   for (int64_t h = 0; h < H; h++) {  // S += k (x) delta, then o = q . S
     const span Sh = state.at(h * S * 4);
-    if (!gemm(kn.at(h * dk * 4), 1, false, span(d2).at(h * dv * 4), dv, false,
+    if (!gemm(kn.at((h % Hk) * dk * 4), 1, false, span(d2).at(h * dv * 4), dv, false,
               up, dk, dv, 1, 1.0f, 0.0f) ||
         !binary(kop::add, S2v.at(h * S * 4), up, Sh, S, 1.0f, 0.0f) ||
-        !gemm(qn.at(h * dk * 4), dk, false, Sh, dv, false, o.at(h * dv * 4), 1,
+        !gemm(qn.at((h % Hk) * dk * 4), dk, false, Sh, dv, false, o.at(h * dv * 4), 1,
               dv, dk, 1.0f, 0.0f)) {
       return false;
     }
@@ -783,11 +784,12 @@ inline bool gated_delta_token_(span qkv, span ab, span adt, span state, span o,
 // The rule over T tokens is the one-token step T times, in order.
 inline bool gated_delta(span qkv, span ab, int64_t ab_ld, span adt, span state,
                         span o, int64_t H, int64_t dk, int64_t dv, int64_t T,
-                        float eps) {
-  const int64_t C = 2 * H * dk + H * dv;
+                        float eps, int64_t Hk = 0) {
+  if (Hk == 0) Hk = H;
+  const int64_t C = 2 * Hk * dk + H * dv;
   for (int64_t t = 0; t < T; t++) {
     if (!gated_delta_token_(qkv.at(t * C * 4), ab.at(t * ab_ld * 4), adt, state,
-                            o.at(t * H * dv * 4), H, dk, dv, eps)) {
+                            o.at(t * H * dv * 4), H, Hk, dk, dv, eps)) {
       return false;
     }
   }
@@ -860,7 +862,9 @@ inline bool ssm_conv(span x, int64_t ld, span state, span w, span o, int64_t C,
 
 // The gated delta rule (Gated DeltaNet, Qwen3.5) over T tokens in order, per
 // head h with a state S_h [dk, dv]. Token t reads row t of qkv [T, C] —
-// q [H, dk] | k [H, dk] | v [H, dv] as the conv left them — and of ab (rows
+// q [Hk, dk] | k [Hk, dk] | v [H, dv] as the conv left them (Hk = 0 means H;
+// fewer key heads than value heads are shared, head h reading key head h % Hk,
+// the order GGUF files store the value heads in) — and of ab (rows
 // ab_ld apart) — alpha [H] | beta [H] raw; adt = A [H] | dt_bias [H]. q and k
 // are L2-normalized (q also over sqrt(dk)), then
 //   decay = exp(A * softplus(alpha + dt)), beta = sigmoid(beta),
@@ -870,13 +874,14 @@ TL_GPU_DETECT_OWN(gated_delta_chunked)
 template <class Own = own>
 inline bool gated_delta(span qkv, span ab, int64_t ab_ld, span adt, span state,
                         span o, int64_t H, int64_t dk, int64_t dv, int64_t T,
-                        float eps) {
-  if (H <= 0 || dk <= 0 || dv <= 0 || T <= 0) return false;
+                        float eps, int64_t Hk = 0) {
+  if (Hk == 0) Hk = H;
+  if (H <= 0 || Hk <= 0 || H % Hk || dk <= 0 || dv <= 0 || T <= 0) return false;
   // A prefill's many tokens: a backend's chunked form, where it has one for
   // the shape, regroups the same rule into per-chunk matrix products.
   if constexpr (detail::owns_gated_delta_chunked<Own>::value) {
     if (T > 1 && detail::ran(Own::gated_delta_chunked(qkv, ab, ab_ld, adt, state, o, H,
-                                                      dk, dv, T, eps))) {
+                                                      dk, dv, T, eps, Hk))) {
       return true;
     }
   }
@@ -890,9 +895,10 @@ inline bool gated_delta(span qkv, span ab, int64_t ab_ld, span adt, span state,
                 {in(qkv), in(ab), in(adt), inout(state), out(o)},
                 gated_delta_params{static_cast<uint32_t>(H), static_cast<uint32_t>(dk),
                                    static_cast<uint32_t>(dv), static_cast<uint32_t>(T),
-                                   static_cast<uint32_t>(ab_ld), eps},
+                                   static_cast<uint32_t>(ab_ld), eps,
+                                   static_cast<uint32_t>(Hk)},
                 g)) ||
-         generic::gated_delta(qkv, ab, ab_ld, adt, state, o, H, dk, dv, T, eps);
+         generic::gated_delta(qkv, ab, ab_ld, adt, state, o, H, dk, dv, T, eps, Hk);
 }
 
 // y[1,N] = a[1,K] . W[N,K]^T with the bf16 weight row-major (GGML-native): one
