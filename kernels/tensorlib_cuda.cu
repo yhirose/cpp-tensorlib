@@ -2135,6 +2135,93 @@ static __device__ __forceinline__ void gemv_row_block_store(
   }
 }
 
+// ---- GEMVs over GGUF K-quant weights ([N,K] rows of K/256 blocks, read where
+// they lie: the decode is bound by the bytes it reads, and a Q4_K weight is
+// 0.56 byte). One block of 4 warps a row, as tl_gemv_bf16_row; the dequantized
+// value is never stored, each lane folds it into the dot product. The formats
+// are ggml's (include/ggml_quant.h has them in words); a block's d / scales
+// are read by every lane that needs them, from L1.
+
+// Q4_K, 144 bytes a block, a warp a block: lane = 8 * pair + j reads 4 bytes of
+// the pair's 32 (8 weights: 4 low nibbles of group 2*pair, 4 high of 2*pair+1)
+// and the 4 + 4 activations they multiply.
+// y_n = sum d*sc*q*a - dmin*m*a.
+__global__ void tl_gemv_q4k_row(const float* __restrict__ a, const unsigned char* __restrict__ W,
+                                float* __restrict__ y, unsigned N, unsigned K) {
+  const unsigned n = blockIdx.x;
+  if (n >= N) return;
+  const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
+  const unsigned nb = K / 256u, p = lane >> 3, j = lane & 7u;
+  const unsigned char* row = W + (size_t)n * nb * 144u;
+  float acc = 0.0f;
+  for (unsigned ib = warp; ib < nb; ib += nwarps) {
+    const unsigned char* b = row + (size_t)ib * 144u;
+    const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(b));  // d, dmin
+    unsigned char sm[12];
+    const uint3 sw = *reinterpret_cast<const uint3*>(b + 4);
+    memcpy(sm, &sw, 12);
+    const unsigned w = *reinterpret_cast<const unsigned*>(b + 16 + 32 * p + 4 * j);
+    const float* ap = a + (size_t)ib * 256u + 64u * p + 4u * j;
+    const float4 alo = *reinterpret_cast<const float4*>(ap), ahi = *reinterpret_cast<const float4*>(ap + 32);
+    const float lo[4] = {(float)(w & 0xFu), (float)((w >> 8) & 0xFu), (float)((w >> 16) & 0xFu), (float)((w >> 24) & 0xFu)};
+    const float hi[4] = {(float)((w >> 4) & 0xFu), (float)((w >> 12) & 0xFu), (float)((w >> 20) & 0xFu), (float)((w >> 28) & 0xFu)};
+    const float sql = lo[0] * alo.x + lo[1] * alo.y + lo[2] * alo.z + lo[3] * alo.w;
+    const float sqh = hi[0] * ahi.x + hi[1] * ahi.y + hi[2] * ahi.z + hi[3] * ahi.w;
+    unsigned char s0, m0, s1, m1;
+    {  // scale / min of groups 2p and 2p+1 (ggml's get_scale_min_k4)
+      const int g0 = 2 * (int)p, g1 = g0 + 1;
+      s0 = g0 < 4 ? (sm[g0] & 63) : (unsigned char)((sm[g0 + 4] & 0xF) | ((sm[g0 - 4] >> 6) << 4));
+      m0 = g0 < 4 ? (sm[g0 + 4] & 63) : (unsigned char)((sm[g0 + 4] >> 4) | ((sm[g0] >> 6) << 4));
+      s1 = g1 < 4 ? (sm[g1] & 63) : (unsigned char)((sm[g1 + 4] & 0xF) | ((sm[g1 - 4] >> 6) << 4));
+      m1 = g1 < 4 ? (sm[g1 + 4] & 63) : (unsigned char)((sm[g1 + 4] >> 4) | ((sm[g1] >> 6) << 4));
+    }
+    const float suml = alo.x + alo.y + alo.z + alo.w, sumh = ahi.x + ahi.y + ahi.z + ahi.w;
+    acc += dd.x * (s0 * sql + s1 * sqh) - dd.y * (m0 * suml + m1 * sumh);
+  }
+  gemv_row_block_store(acc, lane, warp, nwarps, y + n);
+}
+
+// Q6_K, 210 bytes a block (2-byte aligned only, hence the 16-bit loads): a warp
+// takes two blocks at a time, lane = 16 * which + 8 * half + j reading the 4
+// consecutive positions 4j.. of its 128-weight half, in each of the four
+// 32-weight quarters (4 + 4 bytes of ql, 4 of qh, 16 activations).
+__device__ __forceinline__ unsigned ld32_h(const unsigned char* p) {
+  return (unsigned)*reinterpret_cast<const unsigned short*>(p) |
+         ((unsigned)*reinterpret_cast<const unsigned short*>(p + 2) << 16);
+}
+__global__ void tl_gemv_q6k_row(const float* __restrict__ a, const unsigned char* __restrict__ W,
+                                float* __restrict__ y, unsigned N, unsigned K) {
+  const unsigned n = blockIdx.x;
+  if (n >= N) return;
+  const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
+  const unsigned nb = K / 256u, r = lane & 15u, h = r >> 3, j = r & 7u;
+  const unsigned char* row = W + (size_t)n * nb * 210u;
+  float acc = 0.0f;
+  for (unsigned ib = warp * 2u + (lane >> 4); ib < nb; ib += nwarps * 2u) {
+    const unsigned char* b = row + (size_t)ib * 210u;
+    const float d = __half2float(*reinterpret_cast<const __half*>(b + 208));
+    const unsigned qa = ld32_h(b + 64 * h + 4 * j), qb = ld32_h(b + 64 * h + 32 + 4 * j),
+                   qh = ld32_h(b + 128 + 32 * h + 4 * j);
+    const signed char* sc = reinterpret_cast<const signed char*>(b + 192) + 8 * h + (j >> 2);
+    const float* ap = a + (size_t)ib * 256u + 128u * h + 4u * j;
+    const float4 a0 = *reinterpret_cast<const float4*>(ap), a1 = *reinterpret_cast<const float4*>(ap + 32),
+                 a2 = *reinterpret_cast<const float4*>(ap + 64), a3 = *reinterpret_cast<const float4*>(ap + 96);
+    const float v0[4] = {a0.x, a0.y, a0.z, a0.w}, v1[4] = {a1.x, a1.y, a1.z, a1.w},
+                v2[4] = {a2.x, a2.y, a2.z, a2.w}, v3[4] = {a3.x, a3.y, a3.z, a3.w};
+    float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const unsigned la = (qa >> (8 * i)) & 0xFFu, lb = (qb >> (8 * i)) & 0xFFu, hq = (qh >> (8 * i)) & 0xFFu;
+      s0 += (float)((int)((la & 0xF) | ((hq & 3u) << 4)) - 32) * v0[i];
+      s1 += (float)((int)((lb & 0xF) | (((hq >> 2) & 3u) << 4)) - 32) * v1[i];
+      s2 += (float)((int)((la >> 4) | (((hq >> 4) & 3u) << 4)) - 32) * v2[i];
+      s3 += (float)((int)((lb >> 4) | (((hq >> 6) & 3u) << 4)) - 32) * v3[i];
+    }
+    acc += d * ((float)sc[0] * s0 + (float)sc[2] * s1 + (float)sc[4] * s2 + (float)sc[6] * s3);
+  }
+  gemv_row_block_store(acc, lane, warp, nwarps, y + n);
+}
+
 // Warp-per-row bf16 GEMV (M9 decode lever A): weights in [N,K] (K contiguous per
 // output row = GGML-native, so the loader drops the transpose). ONE BLOCK per
 // output row n (grid.x == N); its threads split K, each lane consuming 8 bf16

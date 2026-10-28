@@ -1072,6 +1072,19 @@ inline bool gemm_bf16_nt_f16acc(span A, span B, span C, int64_t M, int64_t N,
   return gemm_bf16_nt<Own>(A, B, C, M, N, K);
 }
 
+// y[n] = W[n,K] . a with W the rows of a GGUF K-quant weight (type = ggml_type
+// code: 12 Q4_K, 14 Q6_K), read as quantized. False where the backend has no
+// such kernel; the caller dequantizes instead.
+TL_GPU_DETECT_OWN(gemv_kquant)
+template <class Own = own>
+inline bool gemv_kquant(int type, span a, span W, span y, int64_t n, int64_t k) {
+  if constexpr (detail::owns_gemv_kquant<Own>::value) {
+    return detail::ran(Own::gemv_kquant(type, a, W, y, n, k));
+  } else {
+    return false;
+  }
+}
+
 // x[rows, D] = rope(rmsnorm(x) * w), in place, rows = heads * T: Qwen3's q and k
 // rows. One pass where the backend has it, else the two ops.
 TL_GPU_DETECT_OWN(rmsnorm_rope)

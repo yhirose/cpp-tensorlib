@@ -574,7 +574,7 @@ struct context {
   CUfunction gemm_bf16_nt_sk_() {
     return cached_(gemm_bf16_nt_sk_fn, "tl_gemm_bf16_nt_sk");
   }
-  CUfunction rmsnorm_rope_fn = nullptr;
+  CUfunction rmsnorm_rope_fn = nullptr, gemv_q4k_fn = nullptr, gemv_q6k_fn = nullptr;
   CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, swiglu_h16_fn = nullptr,
              merge_heads_h16_fn = nullptr, cvt_h16_fn = nullptr;  // the f16 activation's producers
   CUfunction conv_tok_fn = nullptr, conv_state_fn = nullptr;  // a prefill's conv
@@ -909,6 +909,9 @@ struct own {
   // x[rows, D] RMS-normalized by w and then rotated, in place (rows = heads * T).
   static bool rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T, int64_t D,
                            int64_t pos, float base, int64_t rot, float eps);
+  // y[n] = W[n,K] . a over GGUF K-quant rows (type: the ggml_type code, 12 Q4_K
+  // or 14 Q6_K), the blocks read where they lie. K % 256 == 0.
+  static bool gemv_kquant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n, int64_t k);
   // n floats copied device to device on the launch stream (a copy engine's job,
   // not a kernel's).
   static bool copy_f32(gpu::span from, gpu::span to, int64_t n);
@@ -1816,6 +1819,23 @@ inline bool own::gemm_bf16_nt_f16acc(gpu::span a, gpu::span B, gpu::span out, in
 inline bool own::gemm_bf16_nt_f16acc_a16(gpu::span a, gpu::span B, gpu::span out, int64_t m,
                                          int64_t n, int64_t k) {
   return f16acc_run_(context::tc_form::f16h, a, B, out, m, n, k);
+}
+
+inline bool own::gemv_kquant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n,
+                             int64_t k) {
+  auto& c = context::get();
+  if (!c.ready || n <= 0 || k <= 0 || k % 256 || (type != 12 && type != 14)) return false;
+  float* pa = context::off_(a.buf, a.off);
+  if ((uintptr_t)pa % 16) return false;
+  c.device_read_(a.buf);
+  c.device_read_(W.buf);
+  c.device_write_(y.buf);
+  constexpr unsigned threads = 128;  // 4 warps a row
+  return c.launch_(type == 12 ? c.cached_(c.gemv_q4k_fn, "tl_gemv_q4k_row")
+                              : c.cached_(c.gemv_q6k_fn, "tl_gemv_q6k_row"),
+                   {(unsigned)n}, {threads}, threads / 32 * sizeof(float), pa,
+                   reinterpret_cast<unsigned char*>(context::off_(W.buf, W.off)),
+                   context::off_(y.buf, y.off), (unsigned)n, (unsigned)k);
 }
 
 inline bool own::rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T, int64_t D,

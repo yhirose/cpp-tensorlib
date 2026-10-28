@@ -3405,6 +3405,51 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     CHECK(fnv(y) == 0x1da2050114e9c32bull);
   }
 
+  SUBCASE("GEMV over K-quant rows against the dequantized weights") {
+    // Random bytes are valid blocks; only the half scales are set (a random one
+    // could be inf or NaN). Q4_K: d, dmin at the start; Q6_K: d at byte 208.
+    for (int type : {12, 14}) {
+      const bool q4 = type == 12;
+      const int64_t N = 37, K = 1024, nb = K / 256, bb = q4 ? 144 : 210;
+      std::mt19937 rng(7 + type);
+      std::vector<unsigned char> bytes((size_t)N * nb * bb);
+      for (auto& b : bytes) b = (unsigned char)rng();
+      auto set_half = [&](size_t at, float v) {  // a small positive half, built by hand
+        const uint16_t h = (uint16_t)(0x2800 + (rng() & 0x3ff));  // ~ 2^-5 .. 2^-4
+        std::memcpy(&bytes[at], &h, 2);
+        (void)v;
+      };
+      for (int64_t i = 0; i < N * nb; i++) {
+        if (q4) {
+          set_half((size_t)i * bb, 0);
+          set_half((size_t)i * bb + 2, 0);
+        } else {
+          set_half((size_t)i * bb + 208, 0);
+        }
+      }
+      array a = random_array({K}, 1040 + type);
+      a.eval();
+      std::vector<double> ref(N, 0.0);
+      std::vector<float> w((size_t)K);
+      for (int64_t n = 0; n < N; n++) {
+        tl::gguf::dequant_range(q4 ? tl::gguf::ggml_type::q4_k : tl::gguf::ggml_type::q6_k,
+                                bytes.data() + (size_t)n * nb * bb, 0, (size_t)K, w.data());
+        for (int64_t k = 0; k < K; k++) ref[n] += (double)w[k] * a.raw()[k];
+      }
+      std::vector<float> packed((bytes.size() + 3) / 4);
+      std::memcpy(packed.data(), bytes.data(), bytes.size());
+      array W = dev(array::from(std::move(packed), {(int64_t)((bytes.size() + 3) / 4)}));
+      array ad = dev(a), y = array::empty({N});
+      REQUIRE(gpu::gemv_kquant(type, ad.device_span(), W.device_span(), y.device_span(), N, K));
+      tl::gpu::flush();
+      y.eval();
+      double worst = 0;
+      for (int64_t n = 0; n < N; n++)
+        worst = std::max(worst, std::fabs(y.raw()[n] - ref[n]) / (1.0 + std::fabs(ref[n])));
+      CHECK(worst < 1e-5);
+    }
+  }
+
   SUBCASE("rope, split_heads, merge_heads and argmax") {
     const int64_t H = 14, T = 5, D = 64, ld = H * D;
     array x = dev(random_array({H * T, D}, 970)), b = dev(random_array({H * T, D}, 971));
