@@ -1,8 +1,8 @@
 // Dequantization of the GGML block formats a GGUF stores its weights in, on the
 // host: the reference the GPU kernels are checked against, and what a row
 // gather (the embedding table) reads. Bit for bit what ggml's
-// dequantize_row_q4_K / dequantize_row_q6_K produce. A format is a run of
-// blocks along a row of K weights (K a multiple of the block's 256), each
+// dequantize_row_q4_K / _q6_K / _q8_0 produce. A format is a run of blocks along
+// a row of K weights (K a multiple of the block's 256, or 32 for Q8_0), each
 // block self-contained.
 #pragma once
 
@@ -107,19 +107,37 @@ inline void dequant_q6_k(const block_q6_k* x, float* y, size_t nblocks) {
   }
 }
 
+// Q8_0: 32 weights, a half scale and 32 signed bytes; weight = d * q.
+struct block_q8_0 {
+  uint16_t d;
+  int8_t qs[32];
+};
+static_assert(sizeof(block_q8_0) == 34, "block_q8_0");
+
+inline void dequant_q8_0(const block_q8_0* x, float* y, size_t nblocks) {
+  for (size_t i = 0; i < nblocks; i++) {
+    const float d = half_to_float(x[i].d);
+    for (int j = 0; j < 32; j++) *y++ = x[i].qs[j] * d;
+  }
+}
+
 // Whether the type is one of the block formats above.
-inline bool is_kquant(ggml_type t) { return t == ggml_type::q4_k || t == ggml_type::q6_k; }
+inline bool is_quant(ggml_type t) {
+  return t == ggml_type::q4_k || t == ggml_type::q6_k || t == ggml_type::q8_0;
+}
 
 // Elements [first, first + n) of a quantized tensor widened to f32, `first` and
-// `n` multiples of 256 (whole blocks).
+// `n` multiples of the format's block (256, or 32 for Q8_0).
 inline void dequant_range(ggml_type t, const void* data, size_t first, size_t n, float* dst) {
   uint64_t elems = 0, bytes = 0;
   ggml_block(t, elems, bytes);
   const char* base = static_cast<const char*>(data) + (first / elems) * bytes;
   if (t == ggml_type::q4_k) {
     dequant_q4_k(reinterpret_cast<const block_q4_k*>(base), dst, n / elems);
-  } else {
+  } else if (t == ggml_type::q6_k) {
     dequant_q6_k(reinterpret_cast<const block_q6_k*>(base), dst, n / elems);
+  } else {
+    dequant_q8_0(reinterpret_cast<const block_q8_0*>(base), dst, n / elems);
   }
 }
 

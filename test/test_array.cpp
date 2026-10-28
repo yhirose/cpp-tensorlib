@@ -3359,10 +3359,10 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     CHECK(same(Sc, Sref, 1e-4f));
   }
 
-  SUBCASE("GGML K-quant dequantization is bit for bit ggml's") {
+  SUBCASE("GGML block-quantized dequantization is bit for bit ggml's") {
     // One block of each format, the 8th of a Qwen3-0.6B Q4_K_M tensor; the
     // hash is over the 256 float bit patterns ggml's dequantize_row_q4_K /
-    // _q6_K give (checked against libggml over every K-quant value of two
+    // _q6_K give (checked against libggml over every block-quantized value of two
     // models, 7.5e8 of them, none differing).
     static const unsigned char q4k_block[144] = {
       198, 8, 211, 20, 238, 244, 255, 240, 171, 236, 255, 233, 134, 147, 7, 221,
@@ -3374,6 +3374,10 @@ TEST_CASE("generic compositions agree with the fused kernels") {
       205, 170, 226, 101, 48, 162, 151, 185, 137, 187, 149, 104, 130, 105, 102, 240,
       210, 162, 84, 73, 95, 128, 59, 214, 92, 100, 10, 152, 124, 246, 217, 123,
       138, 106, 74, 124, 81, 118, 166, 41, 185, 150, 165, 180, 169, 133, 67, 152};
+    static const unsigned char q80_block[34] = {
+      85, 14, 199, 194, 180, 240, 5, 250, 201, 23, 216, 22, 90, 250, 199, 57,
+      95, 56, 63, 127, 199, 9, 216, 221, 178, 57, 247, 252, 169, 216, 51, 70,
+      51, 39};
     static const unsigned char q6k_block[210] = {
       201, 96, 163, 73, 13, 3, 70, 136, 56, 147, 172, 242, 209, 18, 168, 255,
       19, 208, 98, 9, 212, 63, 89, 128, 63, 77, 222, 22, 73, 207, 131, 49,
@@ -3401,16 +3405,27 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     float y[256];
     tl::gguf::dequant_range(tl::gguf::ggml_type::q4_k, q4k_block, 0, 256, y);
     CHECK(fnv(y) == 0x84924d0639eee2c3ull);
+    {  // Q8_0: one 32-weight block, hashed over its 32 values
+      float y8[256] = {};
+      tl::gguf::dequant_range(tl::gguf::ggml_type::q8_0, q80_block, 0, 32, y8);
+      uint64_t h = 1469598103934665603ull;
+      for (int i = 0; i < 32; i++) {
+        uint32_t b;
+        std::memcpy(&b, &y8[i], 4);
+        for (int k = 0; k < 4; k++) h = (h ^ ((b >> (8 * k)) & 0xff)) * 1099511628211ull;
+      }
+      CHECK(h == 0x393d7402241899c6ull);
+    }
     tl::gguf::dequant_range(tl::gguf::ggml_type::q6_k, q6k_block, 0, 256, y);
     CHECK(fnv(y) == 0x1da2050114e9c32bull);
   }
 
-  SUBCASE("GEMV over K-quant rows against the dequantized weights") {
+  SUBCASE("GEMV over block-quantized rows against the dequantized weights") {
     // Random bytes are valid blocks; only the half scales are set (a random one
-    // could be inf or NaN). Q4_K: d, dmin at the start; Q6_K: d at byte 208.
-    for (int type : {12, 14}) {
-      const bool q4 = type == 12;
-      const int64_t N = 37, K = 1024, nb = K / 256, bb = q4 ? 144 : 210;
+    // could be inf or NaN). Q4_K: d, dmin at the start; Q6_K: d at byte 208; Q8_0: d at the start.
+    for (int type : {12, 14, 8}) {
+      const bool q4 = type == 12, q8 = type == 8;
+      const int64_t N = 37, K = 1024, nb = q8 ? K / 32 : K / 256, bb = q4 ? 144 : q8 ? 34 : 210;
       std::mt19937 rng(7 + type);
       std::vector<unsigned char> bytes((size_t)N * nb * bb);
       for (auto& b : bytes) b = (unsigned char)rng();
@@ -3423,6 +3438,8 @@ TEST_CASE("generic compositions agree with the fused kernels") {
         if (q4) {
           set_half((size_t)i * bb, 0);
           set_half((size_t)i * bb + 2, 0);
+        } else if (q8) {
+          set_half((size_t)i * bb, 0);
         } else {
           set_half((size_t)i * bb + 208, 0);
         }
@@ -3432,7 +3449,9 @@ TEST_CASE("generic compositions agree with the fused kernels") {
       std::vector<double> ref(N, 0.0);
       std::vector<float> w((size_t)K);
       for (int64_t n = 0; n < N; n++) {
-        tl::gguf::dequant_range(q4 ? tl::gguf::ggml_type::q4_k : tl::gguf::ggml_type::q6_k,
+        tl::gguf::dequant_range(q4   ? tl::gguf::ggml_type::q4_k
+                                : q8 ? tl::gguf::ggml_type::q8_0
+                                     : tl::gguf::ggml_type::q6_k,
                                 bytes.data() + (size_t)n * nb * bb, 0, (size_t)K, w.data());
         for (int64_t k = 0; k < K; k++) ref[n] += (double)w[k] * a.raw()[k];
       }
@@ -3440,7 +3459,7 @@ TEST_CASE("generic compositions agree with the fused kernels") {
       std::memcpy(packed.data(), bytes.data(), bytes.size());
       array W = dev(array::from(std::move(packed), {(int64_t)((bytes.size() + 3) / 4)}));
       array ad = dev(a), y = array::empty({N});
-      REQUIRE(gpu::gemv_kquant(type, ad.device_span(), W.device_span(), y.device_span(), N, K));
+      REQUIRE(gpu::gemv_quant(type, ad.device_span(), W.device_span(), y.device_span(), N, K));
       tl::gpu::flush();
       y.eval();
       double worst = 0;

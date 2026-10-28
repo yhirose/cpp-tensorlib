@@ -198,12 +198,12 @@ if(TENSORLIB_CUDA)
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench/cuda)
   target_link_libraries(tensorlib_bench_qwen_prefill PRIVATE tensorlib)
   tensorlib_enable_cuda(tensorlib_bench_qwen_prefill)
-  # A K-quant GGUF dequantized at load against read as blocks (needs the model).
-  add_executable(tensorlib_check_kquant bench/cuda/speed/check_kquant.cpp)
-  target_include_directories(tensorlib_check_kquant BEFORE PRIVATE
+  # A block-quantized GGUF dequantized at load against read as blocks (needs the model).
+  add_executable(tensorlib_check_quant bench/cuda/speed/check_quant.cpp)
+  target_include_directories(tensorlib_check_quant BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench/models)
-  target_link_libraries(tensorlib_check_kquant PRIVATE tensorlib)
-  tensorlib_enable_cuda(tensorlib_check_kquant)
+  target_link_libraries(tensorlib_check_quant PRIVATE tensorlib)
+  tensorlib_enable_cuda(tensorlib_check_quant)
 
   # llama-bench's pp<P> / tg<N> on this library's path, for any Qwen GGUF, so
   # the two engines can be read side by side. Not a ctest (external model).

@@ -574,7 +574,8 @@ struct context {
   CUfunction gemm_bf16_nt_sk_() {
     return cached_(gemm_bf16_nt_sk_fn, "tl_gemm_bf16_nt_sk");
   }
-  CUfunction rmsnorm_rope_fn = nullptr, gemv_q4k_fn = nullptr, gemv_q6k_fn = nullptr;
+  CUfunction rmsnorm_rope_fn = nullptr, gemv_q4k_fn = nullptr, gemv_q6k_fn = nullptr,
+             gemv_q80_fn = nullptr;
   CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, swiglu_h16_fn = nullptr,
              merge_heads_h16_fn = nullptr, cvt_h16_fn = nullptr;  // the f16 activation's producers
   CUfunction conv_tok_fn = nullptr, conv_state_fn = nullptr;  // a prefill's conv
@@ -605,13 +606,13 @@ struct context {
   // The form is the operands and sums: bf16 operands with f32 sums, f16 with f16
   // sums, and f16 sums reading the activation already f16 (no rounding stage).
   enum class tc_form { f32, f16, f16h };
-  // The weight it reads: bf16 [N][K], or the rows of K-quant blocks (Q4_K, Q6_K);
+  // The weight it reads: bf16 [N][K], or the rows of block-quantized blocks (Q4_K, Q6_K);
   // the quantized ones have the f32 and f16h forms only.
-  enum class tc_weight { bf16, q4k, q6k };
-  CUfunction gemm_tc_fn[3][3][3] = {};  // [weight][form][tile]
+  enum class tc_weight { bf16, q4k, q6k, q80 };
+  CUfunction gemm_tc_fn[4][3][3] = {};  // [weight][form][tile]
   CUfunction gemm_tc_(tc_form f, tc_tile t, tc_weight w = tc_weight::bf16) {
     static const char* const forms[3] = {"f32", "f16", "f16h"};
-    static const char* const weights[3] = {"", "_q4k", "_q6k"};
+    static const char* const weights[4] = {"", "_q4k", "_q6k", "_q80"};
     static const char tiles[3] = {'l', 'm', 's'};
     if (w != tc_weight::bf16 && f == tc_form::f16) return nullptr;
     CUfunction& slot = gemm_tc_fn[static_cast<int>(w)][static_cast<int>(f)][static_cast<int>(t)];
@@ -914,14 +915,14 @@ struct own {
   // x[rows, D] RMS-normalized by w and then rotated, in place (rows = heads * T).
   static bool rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T, int64_t D,
                            int64_t pos, float base, int64_t rot, float eps);
-  // C[m, ldc-strided n columns] = A[m,K] . W[n,K]^T over GGUF K-quant rows (type 12
-  // Q4_K, 14 Q6_K). a16: A is f16 and the sums f16, else A is f32 and the sums f32
+  // C[m, ldc-strided n columns] = A[m,K] . W[n,K]^T over GGUF block-quantized rows (type 12
+  // Q4_K, 14 Q6_K, 8 Q8_0). a16: A is f16 and the sums f16, else A is f32 and the sums f32
   // (the exact form). K % 256 == 0, n even.
-  static bool gemm_kquant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
+  static bool gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
                           int64_t n, int64_t k, int64_t ldc);
-  // y[n] = W[n,K] . a over GGUF K-quant rows (type: the ggml_type code, 12 Q4_K
-  // or 14 Q6_K), the blocks read where they lie. K % 256 == 0.
-  static bool gemv_kquant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n, int64_t k);
+  // y[n] = W[n,K] . a over GGUF block-quantized rows (type: the ggml_type code, 12 Q4_K
+  // 14 Q6_K or 8 Q8_0), the blocks read where they lie. K a whole number of blocks.
+  static bool gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n, int64_t k);
   // n floats copied device to device on the launch stream (a copy engine's job,
   // not a kernel's).
   static bool copy_f32(gpu::span from, gpu::span to, int64_t n);
@@ -1845,11 +1846,11 @@ inline bool own::gemm_bf16_nt_f16acc_a16(gpu::span a, gpu::span B, gpu::span out
   return f16acc_run_(context::tc_form::f16h, a, B, out, m, n, k);
 }
 
-inline bool own::gemm_kquant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
+inline bool own::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
                              int64_t n, int64_t k, int64_t ldc) {
   auto& c = context::get();
-  if (!c.ready || m <= 0 || n <= 0 || k % 256 || n % 2 || ldc % 2 || ldc < n ||
-      (type != 12 && type != 14)) {
+  if (!c.ready || m <= 0 || n <= 0 || k % (type == 8 ? 32 : 256) || n % 2 || ldc % 2 || ldc < n ||
+      (type != 12 && type != 14 && type != 8)) {
     return false;
   }
   float* pa = context::off_(A.buf, A.off);
@@ -1861,21 +1862,24 @@ inline bool own::gemm_kquant(int type, bool a16, gpu::span A, gpu::span W, gpu::
   c.device_rmw_(C.buf);  // a part writes some columns of a shared output
   return gemm_tc_run_(c, a16 ? context::tc_form::f16h : context::tc_form::f32, pa, pw, pc,
                       (unsigned)m, (unsigned)n, (unsigned)k, (unsigned)ldc,
-                      type == 12 ? context::tc_weight::q4k : context::tc_weight::q6k);
+                      type == 12 ? context::tc_weight::q4k
+                      : type == 14 ? context::tc_weight::q6k : context::tc_weight::q80);
 }
 
-inline bool own::gemv_kquant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n,
+inline bool own::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n,
                              int64_t k) {
   auto& c = context::get();
-  if (!c.ready || n <= 0 || k <= 0 || k % 256 || (type != 12 && type != 14)) return false;
+  if (!c.ready || n <= 0 || k <= 0 || k % (type == 8 ? 32 : 256) || (type != 12 && type != 14 && type != 8))
+    return false;
   float* pa = context::off_(a.buf, a.off);
   if ((uintptr_t)pa % 16) return false;
   c.device_read_(a.buf);
   c.device_read_(W.buf);
   c.device_write_(y.buf);
   constexpr unsigned threads = 128;  // 4 warps a row
-  return c.launch_(type == 12 ? c.cached_(c.gemv_q4k_fn, "tl_gemv_q4k_row")
-                              : c.cached_(c.gemv_q6k_fn, "tl_gemv_q6k_row"),
+  return c.launch_(type == 12   ? c.cached_(c.gemv_q4k_fn, "tl_gemv_q4k_row")
+                   : type == 14 ? c.cached_(c.gemv_q6k_fn, "tl_gemv_q6k_row")
+                                : c.cached_(c.gemv_q80_fn, "tl_gemv_q80_row"),
                    {(unsigned)n}, {threads}, threads / 32 * sizeof(float), pa,
                    reinterpret_cast<unsigned char*>(context::off_(W.buf, W.off)),
                    context::off_(y.buf, y.off), (unsigned)n, (unsigned)k);

@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
   bool f32acc = false;
   for (int i = 5; i < argc; i++) f32acc |= std::string(argv[i]) == "f32acc";
   qm::Model M = qm::build(m, wdt, q4_mlp, q4_lm, /*maxc=*/4096, /*oracle=*/false, !f32acc,
-                           /*quant=*/qm::kquant_file(m) && !std::getenv("TL_DEQUANT"));
+                           /*quant=*/qm::quant_file(m) && !std::getenv("TL_DEQUANT"));
   double build_ms = ms_since(t_build);
   // What build() chose: a backend without the bf16 GEMV decodes from f32.
   std::printf("weight storage: %s | q4: mlp=%d lm=%d\n",

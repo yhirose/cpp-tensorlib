@@ -1880,7 +1880,7 @@ __device__ __forceinline__ float2 tc_pair_(const unsigned* c, int row_half) {
 __device__ __forceinline__ float2 tc_pair_(const float* c, int row_half) {
   return make_float2(c[2 * row_half], c[2 * row_half + 1]);
 }
-// Eight consecutive weights of one K-quant row (k = gk .. gk+7, gk % 8 == 0),
+// Eight consecutive weights of one block-quantized row (k = gk .. gk+7, gk % 8 == 0),
 // dequantized as ggml does and rounded to the GEMM's operand type, four pairs
 // packed in a uint4: what the GEMM stages for a B row chunk of a quantized weight.
 template <bool F16>
@@ -1936,8 +1936,24 @@ __device__ __forceinline__ uint4 tc_dq8_q6k_(const unsigned char* row, unsigned 
                     tc_pack2_<F16>(v[4], v[5]), tc_pack2_<F16>(v[6], v[7]));
 }
 
+template <bool F16>
+__device__ __forceinline__ uint4 tc_dq8_q80_(const unsigned char* row, unsigned gk) {
+  const unsigned char* b = row + (size_t)(gk >> 5) * 34u;  // 2-byte aligned only
+  const float d = __half2float(*reinterpret_cast<const __half*>(b));
+  const unsigned short* q16 = reinterpret_cast<const unsigned short*>(b + 2 + (gk & 31u));
+  float v[8];
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const unsigned w = q16[i];
+    v[2 * i] = (float)(signed char)(w & 0xFFu) * d;
+    v[2 * i + 1] = (float)(signed char)(w >> 8) * d;
+  }
+  return make_uint4(tc_pack2_<F16>(v[0], v[1]), tc_pack2_<F16>(v[2], v[3]),
+                    tc_pack2_<F16>(v[4], v[5]), tc_pack2_<F16>(v[6], v[7]));
+}
+
 // WF: the weight format B holds: 0 bf16 [N][K], 1 Q4_K, 2 Q6_K blocks (rows of
-// K/256 blocks, K % 256 == 0). C rows are `ldc` apart, so a part of a fused
+// K/256 blocks, K % 256 == 0), 3 Q8_0 (rows of K/32 blocks). C rows are `ldc` apart, so a part of a fused
 // projection writes its own columns of the shared output.
 template <int BM, int BN, int BK, int WM, int WN, bool F16, bool AH = false, int WF = 0>
 __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
@@ -1951,7 +1967,9 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
   const __half* Ah = static_cast<const __half*>(Av);
   const __nv_bfloat16* B = static_cast<const __nv_bfloat16*>(Bv);
   const unsigned char* Bq = static_cast<const unsigned char*>(Bv);
-  const size_t qrow = WF == 1 ? (size_t)(K >> 8) * 144u : (size_t)(K >> 8) * 210u;  // bytes a row
+  const size_t qrow = WF == 1 ? (size_t)(K >> 8) * 144u
+                    : WF == 2 ? (size_t)(K >> 8) * 210u
+                              : (size_t)(K >> 5) * 34u;  // bytes a row
   constexpr int LD = BK + 8;                    // +8: rows stay 16-byte aligned and
                                                 // ldmatrix reads hit distinct banks
   constexpr int NT = (BM / WM) * (BN / WN) * 32;
@@ -1998,8 +2016,10 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
                                  : make_uint4(0u, 0u, 0u, 0u);
       } else if constexpr (WF == 1) {
         rb[v] = gn < N && gk < K ? tc_dq8_q4k_<F16>(Bq + gn * qrow, gk) : make_uint4(0u, 0u, 0u, 0u);
-      } else {
+      } else if constexpr (WF == 2) {
         rb[v] = gn < N && gk < K ? tc_dq8_q6k_<F16>(Bq + gn * qrow, gk) : make_uint4(0u, 0u, 0u, 0u);
+      } else {
+        rb[v] = gn < N && gk < K ? tc_dq8_q80_<F16>(Bq + gn * qrow, gk) : make_uint4(0u, 0u, 0u, 0u);
       }
     }
   };
@@ -2085,7 +2105,7 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
       unsigned K, unsigned ldc) {                                                    \
     gemm_nt_tc_core<BM, BN, BK, WM, WN, F16, AH, WF>(A, B, C, M, N, K, ldc);         \
   }
-// Per weight format: bf16 and the K-quants (Q4_K q4k, Q6_K q6k); per tile (l, m, s);
+// Per weight format: bf16 and the block-quantized ones (q4k, q6k, q80); per tile (l, m, s);
 // per form: f32 (bf16 operands, f32 sums), f16 (f16 operands and sums, A f32), f16h
 // (as f16 with A already f16). The quantized weights have the exact form (f32) and
 // the f16h one: the prefill's two, as a backend that rounds activations where they
@@ -2101,6 +2121,8 @@ TL_GEMM_TC_TILES(tl_gemm_tc_f32_q4k, false, false, 1)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q4k, true, true, 1)
 TL_GEMM_TC_TILES(tl_gemm_tc_f32_q6k, false, false, 2)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q6k, true, true, 2)
+TL_GEMM_TC_TILES(tl_gemm_tc_f32_q80, false, false, 3)
+TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q80, true, true, 3)
 #undef TL_GEMM_TC_TILES
 #undef TL_GEMM_TC
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
@@ -2213,7 +2235,7 @@ static __device__ __forceinline__ void gemv_row_block_store(
   }
 }
 
-// ---- GEMVs over GGUF K-quant weights ([N,K] rows of K/256 blocks, read where
+// ---- GEMVs over GGUF block-quantized weights ([N,K] rows of K/256 blocks, read where
 // they lie: the decode is bound by the bytes it reads, and a Q4_K weight is
 // 0.56 byte). One block of 4 warps a row, as tl_gemv_bf16_row; the dequantized
 // value is never stored, each lane folds it into the dot product. The formats
@@ -2255,6 +2277,35 @@ __global__ void tl_gemv_q4k_row(const float* __restrict__ a, const unsigned char
     }
     const float suml = alo.x + alo.y + alo.z + alo.w, sumh = ahi.x + ahi.y + ahi.z + ahi.w;
     acc += dd.x * (s0 * sql + s1 * sqh) - dd.y * (m0 * suml + m1 * sumh);
+  }
+  gemv_row_block_store(acc, lane, warp, nwarps, y + n);
+}
+
+// Q8_0, 34 bytes a block of 32 (2-byte aligned only): a warp takes eight blocks
+// at a time, lane = 4 * which + j reading the 8 bytes 8j.. of its block and the
+// 8 activations they multiply. y_n = sum d * q * a.
+__global__ void tl_gemv_q80_row(const float* __restrict__ a, const unsigned char* __restrict__ W,
+                                float* __restrict__ y, unsigned N, unsigned K) {
+  const unsigned n = blockIdx.x;
+  if (n >= N) return;
+  const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
+  const unsigned nb = K / 32u, j = lane & 3u;
+  const unsigned char* row = W + (size_t)n * nb * 34u;
+  float acc = 0.0f;
+  for (unsigned ib = warp * 8u + (lane >> 2); ib < nb; ib += nwarps * 8u) {
+    const unsigned char* b = row + (size_t)ib * 34u;
+    const float d = __half2float(*reinterpret_cast<const __half*>(b));
+    const unsigned short* q16 = reinterpret_cast<const unsigned short*>(b + 2 + 8 * j);
+    const float* ap = a + (size_t)ib * 32u + 8u * j;
+    const float4 a0 = *reinterpret_cast<const float4*>(ap), a1 = *reinterpret_cast<const float4*>(ap + 4);
+    const float v[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+    float s = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const unsigned w = q16[i];
+      s += (float)(signed char)(w & 0xFFu) * v[2 * i] + (float)(signed char)(w >> 8) * v[2 * i + 1];
+    }
+    acc += d * s;
   }
   gemv_row_block_store(acc, lane, warp, nwarps, y + n);
 }

@@ -177,7 +177,7 @@ inline const gg::tensor_info* need(const gg::model& m, const std::string& n) {
 
 // Elements [first, first + n) of a tensor, widened to f32 into dst: the one
 // place that reads a weight's bytes, whatever 16- or 32-bit float the file
-// stored it as (an F16 GGUF, or a BF16 one) or K-quant (Q4_K / Q6_K, dequantized
+// stored it as (an F16 GGUF, or a BF16 one) or block-quantized (Q4_K / Q6_K / Q8_0, dequantized
 // here: a quantized file runs as bf16 weights, which a model that fits in memory
 // as bf16 can do). The type is dispatched once per call, outside the element loop.
 inline void widen_(const gg::tensor_info* t, size_t first, size_t n, float* dst) {
@@ -198,14 +198,18 @@ inline void widen_(const gg::tensor_info* t, size_t first, size_t n, float* dst)
       return;
     }
     case gg::ggml_type::q4_k:
-    case gg::ggml_type::q6_k:  // whole 256-blocks: a row of K a multiple of 256
-      if (first % 256 || n % 256) {
-        std::fprintf(stderr, "tensor %s: a K-quant read must cover whole 256-weight blocks\n",
-                     t->name.c_str());
+    case gg::ggml_type::q6_k:
+    case gg::ggml_type::q8_0: {  // whole blocks: a row of K a multiple of the block
+      uint64_t be = 0, bb = 0;
+      gg::ggml_block(t->type, be, bb);
+      if (first % be || n % be) {
+        std::fprintf(stderr, "tensor %s: a block-quantized read must cover whole %llu-weight blocks\n",
+                     t->name.c_str(), (unsigned long long)be);
         std::exit(2);
       }
       gg::dequant_range(t->type, t->data, first, n, dst);
       return;
+    }
     default:
       std::fprintf(stderr, "tensor %s: ggml type %u is not a float the loader reads\n",
                    t->name.c_str(), static_cast<unsigned>(t->type));
@@ -334,7 +338,7 @@ inline array load_f32(const gg::model& m, const std::string& n, int64_t len) {
   return load_f32_cat(m, {{n, len}});  // the single-part case
 }
 
-// A projection kept as the GGUF's own K-quant blocks, device-resident as they lie
+// A projection kept as the GGUF's own quantization blocks, device-resident as they lie
 // in the file (a Q4_K weight is 0.56 byte; bf16 would be 2). The fused projections
 // (q|k|v, gate|up, ...) are their parts' rows end to end, a part a run of rows of
 // one block format — Q4_K_M files mix Q4_K and Q6_K inside one layer, so a fused
@@ -355,15 +359,17 @@ struct qmat {
 // y = Q . a, a GEMV a run.
 inline void gemv_q(const qmat& Q, gpu::span a, gpu::span y) {
   for (const auto& p : Q.parts)
-    gpu::gemv_kquant(p.type, a, sp(Q.raw).at(p.byte_off), y.at(p.row_off * 4), p.rows, Q.K);
+    gpu::gemv_quant(p.type, a, sp(Q.raw).at(p.byte_off), y.at(p.row_off * 4), p.rows, Q.K);
 }
 
-// Whether every tensor of the parts is a K-quant whose rows (in) are whole blocks.
-inline bool kquantizable(const gg::model& m, const std::vector<wpart>& parts, int64_t in) {
-  if (in % 256) return false;
+// Whether every tensor of the parts is a block-quantized whose rows (in) are whole blocks.
+inline bool quantizable(const gg::model& m, const std::vector<wpart>& parts, int64_t in) {
   for (const auto& p : parts) {
     const auto* t = m.tensor(p.name);
-    if (!t || !gg::is_kquant(t->type)) return false;
+    if (!t || !gg::is_quant(t->type)) return false;
+    uint64_t elems, bytes;
+    gg::ggml_block(t->type, elems, bytes);
+    if (in % (int64_t)elems) return false;
   }
   return true;
 }
@@ -373,18 +379,17 @@ inline bool kquantizable(const gg::model& m, const std::vector<wpart>& parts, in
 inline qmat load_q_cat(const gg::model& m, const std::vector<wpart>& parts, int64_t in) {
   qmat Q;
   Q.K = in;
-  struct run { const gg::tensor_info* t; int type; int64_t rows; int64_t src0; const wpart* p; };
   int64_t off = 0, rows_total = 0;
   for (const auto& p : parts) {
     const auto* t = need(m, p.name);
-    if (!gg::is_kquant(t->type) || in % 256) {
-      std::fprintf(stderr, "tensor %s: native quantized weights need a Q4_K / Q6_K tensor, K %% 256 == 0\n",
+    uint64_t elems, bytes;
+    gg::ggml_block(t->type, elems, bytes);
+    if (!gg::is_quant(t->type) || in % (int64_t)elems) {
+      std::fprintf(stderr, "tensor %s: native quantized weights need a Q4_K / Q6_K / Q8_0 tensor, K a whole number of blocks\n",
                    p.name.c_str());
       std::exit(2);
     }
-    uint64_t elems, bytes;
-    gg::ggml_block(t->type, elems, bytes);
-    const int64_t row_bytes = in / 256 * (int64_t)bytes, type = (int64_t)t->type;
+    const int64_t row_bytes = in / (int64_t)elems * (int64_t)bytes, type = (int64_t)t->type;
     if (Q.parts.empty() || Q.parts.back().type != type) {  // a new run, 256-byte aligned
       off = (off + 255) / 256 * 256;
       Q.parts.push_back({(int)type, 0, off, rows_total});
@@ -399,7 +404,7 @@ inline qmat load_q_cat(const gg::model& m, const std::vector<wpart>& parts, int6
     const auto* t = m.tensor(p.name);
     uint64_t elems, bytes;
     gg::ggml_block(t->type, elems, bytes);
-    const int64_t row_bytes = in / 256 * (int64_t)bytes;
+    const int64_t row_bytes = in / (int64_t)elems * (int64_t)bytes;
     while (pi + 1 < (int64_t)Q.parts.size() && Q.parts[pi + 1].row_off <= base) pi++;
     const auto& run_ = Q.parts[pi];
     // Source rows are contiguous runs (the whole tensor, or the blk rows of one
@@ -442,7 +447,7 @@ struct Layer {
   // bf16 fields stay empty), saving memory. Attention proj (QKV.fused, wo) stays
   // bf16-row — q4 loses there (still floor-bound; dequant > byte savings).
   array wgu_q4, wd_q4;
-  // The same projections kept as the file's K-quant blocks (Model.quant): then
+  // The same projections kept as the file's block-quantized blocks (Model.quant): then
   // the array fields above are empty and the GEMVs read these.
   qmat qqkv, qgu, qo, qd, qssm, qsout;
   tl::kv_cache cache;  // attention layers only
@@ -582,8 +587,8 @@ struct Model {
   array onorm;                // final norm [1, NE]
   array outwT_q4;             // q4 lm_head (imperative, when q4_lmhead); outwT
                               // stays bf16 as the array-path oracle
-  qmat qout;                  // the lm_head as K-quant blocks (Model.quant); outwT is empty
-  bool quant = false;         // the projections are K-quant blocks, read as such
+  qmat qout;                  // the lm_head as block-quantized blocks (Model.quant); outwT is empty
+  bool quant = false;         // the projections are block-quantized blocks, read as such
   std::vector<Layer> layers;
   Scratch scratch;
   PrefillScratch pscratch;  // batched-prefill buffers (lazily sized)
@@ -709,11 +714,11 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
   const bool a16 = M.f16_acc && !exact && gpu::f16_activations;
   auto gemm = [&](gpu::span a, gpu::span a16s, const array& w, const qmat& q, gpu::span y,
                   int64_t n, int64_t k) {
-    if (q) {  // K-quant blocks: a GEMM a run of one format, each into its columns of y
+    if (q) {  // block-quantized blocks: a GEMM a run of one format, each into its columns of y
       for (const auto& p : q.parts) {
-        if (!gpu::gemm_kquant(p.type, a16, a16 ? a16s : a, sp(q.raw).at(p.byte_off),
+        if (!gpu::gemm_quant(p.type, a16, a16 ? a16s : a, sp(q.raw).at(p.byte_off),
                               y.at(p.row_off * 4), T, p.rows, k, n))
-          throw std::logic_error("qwen: the K-quant prefill GEMM refused its operands");
+          throw std::logic_error("qwen: the block-quantized prefill GEMM refused its operands");
       }
       return;
     }
@@ -842,7 +847,7 @@ inline void stage_embed_rows_(Model& M, const std::vector<int>& ids, int64_t fro
 // and it must fit the cache. One place answers it, so build(), begin() and
 // prefill_batched() cannot disagree.
 inline bool can_prefill_batched(const Model& M, int64_t T) {
-  return gpu::caps::bf16_gemm && M.row && !M.q4_mlp && (!M.quant || gpu::has_gemm_kquant) &&
+  return gpu::caps::bf16_gemm && M.row && !M.q4_mlp && (!M.quant || gpu::has_gemm_quant) &&
          !M.layers.empty() &&
          T >= PREFILL_MIN && seq_cache(M).pos + T <= M.c.MAXC;
 }
@@ -894,11 +899,11 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
   return argmax_logits(M);
 }
 
-// Whether the file's projections are K-quant blocks the native GEMVs read (the
+// Whether the file's projections are block-quantized blocks the native GEMVs read (the
 // quantized file's own bytes stay on the device); an F16 / BF16 file is not.
-inline bool kquant_file(const gg::model& m) {
+inline bool quant_file(const gg::model& m) {
   const auto* t = m.tensor("blk.0.ffn_down.weight");
-  return t && gg::is_kquant(t->type);
+  return t && gg::is_quant(t->type);
 }
 
 // wdt = the linear-weight storage dtype (f32 exact, or bf16 for the decode
@@ -928,12 +933,12 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
   // and a hybrid model, which the array path does not run, never loads them.
   // Without row weights the imperative path still reads wo/wd from there, so
   // those two stay.
-  // quant: the projections stay the file's K-quant blocks and the GEMVs read
+  // quant: the projections stay the file's block-quantized blocks and the GEMVs read
   // them as such (the decode is bound by the bytes it reads; this is what lets a
   // 27B model's 16 GB sit on the device). It replaces the bf16 weights, so there
   // is no array-path oracle and no q4 copy.
-  const bool nat = quant && row && gpu::has_gemv_kquant;
-  if (quant && !nat) throw std::runtime_error("qwen: this backend cannot read K-quant weights natively");
+  const bool nat = quant && row && gpu::has_gemv_quant;
+  if (quant && !nat) throw std::runtime_error("qwen: this backend cannot read block-quantized weights natively");
   const bool oracle_w = oracle && !c.hybrid() && !nat;
   const bool col_wo = oracle_w || (!row && !nat);
   const tl::dtype f32 = tl::dtype::f32;

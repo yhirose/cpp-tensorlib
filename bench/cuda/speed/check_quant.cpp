@@ -1,12 +1,12 @@
-// A Q4_K_M GGUF run two ways on the same tokens: its K-quant blocks dequantized
+// A Q4_K_M GGUF run two ways on the same tokens: its block-quantized blocks dequantized
 // to bf16 at load (the existing paths, the oracle) and kept as blocks, read by
-// the K-quant GEMVs (Model.quant). Both decode by the imperative step and the
+// the block-quantized GEMVs (Model.quant). Both decode by the imperative step and the
 // native run is fed the oracle's own tokens (teacher forcing), so the only
 // difference is how a weight's bytes are read: each step's logits agree to the
 // bf16 rounding the oracle applies to every dequantized weight, and the top
 // token agrees except where the oracle's top two are within that rounding.
 //
-// Usage: check_kquant model-Q4_K_M.gguf [steps=32]
+// Usage: check_quant model-Q4_K_M.gguf [steps=32]
 
 #include "../../models/qwen.h"
 
@@ -48,7 +48,7 @@ int main(int argc, char** argv) {
   }
   {
     qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, false, true, /*quant=*/true);
-    if (!M.quant) { std::printf("native K-quant path unavailable\n"); return 1; }
+    if (!M.quant) { std::printf("native block-quantized path unavailable\n"); return 1; }
     run(M, steps, lb, &fed);
   }
   // The batched prefill over the same blocks: a prompt through GEMMs that
