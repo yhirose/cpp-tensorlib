@@ -608,13 +608,14 @@ struct context {
   enum class tc_form { f32, f16, f16h };
   // The weight it reads: bf16 [N][K], or the rows of block-quantized blocks (Q4_K, Q6_K);
   // the quantized ones have the f32 and f16h forms only.
-  enum class tc_weight { bf16, q4k, q6k, q80 };
-  CUfunction gemm_tc_fn[4][3][3] = {};  // [weight][form][tile]
+  enum class tc_weight { bf16, q4k, q6k, q80, f16w };
+  CUfunction gemm_tc_fn[5][3][3] = {};  // [weight][form][tile]
   CUfunction gemm_tc_(tc_form f, tc_tile t, tc_weight w = tc_weight::bf16) {
     static const char* const forms[3] = {"f32", "f16", "f16h"};
-    static const char* const weights[4] = {"", "_q4k", "_q6k", "_q80"};
+    static const char* const weights[5] = {"", "_q4k", "_q6k", "_q80", "_f16w"};
     static const char tiles[3] = {'l', 'm', 's'};
     if (w != tc_weight::bf16 && f == tc_form::f16) return nullptr;
+    if (w == tc_weight::f16w && f != tc_form::f16h) return nullptr;
     CUfunction& slot = gemm_tc_fn[static_cast<int>(w)][static_cast<int>(f)][static_cast<int>(t)];
     if (!slot) {
       const std::string name = std::string("tl_gemm_tc_") + forms[static_cast<int>(f)] +
@@ -790,6 +791,15 @@ struct context {
   CUdeviceptr delta_scratch_(size_t bytes) {
     return grow_scratch_(delta_scratch, delta_scratch_bytes, bytes);
   }
+
+  // The f16 copy of one slab of a block-quantized weight (the prefill dequantizes a
+  // projection ahead of its GEMM, a slab of rows at a time).
+  CUdeviceptr dequant_scratch = 0;
+  size_t dequant_scratch_bytes = 0;
+  CUdeviceptr dequant_scratch_(size_t bytes) {
+    return grow_scratch_(dequant_scratch, dequant_scratch_bytes, bytes);
+  }
+  CUfunction dequant_fn[3] = {};
 
   // Reusable device scratch for pad_/fold_'s per-call shape/stride metadata
   // (small int64 arrays, one upload per call — too varied in size and too
@@ -1865,10 +1875,36 @@ inline bool own::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::s
   c.device_read_(A.buf);
   c.device_read_(W.buf);
   c.device_rmw_(C.buf);  // a part writes some columns of a shared output
-  return gemm_tc_run_(c, a16 ? context::tc_form::f16h : context::tc_form::f32, pa, pw, pc,
-                      (unsigned)m, (unsigned)n, (unsigned)k, (unsigned)ldc,
-                      type == 12 ? context::tc_weight::q4k
-                      : type == 14 ? context::tc_weight::q6k : context::tc_weight::q80);
+  const context::tc_weight qw = type == 12 ? context::tc_weight::q4k
+                                : type == 14 ? context::tc_weight::q6k : context::tc_weight::q80;
+  if (!a16) {  // the exact form dequantizes in the GEMM's staging
+    return gemm_tc_run_(c, context::tc_form::f32, pa, pw, pc, (unsigned)m, (unsigned)n, (unsigned)k,
+                        (unsigned)ldc, qw);
+  }
+  // The fast form: the weight to f16 first, a slab of rows at a time (the GEMM then
+  // streams plain f16 and runs at 72 TFLOPS rather than the 45 of dequantizing in
+  // every row block of the activation). The values are the staging's, rounded the
+  // same, so the product is the same bits.
+  // Bytes a row of k weights takes: Q4_K 144 per 256, Q6_K 210 per 256, Q8_0 34 per 32.
+  const size_t row_bytes = type == 12 ? (size_t)k / 256 * 144 : type == 14 ? (size_t)k / 256 * 210 : (size_t)k / 32 * 34;
+  constexpr size_t slab_bytes = 128u << 20;
+  const int64_t slab = std::max<int64_t>(128, (int64_t)(slab_bytes / ((size_t)k * 2)) / 128 * 128);
+  CUfunction& fn = c.dequant_fn[type == 12 ? 0 : type == 14 ? 1 : 2];
+  if (!fn) fn = c.load_(type == 12 ? "tl_dequant_f16_q4k" : type == 14 ? "tl_dequant_f16_q6k" : "tl_dequant_f16_q80");
+  const CUdeviceptr scr = c.dequant_scratch_((size_t)std::min<int64_t>(n, slab) * k * 2);
+  if (!fn || !scr) return false;
+  for (int64_t r0 = 0; r0 < n; r0 += slab) {
+    const unsigned rows = (unsigned)std::min<int64_t>(slab, n - r0);
+    const size_t threads = (size_t)rows * (k / 8);
+    if (!c.launch_(fn, {(unsigned)((threads + 255) / 256)}, {256}, 0,
+                   reinterpret_cast<unsigned char*>(pw) + (size_t)r0 * row_bytes,
+                   reinterpret_cast<void*>(scr), rows, (unsigned)k))
+      return false;
+    if (!gemm_tc_run_(c, context::tc_form::f16h, pa, reinterpret_cast<void*>(scr), pc + r0,
+                      (unsigned)m, rows, (unsigned)k, (unsigned)ldc, context::tc_weight::f16w))
+      return false;
+  }
+  return true;
 }
 
 inline bool own::quantize_act_q8(gpu::span a, gpu::span qa, int64_t k) {

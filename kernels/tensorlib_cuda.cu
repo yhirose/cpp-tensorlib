@@ -1953,7 +1953,8 @@ __device__ __forceinline__ uint4 tc_dq8_q80_(const unsigned char* row, unsigned 
 }
 
 // WF: the weight format B holds: 0 bf16 [N][K], 1 Q4_K, 2 Q6_K blocks (rows of
-// K/256 blocks, K % 256 == 0), 3 Q8_0 (rows of K/32 blocks). C rows are `ldc` apart, so a part of a fused
+// K/256 blocks, K % 256 == 0), 3 Q8_0 (rows of K/32 blocks), 4 f16 [N][K] (a
+// block-quantized weight dequantized once ahead, tl_dequant_f16). C rows are `ldc` apart, so a part of a fused
 // projection writes its own columns of the shared output.
 template <int BM, int BN, int BK, int WM, int WN, bool F16, bool AH = false, int WF = 0>
 __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
@@ -2018,6 +2019,9 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
         rb[v] = gn < N && gk < K ? tc_dq8_q4k_<F16>(Bq + gn * qrow, gk) : make_uint4(0u, 0u, 0u, 0u);
       } else if constexpr (WF == 2) {
         rb[v] = gn < N && gk < K ? tc_dq8_q6k_<F16>(Bq + gn * qrow, gk) : make_uint4(0u, 0u, 0u, 0u);
+      } else if constexpr (WF == 4) {
+        rb[v] = gn < N && gk < K ? *reinterpret_cast<const uint4*>(Bq + (gn * (size_t)K + gk) * 2u)
+                                 : make_uint4(0u, 0u, 0u, 0u);
       } else {
         rb[v] = gn < N && gk < K ? tc_dq8_q80_<F16>(Bq + gn * qrow, gk) : make_uint4(0u, 0u, 0u, 0u);
       }
@@ -2123,7 +2127,34 @@ TL_GEMM_TC_TILES(tl_gemm_tc_f32_q6k, false, false, 2)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q6k, true, true, 2)
 TL_GEMM_TC_TILES(tl_gemm_tc_f32_q80, false, false, 3)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q80, true, true, 3)
+TL_GEMM_TC_TILES(tl_gemm_tc_f16h_f16w, true, true, 4)
 #undef TL_GEMM_TC_TILES
+
+// A block-quantized weight run (rows x K) dequantized to f16 [rows][K], a thread eight
+// weights: the prefill does it once per projection per chunk instead of in every
+// row block's staging of the GEMM, which then reads plain f16 (72 against 45 TFLOPS).
+// The values are the staging's own (tc_dq8_*_<true>), so the GEMM's result is too.
+template <int WF>
+__device__ __forceinline__ void dequant_f16_core(const unsigned char* __restrict__ W,
+                                                 __half* __restrict__ out, unsigned rows, unsigned K) {
+  const size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned per_row = K >> 3;
+  if (t >= (size_t)rows * per_row) return;
+  const unsigned row = (unsigned)(t / per_row), gk = (unsigned)(t % per_row) << 3;
+  const size_t qrow = WF == 1 ? (size_t)(K >> 8) * 144u : WF == 2 ? (size_t)(K >> 8) * 210u : (size_t)(K >> 5) * 34u;
+  const unsigned char* r = W + row * qrow;
+  const uint4 v = WF == 1 ? tc_dq8_q4k_<true>(r, gk) : WF == 2 ? tc_dq8_q6k_<true>(r, gk) : tc_dq8_q80_<true>(r, gk);
+  *reinterpret_cast<uint4*>(out + (size_t)row * K + gk) = v;
+}
+extern "C" __global__ void tl_dequant_f16_q4k(const unsigned char* W, __half* out, unsigned rows, unsigned K) {
+  dequant_f16_core<1>(W, out, rows, K);
+}
+extern "C" __global__ void tl_dequant_f16_q6k(const unsigned char* W, __half* out, unsigned rows, unsigned K) {
+  dequant_f16_core<2>(W, out, rows, K);
+}
+extern "C" __global__ void tl_dequant_f16_q80(const unsigned char* W, __half* out, unsigned rows, unsigned K) {
+  dequant_f16_core<3>(W, out, rows, K);
+}
 #undef TL_GEMM_TC
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 
