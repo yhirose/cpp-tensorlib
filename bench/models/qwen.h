@@ -19,6 +19,7 @@
 #include <kv_cache.h>
 #include <storage.h>
 #include <tensorlib.h>
+#include "ggml_quant.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -176,8 +177,9 @@ inline const gg::tensor_info* need(const gg::model& m, const std::string& n) {
 
 // Elements [first, first + n) of a tensor, widened to f32 into dst: the one
 // place that reads a weight's bytes, whatever 16- or 32-bit float the file
-// stored it as (an F16 GGUF, or a BF16 one). The type is dispatched once per
-// call, outside the element loop.
+// stored it as (an F16 GGUF, or a BF16 one) or K-quant (Q4_K / Q6_K, dequantized
+// here: a quantized file runs as bf16 weights, which a model that fits in memory
+// as bf16 can do). The type is dispatched once per call, outside the element loop.
 inline void widen_(const gg::tensor_info* t, size_t first, size_t n, float* dst) {
   switch (t->type) {
     case gg::ggml_type::f32: {
@@ -195,6 +197,15 @@ inline void widen_(const gg::tensor_info* t, size_t first, size_t n, float* dst)
       for (size_t i = 0; i < n; i++) dst[i] = tl::bf16_to_f32(src[i]);
       return;
     }
+    case gg::ggml_type::q4_k:
+    case gg::ggml_type::q6_k:  // whole 256-blocks: a row of K a multiple of 256
+      if (first % 256 || n % 256) {
+        std::fprintf(stderr, "tensor %s: a K-quant read must cover whole 256-weight blocks\n",
+                     t->name.c_str());
+        std::exit(2);
+      }
+      gg::dequant_range(t->type, t->data, first, n, dst);
+      return;
     default:
       std::fprintf(stderr, "tensor %s: ggml type %u is not a float the loader reads\n",
                    t->name.c_str(), static_cast<unsigned>(t->type));
