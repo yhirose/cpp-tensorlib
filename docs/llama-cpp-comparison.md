@@ -18,34 +18,38 @@ out).
 |---|---|---:|---:|---:|
 | Qwen2.5-0.5B-Instruct F16 | tg128 | 461 | 429-439 | 1.05-1.07 |
 | | tg128 @ d2048 | 423 | 407-430 | 0.98-1.04 |
-| | pp512 | 44,320 | 49,132 | 0.90 |
-| | pp512 @ d2048 | 34,284 | 41,106 | 0.83 |
+| | pp512 | 56,417 | 49,132 | 1.15 |
+| | pp512 @ d2048 | 42,721 | 41,106 | 1.04 |
 | Qwen3-0.6B F16 | tg128 | 400 | 351-373 | 1.07-1.14 |
 | | tg128 @ d2048 | 342 | 330-334 | 1.02-1.04 |
-| | pp512 | 31,062 | 38,881 | 0.80 |
-| | pp512 @ d2048 | 21,050 | 30,004 | 0.70 |
+| | pp512 | 36,966 | 38,881 | 0.95 |
+| | pp512 @ d2048 | 24,510 | 30,004 | 0.82 |
 | Qwen3.5-0.8B F16 | tg128 | 386 | 290-291 | 1.33 |
 | | tg128 @ d2048 | 376 | 289-292 | 1.29-1.30 |
-| | pp512 | 21,905 | 27,916 | 0.78 |
-| | pp512 @ d2048 | 18,703 | 27,401 | 0.68 |
+| | pp512 | 24,996 | 27,916 | 0.90 |
+| | pp512 @ d2048 | 19,745 | 27,401 | 0.72 |
 | Qwen3.5-0.8B BF16 | tg128 | 379 | 288 | 1.32 |
 | | tg128 @ d2048 | 372 | 288 | 1.29 |
-| | pp512 | 22,168 | 23,963 | 0.93 |
-| | pp512 @ d2048 | 18,892 | 23,208 | 0.81 |
+| | pp512 | 25,485 | 23,963 | 1.06 |
+| | pp512 @ d2048 | 21,058 | 23,208 | 0.91 |
 
 Decode is at parity or ahead on every model, with or without 2048 tokens
 cached. Until the decode attention overlapped its key loads and split its
 keys finer (2026-10-27), Qwen2.5 trailed by 18% at depth: a block's warps
 walked ~64 keys each in series, one load at a time.
 
-Prefill is 1.1-1.5x behind. Like llama.cpp, it now sums the GEMMs in f16 by
-default (below). Its GEMM and its attention now run on the tensor
-cores too: the GEMM with the activations rounded to bf16, the attention with
-q, k and v rounded to f16 (both computed in f32 on the CUDA cores until
-2026-10-27, when prefill was 2.6-5.6x behind and Qwen3's dropped 3x at
-depth). Qwen3.5's DeltaNet layers run the gated delta rule in 32-token
-chunks (as small matrix products, f32), where they had walked it a token at
-a time.
+Prefill is between 1.15x ahead and 1.4x behind. Like llama.cpp, it sums the
+GEMMs in f16 by default (below). Its GEMM and its attention run on the tensor
+cores: the GEMM over `mma.sync` and `ldmatrix` with two shared-memory stages
+(two blocks share an SM, which beat deeper pipelines), the weights converted
+to f16 as a block stages them, and the activation rounded to f16 once, by the
+norm, SwiGLU or head merge that writes it, rather than by every block that
+reads it; the attention with q, k and v rounded to f16. Qwen3.5's DeltaNet
+layers run the gated delta rule in 32-token chunks (as small matrix
+products, f32). What is left of the gap is those layers: ~8 ms of a 512-token
+prompt against ~3 ms for llama.cpp's fused tensor-core kernel, the scan being
+bound by a serial chain of ~8 barriers per chunk. The llama.cpp column was
+measured before the GEMM change and not repeated.
 
 ## Accumulation precision
 
