@@ -79,6 +79,10 @@ inline void upload(void* native, const float* src, int64_t n) {
   }
 }
 
+inline void upload_bytes(void* native, int64_t off, const void* src, int64_t bytes) {
+  if (native && src && bytes > 0) std::memcpy(static_cast<char*>(native) + off, src, static_cast<size_t>(bytes));
+}
+
 namespace detail_ {
 
 template <class T>

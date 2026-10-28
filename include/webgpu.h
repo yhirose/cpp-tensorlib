@@ -944,6 +944,7 @@ inline graph_exec capture_end() { return nullptr; }
 inline bool graph_launch(graph_exec) { return false; }
 inline void graph_destroy(graph_exec) {}
 inline void upload(void*, const float*, int64_t) {}
+inline void upload_bytes(void*, int64_t, const void*, int64_t) {}
 inline void upload_u32(void*, unsigned) {}
 inline int64_t attn_dpos_partials_bytes(int64_t, int64_t, int64_t) { return 0; }
 

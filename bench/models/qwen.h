@@ -334,6 +334,90 @@ inline array load_f32(const gg::model& m, const std::string& n, int64_t len) {
   return load_f32_cat(m, {{n, len}});  // the single-part case
 }
 
+// A projection kept as the GGUF's own K-quant blocks, device-resident as they lie
+// in the file (a Q4_K weight is 0.56 byte; bf16 would be 2). The fused projections
+// (q|k|v, gate|up, ...) are their parts' rows end to end, a part a run of rows of
+// one block format — Q4_K_M files mix Q4_K and Q6_K inside one layer, so a fused
+// projection is a GEMV per run, writing its slice of the same contiguous output.
+struct qmat {
+  struct part {
+    int type;           // the ggml_type code (12 Q4_K, 14 Q6_K)
+    int64_t rows;       // output rows of this run
+    int64_t byte_off;   // where its blocks start in `raw`
+    int64_t row_off;    // its first output row
+  };
+  storage raw;
+  std::vector<part> parts;
+  int64_t K = 0;
+  explicit operator bool() const { return !parts.empty(); }
+};
+
+// y = Q . a, a GEMV a run.
+inline void gemv_q(const qmat& Q, gpu::span a, gpu::span y) {
+  for (const auto& p : Q.parts)
+    gpu::gemv_kquant(p.type, a, sp(Q.raw).at(p.byte_off), y.at(p.row_off * 4), p.rows, Q.K);
+}
+
+// Whether every tensor of the parts is a K-quant whose rows (in) are whole blocks.
+inline bool kquantizable(const gg::model& m, const std::vector<wpart>& parts, int64_t in) {
+  if (in % 256) return false;
+  for (const auto& p : parts) {
+    const auto* t = m.tensor(p.name);
+    if (!t || !gg::is_kquant(t->type)) return false;
+  }
+  return true;
+}
+
+// Parts' rows (the subset a wpart names, if strided) uploaded straight from the
+// file's mapping, no host copy in between.
+inline qmat load_q_cat(const gg::model& m, const std::vector<wpart>& parts, int64_t in) {
+  qmat Q;
+  Q.K = in;
+  struct run { const gg::tensor_info* t; int type; int64_t rows; int64_t src0; const wpart* p; };
+  int64_t off = 0, rows_total = 0;
+  for (const auto& p : parts) {
+    const auto* t = need(m, p.name);
+    if (!gg::is_kquant(t->type) || in % 256) {
+      std::fprintf(stderr, "tensor %s: native quantized weights need a Q4_K / Q6_K tensor, K %% 256 == 0\n",
+                   p.name.c_str());
+      std::exit(2);
+    }
+    uint64_t elems, bytes;
+    gg::ggml_block(t->type, elems, bytes);
+    const int64_t row_bytes = in / 256 * (int64_t)bytes, type = (int64_t)t->type;
+    if (Q.parts.empty() || Q.parts.back().type != type) {  // a new run, 256-byte aligned
+      off = (off + 255) / 256 * 256;
+      Q.parts.push_back({(int)type, 0, off, rows_total});
+    }
+    Q.parts.back().rows += p.out;
+    off += p.out * row_bytes;
+    rows_total += p.out;
+  }
+  Q.raw = scratch_f32((off + 3) / 4);
+  int64_t base = 0, pi = 0;
+  for (const auto& p : parts) {
+    const auto* t = m.tensor(p.name);
+    uint64_t elems, bytes;
+    gg::ggml_block(t->type, elems, bytes);
+    const int64_t row_bytes = in / 256 * (int64_t)bytes;
+    while (pi + 1 < (int64_t)Q.parts.size() && Q.parts[pi + 1].row_off <= base) pi++;
+    const auto& run_ = Q.parts[pi];
+    // Source rows are contiguous runs (the whole tensor, or the blk rows of one
+    // head of an interleaved projection): one upload a run.
+    int64_t o = 0;
+    while (o < p.out) {
+      const int64_t s0 = p.src(o);
+      int64_t n = 1;
+      while (o + n < p.out && p.src(o + n) == s0 + n) n++;
+      gpu::upload_bytes(Q.raw.native, run_.byte_off + (base + o - run_.row_off) * row_bytes,
+                        static_cast<const char*>(t->data) + s0 * row_bytes, n * row_bytes);
+      o += n;
+    }
+    base += p.out;
+  }
+  return Q;
+}
+
 struct Layer {
   array wq, bq, wk, bk, wv, bv, wo, wg, wu, wd, an, fn;
   // Qwen3's per-head q / k RMSNorm weights, [1, HD] (empty when !Config::qk_norm).
@@ -358,6 +442,9 @@ struct Layer {
   // bf16 fields stay empty), saving memory. Attention proj (QKV.fused, wo) stays
   // bf16-row — q4 loses there (still floor-bound; dequant > byte savings).
   array wgu_q4, wd_q4;
+  // The same projections kept as the file's K-quant blocks (Model.quant): then
+  // the array fields above are empty and the GEMVs read these.
+  qmat qqkv, qgu, qo, qd, qssm, qsout;
   tl::kv_cache cache;  // attention layers only
   // Gated DeltaNet layers (Qwen3.5) instead of the attention weights above:
   // wssm the fused [qkv | alpha | beta | z] projection and wsout the output
@@ -495,6 +582,8 @@ struct Model {
   array onorm;                // final norm [1, NE]
   array outwT_q4;             // q4 lm_head (imperative, when q4_lmhead); outwT
                               // stays bf16 as the array-path oracle
+  qmat qout;                  // the lm_head as K-quant blocks (Model.quant); outwT is empty
+  bool quant = false;         // the projections are K-quant blocks, read as such
   std::vector<Layer> layers;
   Scratch scratch;
   PrefillScratch pscratch;  // batched-prefill buffers (lazily sized)
@@ -744,7 +833,7 @@ inline void stage_embed_rows_(Model& M, const std::vector<int>& ids, int64_t fro
 // and it must fit the cache. One place answers it, so build(), begin() and
 // prefill_batched() cannot disagree.
 inline bool can_prefill_batched(const Model& M, int64_t T) {
-  return gpu::caps::bf16_gemm && M.row && !M.q4_mlp && !M.layers.empty() &&
+  return gpu::caps::bf16_gemm && M.row && !M.q4_mlp && !M.quant && !M.layers.empty() &&
          T >= PREFILL_MIN && seq_cache(M).pos + T <= M.c.MAXC;
 }
 
@@ -766,8 +855,9 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
     }
     // Only the final row of the final chunk needs logits — one GEMV for the
     // whole prompt rather than one per chunk, read in place as a view of it.
-    gemv_w(M.outwT, at_f32(sp(M.pscratch.h), (last - 1) * c.NE), sp(M.scratch.logits),
-           c.VOCAB, c.NE);
+    if (M.quant) gemv_q(M.qout, at_f32(sp(M.pscratch.h), (last - 1) * c.NE), sp(M.scratch.logits));
+    else gemv_w(M.outwT, at_f32(sp(M.pscratch.h), (last - 1) * c.NE), sp(M.scratch.logits),
+                c.VOCAB, c.NE);
   };
   if (exact) {
     run(true);
@@ -794,6 +884,13 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
   return argmax_logits(M);
 }
 
+// Whether the file's projections are K-quant blocks the native GEMVs read (the
+// quantized file's own bytes stay on the device); an F16 / BF16 file is not.
+inline bool kquant_file(const gg::model& m) {
+  const auto* t = m.tensor("blk.0.ffn_down.weight");
+  return t && gg::is_kquant(t->type);
+}
+
 // wdt = the linear-weight storage dtype (f32 exact, or bf16 for the decode
 // path). Biases, norms and the embedding stay F32 (elementwise / row-gather).
 // q4_mlp / q4_lmhead quantize the large bandwidth-bound gemvs to group-int4 in
@@ -801,7 +898,8 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
 // F16 oracle; validated by coherence + divergence, not greedy-exact.
 inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
                    bool q4_mlp = false, bool q4_lmhead = false,
-                   int64_t maxc = 4096, bool oracle = true, bool f16_acc = true) {
+                   int64_t maxc = 4096, bool oracle = true, bool f16_acc = true,
+                   bool quant = false) {
   const Config c = config_from_gguf(m, maxc);
   // bf16 weights need the backend's bf16 [K,N] GEMV: the lm_head reads it in
   // every mode, and so does every projection off the row path. It has no
@@ -820,17 +918,25 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
   // and a hybrid model, which the array path does not run, never loads them.
   // Without row weights the imperative path still reads wo/wd from there, so
   // those two stay.
-  const bool oracle_w = oracle && !c.hybrid();
-  const bool col_wo = oracle_w || !row;
+  // quant: the projections stay the file's K-quant blocks and the GEMVs read
+  // them as such (the decode is bound by the bytes it reads; this is what lets a
+  // 27B model's 16 GB sit on the device). It replaces the bf16 weights, so there
+  // is no array-path oracle and no q4 copy.
+  const bool nat = quant && row && gpu::has_gemv_kquant;
+  if (quant && !nat) throw std::runtime_error("qwen: this backend cannot read K-quant weights natively");
+  const bool oracle_w = oracle && !c.hybrid() && !nat;
+  const bool col_wo = oracle_w || (!row && !nat);
   const tl::dtype f32 = tl::dtype::f32;
   Model M{
       .c = c,
       .embed = need(m, "token_embd.weight"),
-      .outwT = load_w_T(m, c.output_name(), c.NE, c.VOCAB, wdt),  // stays [K,N]
+      .outwT = nat ? array{} : load_w_T(m, c.output_name(), c.NE, c.VOCAB, wdt),  // stays [K,N]
       .onorm = load_f32(m, "output_norm.weight", c.NE),
       // q4 lm_head (imperative): quantize the f32 [K,VOCAB], keep only the q4.
       .outwT_q4 =
           q4lm ? load_w_T(m, c.output_name(), c.NE, c.VOCAB, f32).to_q4() : array{},
+      .qout = nat ? load_q_cat(m, {{c.output_name(), c.VOCAB}}, c.NE) : qmat{},
+      .quant = nat,
       .row = row,
       .q4_mlp = q4m,
       .q4_lmhead = q4lm,
@@ -850,7 +956,11 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
     // A fused projection in the decode GEMV's layout: in bf16 mode ROW [N,K]
     // for the warp-per-row gemv (lever A), in f32 column [K,N] for split-K.
     auto fused = [&](const std::vector<wpart>& parts, int64_t in) {
+      if (nat) return array{};
       return row ? load_w_T_cat_row(m, parts, in) : load_w_T_cat(m, parts, in, wdt);
+    };
+    auto qfused = [&](const std::vector<wpart>& parts, int64_t in) {
+      return nat ? load_q_cat(m, parts, in) : qmat{};
     };
     // Every layer: the norms and the MLP.
     Layer L{
@@ -862,24 +972,31 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
         // wgu: bf16-row when row & !q4m; column [K,N] in f32; empty when q4m
         // (replaced by wgu_q4). wd_row likewise.
         .wgu = (row && q4m) ? array{} : fused(gu_parts, c.NE),
-        .wd_row = row ? (q4m ? array{}
-                             : load_w_T_row(m, p + "ffn_down.weight", c.FF, c.NE))
-                      : array{},
+        .wd_row = (row && !nat) ? (q4m ? array{}
+                                       : load_w_T_row(m, p + "ffn_down.weight", c.FF, c.NE))
+                                : array{},
         // q4 MLP (imperative, when q4m): quantize the f32 [K,N] fused/down.
         .wgu_q4 = q4m ? load_w_T_cat(m, gu_parts, c.NE, f32).to_q4() : array{},
         .wd_q4 =
-            q4m ? load_w_T(m, p + "ffn_down.weight", c.FF, c.NE, f32).to_q4() : array{}};
+            q4m ? load_w_T(m, p + "ffn_down.weight", c.FF, c.NE, f32).to_q4() : array{},
+        .qqkv = {},
+        .qgu = qfused(gu_parts, c.NE),
+        .qo = {},
+        .qd = qfused({{p + "ffn_down.weight", c.NE}}, c.FF)};
     if (c.is_delta(l)) {
       // Gated DeltaNet. The fused projection's order puts z right before the
       // slot the rule writes its output to (Config::ssm_proj).
       const int64_t C = c.ssm_conv_ch(), V = c.ssm_v();
-      L.wssm = fused({{p + "attn_qkv.weight", C},
-                      {p + "ssm_alpha.weight", c.SH},
-                      {p + "ssm_beta.weight", c.SH},
-                      {p + "attn_gate.weight", V}},
-                     c.NE);
-      L.wsout = row ? load_w_T_row(m, p + "ssm_out.weight", V, c.NE)
-                    : load_w_T(m, p + "ssm_out.weight", V, c.NE, wdt);
+      const std::vector<wpart> ssm_parts = {{p + "attn_qkv.weight", C},
+                                            {p + "ssm_alpha.weight", c.SH},
+                                            {p + "ssm_beta.weight", c.SH},
+                                            {p + "attn_gate.weight", V}};
+      L.wssm = fused(ssm_parts, c.NE);
+      L.qssm = qfused(ssm_parts, c.NE);
+      L.wsout = nat ? array{}
+                    : row ? load_w_T_row(m, p + "ssm_out.weight", V, c.NE)
+                          : load_w_T(m, p + "ssm_out.weight", V, c.NE, wdt);
+      L.qsout = qfused({{p + "ssm_out.weight", c.NE}}, V);
       // The conv taps are [C][SCONV] in the GGUF; the op reads them
       // tap-major, so a transpose here.
       std::vector<float> cw((size_t)c.SCONV * C), taps((size_t)c.SCONV * C);
@@ -920,12 +1037,14 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
       L.qn = qk_norm("attn_q_norm.weight");
       L.kn = qk_norm("attn_k_norm.weight");
       L.wqkv = fused(qkv_parts, c.NE);
+      L.qqkv = qfused(qkv_parts, c.NE);
       // bqkv = [bq|bk|bv], matching wqkv's column order (batched path).
       if (row && c.qkv_bias)
         L.bqkv = load_f32_cat(m, {{p + "attn_q.bias", Q},
                                   {p + "attn_k.bias", c.NKV * c.HD},
                                   {p + "attn_v.bias", c.NKV * c.HD}});
-      if (row) L.wo_row = load_w_T_row(m, p + "attn_output.weight", Q, c.NE);
+      if (row && !nat) L.wo_row = load_w_T_row(m, p + "attn_output.weight", Q, c.NE);
+      L.qo = qfused({{p + "attn_output.weight", c.NE}}, Q);
       L.cache.init(c.NKV, c.MAXC, c.HD);
     }
     M.layers.push_back(std::move(L));
@@ -1140,8 +1259,9 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
   // layout is identical either way (contiguous [n]), so the fused-output slices
   // below are unchanged.
   const bool row = M.row;
-  auto gv = [&](const array& W, gpu::span a, gpu::span y, int64_t n, int64_t k) {
-    if (row) gpu::gemv_bf16_row(a, sp(W), y, n, k);
+  auto gv = [&](const array& W, const qmat& Q, gpu::span a, gpu::span y, int64_t n, int64_t k) {
+    if (Q) gemv_q(Q, a, y);
+    else if (row) gpu::gemv_bf16_row(a, sp(W), y, n, k);
     else gemv_w(W, a, y, n, k);
   };
   gpu::span x = x0;
@@ -1155,19 +1275,19 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
       // silu(z) * rmsnorm(o) as one swiglu over [z | o], then the out projection.
       const int64_t C = c.ssm_conv_ch(), V = c.ssm_v();
       const gpu::span pj = sp(S.qkvb), o = at_f32(pj, c.ssm_proj());
-      gv(L.wssm, sp(S.hb), pj, c.ssm_proj(), c.NE);
+      gv(L.wssm, L.qssm, sp(S.hb), pj, c.ssm_proj(), c.NE);
       gpu::ssm_conv(pj, C, sp(L.conv_state), sp(L.wconv), sp(S.convb), C, c.SCONV);
       gpu::gated_delta(sp(S.convb), at_f32(pj, C), 0, sp(L.adt), sp(L.ssm_state), o,
                        c.SH, c.SDK, c.SDV, 1, c.L2EPS, c.SK);
       gpu::rmsnorm(o, sp(L.sn), o, c.SDV, c.EPS, c.SH);
       gpu::swiglu(at_f32(pj, C + 2 * c.SH), sp(S.ab), V);
-      gv(L.wsout, sp(S.ab), ro, c.NE, V);  // ro = mixer @ ssm_out
+      gv(L.wsout, L.qsout, sp(S.ab), ro, c.NE, V);  // ro = mixer @ ssm_out
     } else {
       // Fused QKV: one GEMV -> [q(NH*HD) | k(NKV*HD) | v(NKV*HD)] in S.qkvb (then
       // Qwen3.5's gate), and q, k and v are views of it: rope q & k in place,
       // bias-add v. Same per-column split-K as the separate wq/wk/wv GEMVs (bx=1,
       // chunk=32), so bit-identical per column.
-      gv(L.wqkv, sp(S.hb), sp(S.qkvb), c.attn_proj(), c.NE);
+      gv(L.wqkv, L.qqkv, sp(S.hb), sp(S.qkvb), c.attn_proj(), c.NE);
       const gpu::span qp = sp(S.qkvb);
       const gpu::span kp = at_f32(qp, c.NH * c.HD);
       const gpu::span vp = at_f32(qp, (c.NH + c.NKV) * c.HD);
@@ -1200,16 +1320,16 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
         gpu::binary(gpu::kop::mul, ao, sp(S.gateb), sp(S.gateb), Q, 1, 0);
         ao = sp(S.gateb);
       }
-      gv(row ? L.wo_row : L.wo, ao, ro, c.NE, c.NH * c.HD);  // ro = attn @ wo
+      gv(row ? L.wo_row : L.wo, L.qo, ao, ro, c.NE, c.NH * c.HD);  // ro = attn @ wo
     }
     // x1 = x + (attn@wo); h2 = rmsnorm(x1, fn) — fused.
     gpu::rmsnorm_res(ro, x, sp(L.fn), ro, sp(S.h2b), c.NE, c.EPS);
     // Fused gate|up: one GEMV -> [gate(FF) | up(FF)] in S.gub; swiglu reads both.
     if (M.q4_mlp) gemv_q4_w(L.wgu_q4, sp(S.h2b), sp(S.gub));  // [NE, 2*FF]
-    else gv(L.wgu, sp(S.h2b), sp(S.gub), 2 * c.FF, c.NE);
+    else gv(L.wgu, L.qgu, sp(S.h2b), sp(S.gub), 2 * c.FF, c.NE);
     gpu::swiglu(sp(S.gub), sp(S.mb), c.FF);
     if (M.q4_mlp) gemv_q4_w(L.wd_q4, sp(S.mb), sp(S.mdb));  // [FF, NE]
-    else gv(row ? L.wd_row : L.wd, sp(S.mb), sp(S.mdb), c.NE, c.FF);
+    else gv(row ? L.wd_row : L.wd, L.qd, sp(S.mb), sp(S.mdb), c.NE, c.FF);
     // x2 = x1 + mlp; next input norm = rmsnorm(x2, next an | final onorm) — fused.
     const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
     gpu::rmsnorm_res(ro, sp(S.mdb), nextw, ro, sp(S.hb), c.NE, c.EPS);
@@ -1218,6 +1338,7 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
   // hb now holds the final RMSNorm output (folded into the last layer's seam).
   const gpu::span logits = logits_out ? logits_out : sp(S.logits);
   if (M.q4_lmhead) gemv_q4_w(M.outwT_q4, sp(S.hb), logits);  // [NE, VOCAB]
+  else if (M.quant) gemv_q(M.qout, sp(S.hb), logits);
   else gemv_w(M.outwT, sp(S.hb), logits, c.VOCAB, c.NE);
   // Tail of the captured region: advance the shared device pos so the next
   // graph replay reads pos+1 (lm_head is pos-independent, so order vs it is free).

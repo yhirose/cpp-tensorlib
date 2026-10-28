@@ -87,7 +87,8 @@ int main(int argc, char** argv) {
   const bool f32acc = argc > 6 && std::string(argv[6]) == "f32acc";
   qm::gg::model m(argv[1]);
   tl::use_gpu();
-  qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false, !f32acc);
+  qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false, !f32acc,
+                           /*quant=*/qm::kquant_file(m) && !std::getenv("TL_DEQUANT"));
   const auto* t = m.tensor("blk.0.ffn_up.weight");
   std::printf("%s | %s | %lld layers | weights %s (file %s) | depth %lld | prefill sums %s\n",
               argv[1], M.c.arch.c_str(), (long long)M.c.NL,

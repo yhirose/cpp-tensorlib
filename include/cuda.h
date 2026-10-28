@@ -1269,6 +1269,19 @@ inline void upload(void* native, const float* src, int64_t n) {
   m->live.uploaded();
 }
 
+// `bytes` of `src` into the buffer at byte offset `off`, straight to the device:
+// the host mirror is left alone (a model's quantized weights are gigabytes, and
+// copying them through a mirror would hold them in host memory twice). The
+// device copy is then the live one.
+inline void upload_bytes(void* native, int64_t off, const void* src, int64_t bytes) {
+  auto& c = context::get();
+  if (!c.ready || !native || bytes <= 0) return;
+  context::mirror* m = c.mirror_(native);
+  if (!m || off < 0 || (size_t)(off + bytes) > m->bytes) return;
+  c.d.MemcpyHtoD(m->dev + off, src, (size_t)bytes);
+  m->live.before_kernel(gpu::access::out);  // device-live, host stale
+}
+
 // Set a device u32 scalar (e.g. the capture pos counter) via its mirror. Raw
 // 4-byte H2D — the mirror's host bytes are set to `val` then copied to device.
 inline void upload_u32(void* native, unsigned val) {

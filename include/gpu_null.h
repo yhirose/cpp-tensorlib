@@ -30,6 +30,7 @@ inline void* alloc(int64_t, float** /*contents*/, bool /*host_fill*/ = false) {
 inline void release(void*, int64_t, float*) {}
 inline void sync_to_host(void*, bool /*for_write*/) {}  // before a host access
 inline void upload(void*, const float*, int64_t) {}     // stage host floats in
+inline void upload_bytes(void*, int64_t, const void*, int64_t) {}
 
 // ---- launch: the one way a shared op (gpu_ops.h) runs a kernel. View i is the
 // kernel's i-th buffer at its byte offset, `params` a block of 4-byte fields

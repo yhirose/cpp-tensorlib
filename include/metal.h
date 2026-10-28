@@ -479,6 +479,13 @@ inline void upload(void* native, const float* src, int64_t n) {
   if (dst && src != dst) std::memcpy(dst, src, (size_t)n * sizeof(float));
 }
 
+inline void upload_bytes(void* native, int64_t off, const void* src, int64_t bytes) {
+  if (!native || bytes <= 0) return;
+  if (pending()) flush();
+  auto* dst = static_cast<char*>(objc::send(native, "contents"));
+  if (dst) std::memcpy(dst + off, src, (size_t)bytes);
+}
+
 namespace detail_ {
 // The kernel scratch, grown to `bytes` (see context::scratch).
 inline void* scratch_(int64_t bytes) {
