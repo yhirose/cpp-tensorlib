@@ -664,13 +664,14 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       const gpu::span vh = at_f32(qh, (c.NH + c.NKV) * T * c.HD);
       // Qwen3: every q / k head row (HD wide, one per h*T + t) is RMS-normalized
       // in place, before rope. v is untouched.
-      if (c.qk_norm) {
-        gpu::rmsnorm(qh, sp(L.qn), qh, c.HD, c.EPS, c.NH * T);
-        gpu::rmsnorm(kh, sp(L.kn), kh, c.HD, c.EPS, c.NKV * T);
-      }
       // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
-      gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
-      gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
+      if (c.qk_norm) {
+        gpu::rmsnorm_rope(qh, sp(L.qn), c.NH * T, T, c.HD, pos0, c.ROPE_BASE, c.ROT, c.EPS);
+        gpu::rmsnorm_rope(kh, sp(L.kn), c.NKV * T, T, c.HD, pos0, c.ROPE_BASE, c.ROT, c.EPS);
+      } else {
+        gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
+        gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
+      }
       L.cache.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale(), exact);
       // Qwen3.5: times sigmoid of the gate, the tail of each projection row —
       // an f32 product, so only the plain form is rounded where it is made.

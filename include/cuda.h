@@ -574,6 +574,7 @@ struct context {
   CUfunction gemm_bf16_nt_sk_() {
     return cached_(gemm_bf16_nt_sk_fn, "tl_gemm_bf16_nt_sk");
   }
+  CUfunction rmsnorm_rope_fn = nullptr;
   CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, swiglu_h16_fn = nullptr,
              merge_heads_h16_fn = nullptr, cvt_h16_fn = nullptr;  // the f16 activation's producers
   CUfunction conv_tok_fn = nullptr, conv_state_fn = nullptr;  // a prefill's conv
@@ -905,6 +906,9 @@ struct own {
                           int64_t T, int64_t ld, int64_t off, int64_t H,
                           int64_t D);
   static bool argmax(gpu::span a, int64_t n, int64_t* out_idx);
+  // x[rows, D] RMS-normalized by w and then rotated, in place (rows = heads * T).
+  static bool rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T, int64_t D,
+                           int64_t pos, float base, int64_t rot, float eps);
   // n floats copied device to device on the launch stream (a copy engine's job,
   // not a kernel's).
   static bool copy_f32(gpu::span from, gpu::span to, int64_t n);
@@ -1812,6 +1816,18 @@ inline bool own::gemm_bf16_nt_f16acc(gpu::span a, gpu::span B, gpu::span out, in
 inline bool own::gemm_bf16_nt_f16acc_a16(gpu::span a, gpu::span B, gpu::span out, int64_t m,
                                          int64_t n, int64_t k) {
   return f16acc_run_(context::tc_form::f16h, a, B, out, m, n, k);
+}
+
+inline bool own::rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T, int64_t D,
+                              int64_t pos, float base, int64_t rot, float eps) {
+  auto& c = context::get();
+  if (!c.ready || rows <= 0 || T <= 0 || rot <= 0 || rot % 2 || rot > D || rows % T) return false;
+  c.device_rmw_(x.buf);
+  c.device_read_(w.buf);
+  constexpr unsigned threads = 256;
+  return c.launch_(c.cached_(c.rmsnorm_rope_fn, "tl_rmsnorm_rope"), {(unsigned)rows}, {threads},
+                   threads * sizeof(float), context::off_(x.buf, x.off), context::off_(w.buf, w.off),
+                   (unsigned)T, (unsigned)D, (unsigned)pos, base, (unsigned)rot, eps);
 }
 
 inline bool own::copy_f32(gpu::span from, gpu::span to, int64_t n) {

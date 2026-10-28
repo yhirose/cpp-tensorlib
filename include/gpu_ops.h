@@ -1066,6 +1066,18 @@ inline bool gemm_bf16_nt_f16acc(span A, span B, span C, int64_t M, int64_t N,
   return gemm_bf16_nt<Own>(A, B, C, M, N, K);
 }
 
+// x[rows, D] = rope(rmsnorm(x) * w), in place, rows = heads * T: Qwen3's q and k
+// rows. One pass where the backend has it, else the two ops.
+TL_GPU_DETECT_OWN(rmsnorm_rope)
+template <class Own = own>
+inline bool rmsnorm_rope(span x, span w, int64_t rows, int64_t T, int64_t D, int64_t pos,
+                         float base, int64_t rot, float eps) {
+  if constexpr (detail::owns_rmsnorm_rope<Own>::value) {
+    if (detail::ran(Own::rmsnorm_rope(x, w, rows, T, D, pos, base, rot, eps))) return true;
+  }
+  return rmsnorm(x, w, x, D, eps, rows) && rope(x, x, rows, T, D, pos, base, {}, rot);
+}
+
 // n floats copied from one buffer to another: the backend's copy where it has
 // one, else an affine pass.
 TL_GPU_DETECT_OWN(copy_f32)

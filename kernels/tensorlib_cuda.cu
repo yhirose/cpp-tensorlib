@@ -3485,6 +3485,35 @@ __global__ void tl_rope(const float* __restrict__ x,
                         unsigned rot) {
   rope_core(x, bias, out, T, D, pos, base, rot);
 }
+// Qwen3's q / k head rows are RMS-normalized and then rotated; this is both in
+// one pass over the rows (in place, one block a row, 256 threads), the sum
+// reduced in rmsnorm_core's order and the rotation rope_core's, so it matches
+// the two kernels bit for bit. A row is r = head * T + token, as for rope.
+__global__ void tl_rmsnorm_rope(float* __restrict__ x, const float* __restrict__ w,
+                                unsigned T, unsigned D, unsigned pos, float base,
+                                unsigned rot, float eps) {
+  extern __shared__ float sm[];
+  const size_t bi = (size_t)blockIdx.x * D;
+  const unsigned t = threadIdx.x, NT = blockDim.x;
+  float acc = 0.0f;
+  for (unsigned i = t; i < D; i += NT) acc += x[bi + i] * x[bi + i];
+  sm[t] = acc;
+  __syncthreads();
+  for (unsigned s = NT >> 1; s > 0; s >>= 1) {
+    if (t < s) sm[t] += sm[t + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(sm[0] / (float)D + eps);
+  const unsigned half = rot >> 1;
+  for (unsigned d = rot + t; d < D; d += NT) x[bi + d] = x[bi + d] * inv * w[d];
+  if (t >= half) return;
+  const float position = (float)(pos + blockIdx.x % T);
+  const float ang = position * __powf(base, -2.0f * (float)t / (float)rot);
+  const float c = __cosf(ang), sn = __sinf(ang);
+  const float x0 = x[bi + t] * inv * w[t], x1 = x[bi + t + half] * inv * w[t + half];
+  x[bi + t] = x0 * c - x1 * sn;
+  x[bi + t + half] = x0 * sn + x1 * c;
+}
 // Device-pos variant (CUDA-graph capture): reads the sequence position from a
 // device scalar `*d_pos` instead of a by-value host arg, so one instantiated
 // graph replays correctly as pos advances. The math is rope_core, byte-identical
