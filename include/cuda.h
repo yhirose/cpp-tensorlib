@@ -715,10 +715,22 @@ struct context {
              attn_prefill_tiled_bf16_64_fn = nullptr;
   CUfunction attn_prefill_tc_64_fn = nullptr, attn_prefill_tc_128_fn = nullptr,
              attn_prefill_tc_256_fn = nullptr;
+  // D = 256 stages Q in shared memory too: (64 queries + 2 buffers of K and V of
+  // 16 keys) rows of D + 8 halves, past the static 48 KB, so its function is
+  // raised to that on first lookup. (the kernel carves the same layout.)
+  static constexpr unsigned attn_tc_smem(int64_t D) {
+    return D == 256 ? (64 + 4 * 16) * (256 + 8) * 2 : 0;
+  }
   CUfunction attn_prefill_tc_(int64_t D) {
-    return D == 64    ? cached_(attn_prefill_tc_64_fn, "tl_attn_prefill_tc_64")
-           : D == 128 ? cached_(attn_prefill_tc_128_fn, "tl_attn_prefill_tc_128")
-                      : cached_(attn_prefill_tc_256_fn, "tl_attn_prefill_tc_256");
+    if (D == 256) {
+      const bool fresh = !attn_prefill_tc_256_fn;
+      CUfunction f = cached_(attn_prefill_tc_256_fn, "tl_attn_prefill_tc_256");
+      if (fresh && f && d.FuncSetAttribute)
+        d.FuncSetAttribute(f, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, static_cast<int>(attn_tc_smem(D)));
+      return f;
+    }
+    return D == 64 ? cached_(attn_prefill_tc_64_fn, "tl_attn_prefill_tc_64")
+                   : cached_(attn_prefill_tc_128_fn, "tl_attn_prefill_tc_128");
   }
   CUfunction attn_prefill_tiled_(int64_t D, bool bf16) {
     return bf16 ? (D == 64 ? cached_(attn_prefill_tiled_bf16_64_fn, "tl_attn_prefill_tiled_bf16_64")
@@ -2140,9 +2152,10 @@ inline bool own::attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V,
   c.device_read_(K.buf);
   c.device_read_(V.buf);
   c.device_write_(out.buf);
-  const unsigned uT = static_cast<unsigned>(T), bq = D == 256 ? 32u : 64u;  // 16 a warp
+  const unsigned uT = static_cast<unsigned>(T), bq = 64u;  // 4 warps, 16 queries each
   return c.launch_(c.attn_prefill_tc_(D),
-                   {static_cast<unsigned>(n_q_heads), (uT + bq - 1) / bq}, {bq * 2}, 0, pq,
+                   {static_cast<unsigned>(n_q_heads), (uT + bq - 1) / bq}, {bq * 2},
+                   context::attn_tc_smem(D), pq,
                    pk, pv, po, uT, static_cast<unsigned>(kv_max * D),
                    static_cast<unsigned>(n_q_heads / n_kv_heads), scale,
                    static_cast<unsigned>(pos0));
