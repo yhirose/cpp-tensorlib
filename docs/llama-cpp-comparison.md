@@ -26,7 +26,7 @@ decode moved by up to 5% between invocations here and its prefill by up to 10%
 |  | pp512 @ d2048 | 28,324-28,447 | 31,012-31,324 | 0.90-0.92 |
 | Qwen3.5-0.8B F16 | tg128 | 393 | 310 | 1.27 |
 |  | tg128 @ d2048 | 383 | 294-310 | 1.24-1.30 |
-|  | pp512 | 27,836-29,641 | 28,780-29,943 | 0.97-0.99 |
+|  | pp512 | 30,718-30,950 | 28,655-29,250 | 1.05-1.08 |
 |  | pp512 @ d2048 | 26,802-27,111 | 28,074-28,133 | 0.95-0.97 |
 | Qwen3.5-0.8B BF16 | tg128 | 388 | 296 | 1.31 |
 |  | tg128 @ d2048 | 379-383 | 304-308 | 1.24-1.26 |
@@ -38,9 +38,9 @@ cached. Until the decode attention overlapped its key loads and split its
 keys finer (2026-10-27), Qwen2.5 trailed by 18% at depth: a block's warps
 walked ~64 keys each in series, one load at a time.
 
-Prefill is ahead on Qwen2.5 and the BF16 Qwen3.5 file, level at 512 tokens on
-Qwen3 and Qwen3.5 F16, and 3-10% behind with 2048 tokens cached on Qwen3 and
-Qwen3.5 F16. Like llama.cpp, it sums the GEMMs in f16 by default (below). Its
+Prefill is ahead on Qwen2.5 and both Qwen3.5 files, level at 512 tokens on
+Qwen3, and 3-10% behind with 2048 tokens cached on Qwen3 and Qwen3.5 F16 (those
+rows were measured before the DeltaNet prep moved onto the tensor cores). Like llama.cpp, it sums the GEMMs in f16 by default (below). Its
 GEMM and its attention run on the tensor cores. The GEMM is `mma.sync` over
 `ldmatrix` with two shared-memory stages (two blocks share an SM, which beat
 deeper pipelines); the weights are converted to f16 as a block stages them, and
@@ -49,9 +49,11 @@ writes it, rather than by every block that reads it. The attention keeps a
 warp's q in registers (shared memory at head width 256), reads k and v with
 `ldmatrix` from a double buffer, and rounds q, k and v to f16. Qwen3.5's
 DeltaNet layers run the gated delta rule in 32-token chunks (as small matrix
-products, f32); what is left there is the chunk prep, ~2.5 ms of a 512-token
-prompt, which is not on the tensor cores, and the scan, bound by a chain of
-~8 barriers per chunk.
+products, f32). The chunk prep's products (K K^T, Q K^T, T K, T V) run on the
+tensor cores as 3xTF32, three tf32 mmas a product, which keeps f32's accuracy
+(1.3e-6 against fp64, the scalar loop's 2.7e-7); the scan reads the next chunk's
+inputs while it updates the state, and is bound by a chain of ~8 barriers per
+chunk.
 
 ## Quantized files
 
@@ -68,11 +70,11 @@ alternated, so a few percent of noise is in the ratios.
 | Qwen3-0.6B Q4_K_M | tg128 | 519 | 528 | 0.98 |
 | | pp512 | 37,300 | 28,900 | 1.29 |
 | Qwen3.5-0.8B Q4_K_M | tg128 | 500 | 439 | 1.14 |
-| | pp512 | 26,100 | 25,900 | 1.01 |
+| | pp512 | 28,800 | 26,700 | 1.08 |
 | Qwen3.5-0.8B Q8_0 | tg128 | 469 | 389 | 1.20 |
 | | pp512 | 26,300 | 28,300 | 0.93 |
 | Qwen3.8-27B Q4_K_M | tg128 | 35.6 | 38.1 | 0.93 |
-| | pp512 | 1,140 | 1,564 | 0.73 |
+| | pp512 | 1,150 | 1,660 | 0.69 |
 
 Qwen3.8-27B is a Qwen3.5 architecture: 64 layers, 48 of them Gated DeltaNet with
 16 q / k heads for 48 value heads (value head h reads key head h % 16, the order
@@ -96,7 +98,7 @@ dequantization slab is 192 MB so that no projection is split into GEMMs too smal
 to fill the GPU. The prefill is then 61% GEMM, 21% dequantization. llama.cpp's
 1,564 is more than an f16 GEMM can reach (the 27B's 26.6 TFLOP take 310 ms at 86
 TFLOPS): it multiplies the quantized weights on the int8 tensor cores (twice the
-f16 rate, and no dequantization pass), which is what is left of the 0.73.
+f16 rate, and no dequantization pass), which is what is left of the 0.69.
 
 ## Accumulation precision
 
