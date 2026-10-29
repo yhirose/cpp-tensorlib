@@ -2316,6 +2316,157 @@ extern "C" __global__ void tl_dequant_f16_q6k(const unsigned char* W, __half* ou
 extern "C" __global__ void tl_dequant_f16_q80(const unsigned char* W, __half* out, unsigned rows, unsigned K) {
   dequant_f16_core<3>(W, out, rows, K);
 }
+
+// ---- The prefill GEMM over Q4_K weights on the int8 tensor cores (llama.cpp's MMQ).
+// C[M,N] = A[M,K] . W[N,K]^T with W kept as Q4_K blocks and A quantized to int8, a
+// scale d = max|a| / 127 per 32 values: a Q4_K block is 8 groups of 32 weights q in
+// 0..15 with value d_w sc q - dmin_w mn, so the group's dot with the activation is
+//   d_a (d_w sc sum q a  -  dmin_w mn sum a)
+// and sum q a is one m16n8k32 s8 mma. Nothing is dequantized: the nibbles are
+// unpacked from shared memory straight into the B fragment. The price is the 8-bit
+// rounding of the activation (the decode's Q8 GEMV makes it too), and it is the
+// only reason this is not the default prefill GEMM.
+//
+// tl_quant_act_mmq lays the activation out for it: int8 [Mpad][K], and the
+// scales S[group][Mpad] as float2 (d, d * sum of the group's int8), so a tile's
+// scales for one group are contiguous (bank-free reads, 16-byte copies). Rows
+// from M to Mpad (a multiple of the tile) are zero.
+extern "C" __global__ void tl_quant_act_mmq(const __half* __restrict__ a, signed char* __restrict__ q,
+                                            float2* __restrict__ S, unsigned M, unsigned Mpad,
+                                            unsigned K) {
+  const unsigned lane = threadIdx.x & 31u, m = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const unsigned g = blockIdx.y;
+  if (m >= Mpad) return;
+  const float x = m < M ? __half2float(a[(size_t)m * K + g * 32u + lane]) : 0.0f;
+  float amax = fabsf(x);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+  const float d = amax / 127.0f;
+  const int qi = d == 0.0f ? 0 : __float2int_rn(x / d);
+  int sum = qi;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+  q[(size_t)m * K + g * 32u + lane] = (signed char)qi;
+  if (lane == 0) S[(size_t)g * Mpad + m] = make_float2(d, d * (float)sum);
+}
+__device__ __forceinline__ void tc_mma_s8_(int* c, const unsigned* a, unsigned b0, unsigned b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+      "{%10,%11,%12,%13};\n"
+      : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0), "r"(0), "r"(0), "r"(0));
+}
+// A 64 x 128 tile, four warps of 32 x 64, one Q4_K super-block (256 of K) a step:
+// its raw 144-byte rows and the activation's int8 and scales are copied in, the
+// B scales (d sc, dmin mn a group) decoded to shared memory, and each of the 8
+// groups is an int8 mma whose int32 sums are scaled into f32 accumulators. One
+// stage of 47 KB so two blocks share an SM (that beat two stages of one block).
+// N is even; K % 256 == 0; the A side is padded to Mpad rows (a multiple of 64).
+#define TL_MMQ_BM 64
+#define TL_MMQ_BN 128
+#define TL_MMQ_THREADS 128
+#define TL_MMQ_SMEM (TL_MMQ_BM * 272 + TL_MMQ_BM * 64 + TL_MMQ_BN * 144 + TL_MMQ_BN * 64)
+extern "C" __global__ void __launch_bounds__(TL_MMQ_THREADS, 2)
+tl_gemm_mmq_q4k(const signed char* __restrict__ Aq, const float2* __restrict__ As_g,
+                const unsigned char* __restrict__ W, float* __restrict__ C, unsigned M,
+                unsigned N, unsigned K, unsigned Mpad, unsigned ldc) {
+  constexpr int BM = TL_MMQ_BM, BN = TL_MMQ_BN, NT = TL_MMQ_THREADS, WM = 32, WN = 64;
+  constexpr int FM = WM / 16, FN = WN / 8;
+  constexpr int ALD = 256 + 16;  // padded int8 row: ldmatrix lanes hit distinct banks
+  constexpr int SZ_A = BM * ALD, SZ_AS = BM * 8 * 8, SZ_B = BN * 144;
+  __shared__ __align__(16) unsigned char sm[TL_MMQ_SMEM];
+  const signed char* a = reinterpret_cast<const signed char*>(sm);
+  const float2* ASs = reinterpret_cast<const float2*>(sm + SZ_A);          // [group][row]
+  const unsigned char* Braw = sm + SZ_A + SZ_AS;                           // [row][144]
+  float2* Bs = reinterpret_cast<float2*>(sm + SZ_A + SZ_AS + SZ_B);        // [group][col]
+  const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const unsigned wm = (warp / (BN / WN)) * WM, wn = (warp % (BN / WN)) * WN;
+  const unsigned row0 = blockIdx.y * BM, col0 = blockIdx.x * BN;
+  const unsigned nk = K / 256;
+  const size_t wrow = (size_t)nk * 144;
+  float acc[FM][FN][4];
+#pragma unroll
+  for (int i = 0; i < FM; i++)
+#pragma unroll
+    for (int j = 0; j < FN; j++)
+#pragma unroll
+      for (int e = 0; e < 4; e++) acc[i][j][e] = 0.0f;
+  const unsigned la_r = lane & 15, la_c = (lane >> 4) * 16;
+  const unsigned g8 = lane >> 2, kq = lane & 3, t2 = (lane & 3) * 2;
+  for (unsigned kt = 0; kt < nk; kt++) {
+    __syncthreads();  // the previous step is done with the tile
+    for (int id = tid; id < BM * 16; id += NT) {  // A: 16 chunks of 16 B a row
+      const unsigned r = id >> 4, c = id & 15;
+      tc_cp16_(sm + r * ALD + c * 16, Aq + (size_t)(row0 + r) * K + kt * 256 + c * 16, true);
+    }
+    for (int id = tid; id < BM * 4; id += NT) {  // the scales, [group][row]: BM / 2 chunks a group
+      const unsigned g = id / (BM / 2), c = id % (BM / 2);
+      tc_cp16_(sm + SZ_A + g * BM * 8 + c * 16, As_g + (size_t)(kt * 8 + g) * Mpad + row0 + c * 2, true);
+    }
+    for (int id = tid; id < BN * 9; id += NT) {  // B: 9 chunks of 16 B a row
+      const unsigned r = id / 9, c = id % 9, gn = min(col0 + r, N - 1);
+      tc_cp16_(sm + SZ_A + SZ_AS + r * 144 + c * 16, W + gn * wrow + (size_t)kt * 144 + c * 16, true);
+    }
+    asm volatile("cp.async.commit_group;\n");
+    asm volatile("cp.async.wait_group 0;\n");
+    __syncthreads();
+    for (int id = tid; id < BN * 8; id += NT) {  // d sc and dmin mn of every (column, group)
+      const unsigned r = id >> 3, g = id & 7;
+      const unsigned char* b = Braw + r * 144;
+      const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(b));
+      const unsigned char* q = b + 4;
+      const unsigned sc = g < 4 ? (q[g] & 63) : ((q[g + 4] & 0xF) | ((q[g - 4] >> 6) << 4));
+      const unsigned mn = g < 4 ? (q[g + 4] & 63) : ((q[g + 4] >> 4) | ((q[g] >> 6) << 4));
+      Bs[g * BN + r] = make_float2(dd.x * (float)sc, dd.y * (float)mn);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int g = 0; g < 8; g++) {
+      unsigned fa[FM][4], fb[FN][2];
+#pragma unroll
+      for (int i = 0; i < FM; i++)
+        tc_ldsm4_(fa[i][0], fa[i][1], fa[i][2], fa[i][3], a + (wm + 16 * i + la_r) * ALD + g * 32 + la_c);
+#pragma unroll
+      for (int j = 0; j < FN; j++) {  // the nibbles of group g: low for even, high for odd
+        const unsigned char* qs = Braw + (wn + 8 * j + g8) * 144 + 16 + 32 * (g >> 1) + kq * 4;
+        unsigned w0 = *reinterpret_cast<const unsigned*>(qs), w1 = *reinterpret_cast<const unsigned*>(qs + 16);
+        if (g & 1) { w0 >>= 4; w1 >>= 4; }
+        fb[j][0] = w0 & 0x0F0F0F0Fu;
+        fb[j][1] = w1 & 0x0F0F0F0Fu;
+      }
+      float2 as[FM][2];
+#pragma unroll
+      for (int i = 0; i < FM; i++) {
+        as[i][0] = ASs[g * BM + wm + 16 * i + g8];
+        as[i][1] = ASs[g * BM + wm + 16 * i + g8 + 8];
+      }
+#pragma unroll
+      for (int j = 0; j < FN; j++) {
+        const float4 bb = *reinterpret_cast<const float4*>(&Bs[g * BN + wn + 8 * j + t2]);
+        const float2 b0 = make_float2(bb.x, bb.y), b1 = make_float2(bb.z, bb.w);
+#pragma unroll
+        for (int i = 0; i < FM; i++) {
+          int c[4];
+          tc_mma_s8_(c, fa[i], fb[j][0], fb[j][1]);
+          // c0, c1: row g8, columns t2, t2 + 1; c2, c3: row g8 + 8.
+          acc[i][j][0] = fmaf(-as[i][0].y, b0.y, fmaf((float)c[0], as[i][0].x * b0.x, acc[i][j][0]));
+          acc[i][j][1] = fmaf(-as[i][0].y, b1.y, fmaf((float)c[1], as[i][0].x * b1.x, acc[i][j][1]));
+          acc[i][j][2] = fmaf(-as[i][1].y, b0.y, fmaf((float)c[2], as[i][1].x * b0.x, acc[i][j][2]));
+          acc[i][j][3] = fmaf(-as[i][1].y, b1.y, fmaf((float)c[3], as[i][1].x * b1.x, acc[i][j][3]));
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int i = 0; i < FM; i++)
+#pragma unroll
+    for (int j = 0; j < FN; j++) {
+      const unsigned gr = row0 + wm + 16 * i + g8, gc = col0 + wn + 8 * j + t2;
+      if (gc >= N) continue;
+      if (gr < M) *reinterpret_cast<float2*>(C + (size_t)gr * ldc + gc) = make_float2(acc[i][j][0], acc[i][j][1]);
+      if (gr + 8 < M) *reinterpret_cast<float2*>(C + (size_t)(gr + 8) * ldc + gc) = make_float2(acc[i][j][2], acc[i][j][3]);
+    }
+}
 #undef TL_GEMM_TC
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 

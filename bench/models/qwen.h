@@ -604,6 +604,7 @@ struct Model {
                               // stays bf16 as the array-path oracle
   qmat qout;                  // the lm_head as block-quantized blocks (Model.quant); outwT is empty
   bool q8act = false;         // Q4_K GEMVs read the activation as int8 (dp4a); else float
+  bool mmq = false;           // prefill Q4_K GEMMs on the int8 tensor cores (opt-in: TL_MMQ=1)
   bool quant = false;         // the projections are block-quantized blocks, read as such
   std::vector<Layer> layers;
   Scratch scratch;
@@ -733,7 +734,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
     if (q) {  // block-quantized blocks: a GEMM a run of one format, each into its columns of y
       for (const auto& p : q.parts) {
         if (!gpu::gemm_quant(p.type, a16, a16 ? a16s : a, sp(q.raw).at(p.byte_off),
-                              y.at(p.row_off * 4), T, p.rows, k, n))
+                              y.at(p.row_off * 4), T, p.rows, k, n, M.mmq && a16))
           throw std::logic_error("qwen: the block-quantized prefill GEMM refused its operands");
       }
       return;
@@ -968,6 +969,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
           q4lm ? load_w_T(m, c.output_name(), c.NE, c.VOCAB, f32).to_q4() : array{},
       .qout = nat ? load_q_cat(m, {{c.output_name(), c.VOCAB}}, c.NE) : qmat{},
       .q8act = nat && gpu::int8_activations && !std::getenv("TL_NO_Q8ACT"),
+      .mmq = nat && gpu::has_gemm_quant && std::getenv("TL_MMQ") != nullptr,
       .quant = nat,
       .row = row,
       .q4_mlp = q4m,

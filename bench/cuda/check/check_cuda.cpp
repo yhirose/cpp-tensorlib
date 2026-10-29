@@ -9,12 +9,53 @@
 #include "gpu.h"  // the shared ops (tl::gpu) resolve to cuda here
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
 using namespace tl::cuda;
 using kop = tl::gpu::kop;
+
+
+// f32 -> f16 bits (round to nearest even; the finite range the checks use) and back.
+static uint16_t to_half(float f) {
+  uint32_t x;
+  std::memcpy(&x, &f, 4);
+  const uint32_t sign = (x >> 16) & 0x8000u;
+  int e = (int)((x >> 23) & 0xFF) - 127 + 15;
+  uint32_t m = x & 0x7FFFFFu;
+  if (e <= 0) {  // subnormal or zero
+    if (e < -10) return (uint16_t)sign;
+    m |= 0x800000u;
+    const int sh = 14 - e;
+    uint32_t h = m >> sh;
+    const uint32_t rem = m & ((1u << sh) - 1), half = 1u << (sh - 1);
+    if (rem > half || (rem == half && (h & 1))) h++;
+    return (uint16_t)(sign | h);
+  }
+  uint32_t h = ((uint32_t)e << 10) | (m >> 13);
+  const uint32_t rem = m & 0x1FFFu;
+  if (rem > 0x1000u || (rem == 0x1000u && (h & 1))) h++;
+  return (uint16_t)(sign | h);
+}
+static float from_half(uint16_t h) {
+  const int e = (h >> 10) & 31, m = h & 1023;
+  const float v = e == 0 ? std::ldexp((float)m, -24) : std::ldexp((float)(m | 1024), e - 25);
+  return (h & 0x8000) ? -v : v;
+}
+// One Q4_K weight of a super-block (144 bytes: d, dmin, 12 bytes of 6-bit scales and
+// mins, 128 bytes of nibbles), as ggml dequantizes it.
+static float q4k_value(const uint8_t* b, int k) {
+  const float d = from_half((uint16_t)(b[0] | b[1] << 8)), dmin = from_half((uint16_t)(b[2] | b[3] << 8));
+  const uint8_t* q = b + 4;
+  const int g = k / 32;
+  const int sc = g < 4 ? (q[g] & 63) : ((q[g + 4] & 0xF) | ((q[g - 4] >> 6) << 4));
+  const int mn = g < 4 ? (q[g + 4] & 63) : ((q[g + 4] >> 4) | ((q[g] >> 6) << 4));
+  const uint8_t byte = b[16 + 32 * (g / 2) + (k % 32)];
+  return d * sc * (float)((g & 1) ? byte >> 4 : byte & 15) - dmin * mn;
+}
 
 static int failures = 0;
 static void check(bool ok, const char* what) {
@@ -195,6 +236,73 @@ int main() {
       if (std::fabs(co[i] - ref[i]) > 1e-4f) match = false;
     check(match, "softmax");
     release(in, 0, nullptr);
+    release(o, 0, nullptr);
+  }
+
+  // ---- the prefill GEMM over Q4_K weights on the int8 tensor cores (gemm_quant, mmq) ----
+  // Rows past the 64-row tile (M = 200), columns past the 128-column one (N = 300) and a
+  // wider output row (ldc), K two super-blocks. Two references: the exact product of the
+  // dequantized weights with the activation rounded to int8 as the kernel does (the
+  // kernel must reproduce it to f32 rounding), and the same with the activation as given
+  // (what the rounding costs).
+  {
+    const int64_t M = 200, N = 300, K = 512, ldc = N + 8, nsb = K / 256;
+    std::vector<uint8_t> W((size_t)N * nsb * 144);
+    for (auto& v : W) v = (uint8_t)(g() >> 8);
+    for (size_t b = 0; b < W.size() / 144; b++) {  // sane d and dmin
+      const uint16_t dh = to_half(0.002f + 0.001f * (float)(g() % 8)), mh = to_half(0.001f * (float)(g() % 8));
+      W[b * 144] = (uint8_t)dh; W[b * 144 + 1] = (uint8_t)(dh >> 8);
+      W[b * 144 + 2] = (uint8_t)mh; W[b * 144 + 3] = (uint8_t)(mh >> 8);
+    }
+    float* cw = nullptr;
+    float* ca = nullptr;
+    float* cc = nullptr;
+    void* w = alloc(W.size(), &cw);
+    void* a = alloc(M * K * 2, &ca);
+    void* o = alloc(M * ldc * 4, &cc);
+    std::memcpy(cw, W.data(), W.size());
+    uint16_t* ah = reinterpret_cast<uint16_t*>(ca);
+    std::vector<float> x((size_t)M * K);
+    for (int64_t m = 0; m < M; m++)
+      for (int64_t k = 0; k < K; k++) {
+        const uint16_t h = to_half(d(g) * (1.0f + (float)((m + k / 32) % 5)));
+        ah[m * K + k] = h;
+        x[m * K + k] = from_half(h);
+      }
+    std::fill(cc, cc + M * ldc, -777.0f);
+    const bool launched = tl::gpu::gemm_quant(12, true, {a, 0}, {w, 0}, {o, 0}, M, N, K, ldc, true);
+    sync_to_host(o, false);
+    double e_kernel = 0, e_round = 0, norm = 0;
+    bool untouched = true;
+    for (int64_t m = 0; m < M; m++) {
+      float xq[512];  // the activation rounded to int8 a group of 32 at a time
+      for (int64_t gr = 0; gr < K / 32; gr++) {
+        float amax = 0;
+        for (int k = 0; k < 32; k++) amax = std::max(amax, std::fabs(x[m * K + gr * 32 + k]));
+        const float dd = amax / 127.0f;
+        for (int k = 0; k < 32; k++)
+          xq[gr * 32 + k] = dd == 0.0f ? 0.0f : std::nearbyint(x[m * K + gr * 32 + k] / dd) * dd;
+      }
+      for (int64_t n = 0; n < N; n++) {
+        double r_q = 0, r_x = 0;
+        for (int64_t k = 0; k < K; k++) {
+          const double wv = q4k_value(&W[((size_t)n * nsb + k / 256) * 144], (int)(k % 256));
+          r_q += wv * xq[k];
+          r_x += wv * x[m * K + k];
+        }
+        e_kernel += (cc[m * ldc + n] - r_q) * (cc[m * ldc + n] - r_q);
+        e_round += (r_q - r_x) * (r_q - r_x);
+        norm += r_x * r_x;
+      }
+      for (int64_t n = N; n < ldc; n++) untouched = untouched && cc[m * ldc + n] == -777.0f;
+    }
+    std::printf("  mmq: kernel vs int8-activation reference rel L2 %.2e, the rounding's cost %.2e\n",
+                std::sqrt(e_kernel / norm), std::sqrt(e_round / norm));
+    check(launched && untouched, "mmq launch, ldc gap");
+    check(std::sqrt(e_kernel / norm) < 1e-5, "mmq vs int8 reference");
+    check(std::sqrt(e_round / norm) < 1e-2, "mmq activation rounding");
+    release(w, 0, nullptr);
+    release(a, 0, nullptr);
     release(o, 0, nullptr);
   }
 

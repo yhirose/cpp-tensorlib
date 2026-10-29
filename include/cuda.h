@@ -803,6 +803,15 @@ struct context {
   }
   CUfunction dequant_fn[3] = {};
 
+  // The int8 copy of the prefill's activation for the MMQ GEMM (tl_quant_act_mmq):
+  // the scales first, then the int8 rows.
+  CUdeviceptr mmq_scratch = 0;
+  size_t mmq_scratch_bytes = 0;
+  CUdeviceptr mmq_scratch_(size_t bytes) {
+    return grow_scratch_(mmq_scratch, mmq_scratch_bytes, bytes);
+  }
+  CUfunction mmq_quant_fn = nullptr, mmq_q4k_fn = nullptr;
+
   // Reusable device scratch for pad_/fold_'s per-call shape/stride metadata
   // (small int64 arrays, one upload per call — too varied in size and too
   // short-lived to route through the tracked mirror allocator).
@@ -934,9 +943,11 @@ struct own {
   static bool gemv_q4k_q8(gpu::span qa, gpu::span W, gpu::span y, int64_t n, int64_t k);
   // C[m, ldc-strided n columns] = A[m,K] . W[n,K]^T over GGUF block-quantized rows (type 12
   // Q4_K, 14 Q6_K, 8 Q8_0). a16: A is f16 and the sums f16, else A is f32 and the sums f32
-  // (the exact form). K % 256 == 0, n even.
+  // (the exact form). K % 256 == 0, n even. mmq (with a16 and Q4_K):
+  // A is quantized to int8 and the product runs on the int8 tensor cores, nothing
+  // dequantized (tl_gemm_mmq_q4k): faster, and lossy by the activation's 8 bits.
   static bool gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
-                          int64_t n, int64_t k, int64_t ldc);
+                          int64_t n, int64_t k, int64_t ldc, bool mmq = false);
   // y[n] = W[n,K] . a over GGUF block-quantized rows (type: the ggml_type code, 12 Q4_K
   // 14 Q6_K or 8 Q8_0), the blocks read where they lie. K a whole number of blocks.
   static bool gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n, int64_t k);
@@ -1872,7 +1883,7 @@ inline bool own::gemm_bf16_nt_f16acc_a16(gpu::span a, gpu::span B, gpu::span out
 }
 
 inline bool own::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
-                             int64_t n, int64_t k, int64_t ldc) {
+                             int64_t n, int64_t k, int64_t ldc, bool mmq) {
   auto& c = context::get();
   if (!c.ready || m <= 0 || n <= 0 || k % (type == 8 ? 32 : 256) || n % 2 || ldc % 2 || ldc < n ||
       (type != 12 && type != 14 && type != 8)) {
@@ -1887,6 +1898,21 @@ inline bool own::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::s
   c.device_rmw_(C.buf);  // a part writes some columns of a shared output
   const context::tc_weight qw = type == 12 ? context::tc_weight::q4k
                                 : type == 14 ? context::tc_weight::q6k : context::tc_weight::q80;
+  if (mmq && a16 && type == 12) {
+    constexpr unsigned bm = 64, bn = 128;
+    const unsigned uM = (unsigned)m, uN = (unsigned)n, uK = (unsigned)k;
+    const unsigned mpad = (uM + bm - 1) / bm * bm;
+    const size_t scales = (size_t)(uK / 32) * mpad * 8;  // float2 (d, d * sum) a group and row
+    const CUdeviceptr scr = c.mmq_scratch_(scales + (size_t)mpad * uK);
+    CUfunction quant = c.cached_(c.mmq_quant_fn, "tl_quant_act_mmq");
+    CUfunction gemm = c.cached_(c.mmq_q4k_fn, "tl_gemm_mmq_q4k");
+    if (!scr || !quant || !gemm) return false;
+    void* ps = reinterpret_cast<void*>(scr);
+    void* pq = reinterpret_cast<char*>(ps) + scales;
+    return c.launch_(quant, {mpad / 8, uK / 32}, {256}, 0, pa, pq, ps, uM, mpad, uK) &&
+           c.launch_(gemm, {(uN + bn - 1) / bn, mpad / bm}, {128}, 0, pq, ps, pw, pc, uM, uN, uK,
+                     mpad, (unsigned)ldc);
+  }
   if (!a16) {  // the exact form dequantizes in the GEMM's staging
     return gemm_tc_run_(c, context::tc_form::f32, pa, pw, pc, (unsigned)m, (unsigned)n, (unsigned)k,
                         (unsigned)ldc, qw);
