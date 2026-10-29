@@ -100,6 +100,24 @@ to fill the GPU. The prefill is then 61% GEMM, 21% dequantization. llama.cpp's
 TFLOPS): it multiplies the quantized weights on the int8 tensor cores (twice the
 f16 rate, and no dequantization pass), which is what is left of the 0.69.
 
+`TL_MMQ=1` does the same for the Q4_K projections (the MLP): the activation is
+rounded to int8 (a scale per 32 values) and multiplied with the Q4_K nibbles on
+`mma.m16n8k32` s8, as llama.cpp's MMQ does, so nothing is dequantized and no f16
+copy of the weight is written and read back. It is off by default because the
+activation's 8 bits change the logits (a greedy reply departs from the default
+path's after a few hundred tokens; `check_cuda` holds the kernel to the
+int8-activation reference at 1e-7 and bounds the rounding's cost at 4e-3).
+Alternated, pp512 with and without it:
+
+| model (GGUF) | default | `TL_MMQ=1` |
+|---|---:|---:|
+| Qwen3-0.6B Q4_K_M | 33.9-35.9k | 37.7-39.1k |
+| Qwen3.5-0.8B Q4_K_M | 27.8-28.2k | 29.9-30.0k |
+| Qwen3.8-27B Q4_K_M | 1,165-1,180 | 1,336-1,339 (llama.cpp 1,660) |
+
+On the 27B a 64-token chunk goes from 314 to 605 tok/s, where the dequantization
+is most of the work.
+
 ## Accumulation precision
 
 **This was most of the prefill gap.** llama.cpp multiplies F16 weights
