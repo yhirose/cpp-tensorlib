@@ -840,6 +840,7 @@ extern "C" __global__ void tl_gated_delta_chunk_scan(
     float* __restrict__ state, float* __restrict__ out, unsigned H, unsigned dv,
     unsigned T) {
   constexpr int C = TL_GDC, DK = 128, R = TL_GDC_SCAN_R, NW = DK / R, NT = NW * 32;
+  static_assert(C * C % NT == 0, "the P tile splits evenly over the block");
   extern __shared__ __align__(16) float smx[];
   float(*Buf)[DK] = reinterpret_cast<float(*)[DK]>(smx);
   float(*red)[C][32] = reinterpret_cast<float(*)[C][32]>(smx + C * DK);
@@ -888,16 +889,27 @@ extern "C" __global__ void tl_gated_delta_chunk_scan(
       for (int u = 0; u < 4; u++) red[w][t + u][lane] = p[u];
     }
   };
-  for (unsigned c = 0; c < nch; c++) {
+  // The next chunk's inputs are read into registers while this one runs its
+  // update, so no chunk starts by waiting on global memory.
+  constexpr int NP = C * C / NT;  // P cells a thread
+  float4 vw[NV], vq[NV], vk[NV];
+  float vp[NP], vg = 0.0f;
+  auto fetch = [&](unsigned c) {
     const unsigned t0 = c * C, n = min((unsigned)C, T - t0);
-    __syncthreads();  // the previous chunk is done with every buffer
-    float4 vw[NV], vq[NV], vk[NV];
     load(W, t0, n, vw);
     load(Qn, t0, n, vq);
     load(Kn, t0, n, vk);
-    for (unsigned e = tid; e < C * C; e += blockDim.x)
-      Pc[e / C][e % C] = P[((size_t)h * nch + c) * C * C + e];
-    if (tid < C) gc[tid] = tid < n ? G[hb + t0 + tid] : 0.0f;
+#pragma unroll
+    for (int k = 0; k < NP; k++) vp[k] = P[((size_t)h * nch + c) * C * C + tid + k * NT];
+    if (tid < C) vg = tid < n ? G[hb + t0 + tid] : 0.0f;
+  };
+  fetch(0);
+  for (unsigned c = 0; c < nch; c++) {
+    const unsigned t0 = c * C, n = min((unsigned)C, T - t0);
+    __syncthreads();  // the previous chunk is done with every buffer
+#pragma unroll
+    for (int k = 0; k < NP; k++) Pc[(tid + k * NT) / C][(tid + k * NT) % C] = vp[k];
+    if (tid < C) gc[tid] = vg;
     put(vw);
     __syncthreads();
     if (tid < C) ed[tid] = tid < n ? expf(gc[n - 1] - gc[tid]) : 0.0f;
@@ -927,6 +939,7 @@ extern "C" __global__ void tl_gated_delta_chunk_scan(
     __syncthreads();  // every warp is done with q's rows
     put(vk);
     __syncthreads();
+    if (c + 1 < nch) fetch(c + 1);  // in flight through the update below
     // h' = e^(g_C) h + sum_t e^(g_C - g_t) k_t d_t^T.
     // The token loop outside: the 32 rows are 32 independent sums.
     const float eC = expf(gc[n - 1]);
