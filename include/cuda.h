@@ -2382,6 +2382,7 @@ inline bool own::gated_delta_chunked(gpu::span qkv, gpu::span ab, int64_t ab_ld,
   float* po = context::off_(o.buf, o.off);
   const unsigned uH = (unsigned)H, udv = (unsigned)dv, uT = (unsigned)T,
                  uld = (unsigned)ab_ld;
+  // prep is laid out for 256 threads (tl_gated_delta_chunk_prep).
   return c.launch_(c.gdc_prep_(), {(unsigned)nch, uH}, {256}, 0, pqkv, pab, padt, Qn,
                    Kn, W, U, P, G, uH, udv, uT, uld, eps, (unsigned)Hk) &&
          c.launch_(c.gdc_scan_(), {udv / 32, uH}, {context::gdc_scan_threads},

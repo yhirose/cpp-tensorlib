@@ -663,9 +663,27 @@ extern "C" __global__ void tl_gated_delta(const float* __restrict__ qkv,
 // Everything but h is the chunk's own, so a first kernel builds it for every
 // (chunk, head) at once, and a second walks the chunks in order, a block a
 // (head, 32 columns of the state): a few small matrix products a chunk where
-// the per-token kernel had a dependent step a token. All f32.
+// the per-token kernel had a dependent step a token. All f32; prep's products
+// (K K^T, Q K^T, T K, T V) run on the tensor cores as 3xTF32, f32's accuracy.
 #define TL_GDC 32  // tokens a chunk
 #define TL_GDC_SCAN_R 8  // state rows a lane holds in the scan (cuda.h repeats it)
+// An f32 split into two tf32s whose sum is the f32 (to ~2^-21), and the product
+// of two such pairs on the tensor cores: three m16n8k8 mmas (the small terms
+// first, the lo*lo one dropped), which keep f32's accuracy where one tf32 mma
+// would not. A and B fragments as the f16 m16n8k16's, in 8-deep steps.
+__device__ __forceinline__ void split_tf32_(float x, unsigned& hi, unsigned& lo) {
+  asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(hi) : "f"(x));
+  asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(lo) : "f"(x - __uint_as_float(hi)));
+}
+__device__ __forceinline__ void mma_tf32_(float* c, const unsigned* a, unsigned b0, unsigned b1) {
+  asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+    : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void mma3_tf32_(float* c, const unsigned* ah, const unsigned* al, const unsigned* bh, const unsigned* bl) {
+  mma_tf32_(c, al, bh[0], bh[1]);
+  mma_tf32_(c, ah, bl[0], bl[1]);
+  mma_tf32_(c, ah, bh[0], bh[1]);
+}
 extern "C" __global__ void tl_gated_delta_chunk_prep(
     const float* __restrict__ qkv, const float* __restrict__ ab,
     const float* __restrict__ adt, float* __restrict__ Qn, float* __restrict__ Kn,
@@ -673,7 +691,9 @@ extern "C" __global__ void tl_gated_delta_chunk_prep(
     float* __restrict__ G, unsigned H, unsigned dv, unsigned T, unsigned ab_ld,
     float eps, unsigned Hk) {
   constexpr int C = TL_GDC, DK = 128;
-  __shared__ float Qs[C][DK], Ks[C][DK];  // Qs later holds V
+  // 256 threads: the K K^T / Q K^T tiles below are one per warp of eight. The rows
+  // are padded by 4 so a fragment's 8 rows x 4 columns fall in 32 distinct banks.
+  __shared__ float Qs[C][DK + 4], Ks[C][DK + 4];  // Qs later holds V
   __shared__ float Am[C][C + 1], Tm[C][C + 1];
   __shared__ float gs[C], bs[C], bg[C];  // bg = beta e^g
   const unsigned c = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, NTH = blockDim.x;
@@ -730,20 +750,36 @@ extern "C" __global__ void tl_gated_delta_chunk_prep(
   __syncthreads();
   if (tid < n) G[hb + t0 + tid] = gs[tid];
   if (tid < C) bg[tid] = bs[tid] * expf(gs[tid]);
-  // A (strictly lower) and P (lower with the diagonal), a dot product a cell.
-  for (unsigned e = tid; e < C * C; e += NTH) {
-    const unsigned t = e / C, sc = e % C;
-    float kk = 0.0f, qk = 0.0f;
-    if (sc <= t && t < n) {
-#pragma unroll 8
-      for (int d = 0; d < DK; d++) {
-        kk += Ks[t][d] * Ks[sc][d];
-        qk += Qs[t][d] * Ks[sc][d];
-      }
+  // A (strictly lower) and P (lower with the diagonal): K K^T and Q K^T on the
+  // tensor cores (3xTF32), a warp an m16n8 tile of both.
+  {
+    const unsigned g = lane >> 2, tq = lane & 3, i = warp >> 2, j = warp & 3;
+    const unsigned r0 = 16 * i + g, r1 = r0 + 8, nn = 8 * j + g;
+    float ckk[4] = {0, 0, 0, 0}, cqk[4] = {0, 0, 0, 0};
+    for (unsigned k0 = 0; k0 < DK; k0 += 8) {
+      unsigned bh[2], bl[2];
+      split_tf32_(Ks[nn][k0 + tq], bh[0], bl[0]);
+      split_tf32_(Ks[nn][k0 + tq + 4], bh[1], bl[1]);
+      unsigned ah[4], al[4];
+      split_tf32_(Ks[r0][k0 + tq], ah[0], al[0]);
+      split_tf32_(Ks[r1][k0 + tq], ah[1], al[1]);
+      split_tf32_(Ks[r0][k0 + tq + 4], ah[2], al[2]);
+      split_tf32_(Ks[r1][k0 + tq + 4], ah[3], al[3]);
+      mma3_tf32_(ckk, ah, al, bh, bl);
+      split_tf32_(Qs[r0][k0 + tq], ah[0], al[0]);
+      split_tf32_(Qs[r1][k0 + tq], ah[1], al[1]);
+      split_tf32_(Qs[r0][k0 + tq + 4], ah[2], al[2]);
+      split_tf32_(Qs[r1][k0 + tq + 4], ah[3], al[3]);
+      mma3_tf32_(cqk, ah, al, bh, bl);
     }
-    const float dec = sc <= t && t < n ? expf(gs[t] - gs[sc]) : 0.0f;
-    Am[t][sc] = sc < t ? bs[t] * dec * kk : 0.0f;
-    P[((size_t)h * gridDim.x + c) * C * C + e] = qk * dec;
+#pragma unroll
+    for (int e = 0; e < 4; e++) {
+      const unsigned t = (e < 2 ? r0 : r1), sc = 8 * j + 2 * tq + (e & 1);
+      const float dec = sc <= t && t < n ? expf(gs[t] - gs[sc]) : 0.0f;
+      const float kk = sc <= t && t < n ? ckk[e] : 0.0f, qk = sc <= t && t < n ? cqk[e] : 0.0f;
+      Am[t][sc] = sc < t ? bs[t] * dec * kk : 0.0f;
+      P[((size_t)h * gridDim.x + c) * C * C + t * C + sc] = qk * dec;
+    }
   }
   __syncthreads();
   // T = (I + A)^-1 by forward substitution, a warp a pass: row t is e_t minus
@@ -762,18 +798,31 @@ extern "C" __global__ void tl_gated_delta_chunk_prep(
     Qs[t][d] = t < n ? qkv[(t0 + t) * Cq + 2 * nq + (size_t)h * dv + d] : 0.0f;
   }
   __syncthreads();
-  // W = T diag(beta e^g) K and U = T diag(beta) V, the rows of the chunk.
-  for (unsigned e = tid; e < n * DK; e += NTH) {
-    const unsigned t = e / DK, d = e % DK;
-    float w = 0.0f;
-    for (unsigned sc = 0; sc <= t; sc++) w += Tm[t][sc] * bg[sc] * Ks[sc][d];
-    W[(hb + t0 + t) * DK + d] = w;
-  }
-  for (unsigned e = tid; e < n * dv; e += NTH) {
-    const unsigned t = e / dv, d = e % dv;
-    float u = 0.0f;
-    for (unsigned sc = 0; sc <= t; sc++) u += Tm[t][sc] * bs[sc] * Qs[sc][d];
-    U[(hb + t0 + t) * dv + d] = u;
+  // W = T diag(beta e^g) K and U = T diag(beta) V on the tensor cores.
+  {
+    const unsigned g = lane >> 2, tq = lane & 3;
+    const unsigned nt = dv / 8;  // n8 tiles a matrix (dk = 128 >= dv)
+    for (unsigned job = warp; job < 2 * 2 * nt; job += NW) {
+      const unsigned mat = job / (2 * nt), i = (job / nt) & 1, nj = job % nt;
+      const float* sc = mat ? bs : bg;
+      const unsigned r0 = 16 * i + g, r1 = r0 + 8;
+      float cc[4] = {0, 0, 0, 0};
+      for (unsigned k0 = 0; k0 < C; k0 += 8) {
+        unsigned ah[4], al[4], bh[2], bl[2];
+        split_tf32_(Tm[r0][k0 + tq] * sc[k0 + tq], ah[0], al[0]);
+        split_tf32_(Tm[r1][k0 + tq] * sc[k0 + tq], ah[1], al[1]);
+        split_tf32_(Tm[r0][k0 + tq + 4] * sc[k0 + tq + 4], ah[2], al[2]);
+        split_tf32_(Tm[r1][k0 + tq + 4] * sc[k0 + tq + 4], ah[3], al[3]);
+        const float(*X)[DK + 4] = mat ? Qs : Ks;
+        split_tf32_(X[k0 + tq][8 * nj + g], bh[0], bl[0]);
+        split_tf32_(X[k0 + tq + 4][8 * nj + g], bh[1], bl[1]);
+        mma3_tf32_(cc, ah, al, bh, bl);
+      }
+      float* dst = mat ? U : W;
+      const unsigned ld = mat ? dv : DK, col = 8 * nj + 2 * tq;
+      if (r0 < n) *reinterpret_cast<float2*>(dst + (hb + t0 + r0) * ld + col) = make_float2(cc[0], cc[1]);
+      if (r1 < n) *reinterpret_cast<float2*>(dst + (hb + t0 + r1) * ld + col) = make_float2(cc[2], cc[3]);
+    }
   }
 }
 // The chunks in order, a block a (head, 32 state columns): DK/R warps, warp w
