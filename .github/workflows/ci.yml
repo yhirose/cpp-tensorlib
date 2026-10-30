@@ -62,7 +62,10 @@ jobs:
         # hard-errors the PTX build (C1189). VS 2022 is in range. The plain
         # `test` job below stays on windows-latest — only the CUDA/nvcc path
         # needs the pinned toolset.
-        os: [ubuntu-latest, windows-2022]
+        # ubuntu-24.04 (not -latest) for the same reason: ubuntu-latest moved to
+        # 26.04, whose CUDA network repo has no 12.6 packages for the toolkit
+        # action to install.
+        os: [ubuntu-24.04, windows-2022]
     steps:
       - uses: actions/checkout@v4
       - uses: Jimver/cuda-toolkit@v0.2.19
