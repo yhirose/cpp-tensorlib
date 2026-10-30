@@ -342,8 +342,9 @@ TL_ROW_REDUCE(tl_row_max, -3.402823466e+38f, (acc > v ? acc : v))
 // Greedy decoding's last mile: reduce logits[VOCAB] on-device so only a 4-byte
 // index crosses PCIe (vs the 608KB logits D2H the host argmax needed). The
 // largest value wins and the SMALLEST index on ties, the host `v[i] > v[bi]`
-// loop's choice, so greedy output stays bit-identical to the CPU reference; NaN
-// never wins, and with nothing above -FLT_MAX the index is 0.
+// loop's choice among numbers, so greedy output stays bit-identical to the CPU
+// reference; NaN never wins, and with nothing above -FLT_MAX the index is 0 (every
+// pair starts at (-FLT_MAX, 0), and only a larger value replaces it).
 // One launch over the GPU: each block reduces a grid-stride stripe to a (value,
 // index) pair in pv / pi, and the last block to finish (`done` counts them)
 // reduces the blocks' pairs, writes out[0] and puts the counter back to 0 for
@@ -371,7 +372,7 @@ __device__ __forceinline__ void argmax_block_(float& v, int& i) {
   if (wid == 0) {
     const bool live = lane < (blockDim.x >> 5);
     v = live ? sv[lane] : -3.402823466e+38f;
-    i = live ? si[lane] : 0x7fffffff;
+    i = live ? si[lane] : 0;
     argmax_warp_(v, i);
   }
 }
@@ -379,7 +380,7 @@ extern "C" __global__ void tl_argmax(const float* __restrict__ in, int* out, uns
                                      float* pv, int* pi, unsigned* done) {
   __shared__ bool last;
   float v = -3.402823466e+38f;
-  int i = 0x7fffffff;  // no index yet: loses every tie
+  int i = 0;
   // Strict '>' within a thread's ascending stripe: its first maximum.
   for (unsigned k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += gridDim.x * blockDim.x) {
     const float x = in[k];
@@ -399,12 +400,12 @@ extern "C" __global__ void tl_argmax(const float* __restrict__ in, int* out, uns
   if (!last) return;
   __threadfence();
   v = -3.402823466e+38f;
-  i = 0x7fffffff;
+  i = 0;
   for (unsigned b = threadIdx.x; b < gridDim.x; b += blockDim.x)
     argmax_take_(v, i, reinterpret_cast<volatile float*>(pv)[b], reinterpret_cast<volatile int*>(pi)[b]);
   argmax_block_(v, i);
   if (threadIdx.x == 0) {
-    out[0] = i == 0x7fffffff ? 0 : i;
+    out[0] = i;
     *done = 0;
   }
 }

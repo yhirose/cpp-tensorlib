@@ -8,6 +8,7 @@
 #endif
 #include "gpu.h"  // the shared ops (tl::gpu) resolve to cuda here
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -460,13 +461,18 @@ int main() {
     };
     int64_t bad = 0, cases = 0;
     bool launched = true;
+    std::vector<float> base[2];  // the two vectors' random values, prefixes of these
+    for (auto& b : base) {
+      b.resize(248320);
+      for (float& x : b) x = d(g) * 10.0f;
+    }
     for (const int64_t n : {1, 255, 257, 70000, 151936, 248320}) {
       for (int pattern = 0; pattern < 6; pattern++) {
         float* cv[2] = {nullptr, nullptr};
         void* v[2] = {alloc(n * 4, &cv[0]), alloc(n * 4, &cv[1])};
         for (int s = 0; s < 2; s++) {
           float* x = cv[s];
-          for (int64_t i = 0; i < n; i++) x[i] = d(g) * 10.0f;
+          std::copy(base[s].begin(), base[s].begin() + n, x);
           const int64_t r = (int64_t)(g() % (uint32_t)n);
           if (pattern == 1) {  // the maximum several times, the first copy anywhere
             for (int k = 0; k < 4; k++) x[(r + k * (n / 4 + 1)) % n] = 50.0f;
