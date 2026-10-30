@@ -2043,17 +2043,31 @@ __device__ __forceinline__ unsigned tc_pack2_(float a, float b) {
     return *reinterpret_cast<const unsigned*>(&h);
   }
 }
+// A Q4_K block's 6-bit scale and min of group j (0..7), ggml's get_scale_min_k4,
+// from its 12 scale bytes (block bytes 4..15) held as three words. Indexing a
+// 12-byte copy of them instead put the copy in local memory (a stack frame) in
+// every kernel that did it: the Q4_K decode GEMV ran at 650-720 GB/s rather than
+// 830, and the MMQ, dequantization and GEMM staging carried the same frame.
+__device__ __forceinline__ unsigned q4k_byte_(uint3 w, int i) {
+  const unsigned x = i < 4 ? w.x : i < 8 ? w.y : w.z;
+  return (x >> (8 * (i & 3))) & 0xFFu;
+}
+__device__ __forceinline__ void q4k_scale_min_(uint3 w, int j, int& sc, int& mn) {
+  if (j < 4) {
+    sc = (int)(q4k_byte_(w, j) & 63u);
+    mn = (int)(q4k_byte_(w, j + 4) & 63u);
+  } else {
+    sc = (int)((q4k_byte_(w, j + 4) & 0xFu) | ((q4k_byte_(w, j - 4) >> 6) << 4));
+    mn = (int)((q4k_byte_(w, j + 4) >> 4) | ((q4k_byte_(w, j) >> 6) << 4));
+  }
+}
 template <bool F16>
 __device__ __forceinline__ uint4 tc_dq8_q4k_(const unsigned char* row, unsigned gk) {
   const unsigned char* b = row + (size_t)(gk >> 8) * 144u;
   const unsigned o = gk & 255u, g = o >> 5, p = g >> 1, l0 = o & 31u;
   const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(b));  // d, dmin
-  unsigned char sm[12];
-  const uint3 sw = *reinterpret_cast<const uint3*>(b + 4);
-  memcpy(sm, &sw, 12);
-  const int gi = (int)g;
-  const unsigned sc = gi < 4 ? (sm[gi] & 63) : ((sm[gi + 4] & 0xF) | ((sm[gi - 4] >> 6) << 4));
-  const unsigned mn = gi < 4 ? (sm[gi + 4] & 63) : ((sm[gi + 4] >> 4) | ((sm[gi] >> 6) << 4));
+  int sc, mn;
+  q4k_scale_min_(*reinterpret_cast<const uint3*>(b + 4), (int)g, sc, mn);
   const float d1 = dd.x * (float)sc, m1 = dd.y * (float)mn;
   const uint2 w = *reinterpret_cast<const uint2*>(b + 16 + 32 * p + l0);
   const unsigned sh = (g & 1u) ? 4u : 0u;
@@ -2583,12 +2597,10 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
             make_uint4((x.x >> 4) & 0x0F0F0F0Fu, (x.y >> 4) & 0x0F0F0F0Fu, (x.z >> 4) & 0x0F0F0F0Fu,
                        (x.w >> 4) & 0x0F0F0F0Fu);
         // Group c's d sc and dmin mn, from d, dmin and the 12 bytes of 6-bit scales.
-        unsigned char hb[16];
-        memcpy(hb, &rh[v], 16);
-        const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(hb));
-        const unsigned char* q = hb + 4;
-        const unsigned sc = c < 4 ? (q[c] & 63) : ((q[c + 4] & 0xF) | ((q[c - 4] >> 6) << 4));
-        const unsigned mn = c < 4 ? (q[c + 4] & 63) : ((q[c + 4] >> 4) | ((q[c] >> 6) << 4));
+        const uint4 hw = rh[v];
+        const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(&hw.x));
+        int sc, mn;
+        q4k_scale_min_(make_uint3(hw.y, hw.z, hw.w), (int)c, sc, mn);
         BSs[c * BN + r] = make_float2(dd.x * (float)sc, dd.y * (float)mn);
       } else {
         const unsigned* w = rw[v];
@@ -2841,9 +2853,7 @@ __global__ void tl_gemv_q4k_row(const float* __restrict__ a, const unsigned char
   for (unsigned ib = warp; ib < nb; ib += nwarps) {
     const unsigned char* b = row + (size_t)ib * 144u;
     const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(b));  // d, dmin
-    unsigned char sm[12];
     const uint3 sw = *reinterpret_cast<const uint3*>(b + 4);
-    memcpy(sm, &sw, 12);
     const unsigned w = *reinterpret_cast<const unsigned*>(b + 16 + 32 * p + 4 * j);
     const float* ap = a + (size_t)ib * 256u + 64u * p + 4u * j;
     const float4 alo = *reinterpret_cast<const float4*>(ap), ahi = *reinterpret_cast<const float4*>(ap + 32);
@@ -2851,14 +2861,9 @@ __global__ void tl_gemv_q4k_row(const float* __restrict__ a, const unsigned char
     const float hi[4] = {(float)((w >> 4) & 0xFu), (float)((w >> 12) & 0xFu), (float)((w >> 20) & 0xFu), (float)((w >> 28) & 0xFu)};
     const float sql = lo[0] * alo.x + lo[1] * alo.y + lo[2] * alo.z + lo[3] * alo.w;
     const float sqh = hi[0] * ahi.x + hi[1] * ahi.y + hi[2] * ahi.z + hi[3] * ahi.w;
-    unsigned char s0, m0, s1, m1;
-    {  // scale / min of groups 2p and 2p+1 (ggml's get_scale_min_k4)
-      const int g0 = 2 * (int)p, g1 = g0 + 1;
-      s0 = g0 < 4 ? (sm[g0] & 63) : (unsigned char)((sm[g0 + 4] & 0xF) | ((sm[g0 - 4] >> 6) << 4));
-      m0 = g0 < 4 ? (sm[g0 + 4] & 63) : (unsigned char)((sm[g0 + 4] >> 4) | ((sm[g0] >> 6) << 4));
-      s1 = g1 < 4 ? (sm[g1] & 63) : (unsigned char)((sm[g1 + 4] & 0xF) | ((sm[g1 - 4] >> 6) << 4));
-      m1 = g1 < 4 ? (sm[g1 + 4] & 63) : (unsigned char)((sm[g1 + 4] >> 4) | ((sm[g1] >> 6) << 4));
-    }
+    int s0, m0, s1, m1;  // scale / min of groups 2p and 2p+1
+    q4k_scale_min_(sw, 2 * (int)p, s0, m0);
+    q4k_scale_min_(sw, 2 * (int)p + 1, s1, m1);
     const float suml = alo.x + alo.y + alo.z + alo.w, sumh = ahi.x + ahi.y + ahi.z + ahi.w;
     acc += dd.x * (s0 * sql + s1 * sqh) - dd.y * (m0 * suml + m1 * sumh);
   }
@@ -2908,11 +2913,7 @@ __global__ void tl_gemv_q4k_q8_row(const signed char* __restrict__ qa, const flo
   for (unsigned ib = sbl; ib < nb; ib += 4) {
     const unsigned char* b = row + (size_t)ib * 144u;
     const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(b));  // d, dmin
-    unsigned char sm[12];
-    {
-      const uint3 sw = *reinterpret_cast<const uint3*>(b + 4);
-      memcpy(sm, &sw, 12);
-    }
+    const uint3 sw = *reinterpret_cast<const uint3*>(b + 4);
     const uint4 q = *reinterpret_cast<const uint4*>(b + 16 + 32 * p + 16 * hf);
     const signed char* ap = qa + (size_t)ib * 256u + 64u * p + 16u * hf;
     const uint4 al = *reinterpret_cast<const uint4*>(ap), ah = *reinterpret_cast<const uint4*>(ap + 32);
@@ -2925,11 +2926,10 @@ __global__ void tl_gemv_q4k_q8_row(const signed char* __restrict__ qa, const flo
     sh = __dp4a((int)((q.y >> 4) & 0x0F0F0F0Fu), (int)ah.y, sh);
     sh = __dp4a((int)((q.z >> 4) & 0x0F0F0F0Fu), (int)ah.z, sh);
     sh = __dp4a((int)((q.w >> 4) & 0x0F0F0F0Fu), (int)ah.w, sh);
-    const int g0 = 2 * (int)p, g1 = g0 + 1;  // scale / min of groups 2p, 2p+1 (get_scale_min_k4)
-    const int s0 = g0 < 4 ? (sm[g0] & 63) : ((sm[g0 + 4] & 0xF) | ((sm[g0 - 4] >> 6) << 4));
-    const int m0 = g0 < 4 ? (sm[g0 + 4] & 63) : ((sm[g0 + 4] >> 4) | ((sm[g0] >> 6) << 4));
-    const int s1 = g1 < 4 ? (sm[g1] & 63) : ((sm[g1 + 4] & 0xF) | ((sm[g1 - 4] >> 6) << 4));
-    const int m1 = g1 < 4 ? (sm[g1 + 4] & 63) : ((sm[g1 + 4] >> 4) | ((sm[g1] >> 6) << 4));
+    const int g0 = 2 * (int)p, g1 = g0 + 1;  // scale / min of groups 2p, 2p+1
+    int s0, m0, s1, m1;
+    q4k_scale_min_(sw, g0, s0, m0);
+    q4k_scale_min_(sw, g1, s1, m1);
     const float2 d0 = ds[ib * 8u + g0], d1 = ds[ib * 8u + g1];
     float t = dd.x * (d0.x * (float)(s0 * sl) + d1.x * (float)(s1 * sh));
     if (hf == 0) t -= dd.y * (d0.y * (float)m0 + d1.y * (float)m1);
