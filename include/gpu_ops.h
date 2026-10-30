@@ -1098,6 +1098,19 @@ inline bool gemm_quant_glu(int type, span A16, span W, span H16, int64_t m, int6
   }
 }
 
+// Qwen3.5's gated norm, silu(z) * rmsnorm(o) * w, in one pass (see own::gated_rmsnorm in
+// cuda.h). False where the backend has none: the caller composes it.
+TL_GPU_DETECT_OWN(gated_rmsnorm)
+template <class Own = own>
+inline bool gated_rmsnorm(span o, span z, int64_t ldz, span w, span out, bool h16, int64_t T,
+                          int64_t H, int64_t D, float eps) {
+  if constexpr (detail::owns_gated_rmsnorm<Own>::value) {
+    return detail::ran(Own::gated_rmsnorm(o, z, ldz, w, out, h16, T, H, D, eps));
+  } else {
+    return false;
+  }
+}
+
 // The activation quantized to int8 blocks (see own::quantize_act_q8 in cuda.h) and
 // the Q4_K GEMV that reads it; false where the backend has no such pair.
 TL_GPU_DETECT_OWN(quantize_act_q8)

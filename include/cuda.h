@@ -576,6 +576,7 @@ struct context {
   }
   CUfunction rmsnorm_rope_fn = nullptr, gemv_q4k_fn = nullptr, gemv_q6k_fn = nullptr,
              gemv_q80_fn = nullptr, quant_act_fn = nullptr, gemv_q4k_q8_fn = nullptr;
+  CUfunction gated_rmsnorm_fn[2] = {};
   CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, swiglu_h16_fn = nullptr,
              merge_heads_h16_fn = nullptr, cvt_h16_fn = nullptr;  // the f16 activation's producers
   CUfunction conv_tok_fn = nullptr, conv_state_fn = nullptr;  // a prefill's conv
@@ -991,6 +992,10 @@ struct own {
                               gpu::span xout, gpu::span hout, gpu::span hout16,
                               int64_t n, float eps, int64_t rows);
   static bool swiglu_h16(gpu::span gu, gpu::span o16, int64_t ff, int64_t rows);
+  // out = silu(z) * rmsnorm(o) * w over T x H rows of D (tl_gated_rmsnorm): o contiguous,
+  // z's row t ldz apart, out f32 or (h16) f16 [T, H D]. D % 32 == 0.
+  static bool gated_rmsnorm(gpu::span o, gpu::span z, int64_t ldz, gpu::span w, gpu::span out,
+                            bool h16, int64_t T, int64_t H, int64_t D, float eps);
   static bool merge_heads_h16(gpu::span src, gpu::span dst16, int64_t T, int64_t H,
                               int64_t D);
   static bool cvt_h16(gpu::span src, gpu::span dst16, int64_t n);
@@ -2117,6 +2122,22 @@ inline bool own::swiglu_h16(gpu::span gu, gpu::span o16, int64_t ff, int64_t row
   const gpu::arg args[] = {gpu::in(gu), gpu::out(o16)};
   return c.dispatch_(c.cached_(c.swiglu_h16_fn, "tl_swiglu_h16"), args, 2, &p, sizeof(p),
                      gpu::policy::flat_rows(ff, rows));
+}
+inline bool own::gated_rmsnorm(gpu::span o, gpu::span z, int64_t ldz, gpu::span w, gpu::span out,
+                               bool h16, int64_t T, int64_t H, int64_t D, float eps) {
+  auto& c = context::get();
+  if (!c.ready || T <= 0 || H <= 0 || D <= 0 || D % 32) return false;
+  c.device_read_(o.buf);
+  c.device_read_(z.buf);
+  c.device_read_(w.buf);
+  c.device_write_(out.buf);
+  CUfunction f = h16 ? c.cached_(c.gated_rmsnorm_fn[1], "tl_gated_rmsnorm_h16")
+                     : c.cached_(c.gated_rmsnorm_fn[0], "tl_gated_rmsnorm");
+  const unsigned rows = (unsigned)(T * H);
+  return f && c.launch_(f, {(rows + 7) / 8}, {256}, 0, context::off_(o.buf, o.off),
+                        context::off_(z.buf, z.off), context::off_(w.buf, w.off),
+                        context::off_(out.buf, out.off), rows, (unsigned)H, (unsigned)D,
+                        (unsigned)ldz, eps);
 }
 inline bool own::merge_heads_h16(gpu::span src, gpu::span dst16, int64_t T, int64_t H,
                                  int64_t D) {

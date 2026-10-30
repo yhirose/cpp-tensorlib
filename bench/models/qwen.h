@@ -771,9 +771,9 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
     if (c.is_delta(l)) {
       // Gated DeltaNet over the chunk: the projection as one GEMM, then the
       // conv and the rule walk the tokens in order (each one launch). The
-      // rule's output lands in o, the second half of [z | o]; z is copied out
-      // of the projection rows into the first, so silu(z) * rmsnorm(o) is one
-      // swiglu over the flattened [T, V].
+      // rule's output lands in o, and the gated norm silu(z) * rmsnorm(o) reads
+      // z where the projection left it (where the backend has no such pass, z is
+      // copied out beside o and the norm and a swiglu over [z | o] make it).
       const int64_t C = c.ssm_conv_ch(), V = c.ssm_v(), PJ = c.ssm_proj();
       const gpu::span z = sp(P.zo), o = at_f32(z, T * V);
       gemm(sp(P.h), sp(P.h16), L.wssm, L.qssm, sp(P.qkv), PJ, c.NE);
@@ -781,10 +781,14 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
                     c.SCONV, T);
       gpu::gated_delta(sp(P.conv), at_f32(sp(P.qkv), C), PJ, sp(L.adt),
                        sp(L.ssm_state), o, c.SH, c.SDK, c.SDV, T, c.L2EPS, c.SK);
-      gpu::rmsnorm(o, sp(L.sn), o, c.SDV, c.EPS, T * c.SH);
-      rows_out(at_f32(sp(P.qkv), C + 2 * c.SH), PJ, z, V);
-      if (a16) gpu::swiglu_h16(z, sp(P.at16), T * V, 1);
-      else gpu::swiglu(z, sp(P.at), T * V);
+      const gpu::span zp = at_f32(sp(P.qkv), C + 2 * c.SH);
+      if (!gpu::gated_rmsnorm(o, zp, PJ, sp(L.sn), a16 ? sp(P.at16) : sp(P.at), a16, T, c.SH, c.SDV,
+                              c.EPS)) {
+        gpu::rmsnorm(o, sp(L.sn), o, c.SDV, c.EPS, T * c.SH);
+        rows_out(zp, PJ, z, V);
+        if (a16) gpu::swiglu_h16(z, sp(P.at16), T * V, 1);
+        else gpu::swiglu(z, sp(P.at), T * V);
+      }
       gemm(sp(P.at), sp(P.at16), L.wsout, L.qsout, ro, c.NE, V);
     } else {
       gemm(sp(P.h), sp(P.h16), L.wqkv, L.qqkv, sp(P.qkv), AP, c.NE);
@@ -1314,15 +1318,19 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
     if (c.is_delta(l)) {
       // Gated DeltaNet: one GEMV -> q|k|v | alpha | beta | z in S.qkvb, the conv
       // over q|k|v, the rule (its output lands right after z), the gated norm
-      // silu(z) * rmsnorm(o) as one swiglu over [z | o], then the out projection.
+      // silu(z) * rmsnorm(o) (one pass, or the norm and a swiglu over [z | o]), then
+      // the out projection.
       const int64_t C = c.ssm_conv_ch(), V = c.ssm_v();
       const gpu::span pj = sp(S.qkvb), o = at_f32(pj, c.ssm_proj());
       gv(L.wssm, L.qssm, sp(S.hb), pj, c.ssm_proj(), c.NE);
       gpu::ssm_conv(pj, C, sp(L.conv_state), sp(L.wconv), sp(S.convb), C, c.SCONV);
       gpu::gated_delta(sp(S.convb), at_f32(pj, C), 0, sp(L.adt), sp(L.ssm_state), o,
                        c.SH, c.SDK, c.SDV, 1, c.L2EPS, c.SK);
-      gpu::rmsnorm(o, sp(L.sn), o, c.SDV, c.EPS, c.SH);
-      gpu::swiglu(at_f32(pj, C + 2 * c.SH), sp(S.ab), V);
+      if (!gpu::gated_rmsnorm(o, at_f32(pj, C + 2 * c.SH), V, sp(L.sn), sp(S.ab), false, 1, c.SH,
+                              c.SDV, c.EPS)) {
+        gpu::rmsnorm(o, sp(L.sn), o, c.SDV, c.EPS, c.SH);
+        gpu::swiglu(at_f32(pj, C + 2 * c.SH), sp(S.ab), V);
+      }
       gv(L.wsout, L.qsout, sp(S.ab), ro, c.NE, V);  // ro = mixer @ ssm_out
     } else {
       // Fused QKV: one GEMV -> [q(NH*HD) | k(NKV*HD) | v(NKV*HD)] in S.qkvb (then

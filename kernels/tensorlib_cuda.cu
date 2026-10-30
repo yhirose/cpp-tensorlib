@@ -481,6 +481,45 @@ extern "C" __global__ void tl_swiglu_h16(const float* __restrict__ gu,
   float g = gu[src];
   out[(size_t)blockIdx.y * ff + f] = __float2half((g / (1.0f + expf(-g))) * gu[src + ff]);
 }
+// Qwen3.5's gated norm of the DeltaNet output: out[t, h D + d] = silu(z) * o * w[d] /
+// sqrt(mean_d o^2 + eps), o's rows (t H + h) D wide and contiguous, z's at t ldz + h D.
+// One warp a row (D % 32 == 0), so a short row is not a block of mostly idle threads;
+// the norm and the gate are rmsnorm_core's and tl_swiglu's formulas. Written as f32, or
+// (h16, a constant at each call) f16 for the GEMM that reads it.
+__device__ __forceinline__ void gated_rmsnorm_core(const float* __restrict__ o,
+                                                   const float* __restrict__ z,
+                                                   const float* __restrict__ w, void* __restrict__ out,
+                                                   unsigned rows, unsigned H, unsigned D,
+                                                   unsigned ldz, float eps, bool h16) {
+  const unsigned lane = threadIdx.x & 31u, r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (r >= rows) return;
+  const unsigned t = r / H, h = r % H;
+  const float* orow = o + (size_t)r * D;
+  const float* zrow = z + (size_t)t * ldz + (size_t)h * D;
+  float ss = 0.0f;
+  for (unsigned d = lane; d < D; d += 32) ss += orow[d] * orow[d];
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+  const float inv = 1.0f / sqrtf(ss / (float)D + eps);
+  for (unsigned d = lane; d < D; d += 32) {
+    const float y = orow[d] * inv * w[d], g = zrow[d];
+    const float v = (g / (1.0f + expf(-g))) * y;
+    if (h16) static_cast<__half*>(out)[(size_t)r * D + d] = __float2half(v);
+    else static_cast<float*>(out)[(size_t)r * D + d] = v;
+  }
+}
+extern "C" __global__ void tl_gated_rmsnorm(const float* __restrict__ o, const float* __restrict__ z,
+                                            const float* __restrict__ w, float* __restrict__ out,
+                                            unsigned rows, unsigned H, unsigned D, unsigned ldz,
+                                            float eps) {
+  gated_rmsnorm_core(o, z, w, out, rows, H, D, ldz, eps, false);
+}
+extern "C" __global__ void tl_gated_rmsnorm_h16(const float* __restrict__ o, const float* __restrict__ z,
+                                                const float* __restrict__ w, __half* __restrict__ out,
+                                                unsigned rows, unsigned H, unsigned D, unsigned ldz,
+                                                float eps) {
+  gated_rmsnorm_core(o, z, w, out, rows, H, D, ldz, eps, true);
+}
 // f32 -> f16, for an activation no fused producer rounds.
 extern "C" __global__ void tl_cvt_h16(const float* __restrict__ src,
                                       __half* __restrict__ dst, unsigned n) {
