@@ -78,5 +78,8 @@ inline bool gpu_available() { return gpu::available(); }
 }  // namespace tl
 
 #include "gpu_ops.h"
+#include "gpu_ops_nn.h"
+#include "gpu_ops_llm.h"
 
+#undef TL_GPU_DETECT_OWN
 #undef TL_GPU_BACKEND
