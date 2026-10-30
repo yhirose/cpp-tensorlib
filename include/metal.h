@@ -161,6 +161,10 @@ struct context {
   static const char* msl_source_() {
     static const char src[] = {
 #embed "metal_kernels.metal"
+        , '\n',
+#embed "metal_kernels_nn.metal"
+        , '\n',
+#embed "metal_kernels_llm.metal"
         , '\0'};
     return src;
   }

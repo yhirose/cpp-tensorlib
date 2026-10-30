@@ -64,6 +64,9 @@ if(TENSORLIB_CUDA)
     COMMAND ${TL_NVCC} ${TL_NVCC_ARGS}
             ${CMAKE_CURRENT_SOURCE_DIR}/kernels/tensorlib_cuda.cu -o ${TL_CUDA_PTX}
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernels/tensorlib_cuda.cu
+            ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda_core.cuh
+            ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda_nn.cuh
+            ${CMAKE_CURRENT_SOURCE_DIR}/kernels/cuda_llm.cuh
     COMMENT "nvcc: tensorlib_cuda.cu -> PTX (${TENSORLIB_CUDA_PTX_ARCH})"
     VERBATIM)
   add_custom_command(
