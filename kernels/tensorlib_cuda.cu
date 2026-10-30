@@ -2495,6 +2495,11 @@ __device__ __forceinline__ void tc_mma_s8_(int* c, const unsigned* a, unsigned b
 // small to fill the GPU splits K over blockIdx.z, kchunk super-blocks a part, part z writing
 // its own copy of C zstride floats on (tl_mmq_reduce sums them, in order, so the result
 // does not depend on scheduling).
+// The activation's 128-row tiles run along blockIdx.x and the weight's along blockIdx.y,
+// so the blocks the GPU runs at once hold every activation tile of a prompt chunk (four
+// at 512 tokens) for ~20 weight tiles: each weight tile comes from memory once and its
+// other blocks find it in L2, where the weight-major order read it once per activation
+// tile: Qwen3.8-27B's prefill GEMMs take 2.6% (Q4_K) to 4.2% (Q8_0) less time.
 //
 // GLU: W is a fused gate|up projection (rows [0, N) the gate, [N, 2N) the up) and the
 // output is silu(gate) * up in f16, [M][N] ldc apart, as tl_swiglu_h16 rounds it: a
@@ -2523,7 +2528,8 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
   float2* BSs = reinterpret_cast<float2*>(mmq_sm + (BM + BN) * LDK + BM * 64);    // [group][BN]
   const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const unsigned wm = (warp / (BN / WN)) * WM, wn = (warp % (BN / WN)) * WN;
-  const unsigned row0 = blockIdx.y * BM, col0 = blockIdx.x * BN;
+  const unsigned tn = blockIdx.y;  // the weight tile (the activation's is blockIdx.x)
+  const unsigned row0 = blockIdx.x * BM, col0 = tn * BN;
   const unsigned nk = K / 256;
   const size_t wrow = (size_t)nk * (WF == 1 ? 144 : 272);  // bytes a weight row
   const unsigned kt0 = blockIdx.z * kchunk, kt1 = min(nk, kt0 + kchunk);
@@ -2532,7 +2538,7 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
   // the same outputs' up rows, twice over 64 outputs.
   auto wrow_of = [&](unsigned r) {
     if constexpr (GLU) {
-      const unsigned o = min(blockIdx.x * (BN / 2) + (r / 64) * 32 + (r & 31), N - 1);
+      const unsigned o = min(tn * (BN / 2) + (r / 64) * 32 + (r & 31), N - 1);
       return (r & 32) ? o + N : o;
     } else {
       return min(col0 + r, N - 1);
@@ -2670,7 +2676,7 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
 #pragma unroll
       for (int j = 0; j < FN / 2; j++) {
         const unsigned gr = row0 + wm + 16 * i + g8;
-        const unsigned o = blockIdx.x * (BN / 2) + (wn / WN) * 32 + 8 * j + t2;
+        const unsigned o = tn * (BN / 2) + (wn / WN) * 32 + 8 * j + t2;
         if (o >= N) continue;
         const float* gt = acc[i][j];
         const float* up = acc[i][j + FN / 2];

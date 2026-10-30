@@ -1935,9 +1935,10 @@ inline bool mmq_run_(context& c, int type, bool glu, void* pa, void* pw, void* o
   // wave (rounding down: a part past it would start a second, nearly empty wave), each
   // at least two super-blocks. The parts' sums go through a scratch and are added in order.
   const unsigned mpad = (uM + tile - 1) / tile * tile, nk = uK / 256;
-  const unsigned gx = glu ? (uN + tile / 2 - 1) / (tile / 2) : (uN + tile - 1) / tile, gy = mpad / tile;
+  // Weight tiles tn, activation tiles tm (the grid's y and x: tl_gemm_mmq_*'s order).
+  const unsigned tn = glu ? (uN + tile / 2 - 1) / (tile / 2) : (uN + tile - 1) / tile, tm = mpad / tile;
   constexpr unsigned sms = traits::fill_groups / 2;
-  const unsigned parts = std::max(1u, std::min(sms / (gx * gy), nk / 2));
+  const unsigned parts = std::max(1u, std::min(sms / (tn * tm), nk / 2));
   if (glu && parts > 1) return false;
   const unsigned kchunk = (nk + parts - 1) / parts;
   const unsigned z = (nk + kchunk - 1) / kchunk;
@@ -1952,14 +1953,14 @@ inline bool mmq_run_(context& c, int type, bool glu, void* pa, void* pw, void* o
                  mpad, uK))
     return false;
   if (z == 1)
-    return c.launch_(gemm, {gx, gy}, {context::mmq_threads}, context::mmq_smem, pq, ps, pw, out, uM, uN,
+    return c.launch_(gemm, {tm, tn}, {context::mmq_threads}, context::mmq_smem, pq, ps, pw, out, uM, uN,
                      uK, mpad, ldc, kchunk, 0u);
   const unsigned stride = uM * uN;
   const CUdeviceptr part = c.mmq_part_scratch_((size_t)z * stride * sizeof(float));
   CUfunction reduce = c.cached_(c.mmq_reduce_fn, "tl_mmq_reduce");
   if (!part || !reduce) return false;
   float* pp = reinterpret_cast<float*>(part);
-  return c.launch_(gemm, {gx, gy, z}, {context::mmq_threads}, context::mmq_smem, pq, ps, pw, pp, uM, uN,
+  return c.launch_(gemm, {tm, tn, z}, {context::mmq_threads}, context::mmq_smem, pq, ps, pw, pp, uM, uN,
                    uK, mpad, uN, kchunk, stride) &&
          c.launch_(reduce, {(uM * (uN / 2) + 255) / 256}, {256}, 0, pp, out, uM, uN, ldc, z, stride);
 }
