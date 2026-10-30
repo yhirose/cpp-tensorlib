@@ -50,7 +50,8 @@ if [[ "$WHAT" == all || "$WHAT" == tests ]]; then
     -sJSPI=1 -sJSPI_EXPORTS=run_tests \
     -sEXPORT_NAME=createTests \
     -sEXPORTED_FUNCTIONS=_run_tests,_malloc,_free \
-    "$HERE/main_wasm.cpp" "$ROOT/test/test_array.cpp" \
+    "$HERE/main_wasm.cpp" "$ROOT/test/test_array.cpp" "$ROOT/test/test_nn.cpp" \
+    "$ROOT/test/test_llm.cpp" \
     -o "$OUT/tests.js"
   set +x
   cp "$HERE/index.html" "$HERE/worker.js" "$OUT/"

@@ -89,7 +89,8 @@ endif()
 
 enable_testing()
 
-add_executable(tensorlib_test test/test_basic.cpp test/test_array.cpp)
+add_executable(tensorlib_test test/test_basic.cpp test/test_array.cpp test/test_nn.cpp
+                              test/test_llm.cpp)
 target_link_libraries(tensorlib_test PRIVATE tensorlib)
 if(TENSORLIB_CUDA)
   # The test suite's gpu/auto modes now exercise the real CUDA backend (the
