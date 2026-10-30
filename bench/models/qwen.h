@@ -619,6 +619,13 @@ struct Model {
   // counted in f16_retries.
   bool f16_acc = false;
   int64_t f16_retries = 0;
+  // The attention layers' KV caches hold f16 where the backend can (caps::kv_f16):
+  // half the bytes every decode step streams, and the values the tensor-core
+  // prefill rounds K and V to anyway, as llama.cpp's default cache. The decode's
+  // attention then reads K and V rounded to f16. An f32-weight model (the exact
+  // build, which the oracle checks run) keeps an f32 cache, and so does any with
+  // TL_KV_F32=1.
+  bool kv_f16 = false;
 };
 
 // Decode GEMV picking the weight-dtype kernel: y(n) = a(1,k) @ W[k,n].
@@ -985,7 +992,8 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
       .row = row,
       .q4_mlp = q4m,
       .q4_lmhead = q4lm,
-      .f16_acc = f16_acc};
+      .f16_acc = f16_acc,
+      .kv_f16 = wdt == tl::dtype::bf16 && gpu::caps::kv_f16 && !std::getenv("TL_KV_F32")};
   for (int64_t l = 0; l < c.NL; l++) {
     std::string p = "blk." + std::to_string(l) + ".";
     // Named per field: the ternaries below decide LAYOUT, and a positional list
@@ -1090,7 +1098,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
                                   {p + "attn_v.bias", c.NKV * c.HD}});
       if (row && !nat) L.wo_row = load_w_T_row(m, p + "attn_output.weight", Q, c.NE);
       L.qo = qfused({{p + "attn_output.weight", c.NE}}, Q);
-      L.cache.init(c.NKV, c.MAXC, c.HD);
+      L.cache.init(c.NKV, c.MAXC, c.HD, M.kv_f16);
     }
     M.layers.push_back(std::move(L));
   }

@@ -177,7 +177,8 @@ What is left there is mostly the GEMM: this library's runs at ~46% of the
 - **Prefill precision.** This library's prefill GEMM sums in f16 by default
   (above; with `f32acc`, bf16 operands and f32 sums), and its attention rounds
   q, k and v to f16 (normalized q and k sit far inside f16's range — Qwen2.5's
-  largest is ~220). Decode and the array API's attention stay f32. Against
+  largest is ~220). The decode's attention sums in f32 over the f16 cache
+  (below); the array API's attention stays f32. Against
   the f32 path, the top-5 logits of a prompt's last token move by up to ~8e-3;
   a long thinking-mode answer can take another word where two were near-tied.
 - **Weights.** llama.cpp computes from the F16 (or BF16) weights as the file
@@ -186,9 +187,13 @@ What is left there is mostly the GEMM: this library's runs at ~46% of the
   Qwen3 and Qwen3.5 F16 files every value is exact in bf16, so the weights
   are identical too; Qwen's own Qwen2.5 F16 file has values that bf16 rounds
   (by at most 0.39%).
-- **KV cache.** llama.cpp's default is F16 and `llama-bench` offers no f32;
-  this library's is f32, so at depth it reads twice the cache bytes per step.
-  At 2048 tokens that is tens of microseconds of a ~2.5 ms step.
+- **KV cache.** f16 on both by default: llama.cpp's default, and this
+  library's where the backend has it (CUDA; `TL_KV_F32=1` keeps it f32, as an
+  f32-weight model does). The prefill's attention rounds K and V to f16 either
+  way, so a prompt's logits are the same with either cache; the decode then
+  reads K and V rounded, and its logits move (check_qwen's greedy runs match).
+  Half the bytes per step at depth: Qwen3-0.6B's cache is 470 MB at 2048 tokens
+  in f32.
 - **Variance.** Within one invocation, llama.cpp's prefill rows vary by
   5-10% here and this library's by 1-2%, decode by 1-2% on both. Between
   invocations llama.cpp's decode moved by up to 5%, hence the ranges.
