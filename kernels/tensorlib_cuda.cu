@@ -525,6 +525,23 @@ extern "C" __global__ void tl_swiglu_h16(const float* __restrict__ gu,
 // amplifies even a reordering of that sum (check_qwen's 96-token prompt moved 6x), so
 // the fusion keeps the numbers rather than approximating them. Written as f32, or (h16,
 // a constant at each call) f16 for the GEMM that reads it.
+//
+// rmsnorm_core's sum of squares on its 256 threads, taken by one warp: acc[k] is what
+// thread lane + 32 k accumulated over its elements t, t + 256, ... (as rounded values:
+// a square left to fuse into the tree's first add would round differently), the tree's
+// levels 128, 64 and 32 pair a lane's own values and its levels 16 .. 1 cross the warp.
+// An xor step leaves both lanes the same sum (an add commutes), so every lane ends
+// with the tree's thread 0's.
+__device__ __forceinline__ float rmsnorm_sum_warp_(float (&acc)[8]) {
+#pragma unroll
+  for (int k = 0; k < 4; k++) acc[k] += acc[k + 4];  // s = 128
+#pragma unroll
+  for (int k = 0; k < 2; k++) acc[k] += acc[k + 2];  // s = 64
+  float ss = acc[0] + acc[1];                          // s = 32
+#pragma unroll
+  for (int s = 16; s > 0; s >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, s);  // s = 16 .. 1
+  return ss;
+}
 __device__ __forceinline__ void gated_rmsnorm_core(const float* __restrict__ o,
                                                    const float* __restrict__ z,
                                                    const float* __restrict__ w, void* __restrict__ out,
@@ -541,15 +558,7 @@ __device__ __forceinline__ void gated_rmsnorm_core(const float* __restrict__ o,
     acc[k] = 0.0f;
     for (unsigned i = lane + 32u * k; i < D; i += 256) acc[k] += orow[i] * orow[i];
   }
-#pragma unroll
-  for (int k = 0; k < 4; k++) acc[k] += acc[k + 4];  // s = 128
-#pragma unroll
-  for (int k = 0; k < 2; k++) acc[k] += acc[k + 2];  // s = 64
-  float ss = acc[0] + acc[1];                          // s = 32
-#pragma unroll
-  for (int s = 16; s > 0; s >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, s);  // s = 16 .. 1
-  ss = __shfl_sync(0xffffffffu, ss, 0);
-  const float inv = 1.0f / sqrtf(ss / (float)D + eps);
+  const float inv = 1.0f / sqrtf(rmsnorm_sum_warp_(acc) / (float)D + eps);
   for (unsigned d = lane; d < D; d += 32) {
     const float y = orow[d] * inv * w[d], g = zrow[d];
     const float v = (g / (1.0f + expf(-g))) * y;
@@ -4326,6 +4335,70 @@ extern "C" __global__ void tl_attn_bwd_dkv_f32_64(const float* q, const float* K
   attn_bwd_dkv_core<64, 2>(q, K, V, dO, stats, dK, dV, T, scale);
 }
 
+// RoPE's turn of the pair (x0, x1) at dims (j, j + rot/2) of a row at `position`
+// (rope_core below; every rotation here goes through it, so they agree bit for bit).
+__device__ __forceinline__ void rope_pair_(float position, unsigned j, unsigned rot, float base,
+                                           float& x0, float& x1) {
+  const float ang = position * __powf(base, -2.0f * (float)j / (float)rot);
+  const float c = __cosf(ang), s = __sinf(ang);
+  // r1's fused multiply-add named (x0 s fused, x1 c rounded first, the form rope_core
+  // had): left to contraction, the compiler fused whichever product suited the code
+  // around each copy, and the copies stopped agreeing bit for bit. r0 stays as written,
+  // the PTX it always produced (the JIT's own contraction then sees the same code).
+  const float r0 = x0 * c - x1 * s;
+  const float r1 = __fmaf_rn(x0, s, x1 * c);
+  x0 = r0;
+  x1 = r1;
+}
+// Qwen3's q / k head rows RMS-normalized and then rotated, in place, a warp a row (eight
+// a block); a row is r = head * T + token, as for rope. D = 64, 128 or 256 and rot a
+// multiple of 64, so that a lane's values x[lane + 32 k] hold both halves of its
+// rotation pairs; own::rmsnorm_rope refuses other shapes (the caller then runs rmsnorm
+// and rope). The sum is rmsnorm_core's (rmsnorm_sum_warp_, the squares rounded) and the
+// turn rope_core's, so the result is tl_rmsnorm then tl_rope's, bit for bit. A block a
+// row, 256 threads for 128 values, took 36 us for Qwen3-0.6B's 8192 q rows; this 8.6.
+template <unsigned D>
+__device__ __forceinline__ void rmsnorm_rope_core_(float* __restrict__ x, const float* __restrict__ w,
+                                                   unsigned rows, unsigned T, unsigned pos, float base,
+                                                   unsigned rot, float eps) {
+  constexpr int E = D / 32;
+  const unsigned lane = threadIdx.x & 31, row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (row >= rows) return;
+  float* xr = x + (size_t)row * D;
+  float v[E], acc[8];
+#pragma unroll
+  for (int k = 0; k < E; k++) v[k] = xr[lane + 32 * k];
+#pragma unroll
+  for (int k = 0; k < 8; k++) acc[k] = k < E ? __fmul_rn(v[k], v[k]) : 0.0f;
+  const float inv = 1.0f / sqrtf(rmsnorm_sum_warp_(acc) / (float)D + eps);
+  const unsigned half = rot >> 1, P = half / 32;  // rotation pairs a lane
+#pragma unroll
+  for (int k = 0; k < E; k++) {
+    const unsigned d = lane + 32 * k;
+    if (d >= rot) xr[d] = v[k] * inv * w[d];
+  }
+  const float position = (float)(pos + row % T);
+#pragma unroll
+  for (int k = 0; k < E / 2; k++) {
+    if ((unsigned)k >= P) break;
+    const unsigned t = lane + 32 * k;
+    float x0 = v[k] * inv * w[t], x1 = v[k + P] * inv * w[t + half];
+    rope_pair_(position, t, rot, base, x0, x1);
+    xr[t] = x0;
+    xr[t + half] = x1;
+  }
+}
+#define TL_RMSNORM_ROPE(D)                                                                       \
+  extern "C" __global__ void tl_rmsnorm_rope_##D(float* __restrict__ x, const float* __restrict__ w, \
+                                                 unsigned rows, unsigned T, unsigned pos, float base, \
+                                                 unsigned rot, float eps) {                          \
+    rmsnorm_rope_core_<D>(x, w, rows, T, pos, base, rot, eps);                                     \
+  }
+TL_RMSNORM_ROPE(64)
+TL_RMSNORM_ROPE(128)
+TL_RMSNORM_ROPE(256)
+#undef TL_RMSNORM_ROPE
+
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 
 // RoPE (rotary position embedding), half-split (GPT-NeoX / HF-llama) convention.
@@ -4349,18 +4422,15 @@ static __device__ __forceinline__ void rope_core(
   const unsigned half = rot >> 1;
   if (j >= half) return;
   const unsigned t = T ? (r % T) : 0u;
-  const float position = (float)(pos + t);
-  const float theta = __powf(base, -2.0f * (float)j / (float)rot);
-  const float ang = position * theta;
-  const float c = __cosf(ang), s = __sinf(ang);
   float x0 = x[bi + j];
   float x1 = x[bi + j + half];
   if (bias) {
     x0 += bias[bi + j];
     x1 += bias[bi + j + half];
   }
-  out[bi + j] = x0 * c - x1 * s;
-  out[bi + j + half] = x0 * s + x1 * c;
+  rope_pair_((float)(pos + t), j, rot, base, x0, x1);
+  out[bi + j] = x0;
+  out[bi + j + half] = x1;
 }
 __global__ void tl_rope(const float* __restrict__ x,
                         const float* __restrict__ bias, float* __restrict__ out,
@@ -4368,97 +4438,6 @@ __global__ void tl_rope(const float* __restrict__ x,
                         unsigned rot) {
   rope_core(x, bias, out, T, D, pos, base, rot);
 }
-// Qwen3's q / k head rows are RMS-normalized and then rotated; this is both in
-// one pass over the rows (in place, one block a row, 256 threads), the sum
-// reduced in rmsnorm_core's order and the rotation rope_core's, so it matches
-// the two kernels bit for bit. A row is r = head * T + token, as for rope.
-// Any D and rot; the head widths models have take the warp form below.
-__global__ void tl_rmsnorm_rope(float* __restrict__ x, const float* __restrict__ w,
-                                unsigned T, unsigned D, unsigned pos, float base,
-                                unsigned rot, float eps) {
-  extern __shared__ float sm[];
-  const size_t bi = (size_t)blockIdx.x * D;
-  const unsigned t = threadIdx.x, NT = blockDim.x;
-  float acc = 0.0f;
-  for (unsigned i = t; i < D; i += NT) acc += x[bi + i] * x[bi + i];
-  sm[t] = acc;
-  __syncthreads();
-  for (unsigned s = NT >> 1; s > 0; s >>= 1) {
-    if (t < s) sm[t] += sm[t + s];
-    __syncthreads();
-  }
-  const float inv = 1.0f / sqrtf(sm[0] / (float)D + eps);
-  const unsigned half = rot >> 1;
-  for (unsigned d = rot + t; d < D; d += NT) x[bi + d] = x[bi + d] * inv * w[d];
-  if (t >= half) return;
-  const float position = (float)(pos + blockIdx.x % T);
-  const float ang = position * __powf(base, -2.0f * (float)t / (float)rot);
-  const float c = __cosf(ang), sn = __sinf(ang);
-  const float x0 = x[bi + t] * inv * w[t], x1 = x[bi + t + half] * inv * w[t + half];
-  x[bi + t] = x0 * c - x1 * sn;
-  x[bi + t + half] = x0 * sn + x1 * c;
-}
-}  // extern "C"
-// The same a warp a row, for D = 32 E <= 256 and rot a multiple of 64, so that a
-// lane's values x[lane + 32 k] hold both halves of its rotation pairs (t, t + rot/2).
-// A block of 256 threads put a row of 128 values through a chain of nine barriers
-// with half its threads idle: 36 us for Qwen3-0.6B's 8192 q rows, 8.6 this way.
-// The sum is still the 256-thread tree's: thread t < D holds x[t]^2 (rounded, as
-// it is there: no fused multiply-add into the first sum), the levels 128, 64 and 32
-// pair a lane's own values, the warp's xor steps the rest (lane 0 adds what the
-// tree's thread 0 adds), and everyone takes lane 0's; the rotation is rope_core's.
-// Bit for bit tl_rmsnorm_rope, so tl_rmsnorm then tl_rope.
-template <int E>
-__device__ __forceinline__ void rmsnorm_rope_warp_(float* __restrict__ x, const float* __restrict__ w,
-                                                   unsigned rows, unsigned T, unsigned pos, float base,
-                                                   unsigned rot, float eps) {
-  constexpr unsigned D = 32 * E;
-  const unsigned lane = threadIdx.x & 31, row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
-  if (row >= rows) return;
-  float* xr = x + (size_t)row * D;
-  float v[E], s[8];
-#pragma unroll
-  for (int k = 0; k < E; k++) v[k] = xr[lane + 32 * k];
-#pragma unroll
-  for (int k = 0; k < 8; k++) s[k] = k < E ? __fmul_rn(v[k], v[k]) : 0.0f;
-#pragma unroll
-  for (int h = 4; h >= 1; h >>= 1)
-#pragma unroll
-    for (int k = 0; k < h; k++) s[k] += s[k + h];
-  float sum = s[0];
-#pragma unroll
-  for (int o = 16; o >= 1; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-  sum = __shfl_sync(0xffffffffu, sum, 0);
-  const float inv = 1.0f / sqrtf(sum / (float)D + eps);
-  const unsigned half = rot >> 1, P = half / 32;  // rotation pairs a lane
-#pragma unroll
-  for (int k = 0; k < E; k++) {
-    const unsigned d = lane + 32 * k;
-    if (d >= rot) xr[d] = v[k] * inv * w[d];
-  }
-  const float position = (float)(pos + row % T);
-#pragma unroll
-  for (int k = 0; k < E / 2; k++) {
-    if ((unsigned)k >= P) break;
-    const unsigned t = lane + 32 * k;
-    const float ang = position * __powf(base, -2.0f * (float)t / (float)rot);
-    const float c = __cosf(ang), sn = __sinf(ang);
-    const float x0 = v[k] * inv * w[t], x1 = v[k + P] * inv * w[t + half];
-    xr[t] = x0 * c - x1 * sn;
-    xr[t + half] = x0 * sn + x1 * c;
-  }
-}
-#define TL_RMSNORM_ROPE_WARP(E)                                                                     \
-  extern "C" __global__ void tl_rmsnorm_rope_w##E(float* __restrict__ x, const float* __restrict__ w, \
-                                                  unsigned rows, unsigned T, unsigned pos, float base, \
-                                                  unsigned rot, float eps) {                          \
-    rmsnorm_rope_warp_<E>(x, w, rows, T, pos, base, rot, eps);                                       \
-  }
-TL_RMSNORM_ROPE_WARP(2)
-TL_RMSNORM_ROPE_WARP(4)
-TL_RMSNORM_ROPE_WARP(8)
-#undef TL_RMSNORM_ROPE_WARP
-extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 // Device-pos variant (CUDA-graph capture): reads the sequence position from a
 // device scalar `*d_pos` instead of a by-value host arg, so one instantiated
 // graph replays correctly as pos advances. The math is rope_core, byte-identical

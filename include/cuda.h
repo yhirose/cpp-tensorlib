@@ -573,9 +573,9 @@ struct context {
   CUfunction gemm_bf16_nt_sk_() {
     return cached_(gemm_bf16_nt_sk_fn, "tl_gemm_bf16_nt_sk");
   }
-  CUfunction rmsnorm_rope_fn = nullptr, gemv_q4k_fn = nullptr, gemv_q6k_fn = nullptr,
+  CUfunction gemv_q4k_fn = nullptr, gemv_q6k_fn = nullptr,
              gemv_q80_fn = nullptr, quant_act_fn = nullptr, gemv_q4k_q8_fn = nullptr;
-  CUfunction rmsnorm_rope_warp_fn[3] = {};  // D 64, 128, 256
+  CUfunction rmsnorm_rope_fn[3] = {};  // D 64, 128, 256
   CUfunction gated_rmsnorm_fn[2] = {};
   CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, swiglu_h16_fn = nullptr,
              merge_heads_h16_fn = nullptr, cvt_h16_fn = nullptr;  // the f16 activation's producers
@@ -962,7 +962,8 @@ struct own {
                           int64_t T, int64_t ld, int64_t off, int64_t H,
                           int64_t D);
   static bool argmax(gpu::span a, int64_t n, int64_t* out_idx);
-  // x[rows, D] RMS-normalized by w and then rotated, in place (rows = heads * T).
+  // x[rows, D] RMS-normalized by w and then rotated, in place (rows = heads * T); D 64,
+  // 128 or 256 and rot a multiple of 64, else false.
   static bool rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T, int64_t D,
                            int64_t pos, float base, int64_t rot, float eps);
   // The activation a[K] quantized to int8 blocks of 32 (K int8, then K/32 float2 of
@@ -2082,21 +2083,16 @@ inline bool own::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, int
 inline bool own::rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T, int64_t D,
                               int64_t pos, float base, int64_t rot, float eps) {
   auto& c = context::get();
-  if (!c.ready || rows <= 0 || T <= 0 || rot <= 0 || rot % 2 || rot > D || rows % T) return false;
+  // tl_rmsnorm_rope_<D>: a warp a row, for the head widths whose rotation pairs a lane
+  // holds whole; other shapes are refused (gpu::rmsnorm_rope then runs rmsnorm and rope).
+  const int e = D == 64 ? 0 : D == 128 ? 1 : D == 256 ? 2 : -1;
+  if (!c.ready || e < 0 || rows <= 0 || T <= 0 || rot <= 0 || rot % 64 || rot > D || rows % T) return false;
   c.device_rmw_(x.buf);
   c.device_read_(w.buf);
-  constexpr unsigned threads = 256;
-  // A warp a row (eight a block) where a lane's values hold whole rotation pairs.
-  const int e = D == 64 ? 0 : D == 128 ? 1 : D == 256 ? 2 : -1;
-  if (e >= 0 && rot % 64 == 0) {
-    static const char* const names[3] = {"tl_rmsnorm_rope_w2", "tl_rmsnorm_rope_w4", "tl_rmsnorm_rope_w8"};
-    return c.launch_(c.cached_(c.rmsnorm_rope_warp_fn[e], names[e]), {(unsigned)((rows + 7) / 8)}, {threads}, 0,
-                     context::off_(x.buf, x.off), context::off_(w.buf, w.off), (unsigned)rows, (unsigned)T,
-                     (unsigned)pos, base, (unsigned)rot, eps);
-  }
-  return c.launch_(c.cached_(c.rmsnorm_rope_fn, "tl_rmsnorm_rope"), {(unsigned)rows}, {threads},
-                   threads * sizeof(float), context::off_(x.buf, x.off), context::off_(w.buf, w.off),
-                   (unsigned)T, (unsigned)D, (unsigned)pos, base, (unsigned)rot, eps);
+  static const char* const names[3] = {"tl_rmsnorm_rope_64", "tl_rmsnorm_rope_128", "tl_rmsnorm_rope_256"};
+  return c.launch_(c.cached_(c.rmsnorm_rope_fn[e], names[e]), {(unsigned)((rows + 7) / 8)}, {256u}, 0,
+                   context::off_(x.buf, x.off), context::off_(w.buf, w.off), (unsigned)rows, (unsigned)T,
+                   (unsigned)pos, base, (unsigned)rot, eps);
 }
 
 inline bool own::copy_f32(gpu::span from, gpu::span to, int64_t n) {

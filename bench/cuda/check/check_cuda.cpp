@@ -416,9 +416,9 @@ int main() {
   }
 
   // ---- Qwen3's q / k norm and rotation in one pass (rmsnorm_rope) against rmsnorm then
-  // rope, bit for bit: the head widths the warp form takes (Qwen3's 128, Qwen3.5's 256
-  // turning 64, and 64), and two it leaves to the block form (rot 32, D 320). T = 37
-  // leaves rows past a whole number of eight-row blocks.
+  // rope, bit for bit: the head widths the kernel takes (Qwen3's 128, Qwen3.5's 256
+  // turning 64, and 64), and two it refuses (rot 32, D 320), which gpu::rmsnorm_rope
+  // then runs as the two. T = 37 leaves rows past a whole number of eight-row blocks.
   {
     struct shape { int64_t D, rot, H; };
     for (const shape s : {shape{128, 128, 5}, shape{256, 64, 3}, shape{64, 64, 4}, shape{128, 32, 3}, shape{320, 320, 2}}) {
