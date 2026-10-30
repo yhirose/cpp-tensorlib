@@ -415,6 +415,37 @@ int main() {
     for (void* b : {o, z, w, f, h, zc, zn, r, rh}) release(b, 0, nullptr);
   }
 
+  // ---- Qwen3's q / k norm and rotation in one pass (rmsnorm_rope) against rmsnorm then
+  // rope, bit for bit: the head widths the warp form takes (Qwen3's 128, Qwen3.5's 256
+  // turning 64, and 64), and two it leaves to the block form (rot 32, D 320). T = 37
+  // leaves rows past a whole number of eight-row blocks.
+  {
+    struct shape { int64_t D, rot, H; };
+    for (const shape s : {shape{128, 128, 5}, shape{256, 64, 3}, shape{64, 64, 4}, shape{128, 32, 3}, shape{320, 320, 2}}) {
+      const int64_t T = 37, rows = s.H * T;
+      float *cx = nullptr, *cw = nullptr, *cf = nullptr, *cr = nullptr;
+      void* x = alloc(rows * s.D * 4, &cx);
+      void* w = alloc(s.D * 4, &cw);
+      void* f = alloc(rows * s.D * 4, &cf);
+      void* r = alloc(rows * s.D * 4, &cr);
+      for (int64_t i = 0; i < rows * s.D; i++) cx[i] = cf[i] = d(g) * 3.0f;
+      for (int64_t i = 0; i < s.D; i++) cw[i] = 0.5f + d(g);
+      const bool ok = tl::gpu::rmsnorm_rope({f, 0}, {w, 0}, rows, T, s.D, 2000, 1e6f, s.rot, 1e-6f) &&
+                      tl::gpu::rmsnorm({x, 0}, {w, 0}, {r, 0}, s.D, 1e-6f, rows) &&
+                      tl::gpu::rope({r, 0}, {r, 0}, rows, T, s.D, 2000, 1e6f, {}, s.rot);
+      sync_to_host(f, false);
+      sync_to_host(r, false);
+      int64_t diff = 0;
+      for (int64_t i = 0; i < rows * s.D; i++) diff += std::memcmp(&cf[i], &cr[i], 4) != 0;
+      std::printf("  rmsnorm_rope D=%lld rot=%lld: %lld of %lld values differ from rmsnorm + rope\n", (long long)s.D,
+                  (long long)s.rot, (long long)diff, (long long)(rows * s.D));
+      char what[48];
+      std::snprintf(what, sizeof what, "rmsnorm_rope D=%lld rot=%lld", (long long)s.D, (long long)s.rot);
+      check(ok && diff == 0, what);
+      for (void* b : {x, w, f, r}) release(b, 0, nullptr);
+    }
+  }
+
   // ---- argmax: the host loop's index (the largest value, the first one on ties; NaN
   // never wins; nothing above -FLT_MAX gives 0), over lengths a block short of, at and
   // past one block's 256 and a vocabulary's, with ties, NaN and -inf. Two vectors a

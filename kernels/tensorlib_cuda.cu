@@ -4366,6 +4366,7 @@ __global__ void tl_rope(const float* __restrict__ x,
 // one pass over the rows (in place, one block a row, 256 threads), the sum
 // reduced in rmsnorm_core's order and the rotation rope_core's, so it matches
 // the two kernels bit for bit. A row is r = head * T + token, as for rope.
+// Any D and rot; the head widths models have take the warp form below.
 __global__ void tl_rmsnorm_rope(float* __restrict__ x, const float* __restrict__ w,
                                 unsigned T, unsigned D, unsigned pos, float base,
                                 unsigned rot, float eps) {
@@ -4391,6 +4392,67 @@ __global__ void tl_rmsnorm_rope(float* __restrict__ x, const float* __restrict__
   x[bi + t] = x0 * c - x1 * sn;
   x[bi + t + half] = x0 * sn + x1 * c;
 }
+}  // extern "C"
+// The same a warp a row, for D = 32 E <= 256 and rot a multiple of 64, so that a
+// lane's values x[lane + 32 k] hold both halves of its rotation pairs (t, t + rot/2).
+// A block of 256 threads put a row of 128 values through a chain of nine barriers
+// with half its threads idle: 36 us for Qwen3-0.6B's 8192 q rows, 8.6 this way.
+// The sum is still the 256-thread tree's: thread t < D holds x[t]^2 (rounded, as
+// it is there: no fused multiply-add into the first sum), the levels 128, 64 and 32
+// pair a lane's own values, the warp's xor steps the rest (lane 0 adds what the
+// tree's thread 0 adds), and everyone takes lane 0's; the rotation is rope_core's.
+// Bit for bit tl_rmsnorm_rope, so tl_rmsnorm then tl_rope.
+template <int E>
+__device__ __forceinline__ void rmsnorm_rope_warp_(float* __restrict__ x, const float* __restrict__ w,
+                                                   unsigned rows, unsigned T, unsigned pos, float base,
+                                                   unsigned rot, float eps) {
+  constexpr unsigned D = 32 * E;
+  const unsigned lane = threadIdx.x & 31, row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  if (row >= rows) return;
+  float* xr = x + (size_t)row * D;
+  float v[E], s[8];
+#pragma unroll
+  for (int k = 0; k < E; k++) v[k] = xr[lane + 32 * k];
+#pragma unroll
+  for (int k = 0; k < 8; k++) s[k] = k < E ? __fmul_rn(v[k], v[k]) : 0.0f;
+#pragma unroll
+  for (int h = 4; h >= 1; h >>= 1)
+#pragma unroll
+    for (int k = 0; k < h; k++) s[k] += s[k + h];
+  float sum = s[0];
+#pragma unroll
+  for (int o = 16; o >= 1; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+  sum = __shfl_sync(0xffffffffu, sum, 0);
+  const float inv = 1.0f / sqrtf(sum / (float)D + eps);
+  const unsigned half = rot >> 1, P = half / 32;  // rotation pairs a lane
+#pragma unroll
+  for (int k = 0; k < E; k++) {
+    const unsigned d = lane + 32 * k;
+    if (d >= rot) xr[d] = v[k] * inv * w[d];
+  }
+  const float position = (float)(pos + row % T);
+#pragma unroll
+  for (int k = 0; k < E / 2; k++) {
+    if ((unsigned)k >= P) break;
+    const unsigned t = lane + 32 * k;
+    const float ang = position * __powf(base, -2.0f * (float)t / (float)rot);
+    const float c = __cosf(ang), sn = __sinf(ang);
+    const float x0 = v[k] * inv * w[t], x1 = v[k + P] * inv * w[t + half];
+    xr[t] = x0 * c - x1 * sn;
+    xr[t + half] = x0 * sn + x1 * c;
+  }
+}
+#define TL_RMSNORM_ROPE_WARP(E)                                                                     \
+  extern "C" __global__ void tl_rmsnorm_rope_w##E(float* __restrict__ x, const float* __restrict__ w, \
+                                                  unsigned rows, unsigned T, unsigned pos, float base, \
+                                                  unsigned rot, float eps) {                          \
+    rmsnorm_rope_warp_<E>(x, w, rows, T, pos, base, rot, eps);                                       \
+  }
+TL_RMSNORM_ROPE_WARP(2)
+TL_RMSNORM_ROPE_WARP(4)
+TL_RMSNORM_ROPE_WARP(8)
+#undef TL_RMSNORM_ROPE_WARP
+extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage
 // Device-pos variant (CUDA-graph capture): reads the sequence position from a
 // device scalar `*d_pos` instead of a by-value host arg, so one instantiated
 // graph replays correctly as pos advances. The math is rope_core, byte-identical

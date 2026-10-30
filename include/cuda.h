@@ -575,6 +575,7 @@ struct context {
   }
   CUfunction rmsnorm_rope_fn = nullptr, gemv_q4k_fn = nullptr, gemv_q6k_fn = nullptr,
              gemv_q80_fn = nullptr, quant_act_fn = nullptr, gemv_q4k_q8_fn = nullptr;
+  CUfunction rmsnorm_rope_warp_fn[3] = {};  // D 64, 128, 256
   CUfunction gated_rmsnorm_fn[2] = {};
   CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, swiglu_h16_fn = nullptr,
              merge_heads_h16_fn = nullptr, cvt_h16_fn = nullptr;  // the f16 activation's producers
@@ -2084,6 +2085,14 @@ inline bool own::rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T,
   c.device_rmw_(x.buf);
   c.device_read_(w.buf);
   constexpr unsigned threads = 256;
+  // A warp a row (eight a block) where a lane's values hold whole rotation pairs.
+  const int e = D == 64 ? 0 : D == 128 ? 1 : D == 256 ? 2 : -1;
+  if (e >= 0 && rot % 64 == 0) {
+    static const char* const names[3] = {"tl_rmsnorm_rope_w2", "tl_rmsnorm_rope_w4", "tl_rmsnorm_rope_w8"};
+    return c.launch_(c.cached_(c.rmsnorm_rope_warp_fn[e], names[e]), {(unsigned)((rows + 7) / 8)}, {threads}, 0,
+                     context::off_(x.buf, x.off), context::off_(w.buf, w.off), (unsigned)rows, (unsigned)T,
+                     (unsigned)pos, base, (unsigned)rot, eps);
+  }
   return c.launch_(c.cached_(c.rmsnorm_rope_fn, "tl_rmsnorm_rope"), {(unsigned)rows}, {threads},
                    threads * sizeof(float), context::off_(x.buf, x.off), context::off_(w.buf, w.off),
                    (unsigned)T, (unsigned)D, (unsigned)pos, base, (unsigned)rot, eps);
