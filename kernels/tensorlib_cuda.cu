@@ -2058,18 +2058,12 @@ __device__ __forceinline__ unsigned tc_pack2_(float a, float b) {
 // 12-byte copy of them instead put the copy in local memory (a stack frame) in
 // every kernel that did it: the Q4_K decode GEMV ran at 650-720 GB/s rather than
 // 830, and the MMQ, dequantization and GEMM staging carried the same frame.
-__device__ __forceinline__ unsigned q4k_byte_(uint3 w, int i) {
-  const unsigned x = i < 4 ? w.x : i < 8 ? w.y : w.z;
-  return (x >> (8 * (i & 3))) & 0xFFu;
-}
 __device__ __forceinline__ void q4k_scale_min_(uint3 w, int j, int& sc, int& mn) {
-  if (j < 4) {
-    sc = (int)(q4k_byte_(w, j) & 63u);
-    mn = (int)(q4k_byte_(w, j + 4) & 63u);
-  } else {
-    sc = (int)((q4k_byte_(w, j + 4) & 0xFu) | ((q4k_byte_(w, j - 4) >> 6) << 4));
-    mn = (int)((q4k_byte_(w, j + 4) >> 4) | ((q4k_byte_(w, j) >> 6) << 4));
-  }
+  // Bytes j & 3 of the three words: j < 4 reads q[j] and q[j + 4], j >= 4 the low or high
+  // nibble of q[j + 4] and the top two bits of q[j - 4] / q[j].
+  const unsigned sh = 8u * (unsigned)(j & 3), a = w.x >> sh, b = w.y >> sh, c = w.z >> sh;
+  sc = (int)(j < 4 ? a & 63u : (c & 0xFu) | ((a >> 2) & 0x30u));
+  mn = (int)(j < 4 ? b & 63u : ((c >> 4) & 0xFu) | ((b >> 2) & 0x30u));
 }
 template <bool F16>
 __device__ __forceinline__ uint4 tc_dq8_q4k_(const unsigned char* row, unsigned gk) {
@@ -2538,8 +2532,8 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
   float2* BSs = reinterpret_cast<float2*>(mmq_sm + (BM + BN) * LDK + BM * 64);    // [group][BN]
   const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const unsigned wm = (warp / (BN / WN)) * WM, wn = (warp % (BN / WN)) * WN;
-  const unsigned tn = blockIdx.y;  // the weight tile (the activation's is blockIdx.x)
-  const unsigned row0 = blockIdx.x * BM, col0 = tn * BN;
+  const unsigned tm = blockIdx.x, tn = blockIdx.y;  // the activation's tile, the weight's
+  const unsigned row0 = tm * BM, col0 = tn * BN;
   const unsigned nk = K / 256;
   const size_t wrow = (size_t)nk * (WF == 1 ? 144 : 272);  // bytes a weight row
   const unsigned kt0 = blockIdx.z * kchunk, kt1 = min(nk, kt0 + kchunk);
