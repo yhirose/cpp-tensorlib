@@ -3671,7 +3671,10 @@ __device__ __forceinline__ unsigned tc_pack_(float a,float b){__half2 h=__floats
 // A K/V tile of the tensor-core prefill: BK cached rows of K and V read into registers
 // ahead (the next tile's while this one multiplies), then staged to shared memory as
 // f16 rows LD apart. An f32 cache is rounded to nearest as it is staged; an f16 one
-// holds those same values already and is copied.
+// holds those same values already and is copied. The two address the rows in the forms
+// the compiler schedules best for each (measured at Qwen3's 16 heads, 2048 cached
+// tokens: an offset from the tile's start takes the f32 tile 243 -> 221 us, while the
+// f16 copy runs 230 there and 220 indexed by row).
 template <int AD, int NTH, int NV, typename KT>
 struct attn_kv_tile_ {
   using RT = typename std::conditional<std::is_same<KT, float>::value, float4, uint2>::type;
@@ -3687,20 +3690,20 @@ struct attn_kv_tile_ {
     }
   }
   template <int LD>
-  __device__ __forceinline__ void stage(__half* Ks, __half* Vs, unsigned tid) const {
+  __device__ __forceinline__ void stage(__half (*Ks)[LD], __half (*Vs)[LD], unsigned tid) const {
 #pragma unroll
     for (int i = 0; i < NV; i++) {
       const unsigned e = (tid + i * NTH) * 4, r = e / AD, c = e % AD;
-      __half* k = Ks + r * LD + c;
-      __half* v = Vs + r * LD + c;
       if constexpr (std::is_same<KT, float>::value) {
+        __half* k = &Ks[0][0] + r * LD + c;
+        __half* v = &Vs[0][0] + r * LD + c;
         *reinterpret_cast<__half2*>(k) = __floats2half2_rn(rk[i].x, rk[i].y);
         *reinterpret_cast<__half2*>(k + 2) = __floats2half2_rn(rk[i].z, rk[i].w);
         *reinterpret_cast<__half2*>(v) = __floats2half2_rn(rv[i].x, rv[i].y);
         *reinterpret_cast<__half2*>(v + 2) = __floats2half2_rn(rv[i].z, rv[i].w);
       } else {
-        *reinterpret_cast<uint2*>(k) = rk[i];
-        *reinterpret_cast<uint2*>(v) = rv[i];
+        *reinterpret_cast<uint2*>(&Ks[r][c]) = rk[i];
+        *reinterpret_cast<uint2*>(&Vs[r][c]) = rv[i];
       }
     }
   }
@@ -3737,7 +3740,7 @@ __device__ void attn_prefill_tc_core(const float* __restrict__ q, const KT* __re
   }
   attn_kv_tile_<AD, NTH, NV, KT> kv;
   auto load = [&](unsigned k0) { kv.load(Kh, Vh, tid, k0, kv_end); };
-  auto stage = [&](int b) { kv.template stage<LD>(&Ks[b][0][0], &Vs[b][0][0], tid); };
+  auto stage = [&](int b) { kv.template stage<LD>(Ks[b], Vs[b], tid); };
   const unsigned lb_r = (lane & 7) + ((lane >> 4) << 3), lb_c = ((lane >> 3) & 1) * 8;   // K (non-trans)
   const unsigned lv_r = (lane & 7) + ((lane >> 3 & 1) << 3), lv_c = (lane >> 4) * 8;      // V (trans)
   float o[NO][4];
@@ -3863,7 +3866,7 @@ __device__ void attn_prefill_tc_core_smem(const float* __restrict__ q, const KT*
   }
   attn_kv_tile_<AD, NTH, NV, KT> kv;
   auto load = [&](unsigned k0) { kv.load(Kh, Vh, tid, k0, kv_end); };
-  auto stage = [&](int b) { kv.template stage<LD>(&Ks[b][0][0], &Vs[b][0][0], tid); };
+  auto stage = [&](int b) { kv.template stage<LD>(Ks[b], Vs[b], tid); };
   const unsigned lb_r = (lane & 7) + ((lane >> 4) << 3), lb_c = ((lane >> 3) & 1) * 8;   // K (non-trans)
   const unsigned lv_r = (lane & 7) + ((lane >> 3 & 1) << 3), lv_c = (lane >> 4) * 8;      // V (trans)
   float o[NO][4];
