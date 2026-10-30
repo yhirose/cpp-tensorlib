@@ -483,9 +483,14 @@ extern "C" __global__ void tl_swiglu_h16(const float* __restrict__ gu,
 }
 // Qwen3.5's gated norm of the DeltaNet output: out[t, h D + d] = silu(z) * o * w[d] /
 // sqrt(mean_d o^2 + eps), o's rows (t H + h) D wide and contiguous, z's at t ldz + h D.
-// One warp a row (D % 32 == 0), so a short row is not a block of mostly idle threads;
-// the norm and the gate are rmsnorm_core's and tl_swiglu's formulas. Written as f32, or
-// (h16, a constant at each call) f16 for the GEMM that reads it.
+// One warp a row, so a short row is not a block of mostly idle threads, and bit for bit
+// the composition it replaces (tl_rmsnorm, then tl_swiglu / tl_swiglu_h16): the squares
+// are summed in rmsnorm_core's order on its 256 threads (thread t the elements t, t+256,
+// ..., then a tree halving 256 -> 1), lane l standing in for threads l + 32 k, and the
+// norm and the gate are their formulas. A chunked prefill of a repetitive prompt
+// amplifies even a reordering of that sum (check_qwen's 96-token prompt moved 6x), so
+// the fusion keeps the numbers rather than approximating them. Written as f32, or (h16,
+// a constant at each call) f16 for the GEMM that reads it.
 __device__ __forceinline__ void gated_rmsnorm_core(const float* __restrict__ o,
                                                    const float* __restrict__ z,
                                                    const float* __restrict__ w, void* __restrict__ out,
@@ -496,10 +501,20 @@ __device__ __forceinline__ void gated_rmsnorm_core(const float* __restrict__ o,
   const unsigned t = r / H, h = r % H;
   const float* orow = o + (size_t)r * D;
   const float* zrow = z + (size_t)t * ldz + (size_t)h * D;
-  float ss = 0.0f;
-  for (unsigned d = lane; d < D; d += 32) ss += orow[d] * orow[d];
+  float acc[8];  // rmsnorm_core's thread lane + 32 k
 #pragma unroll
-  for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+  for (int k = 0; k < 8; k++) {
+    acc[k] = 0.0f;
+    for (unsigned i = lane + 32u * k; i < D; i += 256) acc[k] += orow[i] * orow[i];
+  }
+#pragma unroll
+  for (int k = 0; k < 4; k++) acc[k] += acc[k + 4];  // s = 128
+#pragma unroll
+  for (int k = 0; k < 2; k++) acc[k] += acc[k + 2];  // s = 64
+  float ss = acc[0] + acc[1];                          // s = 32
+#pragma unroll
+  for (int s = 16; s > 0; s >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, s);  // s = 16 .. 1
+  ss = __shfl_sync(0xffffffffu, ss, 0);
   const float inv = 1.0f / sqrtf(ss / (float)D + eps);
   for (unsigned d = lane; d < D; d += 32) {
     const float y = orow[d] * inv * w[d], g = zrow[d];

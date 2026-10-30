@@ -376,38 +376,43 @@ int main() {
   }
 
   // ---- Qwen3.5's gated norm in one pass (gated_rmsnorm) against the norm and a swiglu ----
-  // T x H rows of D, z strided as in the projection's rows; f32 and f16 outputs. The two
-  // sum the squares in a different order, so f32 agrees to its rounding, not bit for bit.
-  {
-    const int64_t T = 37, H = 6, D = 128, V = H * D, ldz = 3 * V;
-    float *co = nullptr, *cz = nullptr, *cw = nullptr, *cf = nullptr, *ch = nullptr, *cn = nullptr;
+  // T x H rows of D, z strided as in the projection's rows; f32 and f16 outputs, each bit
+  // for bit the composition it replaces (rmsnorm, then swiglu / swiglu_h16 over [z | norm]).
+  // D = 128 is Qwen3.5's; 320 runs past rmsnorm's 256 threads.
+  for (const int64_t D : {128, 320}) {
+    const int64_t T = 37, H = 6, V = H * D, ldz = 3 * V;
+    float *co = nullptr, *cz = nullptr, *cw = nullptr, *cf = nullptr, *ch = nullptr, *czc = nullptr,
+          *czn = nullptr, *cr = nullptr, *crh = nullptr;
     void* o = alloc(T * V * 4, &co);
     void* z = alloc(T * ldz * 4, &cz);
     void* w = alloc(D * 4, &cw);
     void* f = alloc(T * V * 4, &cf);
     void* h = alloc(T * V * 2, &ch);
-    void* n = alloc(T * V * 4, &cn);
+    void* zc = alloc(T * V * 4, &czc);      // z's rows, contiguous
+    void* zn = alloc(2 * T * V * 4, &czn);  // [z | rmsnorm(o)], what the swiglu reads, made on the device
+    void* r = alloc(T * V * 4, &cr);
+    void* rh = alloc(T * V * 2, &crh);
     for (int64_t i = 0; i < T * V; i++) co[i] = d(g) * 3.0f;
     for (int64_t i = 0; i < T * ldz; i++) cz[i] = d(g) * 4.0f;
     for (int64_t i = 0; i < D; i++) cw[i] = 0.5f + d(g);
-    bool ok = tl::gpu::gated_rmsnorm({o, 0}, {z, 4 * V}, ldz, {w, 0}, {f, 0}, false, T, H, D, 1e-6f) &&
-              tl::gpu::gated_rmsnorm({o, 0}, {z, 4 * V}, ldz, {w, 0}, {h, 0}, true, T, H, D, 1e-6f) &&
-              tl::gpu::rmsnorm({o, 0}, {w, 0}, {n, 0}, D, 1e-6f, T * H);
-    sync_to_host(f, false);
-    sync_to_host(h, false);
-    sync_to_host(n, false);
-    double e32 = 0, e16 = 0;
     for (int64_t t = 0; t < T; t++)
-      for (int64_t i = 0; i < V; i++) {
-        const float zz = cz[t * ldz + V + i], ref = (zz / (1.0f + std::exp(-zz))) * cn[t * V + i];
-        e32 = std::max(e32, (double)std::fabs(cf[t * V + i] - ref) / (std::fabs(ref) + 1e-3));
-        e16 = std::max(e16, (double)std::fabs(from_half(reinterpret_cast<const uint16_t*>(ch)[t * V + i]) - ref) /
-                                (std::fabs(ref) + 1e-3));
-      }
-    std::printf("  gated_rmsnorm: f32 maxrel %.2e, f16 maxrel %.2e vs rmsnorm then swiglu\n", e32, e16);
-    check(ok && e32 < 1e-5, "gated_rmsnorm f32");
-    check(ok && e16 < 1e-3, "gated_rmsnorm f16");
-    for (void* b : {o, z, w, f, h, n}) release(b, 0, nullptr);
+      for (int64_t i = 0; i < V; i++) czc[t * V + i] = cz[t * ldz + V + i];
+    const bool ok =
+        tl::gpu::gated_rmsnorm({o, 0}, {z, 4 * V}, ldz, {w, 0}, {f, 0}, false, T, H, D, 1e-6f) &&
+        tl::gpu::gated_rmsnorm({o, 0}, {z, 4 * V}, ldz, {w, 0}, {h, 0}, true, T, H, D, 1e-6f) &&
+        tl::gpu::copy_f32({zc, 0}, {zn, 0}, T * V) &&
+        tl::gpu::rmsnorm({o, 0}, {w, 0}, {zn, 4 * T * V}, D, 1e-6f, T * H) &&
+        tl::gpu::swiglu({zn, 0}, {r, 0}, T * V) && tl::gpu::swiglu_h16({zn, 0}, {rh, 0}, T * V, 1);
+    for (void* b : {f, h, r, rh}) sync_to_host(b, false);
+    int64_t d32 = 0, d16 = 0;
+    for (int64_t i = 0; i < T * V; i++) {
+      d32 += std::memcmp(&cf[i], &cr[i], 4) != 0;
+      d16 += reinterpret_cast<const uint16_t*>(ch)[i] != reinterpret_cast<const uint16_t*>(crh)[i];
+    }
+    std::printf("  gated_rmsnorm D=%lld: %lld f32 and %lld f16 of %lld outputs differ from rmsnorm + swiglu\n",
+                (long long)D, (long long)d32, (long long)d16, (long long)(T * V));
+    check(ok && d32 == 0 && d16 == 0, D == 128 ? "gated_rmsnorm D=128" : "gated_rmsnorm D=320");
+    for (void* b : {o, z, w, f, h, zc, zn, r, rh}) release(b, 0, nullptr);
   }
 
   std::printf(failures ? "CUDA cuda.h: FAILED\n" : "CUDA cuda.h: ALL OK\n");

@@ -993,7 +993,7 @@ struct own {
                               int64_t n, float eps, int64_t rows);
   static bool swiglu_h16(gpu::span gu, gpu::span o16, int64_t ff, int64_t rows);
   // out = silu(z) * rmsnorm(o) * w over T x H rows of D (tl_gated_rmsnorm): o contiguous,
-  // z's row t ldz apart, out f32 or (h16) f16 [T, H D]. D % 32 == 0.
+  // z's row t ldz apart, out f32 or (h16) f16 [T, H D]; bit for bit rmsnorm then swiglu.
   static bool gated_rmsnorm(gpu::span o, gpu::span z, int64_t ldz, gpu::span w, gpu::span out,
                             bool h16, int64_t T, int64_t H, int64_t D, float eps);
   static bool merge_heads_h16(gpu::span src, gpu::span dst16, int64_t T, int64_t H,
@@ -2126,7 +2126,7 @@ inline bool own::swiglu_h16(gpu::span gu, gpu::span o16, int64_t ff, int64_t row
 inline bool own::gated_rmsnorm(gpu::span o, gpu::span z, int64_t ldz, gpu::span w, gpu::span out,
                                bool h16, int64_t T, int64_t H, int64_t D, float eps) {
   auto& c = context::get();
-  if (!c.ready || T <= 0 || H <= 0 || D <= 0 || D % 32) return false;
+  if (!c.ready || T <= 0 || H <= 0 || D <= 0) return false;
   c.device_read_(o.buf);
   c.device_read_(z.buf);
   c.device_read_(w.buf);
