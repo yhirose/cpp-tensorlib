@@ -20,23 +20,14 @@ struct ew_params {
   float offset;
 };
 
-// bf16 is the top 16 bits of the f32 pattern: widen by a shift, narrow with
-// round-to-nearest-even (types.h's f32_to_bf16, and the CUDA path's). A
-// weight or a KV cache is stored as ushort; the arithmetic is always f32.
+// bf16 is the top 16 bits of the f32 pattern, widened by a shift. A bf16 weight is
+// stored as ushort; the arithmetic is always f32.
 static inline float widen_(float w) { return w; }
 static inline float widen_(ushort h) { return as_type<float>(uint(h) << 16); }
 static inline void narrow_(device float* dst, float v) { *dst = v; }
-static inline void narrow_(device ushort* dst, float v) {
-  const uint u = as_type<uint>(v);
-  *dst = ushort((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
-}
 // Four consecutive elements as a float4 (i4 counts float4s).
 static inline float4 load4_(device const float* p, uint i4) {
   return ((device const float4*)p)[i4];
-}
-static inline float4 load4_(device const ushort* p, uint i4) {
-  const ushort4 u = ((device const ushort4*)p)[i4];
-  return float4(widen_(u.x), widen_(u.y), widen_(u.z), widen_(u.w));
 }
 
 #define EW_BINARY(name, expr)                                  \
@@ -1645,7 +1636,7 @@ static inline void attn_store_row_(device float* row,
 
 // q, out [H,T,D]; K/V a cache of kv_stride elements per kv head read over
 // [0, pos0+T); query p sits at pos0+p. BK keys per tile. KT is the cache's
-// element type (f32, or bf16 as ushort).
+// element type (f32 is the one instantiated).
 template <int AD, int BK, typename KT>
 kernel void attn_prefill_(device const float* q   [[buffer(0)]],
                           device const KT* K      [[buffer(1)]],
@@ -1755,16 +1746,6 @@ attn_prefill_<128, 16, float>(device const float*, device const float*,
                               device const float*, device float*,
                               constant attn_params&, uint2, uint2, uint, uint,
                               uint);
-template [[host_name("attn_prefill_bf16_64_")]] kernel void
-attn_prefill_<64, 32, ushort>(device const float*, device const ushort*,
-                              device const ushort*, device float*,
-                              constant attn_params&, uint2, uint2, uint, uint,
-                              uint);
-template [[host_name("attn_prefill_bf16_128_")]] kernel void
-attn_prefill_<128, 16, ushort>(device const float*, device const ushort*,
-                               device const ushort*, device float*,
-                               constant attn_params&, uint2, uint2, uint, uint,
-                               uint);
 
 // The query half of the pullback: dq and `stats` [2,H,T] (the row
 // logsumexp, then Δ = dO·O) for the key/value half. dq = scale·C·K / l with
@@ -2401,14 +2382,6 @@ template [[host_name("attn_decode_128_")]] kernel void
 attn_decode_<128, float>(device const float*, device const float*,
                          device const float*, device float*,
                          constant attn_decode_params&, uint, uint, uint, uint);
-template [[host_name("attn_decode_bf16_64_")]] kernel void
-attn_decode_<64, ushort>(device const float*, device const ushort*,
-                         device const ushort*, device float*,
-                         constant attn_decode_params&, uint, uint, uint, uint);
-template [[host_name("attn_decode_bf16_128_")]] kernel void
-attn_decode_<128, ushort>(device const float*, device const ushort*,
-                          device const ushort*, device float*,
-                          constant attn_decode_params&, uint, uint, uint, uint);
 
 // One key chunk of one head: partials pm[H*S] | pl[H*S] | pacc[H*S*AD], the
 // layout attn_combine_ reads (cuda's attn_partials).
@@ -2451,16 +2424,6 @@ attn_decode_split_<128, float>(device const float*, device const float*,
                                device const float*, device float*,
                                constant attn_decode_params&, uint2, uint2, uint,
                                uint, uint);
-template [[host_name("attn_decode_split_bf16_64_")]] kernel void
-attn_decode_split_<64, ushort>(device const float*, device const ushort*,
-                               device const ushort*, device float*,
-                               constant attn_decode_params&, uint2, uint2, uint,
-                               uint, uint);
-template [[host_name("attn_decode_split_bf16_128_")]] kernel void
-attn_decode_split_<128, ushort>(device const float*, device const ushort*,
-                                device const ushort*, device float*,
-                                constant attn_decode_params&, uint2, uint2,
-                                uint, uint, uint);
 
 // Merge one head's S partials, rescaling each by exp(m_s − max m).
 struct attn_combine_params {
@@ -2530,9 +2493,6 @@ kernel void kv_append_(device KT* Kc             [[buffer(0)]],
 template [[host_name("kv_append_")]] kernel void
 kv_append_<float>(device float*, device float*, device const float*,
                   device const float*, constant kv_append_params&, uint, uint, uint);
-template [[host_name("kv_append_bf16_")]] kernel void
-kv_append_<ushort>(device ushort*, device ushort*, device const float*,
-                   device const float*, constant kv_append_params&, uint, uint, uint);
 
 // A prefill's k/v ([n_kv_heads, T, D]) into cache rows [pos, pos + T); grid
 // (n_kv_heads, T), D threads.
@@ -2554,9 +2514,6 @@ kernel void kv_fill_(device KT* Kc             [[buffer(0)]],
 template [[host_name("kv_fill_")]] kernel void
 kv_fill_<float>(device float*, device float*, device const float*,
                 device const float*, constant kv_fill_params&, uint2, uint, uint2);
-template [[host_name("kv_fill_bf16_")]] kernel void
-kv_fill_<ushort>(device ushort*, device ushort*, device const float*,
-                 device const float*, constant kv_fill_params&, uint2, uint, uint2);
 
 // argmax of one length-n vector, the smallest index on ties (the host scan's
 // `v[i] > best`), so greedy decoding reads one int back instead of the logits.

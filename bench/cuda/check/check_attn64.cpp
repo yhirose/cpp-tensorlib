@@ -46,13 +46,15 @@ int main() {
 
   // ---- KV cache + GQA: grow one token at a time, verify prefix reads + GQA
   // mapping at checkpoints straddling the split-KV boundary (ctx>=256), at
-  // each head width the decode kernels serve a model at. ----
-  auto decode_check = [&](int64_t D, int64_t HQ, int64_t HKV) -> bool {
+  // each head width the decode kernels serve a model at, in an f32 cache and an
+  // f16 one (the reference then reads the values the cache rounded to). ----
+  auto decode_check = [&](int64_t D, int64_t HQ, int64_t HKV, bool f16) -> bool {
     const int64_t group = HQ / HKV;
     const float scale = 1.0f / std::sqrt((float)D);
     bool ok = true;
     tl::kv_cache cache;
-    if (!cache.init(HKV, MAXC, D)) { std::printf("  cache init failed\n"); return false; }
+    if (!cache.init(HKV, MAXC, D, f16)) { std::printf("  cache init failed\n"); return false; }
+    auto held = [&](float x) { return f16 ? tl::f16_to_f32(tl::f32_to_f16(x)) : x; };
     float *hkn = nullptr, *hvn = nullptr, *hq = nullptr, *ho = nullptr;
     void* kn = alloc(HKV * D * 4, &hkn);
     void* vn = alloc(HKV * D * 4, &hvn);
@@ -79,8 +81,8 @@ int main() {
         float kv = rnd();
         hkn[i] = kv; hvn[i] = rnd();
         int64_t head = i / D, d = i % D;
-        Khist[(size_t)head * MAXC * D + pos * D + d] = kv;
-        Vhist[(size_t)head * MAXC * D + pos * D + d] = hvn[i];
+        Khist[(size_t)head * MAXC * D + pos * D + d] = held(kv);
+        Vhist[(size_t)head * MAXC * D + pos * D + d] = held(hvn[i]);
       }
       sync_to_host(kn, true);
       sync_to_host(vn, true);
@@ -130,8 +132,8 @@ int main() {
       }
     }
     ok &= maxrel < 1e-4;
-    std::printf("  D=%lld kv cache grow to %lld tokens (%zu checkpoints, split-KV @>=256) "
-                "— maxrel %.1e %s\n", (long long)D, (long long)cache.pos,
+    std::printf("  D=%lld %s kv cache grow to %lld tokens (%zu checkpoints, split-KV @>=256) "
+                "— maxrel %.1e %s\n", (long long)D, f16 ? "f16" : "f32", (long long)cache.pos,
                 sizeof(checks) / sizeof(checks[0]), maxrel, maxrel < 1e-4 ? "OK" : "FAIL");
     ok &= dpos_eq;
     std::printf("  attn_dpos (capacity-grid split) vs attn — bit-equal at every "
@@ -141,8 +143,10 @@ int main() {
     release(o2, 0, nullptr); release(dp, 0, nullptr);
       return ok;
   };
-  ok &= decode_check(64, 14, 2);  // Qwen2.5-0.5B
-  ok &= decode_check(256, 8, 2);  // Qwen3.5's full-attention layers
+  for (const bool f16 : {false, true}) {
+    ok &= decode_check(64, 14, 2, f16);  // Qwen2.5-0.5B
+    ok &= decode_check(256, 8, 2, f16);  // Qwen3.5's full-attention layers
+  }
 
   // ---- Causal prefill at D=64 + prefill->decode handoff. ----
   {

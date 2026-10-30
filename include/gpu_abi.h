@@ -47,7 +47,7 @@ enum class kop {
   pow_s_, gt_s_, lt_s_, ge_s_, le_s_, eq_s_, ne_s_,  // scalar_op maps onto these
   layer_norm_,                                       // the fused layer norm
   layer_norm_bwd_dx_, layer_norm_bwd_gb_, layer_norm_bwd_gb_fold_,  // its pullback
-  kv_append_, kv_append_bf16_, kv_fill_, kv_fill_bf16_,  // the KV cache's writes
+  kv_append_, kv_append_f16_, kv_fill_, kv_fill_f16_,  // the KV cache's writes
   argmax_, rmsnorm_, add_rmsnorm_, swiglu_, split_heads_, merge_heads_,  // decode's rest
   gemv_f32_, gemv_bf16_, gemv_q4_,   // decode GEMVs, per weight dtype
   gemv_combine_,                     // their split-K partials
@@ -70,7 +70,7 @@ inline constexpr const char* kKopNames[] = {
     "pow_s_", "gt_s_", "lt_s_", "ge_s_", "le_s_", "eq_s_", "ne_s_",
     "layer_norm_", "layer_norm_bwd_dx_", "layer_norm_bwd_gb_",
     "layer_norm_bwd_gb_fold_", "kv_append_",
-    "kv_append_bf16_", "kv_fill_", "kv_fill_bf16_", "argmax_", "rmsnorm_",
+    "kv_append_f16_", "kv_fill_", "kv_fill_f16_", "argmax_", "rmsnorm_",
     "add_rmsnorm_", "swiglu_", "split_heads_", "merge_heads_", "gemv_f32_",
     "gemv_bf16_", "gemv_q4_", "gemv_combine_", "gemv_bf16_row_",
     "gemm_bf16_nt_", "gemm_bf16_nt32_", "gather_axis_", "row_logsumexp_",

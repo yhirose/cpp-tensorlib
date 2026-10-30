@@ -372,12 +372,11 @@ inline bool gemv_q4(const gpu::arg* v, const void* params) {
   }
   return true;
 }
-// The KV cache's writes, f32 or bf16: heads ride on the grid's x, a fill's T
-// rows on its y, and the head dim is the group's thread count.
-template <class KT, class Narrow>
+// The KV cache's writes (an f32 cache: caps::kv_f16 is false here): heads ride on
+// the grid's x, a fill's T rows on its y, and the head dim is the group's thread count.
 inline bool kv_write(const gpu::arg* v, const gpu::grid& g, uint32_t kv_stride,
-                     uint32_t pos0, uint32_t T, Narrow narrow) {
-  KT *Kc = at<KT>(v[0]), *Vc = at<KT>(v[1]);
+                     uint32_t pos0, uint32_t T) {
+  float *Kc = at<float>(v[0]), *Vc = at<float>(v[1]);
   const float *k = at<const float>(v[2]), *val = at<const float>(v[3]);
   const uint32_t D = g.tx;
   for (uint32_t h = 0; h < g.gx; h++) {
@@ -385,24 +384,20 @@ inline bool kv_write(const gpu::arg* v, const gpu::grid& g, uint32_t kv_stride,
       for (uint32_t d = 0; d < D; d++) {
         const size_t dst = size_t(h) * kv_stride + size_t(pos0 + t) * D + d;
         const size_t src = (size_t(h) * T + t) * D + d;
-        Kc[dst] = narrow(k[src]);
-        Vc[dst] = narrow(val[src]);
+        Kc[dst] = k[src];
+        Vc[dst] = val[src];
       }
     }
   }
   return true;
 }
-inline bool kv_append(const gpu::arg* v, const void* params, const gpu::grid& g,
-                      bool bf16) {
+inline bool kv_append(const gpu::arg* v, const void* params, const gpu::grid& g) {
   const auto& p = as<gpu::kv_append_params>(params);
-  return bf16 ? kv_write<uint16_t>(v, g, p.kv_stride, p.pos, 1, f32_to_bf16)
-              : kv_write<float>(v, g, p.kv_stride, p.pos, 1, [](float f) { return f; });
+  return kv_write(v, g, p.kv_stride, p.pos, 1);
 }
-inline bool kv_fill(const gpu::arg* v, const void* params, const gpu::grid& g,
-                    bool bf16) {
+inline bool kv_fill(const gpu::arg* v, const void* params, const gpu::grid& g) {
   const auto& p = as<gpu::kv_fill_params>(params);
-  return bf16 ? kv_write<uint16_t>(v, g, p.kv_stride, p.pos0, p.T, f32_to_bf16)
-              : kv_write<float>(v, g, p.kv_stride, p.pos0, p.T, [](float f) { return f; });
+  return kv_write(v, g, p.kv_stride, p.pos0, p.T);
 }
 inline bool merge_heads(const gpu::arg* v, const void* params) {
   const auto& p = as<gpu::merge_heads_params>(params);
@@ -484,10 +479,8 @@ inline bool kernel_(kop k, const gpu::arg* v, const void* params,
     case kop::swiglu_: return d::swiglu(v, params, g);
     case kop::gemv_bf16_row_: return d::gemv_bf16_row(v, params);
     case kop::gemv_q4_: return d::gemv_q4(v, params);
-    case kop::kv_append_: return d::kv_append(v, params, g, false);
-    case kop::kv_append_bf16_: return d::kv_append(v, params, g, true);
-    case kop::kv_fill_: return d::kv_fill(v, params, g, false);
-    case kop::kv_fill_bf16_: return d::kv_fill(v, params, g, true);
+    case kop::kv_append_: return d::kv_append(v, params, g);
+    case kop::kv_fill_: return d::kv_fill(v, params, g);
     case kop::merge_heads_: return d::merge_heads(v, params);
     case kop::ssm_conv_: return d::ssm_conv(v, params);
     case kop::gated_delta_: return d::gated_delta(v, params);
@@ -589,6 +582,7 @@ struct caps {
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = true;
   static constexpr bool bf16_gemm = false;
+  static constexpr bool kv_f16 = false;
 };
 using graph_exec = void*;
 inline bool graph_available() { return false; }

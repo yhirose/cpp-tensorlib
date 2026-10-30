@@ -21,36 +21,10 @@ using namespace tl::cuda;
 using kop = tl::gpu::kop;
 
 
-// f32 -> f16 bits (round to nearest even; the finite range the checks use) and back.
-static uint16_t to_half(float f) {
-  uint32_t x;
-  std::memcpy(&x, &f, 4);
-  const uint32_t sign = (x >> 16) & 0x8000u;
-  int e = (int)((x >> 23) & 0xFF) - 127 + 15;
-  uint32_t m = x & 0x7FFFFFu;
-  if (e <= 0) {  // subnormal or zero
-    if (e < -10) return (uint16_t)sign;
-    m |= 0x800000u;
-    const int sh = 14 - e;
-    uint32_t h = m >> sh;
-    const uint32_t rem = m & ((1u << sh) - 1), half = 1u << (sh - 1);
-    if (rem > half || (rem == half && (h & 1))) h++;
-    return (uint16_t)(sign | h);
-  }
-  uint32_t h = ((uint32_t)e << 10) | (m >> 13);
-  const uint32_t rem = m & 0x1FFFu;
-  if (rem > 0x1000u || (rem == 0x1000u && (h & 1))) h++;
-  return (uint16_t)(sign | h);
-}
-static float from_half(uint16_t h) {
-  const int e = (h >> 10) & 31, m = h & 1023;
-  const float v = e == 0 ? std::ldexp((float)m, -24) : std::ldexp((float)(m | 1024), e - 25);
-  return (h & 0x8000) ? -v : v;
-}
 // One Q4_K weight of a super-block (144 bytes: d, dmin, 12 bytes of 6-bit scales and
 // mins, 128 bytes of nibbles), as ggml dequantizes it.
 static float q4k_value(const uint8_t* b, int k) {
-  const float d = from_half((uint16_t)(b[0] | b[1] << 8)), dmin = from_half((uint16_t)(b[2] | b[3] << 8));
+  const float d = tl::f16_to_f32((uint16_t)(b[0] | b[1] << 8)), dmin = tl::f16_to_f32((uint16_t)(b[2] | b[3] << 8));
   const uint8_t* q = b + 4;
   const int g = k / 32;
   const int sc = g < 4 ? (q[g] & 63) : ((q[g + 4] & 0xF) | ((q[g - 4] >> 6) << 4));
@@ -60,7 +34,7 @@ static float q4k_value(const uint8_t* b, int k) {
 }
 // One Q8_0 weight: a block is d (f16) then 32 int8.
 static float q80_value(const uint8_t* b, int k) {
-  return from_half((uint16_t)(b[0] | b[1] << 8)) * (float)(int8_t)b[2 + k];
+  return tl::f16_to_f32((uint16_t)(b[0] | b[1] << 8)) * (float)(int8_t)b[2 + k];
 }
 
 static int failures = 0;
@@ -259,7 +233,7 @@ int main() {
     std::vector<uint8_t> W((size_t)N * rowb);
     for (auto& v : W) v = (uint8_t)(g() >> 8);
     for (size_t b = 0; b < W.size() / blk; b++) {  // sane d (and dmin)
-      const uint16_t dh = to_half(0.002f + 0.001f * (float)(g() % 8)), mh = to_half(0.001f * (float)(g() % 8));
+      const uint16_t dh = tl::f32_to_f16(0.002f + 0.001f * (float)(g() % 8)), mh = tl::f32_to_f16(0.001f * (float)(g() % 8));
       W[b * blk] = (uint8_t)dh;
       W[b * blk + 1] = (uint8_t)(dh >> 8);
       if (type == 12) {
@@ -282,9 +256,9 @@ int main() {
     std::vector<float> x((size_t)M * K);
     for (int64_t m = 0; m < M; m++)
       for (int64_t k = 0; k < K; k++) {
-        const uint16_t h = to_half(d(g) * (1.0f + (float)((m + k / 32) % 5)));
+        const uint16_t h = tl::f32_to_f16(d(g) * (1.0f + (float)((m + k / 32) % 5)));
         ah[m * K + k] = h;
-        x[m * K + k] = from_half(h);
+        x[m * K + k] = tl::f16_to_f32(h);
       }
     std::fill(cc, cc + M * ldc, -777.0f);
     const bool launched = tl::gpu::gemm_quant(type, true, {a, 0}, {w, 0}, {o, 0}, M, N, K, ldc, true);
@@ -337,7 +311,7 @@ int main() {
     std::vector<uint8_t> W((size_t)N * rowb);
     for (auto& v : W) v = (uint8_t)(g() >> 8);
     for (size_t b = 0; b < W.size() / blk; b++) {
-      const uint16_t dh = to_half(0.002f + 0.001f * (float)(g() % 8)), mh = to_half(0.001f * (float)(g() % 8));
+      const uint16_t dh = tl::f32_to_f16(0.002f + 0.001f * (float)(g() % 8)), mh = tl::f32_to_f16(0.001f * (float)(g() % 8));
       W[b * blk] = (uint8_t)dh;
       W[b * blk + 1] = (uint8_t)(dh >> 8);
       if (type == 12) {
@@ -357,7 +331,7 @@ int main() {
     void* r = alloc(M * FF * 2, &cr);
     std::memcpy(cw, W.data(), W.size());
     uint16_t* ah = reinterpret_cast<uint16_t*>(ca);
-    for (int64_t i = 0; i < M * K; i++) ah[i] = to_half(d(g) * 2.0f);
+    for (int64_t i = 0; i < M * K; i++) ah[i] = tl::f32_to_f16(d(g) * 2.0f);
     const bool launched = tl::gpu::gemm_quant(type, true, {a, 0}, {w, 0}, {o, 0}, M, N, K, N, true) &&
                           tl::gpu::swiglu_h16({o, 0}, {r, 0}, FF, M) &&
                           tl::gpu::gemm_quant_glu(type, {a, 0}, {w, 0}, {h, 0}, M, FF, K);

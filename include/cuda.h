@@ -231,9 +231,9 @@ inline const char* kernel_name_(kop op) {
     case kop::gemv_bf16_row_: return "tl_gemv_bf16_row";
     case kop::gemv_q4_: return "tl_gemv_q4";
     case kop::kv_append_: return "tl_kv_append";
-    case kop::kv_append_bf16_: return "tl_kv_append_bf16";
+    case kop::kv_append_f16_: return "tl_kv_append_f16";
     case kop::kv_fill_: return "tl_kv_fill";
-    case kop::kv_fill_bf16_: return "tl_kv_fill_bf16";
+    case kop::kv_fill_f16_: return "tl_kv_fill_f16";
     case kop::merge_heads_: return "tl_merge_heads";
     case kop::split_heads_: return "tl_split_heads";
     default: return nullptr;  // no kernel here: dispatch declines
@@ -654,33 +654,35 @@ struct context {
                            : tc_shape{256, 128, 32, 512, 3};
   }
 
-  // M9 fused decode attention (single-pass + split-KV two-pass).
-  // head_dim {64,128} variants (M9): each templated instantiation has its own
-  // symbol; the launchers pick by D. The unsuffixed name is the D=128 build.
-  // D=256 (Qwen3.5) exists for an f32 cache only (attn_decode_head_ok).
-  // Each attention/KV kernel has an f32 and a bf16-KV-storage instantiation
-  // (M9 bf16 KV cache): the bf16 variants read/write K,V as __nv_bfloat16 while
-  // q/out/scratch stay f32. The getters pick by (D, kv_bf16); a small 2x2 cache.
-  CUfunction attn_decode_fn = nullptr, attn_split_fn = nullptr,
-             attn_combine_fn = nullptr;
-  CUfunction attn_decode_64_fn = nullptr, attn_split_64_fn = nullptr;
-  CUfunction attn_decode_bf16_fn = nullptr, attn_decode_bf16_64_fn = nullptr;
-  CUfunction attn_split_bf16_fn = nullptr, attn_split_bf16_64_fn = nullptr;
-  CUfunction attn_decode_256_fn = nullptr, attn_split_256_fn = nullptr;
-  CUfunction attn_decode_(int64_t D, bool bf16 = false) {
-    if (D == 256) return cached_(attn_decode_256_fn, "tl_attn_decode_f32_256");
-    return bf16 ? (D == 64 ? cached_(attn_decode_bf16_64_fn, "tl_attn_decode_bf16_64")
-                           : cached_(attn_decode_bf16_fn, "tl_attn_decode_bf16"))
-                : (D == 64 ? cached_(attn_decode_64_fn, "tl_attn_decode_f32_64")
-                           : cached_(attn_decode_fn, "tl_attn_decode_f32"));
+  // The attention kernels, by kind, head width (64, 128, 256) and the KV cache's
+  // element type (f32, f16): tl_<kind>_{f32,f16}_<D>, looked up on first use. A
+  // width or type a kind has no kernel for comes back null (its launcher says no
+  // first). The tensor-core prefill at 256 stages Q in dynamic shared memory too:
+  // (64 queries + 2 buffers of K and V of 16 keys) rows of D + 8 halves, past the
+  // static 48 KB, so its function is raised to that on lookup (the kernel carves
+  // the same layout).
+  enum class attn_k { decode, split, split_dpos, tiled, tc };
+  CUfunction attn_fns_[5][3][2] = {};
+  static constexpr unsigned attn_tc_smem(int64_t D) {
+    return D == 256 ? (64 + 4 * 16) * (256 + 8) * 2 : 0;
   }
-  CUfunction attn_split_(int64_t D, bool bf16 = false) {
-    if (D == 256) return cached_(attn_split_256_fn, "tl_attn_decode_split_256");
-    return bf16 ? (D == 64 ? cached_(attn_split_bf16_64_fn, "tl_attn_decode_split_bf16_64")
-                           : cached_(attn_split_bf16_fn, "tl_attn_decode_split_bf16"))
-                : (D == 64 ? cached_(attn_split_64_fn, "tl_attn_decode_split_64")
-                           : cached_(attn_split_fn, "tl_attn_decode_split"));
+  CUfunction attn_(attn_k k, int64_t D, bool f16) {
+    static const char* const kind[5] = {"tl_attn_decode_", "tl_attn_decode_split_",
+                                        "tl_attn_decode_split_dpos_", "tl_attn_prefill_tiled_",
+                                        "tl_attn_prefill_tc_"};
+    const int di = D == 64 ? 0 : D == 128 ? 1 : D == 256 ? 2 : -1;
+    if (di < 0) return nullptr;
+    CUfunction& slot = attn_fns_[static_cast<int>(k)][di][f16];
+    if (!slot) {
+      char name[64];
+      std::snprintf(name, sizeof name, "%s%s_%d", kind[static_cast<int>(k)], f16 ? "f16" : "f32", (int)D);
+      slot = load_(name);
+      if (slot && k == attn_k::tc && D == 256 && d.FuncSetAttribute)
+        d.FuncSetAttribute(slot, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, static_cast<int>(attn_tc_smem(D)));
+    }
+    return slot;
   }
+  CUfunction attn_combine_fn = nullptr;
   CUfunction attn_combine_() {  // head_dim implicit (blockDim.x) — one symbol
     return cached_(attn_combine_fn, "tl_attn_combine");
   }
@@ -691,19 +693,13 @@ struct context {
 
   // Device-pos variants (CUDA-graph capture): pos/ctx read from a device scalar
   // so one instantiated graph replays correctly as the decode position advances.
-  CUfunction rope_dpos_fn = nullptr, incr_u32_fn = nullptr,
-             kv_append_dpos_fn = nullptr, attn_split_dpos_fn = nullptr,
-             attn_split_dpos_64_fn = nullptr, attn_split_dpos_256_fn = nullptr;
+  CUfunction rope_dpos_fn = nullptr, incr_u32_fn = nullptr, kv_append_dpos_fn[2] = {};
   CUfunction rope_dpos_() { return cached_(rope_dpos_fn, "tl_rope_dpos"); }
   CUfunction incr_u32_() { return cached_(incr_u32_fn, "tl_incr_u32"); }
-  CUfunction kv_append_dpos_() {
-    return cached_(kv_append_dpos_fn, "tl_kv_append_dpos");
+  CUfunction kv_append_dpos_(bool f16) {
+    return cached_(kv_append_dpos_fn[f16], f16 ? "tl_kv_append_dpos_f16" : "tl_kv_append_dpos");
   }
-  CUfunction attn_split_dpos_(int64_t D) {
-    if (D == 256) return cached_(attn_split_dpos_256_fn, "tl_attn_decode_split_256_dpos");
-    return D == 64 ? cached_(attn_split_dpos_64_fn, "tl_attn_decode_split_64_dpos")
-                   : cached_(attn_split_dpos_fn, "tl_attn_decode_split_dpos");
-  }
+
 
   // GPU argmax (greedy last-mile, tl_argmax): a persistent device buffer, so the
   // per-token result is a 4-byte D2H, not the 608KB logits copy. The index at 0,
@@ -737,36 +733,6 @@ struct context {
   // A fused gemm bias laid under split partials (gemm_batched).
   CUfunction fill_rows_fn = nullptr;
   CUfunction fill_rows_() { return cached_(fill_rows_fn, "tl_fill_rows"); }
-
-  // M9 prefill: causal prefill attention.
-  CUfunction attn_prefill_tiled_fn = nullptr, attn_prefill_tiled_64_fn = nullptr,
-             attn_prefill_tiled_bf16_fn = nullptr,
-             attn_prefill_tiled_bf16_64_fn = nullptr;
-  CUfunction attn_prefill_tc_64_fn = nullptr, attn_prefill_tc_128_fn = nullptr,
-             attn_prefill_tc_256_fn = nullptr;
-  // D = 256 stages Q in shared memory too: (64 queries + 2 buffers of K and V of
-  // 16 keys) rows of D + 8 halves, past the static 48 KB, so its function is
-  // raised to that on first lookup. (the kernel carves the same layout.)
-  static constexpr unsigned attn_tc_smem(int64_t D) {
-    return D == 256 ? (64 + 4 * 16) * (256 + 8) * 2 : 0;
-  }
-  CUfunction attn_prefill_tc_(int64_t D) {
-    if (D == 256) {
-      const bool fresh = !attn_prefill_tc_256_fn;
-      CUfunction f = cached_(attn_prefill_tc_256_fn, "tl_attn_prefill_tc_256");
-      if (fresh && f && d.FuncSetAttribute)
-        d.FuncSetAttribute(f, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, static_cast<int>(attn_tc_smem(D)));
-      return f;
-    }
-    return D == 64 ? cached_(attn_prefill_tc_64_fn, "tl_attn_prefill_tc_64")
-                   : cached_(attn_prefill_tc_128_fn, "tl_attn_prefill_tc_128");
-  }
-  CUfunction attn_prefill_tiled_(int64_t D, bool bf16) {
-    return bf16 ? (D == 64 ? cached_(attn_prefill_tiled_bf16_64_fn, "tl_attn_prefill_tiled_bf16_64")
-                           : cached_(attn_prefill_tiled_bf16_fn, "tl_attn_prefill_tiled_bf16"))
-                : (D == 64 ? cached_(attn_prefill_tiled_64_fn, "tl_attn_prefill_tiled_f32_64")
-                           : cached_(attn_prefill_tiled_fn, "tl_attn_prefill_tiled_f32"));
-  }
 
   // The two halves of that kernel's pullback. Training only, so f32 only.
   CUfunction attn_bwd_dq_fn = nullptr, attn_bwd_dq_64_fn = nullptr;
@@ -1025,12 +991,12 @@ struct own {
                         gpu::span bias = {}, int64_t rot = 0);
   static bool kv_append_dpos(gpu::span Kc, gpu::span Vc, gpu::span k_new,
                              gpu::span v_new, gpu::span d_pos, int64_t kv_max,
-                             int64_t n_kv_heads, int64_t D);
+                             int64_t n_kv_heads, int64_t D, bool kv_f16 = false);
   static bool attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
                                gpu::span out, int64_t n_q_heads,
                                int64_t n_kv_heads, gpu::span d_pos,
                                int64_t kv_max, int64_t D, float scale,
-                               gpu::span partials);
+                               gpu::span partials, bool kv_f16 = false);
   static bool incr_u32(gpu::span d_pos);
   static bool binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
                               gpu::span b, const int64_t* b_strides,
@@ -1077,15 +1043,15 @@ struct own {
   static bool attn_decode(gpu::span q, gpu::span K, gpu::span V, gpu::span out,
                           int64_t n_q_heads, int64_t n_kv_heads, int64_t ctx,
                           int64_t kv_max, int64_t D, float scale,
-                          bool kv_bf16 = false);
+                          bool kv_f16 = false);
   static bool attn_prefill(gpu::span q, gpu::span K, gpu::span V, gpu::span out,
                            int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
                            int64_t kv_max, int64_t D, float scale,
-                           bool kv_bf16 = false, int64_t pos0 = 0);
+                           bool kv_f16 = false, int64_t pos0 = 0);
   static bool attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V, gpu::span out,
                                int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
                                int64_t kv_max, int64_t D, float scale,
-                               bool kv_bf16 = false, int64_t pos0 = 0);
+                               bool kv_f16 = false, int64_t pos0 = 0);
   // Gated DeltaNet's conv over a prefill's T tokens, a thread a (channel, token).
   static bool ssm_conv_tokens(gpu::span x, int64_t ld, gpu::span state, gpu::span w,
                               gpu::span o, int64_t C, int64_t K, int64_t T);
@@ -1284,6 +1250,7 @@ struct caps {
   static constexpr bool graph_capture = true;
   static constexpr bool row_gemv = true;   // gemv_bf16_row: weights as [N,K]
   static constexpr bool bf16_gemm = true;  // gemm_bf16_nt: the batched prefill
+  static constexpr bool kv_f16 = true;     // an f16 KV cache, every head width and path
 };
 using graph_exec = CUgraphExec;
 
@@ -2213,7 +2180,7 @@ inline unsigned attn_split_count(unsigned n_heads, int64_t ctx) {
 // and D=128 carries fewer only because its Q tile would otherwise blow the 48 KB
 // static shared limit. See the kernel for the measurements behind both.
 inline constexpr unsigned attn_tile_threads = 128;
-inline constexpr unsigned attn_tile_queries(int64_t D) { return D == 64 ? 64 : 32; }
+inline constexpr unsigned attn_tile_queries(int64_t D) { return D == 64 ? 64 : D == 128 ? 32 : 16; }
 
 // The same ABI for the two backward kernels — rows of the sequence a block
 // owns, queries in the dq half and keys in the dK/dV half. Half the forward's
@@ -2252,21 +2219,19 @@ struct attn_partials {
 
 // The head widths the decode-attention kernels are instantiated for: 64 and
 // 128 with either cache dtype, 256 with an f32 cache.
-inline bool attn_decode_head_ok(int64_t D, bool kv_bf16) {
-  return D == 64 || D == 128 || (D == 256 && !kv_bf16);
-}
+inline bool attn_decode_head_ok(int64_t D) { return D == 64 || D == 128 || D == 256; }
 
 // M9 fused decode attention: out(h,:) = softmax(scale·q(h,:)·K(kv,:)^T)·V(kv) in
 // one pass. q [n_q_heads,D], out [n_q_heads,D]; K/V are a [n_kv_heads,kv_max,D]
 // cache read over its valid prefix [0,ctx) (kv_max==ctx is the no-cache case).
 // GQA: q head h reads kv head h/(n_q_heads/n_kv_heads). Contiguous, D as
-// attn_decode_head_ok allows.
+// attn_decode_head_ok allows; the cache f32, or f16 with kv_f16.
 inline bool own::attn_decode(gpu::span q, gpu::span K, gpu::span V,
                              gpu::span out, int64_t n_q_heads,
                              int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
-                             int64_t D, float scale, bool kv_bf16) {
+                             int64_t D, float scale, bool kv_f16) {
   auto& c = context::get();
-  if (!c.ready || !attn_decode_head_ok(D, kv_bf16)) return false;
+  if (!c.ready || !attn_decode_head_ok(D)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
   c.device_read_(q.buf);
   c.device_read_(K.buf);
@@ -2285,7 +2250,7 @@ inline bool own::attn_decode(gpu::span q, gpu::span K, gpu::span V,
   unsigned S = attn_split_count(uh, ctx);
   unsigned uD = static_cast<unsigned>(D);
   if (S == 1) {
-    return c.launch_(c.attn_decode_(D, kv_bf16), {uh}, {uD}, 0, pq, pk, pv, po,
+    return c.launch_(c.attn_(context::attn_k::decode, D, kv_f16), {uh}, {uD}, 0, pq, pk, pv, po,
                      uctx, kv_stride, group, scale);
   }
 
@@ -2295,7 +2260,7 @@ inline bool own::attn_decode(gpu::span q, gpu::span K, gpu::span V,
   CUdeviceptr scr = c.attn_scratch_(attn_partials::bytes(hs, D));
   if (!scr) return false;
   attn_partials p(reinterpret_cast<float*>(scr), hs);
-  if (!c.launch_(c.attn_split_(D, kv_bf16), {uh, S}, {uD}, 0, pq, pk, pv, p.pm,
+  if (!c.launch_(c.attn_(context::attn_k::split, D, kv_f16), {uh, S}, {uD}, 0, pq, pk, pv, p.pm,
                  p.pl, p.pacc, uctx, kv_stride, group, chunk, scale)) {
     return false;
   }
@@ -2340,7 +2305,7 @@ inline bool own::incr_u32(gpu::span d_pos) {
 // KV append with write-row = *d_pos (else identical to kv_append(); f32 KV).
 inline bool own::kv_append_dpos(gpu::span Kc, gpu::span Vc, gpu::span k_new,
                                 gpu::span v_new, gpu::span d_pos,
-                                int64_t kv_max, int64_t n_kv_heads, int64_t D) {
+                                int64_t kv_max, int64_t n_kv_heads, int64_t D, bool kv_f16) {
   auto& c = context::get();
   if (!c.ready || D <= 0 || D > gpu::policy::max_group_threads) return false;
   c.device_read_(k_new.buf);
@@ -2354,7 +2319,7 @@ inline bool own::kv_append_dpos(gpu::span Kc, gpu::span Vc, gpu::span k_new,
   float* pv = context::off_(v_new.buf, v_new.off);
   float* pp = context::off_(d_pos.buf, d_pos.off);
   unsigned kv_stride = (unsigned)(kv_max * D);
-  return c.launch_(c.kv_append_dpos_(), {(unsigned)n_kv_heads}, {(unsigned)D},
+  return c.launch_(c.kv_append_dpos_(kv_f16), {(unsigned)n_kv_heads}, {(unsigned)D},
                    0, pKc, pVc, pk, pv, pp, kv_stride);
 }
 
@@ -2369,14 +2334,14 @@ inline bool own::kv_append_dpos(gpu::span Kc, gpu::span Vc, gpu::span k_new,
 // `partials` is a caller-OWNED device buffer of attn_partials::bytes(H*S_max, D)
 // — like d_pos, it is graph-lifetime state (a captured graph bakes its address
 // in), so it must not be a shared growable scratch; kv_cache owns one per
-// cache. f32 KV.
+// cache. The cache f32, or f16 with kv_f16.
 inline bool own::attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
                                   gpu::span out, int64_t n_q_heads,
                                   int64_t n_kv_heads, gpu::span d_pos,
                                   int64_t kv_max, int64_t D, float scale,
-                                  gpu::span partials) {
+                                  gpu::span partials, bool kv_f16) {
   auto& c = context::get();
-  if (!c.ready || !attn_decode_head_ok(D, false) || !partials.buf) return false;
+  if (!c.ready || !attn_decode_head_ok(D) || !partials.buf) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
   c.device_read_(q.buf);
   c.device_read_(K.buf);
@@ -2394,7 +2359,7 @@ inline bool own::attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
   unsigned group = (unsigned)(n_q_heads / n_kv_heads);
   unsigned S = attn_split_count(uh, kv_max);
   attn_partials p(context::off_(partials.buf, partials.off), (size_t)uh * S);
-  if (!c.launch_(c.attn_split_dpos_(D), {uh, S}, {uD}, 0, pq, pk, pv, p.pm,
+  if (!c.launch_(c.attn_(context::attn_k::split_dpos, D, kv_f16), {uh, S}, {uD}, 0, pq, pk, pv, p.pm,
                  p.pl, p.pacc, pp, kv_stride, group, scale)) {
     return false;
   }
@@ -2409,10 +2374,12 @@ inline bool own::attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
 inline bool own::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
                               gpu::span out, int64_t n_q_heads,
                               int64_t n_kv_heads, int64_t T, int64_t kv_max,
-                              int64_t D, float scale, bool kv_bf16,
+                              int64_t D, float scale, bool kv_f16,
                               int64_t pos0) {
   auto& c = context::get();
-  if (!c.ready || (D != 128 && D != 64)) return false;
+  // D 64 or 128; 256 for an f16 cache (an f32 one there takes gpu::attn_prefill's
+  // GEMM form, which reads only f32).
+  if (!c.ready || (D != 128 && D != 64 && !(D == 256 && kv_f16))) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
   if (T <= 0 || T > 65535) return false;  // one call is one prompt chunk
   c.device_read_(q.buf);
@@ -2433,22 +2400,22 @@ inline bool own::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
   // reduction. Same online softmax, same causal rule. See
   // tl_attn_prefill_tiled_*.
   const unsigned tile = attn_tile_queries(D);
-  return c.launch_(c.attn_prefill_tiled_(D, kv_bf16),
+  return c.launch_(c.attn_(context::attn_k::tiled, D, kv_f16),
                    {static_cast<unsigned>(n_q_heads), (uT + tile - 1) / tile},
                    {attn_tile_threads}, 0, pq, pk, pv, po, uT, kv_stride, group,
                    scale, up0);
 }
 
 // The same causal prefill on the tensor cores (tl_attn_prefill_tc_*), its
-// operands rounded to f16 as staged: an f32 cache at head width 64, 128 or
-// 256, operands on 16 bytes. Inference only (gpu::attn_prefill_f16).
+// operands rounded to f16 as staged (an f16 cache's K and V already are): head
+// width 64, 128 or 256, operands on 16 bytes. Inference only (gpu::attn_prefill_f16).
 inline bool own::attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V,
                                   gpu::span out, int64_t n_q_heads,
                                   int64_t n_kv_heads, int64_t T, int64_t kv_max,
-                                  int64_t D, float scale, bool kv_bf16,
+                                  int64_t D, float scale, bool kv_f16,
                                   int64_t pos0) {
   auto& c = context::get();
-  if (!c.ready || kv_bf16 || (D != 64 && D != 128 && D != 256)) return false;
+  if (!c.ready || (D != 64 && D != 128 && D != 256)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
   if (T <= 0 || T > 65535) return false;
   float* pq = context::off_(q.buf, q.off);
@@ -2461,7 +2428,7 @@ inline bool own::attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V,
   c.device_read_(V.buf);
   c.device_write_(out.buf);
   const unsigned uT = static_cast<unsigned>(T), bq = 64u;  // 4 warps, 16 queries each
-  return c.launch_(c.attn_prefill_tc_(D),
+  return c.launch_(c.attn_(context::attn_k::tc, D, kv_f16),
                    {static_cast<unsigned>(n_q_heads), (uT + bq - 1) / bq}, {bq * 2},
                    context::attn_tc_smem(D), pq,
                    pk, pv, po, uT, static_cast<unsigned>(kv_max * D),

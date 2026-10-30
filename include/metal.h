@@ -73,23 +73,20 @@ inline const char* gtile_name_(gtile t) {
   return "";
 }
 
-// The attention kernels' variant, by D and whether the KV cache is bf16: also
-// no other backend's, so also kept out of kop. Offset far enough past
+// The attention kernels' variant, by D (an f32 KV cache; caps::kv_f16 is false
+// here): also no other backend's, so also kept out of kop. Offset far enough past
 // gtile_key_'s range that the two never collide either.
 enum class attn_op {
-  prefill_64, prefill_128, prefill_bf16_64, prefill_bf16_128,
+  prefill_64, prefill_128,
   bwd_dq_64, bwd_dq_128, bwd_dkv_64, bwd_dkv_128,
   decode_64, decode_128, decode_split_64, decode_split_128,
-  combine_64, combine_128, decode_bf16_64, decode_bf16_128,
-  decode_split_bf16_64, decode_split_bf16_128,
+  combine_64, combine_128,
 };
 constexpr int attn_op_key_(attn_op t) { return -101 - static_cast<int>(t); }
 inline const char* attn_op_name_(attn_op t) {
   switch (t) {
     case attn_op::prefill_64: return "attn_prefill_64_";
     case attn_op::prefill_128: return "attn_prefill_128_";
-    case attn_op::prefill_bf16_64: return "attn_prefill_bf16_64_";
-    case attn_op::prefill_bf16_128: return "attn_prefill_bf16_128_";
     case attn_op::bwd_dq_64: return "attn_bwd_dq_64_";
     case attn_op::bwd_dq_128: return "attn_bwd_dq_128_";
     case attn_op::bwd_dkv_64: return "attn_bwd_dkv_64_";
@@ -100,10 +97,6 @@ inline const char* attn_op_name_(attn_op t) {
     case attn_op::decode_split_128: return "attn_decode_split_128_";
     case attn_op::combine_64: return "attn_combine_64_";
     case attn_op::combine_128: return "attn_combine_128_";
-    case attn_op::decode_bf16_64: return "attn_decode_bf16_64_";
-    case attn_op::decode_bf16_128: return "attn_decode_bf16_128_";
-    case attn_op::decode_split_bf16_64: return "attn_decode_split_bf16_64_";
-    case attn_op::decode_split_bf16_128: return "attn_decode_split_bf16_128_";
   }
   return "";
 }
@@ -231,9 +224,7 @@ struct context {
       case kop::layer_norm_bwd_gb_: return "layer_norm_bwd_gb_";
       case kop::layer_norm_bwd_gb_fold_: return "layer_norm_bwd_gb_fold_";
       case kop::kv_append_: return "kv_append_";
-      case kop::kv_append_bf16_: return "kv_append_bf16_";
       case kop::kv_fill_: return "kv_fill_";
-      case kop::kv_fill_bf16_: return "kv_fill_bf16_";
       case kop::argmax_: return "argmax_";
       case kop::rmsnorm_: return "rmsnorm_";
       case kop::add_rmsnorm_: return "add_rmsnorm_";
@@ -379,11 +370,11 @@ struct own {
   static bool attn_decode(gpu::span q, gpu::span K, gpu::span V, gpu::span out,
                           int64_t n_q_heads, int64_t n_kv_heads, int64_t ctx,
                           int64_t kv_max, int64_t D, float scale,
-                          bool kv_bf16 = false);
+                          bool kv_f16 = false);
   static bool attn_prefill(gpu::span q, gpu::span K, gpu::span V, gpu::span out,
                            int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
                            int64_t kv_max, int64_t D, float scale,
-                           bool kv_bf16 = false, int64_t pos0 = 0);
+                           bool kv_f16 = false, int64_t pos0 = 0);
   static bool attn_prefill_dq(gpu::span q, gpu::span K, gpu::span V,
                               gpu::span dO, gpu::span O, gpu::span dq,
                               gpu::span stats, int64_t H, int64_t T, int64_t D,
@@ -1143,18 +1134,16 @@ inline void attn_dispatch_(objc::id enc, const attn_params& p,
 
 // q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D] cache read over
 // [0,pos0+T), query p at absolute position pos0+p. GQA via the head ratio.
-// D∈{64,128}; the cache is f32, or bf16 with kv_bf16.
+// D∈{64,128}; an f32 cache.
 inline bool own::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
                               gpu::span out, int64_t n_q_heads,
                               int64_t n_kv_heads, int64_t T, int64_t kv_max,
-                              int64_t D, float scale, bool kv_bf16,
+                              int64_t D, float scale, bool kv_f16,
                               int64_t pos0) {
   auto& c = context::get();
-  if (!c.device || (D != 64 && D != 128)) return false;
+  if (!c.device || kv_f16 || (D != 64 && D != 128)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || T <= 0) return false;
-  c.bind_(kv_bf16 ? (D == 64 ? attn_op::prefill_bf16_64
-                             : attn_op::prefill_bf16_128)
-                  : (D == 64 ? attn_op::prefill_64 : attn_op::prefill_128));
+  c.bind_(D == 64 ? attn_op::prefill_64 : attn_op::prefill_128);
   detail_::set_buf_(c.enc, q, 0ul);
   detail_::set_buf_(c.enc, K, 1ul);
   detail_::set_buf_(c.enc, V, 2ul);
@@ -1237,13 +1226,13 @@ inline bool own::gemm_bf16_nt(gpu::span A, gpu::span B, gpu::span C, int64_t M,
 }
 
 // One decode step: q [n_q_heads,D] against a [n_kv_heads,kv_max,D] cache read
-// over [0,ctx). GQA via the head ratio; the cache is f32, or bf16 with kv_bf16.
+// over [0,ctx). GQA via the head ratio; an f32 cache.
 inline bool own::attn_decode(gpu::span q, gpu::span K, gpu::span V,
                              gpu::span out, int64_t n_q_heads,
                              int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
-                             int64_t D, float scale, bool kv_bf16) {
+                             int64_t D, float scale, bool kv_f16) {
   auto& c = context::get();
-  if (!c.device || (D != 64 && D != 128)) return false;
+  if (!c.device || kv_f16 || (D != 64 && D != 128)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || ctx <= 0) return false;
   const bool d64 = D == 64;
   unsigned long chunk = detail_::attn_split_chunk_(n_q_heads, ctx);
@@ -1257,16 +1246,8 @@ inline bool own::attn_decode(gpu::span q, gpu::span K, gpu::span V,
     if (!dst) chunk = 0, dst = out;
   }
   const bool split = chunk != 0;
-  if (split) {
-    c.bind_(kv_bf16 ? (d64 ? attn_op::decode_split_bf16_64
-                           : attn_op::decode_split_bf16_128)
-                    : (d64 ? attn_op::decode_split_64
-                           : attn_op::decode_split_128));
-  } else {
-    c.bind_(kv_bf16 ? (d64 ? attn_op::decode_bf16_64
-                           : attn_op::decode_bf16_128)
-                    : (d64 ? attn_op::decode_64 : attn_op::decode_128));
-  }
+  c.bind_(split ? (d64 ? attn_op::decode_split_64 : attn_op::decode_split_128)
+                : (d64 ? attn_op::decode_64 : attn_op::decode_128));
   detail_::set_buf_(c.enc, q, 0ul);
   detail_::set_buf_(c.enc, K, 1ul);
   detail_::set_buf_(c.enc, V, 2ul);
@@ -1366,6 +1347,7 @@ struct caps {
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = true;   // gemv_bf16_row: weights as [N,K]
   static constexpr bool bf16_gemm = true;  // gemm_bf16_nt: a bf16-weight GEMM
+  static constexpr bool kv_f16 = false;    // the KV cache is f32
 };
 
 // The capture group, cuda.h's contracts: absent here, so each answers false

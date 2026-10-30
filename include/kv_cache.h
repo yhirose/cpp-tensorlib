@@ -10,9 +10,11 @@
 // append() writes one token's k/v and advances; attn() runs the fused decode
 // attention over the cached prefix [0, pos); prefill() appends a block of T
 // tokens and runs the causal attention over it, so a long prompt runs in
-// chunks and a later turn extends a live cache. The cache is f32, or bf16
-// (half the bytes every step streams) with init(..., dtype::bf16); q, out and
-// the arithmetic stay f32.
+// chunks and a later turn extends a live cache. The cache is f32, or f16 with
+// init(..., true) where the backend has it (gpu::caps::kv_f16): half the bytes
+// every decode step streams, the values the tensor-core prefill rounds K and V
+// to anyway (llama.cpp's default cache), up to f16's 65504. q, out and the
+// arithmetic stay f32.
 //
 // The *_dpos variants read the position from a device scalar instead of the
 // host `pos`, so a captured forward replays at the advancing position (CUDA
@@ -30,17 +32,19 @@ namespace tl {
 struct kv_cache {
   storage K, V;
   int64_t n_kv_heads = 0, max_ctx = 0, D = 0, pos = 0;
-  bool kv_bf16 = false;
+  bool f16 = false;
 
-  bool init(int64_t kv_heads, int64_t maxctx, int64_t d,
-            dtype kv_dt = dtype::f32) {
+  bool init(int64_t kv_heads, int64_t maxctx, int64_t d, bool f16_cache = false) {
     n_kv_heads = kv_heads;
     max_ctx = maxctx;
     D = d;
     pos = 0;
-    kv_bf16 = kv_dt == dtype::bf16;
-    K = storage::make(n_kv_heads * max_ctx * D, kv_dt);
-    V = storage::make(n_kv_heads * max_ctx * D, kv_dt);
+    f16 = f16_cache;
+    // An f16 cache is raw device bytes, two elements in each f32 of a storage
+    // half as long (tl::dtype has no f16; nothing reads the cache but kernels).
+    const int64_t n = n_kv_heads * max_ctx * D, floats = f16 ? (n + 1) / 2 : n;
+    K = storage::make(floats);
+    V = storage::make(floats);
     return K.native && V.native;  // a heap fallback has no device buffer
   }
 
@@ -48,7 +52,7 @@ struct kv_cache {
   bool append(gpu::span k_new, gpu::span v_new) {
     if (pos >= max_ctx) return false;
     if (!gpu::kv_append(K.device_span(), V.device_span(), k_new, v_new, pos,
-                        max_ctx, n_kv_heads, D, kv_bf16)) {
+                        max_ctx, n_kv_heads, D, f16)) {
       return false;
     }
     pos++;
@@ -58,7 +62,7 @@ struct kv_cache {
   // q/out: [n_q_heads, D] device views. Attends over the cached prefix.
   bool attn(gpu::span q, gpu::span out, int64_t n_q_heads, float scale) {
     return gpu::attn_decode(q, K.device_span(), V.device_span(), out, n_q_heads,
-                            n_kv_heads, pos, max_ctx, D, scale, kv_bf16);
+                            n_kv_heads, pos, max_ctx, D, scale, f16);
   }
 
   // T tokens at once: k_src/v_src [n_kv_heads, T, D] appended at `pos`, and
@@ -70,7 +74,7 @@ struct kv_cache {
                int64_t T, int64_t n_q_heads, float scale, bool exact = false) {
     if (T <= 0 || pos + T > max_ctx) return false;
     if (!gpu::kv_fill(K.device_span(), V.device_span(), k_src, v_src, T, max_ctx,
-                      n_kv_heads, D, kv_bf16, pos)) {
+                      n_kv_heads, D, f16, pos)) {
       return false;
     }
     const int64_t p0 = pos;
@@ -78,17 +82,17 @@ struct kv_cache {
     // A cache serves inference, so the attention may take the tensor cores.
     if (exact) {
       return gpu::attn_prefill(q, K.device_span(), V.device_span(), out, n_q_heads,
-                               n_kv_heads, T, max_ctx, D, scale, kv_bf16, p0);
+                               n_kv_heads, T, max_ctx, D, scale, f16, p0);
     }
     return gpu::attn_prefill_f16(q, K.device_span(), V.device_span(), out,
-                                 n_q_heads, n_kv_heads, T, max_ctx, D, scale, kv_bf16,
+                                 n_q_heads, n_kv_heads, T, max_ctx, D, scale, f16,
                                  p0);
   }
 
-  // Graph-capture forms (f32 cache only): the position is *d_pos.
+  // Graph-capture forms: the position is *d_pos.
   bool append_dpos(gpu::span k_new, gpu::span v_new, gpu::span d_pos) {
     return gpu::kv_append_dpos(K.device_span(), V.device_span(), k_new, v_new,
-                               d_pos, max_ctx, n_kv_heads, D);
+                               d_pos, max_ctx, n_kv_heads, D, f16);
   }
   // The split-KV partials a captured graph bakes in are this cache's own (a
   // shared scratch could be freed under a live graph), sized once from the
@@ -105,7 +109,7 @@ struct kv_cache {
     }
     return gpu::attn_decode_dpos(q, K.device_span(), V.device_span(), out,
                                  n_q_heads, n_kv_heads, d_pos, max_ctx, D, scale,
-                                 dpos_partials.device_span());
+                                 dpos_partials.device_span(), f16);
   }
 };
 

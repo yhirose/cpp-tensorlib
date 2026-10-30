@@ -591,8 +591,8 @@ inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
 // prefix, softmax, times V. An f32 cache only.
 inline bool attn_decode(span q, span K, span V, span o, int64_t n_q_heads,
                         int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
-                        int64_t D, float scale, bool kv_bf16) {
-  if (kv_bf16 || n_kv_heads <= 0 || n_q_heads % n_kv_heads || ctx <= 0 ||
+                        int64_t D, float scale, bool kv_f16) {
+  if (kv_f16 || n_kv_heads <= 0 || n_q_heads % n_kv_heads || ctx <= 0 ||
       D <= 0) {
     return false;
   }
@@ -617,8 +617,8 @@ inline bool attn_decode(span q, span K, span V, span o, int64_t n_q_heads,
 // softmax by row, times V.
 inline bool attn_prefill(span q, span K, span V, span o, int64_t n_q_heads,
                          int64_t n_kv_heads, int64_t T, int64_t kv_max,
-                         int64_t D, float scale, bool kv_bf16, int64_t pos0) {
-  if (kv_bf16 || n_kv_heads <= 0 || n_q_heads % n_kv_heads || T <= 0 ||
+                         int64_t D, float scale, bool kv_f16, int64_t pos0) {
+  if (kv_f16 || n_kv_heads <= 0 || n_q_heads % n_kv_heads || T <= 0 ||
       D <= 0 || pos0 < 0 || pos0 + T > kv_max) {
     return false;
   }
@@ -802,7 +802,7 @@ inline bool gated_delta(span qkv, span ab, int64_t ab_ld, span adt, span state,
 // GEMVs and attention. Each is the backend's kernel where it has one and the
 // generic composition where it does not, so every backend has the f32 model
 // path; an op still answers false for an operand its backend cannot read (a
-// bf16 cache or weight, int4 weights), and a model keeps to the array ops
+// f16 cache, bf16 weight, int4 weights), and a model keeps to the array ops
 // there.
 
 // out = x * rsqrt(mean(x^2) + eps) * w per row of [rows, n]. out may alias x.
@@ -925,36 +925,36 @@ inline bool gemv_q4(span a, span qw, span scales, span y, int64_t N, int64_t K,
 }
 
 // One decode step's k, v (each [n_kv_heads, D]) into row `pos` of a
-// [n_kv_heads, kv_max, D] cache, f32 or bf16.
+// [n_kv_heads, kv_max, D] cache, f32, or f16 with kv_f16 (where caps::kv_f16).
 inline bool kv_append(span Kc, span Vc, span k_new, span v_new, int64_t pos,
                       int64_t kv_max, int64_t n_kv_heads, int64_t D,
-                      bool kv_bf16 = false) {
+                      bool kv_f16 = false) {
   if (n_kv_heads <= 0 || D <= 0) return false;
   // The kernels run a head as one group of D threads; a head wider than a group
   // can be takes the composition.
   return (D <= policy::max_group_threads &&
-          launch(kv_bf16 ? kop::kv_append_bf16_ : kop::kv_append_,
+          launch(kv_f16 ? kop::kv_append_f16_ : kop::kv_append_,
                  {out(Kc), out(Vc), in(k_new), in(v_new)},
                  kv_append_params{static_cast<uint32_t>(pos),
                                   static_cast<uint32_t>(kv_max * D)},
                  policy::per_head(n_kv_heads, 1, D))) ||
-         (!kv_bf16 &&
+         (!kv_f16 &&
           generic::kv_append(Kc, Vc, k_new, v_new, pos, kv_max, n_kv_heads, D));
 }
 
 // A prefill's k, v (each [n_kv_heads, T, D]) into cache rows [pos0, pos0 + T).
 inline bool kv_fill(span Kc, span Vc, span K, span V, int64_t T, int64_t kv_max,
-                    int64_t n_kv_heads, int64_t D, bool kv_bf16 = false,
+                    int64_t n_kv_heads, int64_t D, bool kv_f16 = false,
                     int64_t pos0 = 0) {
   if (n_kv_heads <= 0 || D <= 0 || T <= 0) return false;
   return (D <= policy::max_group_threads &&  // a group a head, as in kv_append
-          launch(kv_bf16 ? kop::kv_fill_bf16_ : kop::kv_fill_,
+          launch(kv_f16 ? kop::kv_fill_f16_ : kop::kv_fill_,
                  {out(Kc), out(Vc), in(K), in(V)},
                  kv_fill_params{static_cast<uint32_t>(T),
                                 static_cast<uint32_t>(kv_max * D),
                                 static_cast<uint32_t>(pos0)},
                  policy::per_head(n_kv_heads, T, D))) ||
-         (!kv_bf16 &&
+         (!kv_f16 &&
           generic::kv_fill(Kc, Vc, K, V, T, kv_max, n_kv_heads, D, pos0));
 }
 
@@ -1206,19 +1206,19 @@ TL_GPU_F16_OP(cvt_h16, (span src, span dst16, int64_t n), (src, dst16, n))
 #undef TL_GPU_F16_OP
 
 // One decode step: q [n_q_heads, D] against a [n_kv_heads, kv_max, D] cache
-// read over [0, ctx). GQA by the head ratio; the cache is f32 or bf16.
+// read over [0, ctx). GQA by the head ratio; the cache is f32, or f16 with kv_f16.
 TL_GPU_DETECT_OWN(attn_decode)
 template <class Own = own>
 inline bool attn_decode(span q, span K, span V, span o, int64_t n_q_heads,
                         int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
-                        int64_t D, float scale, bool kv_bf16 = false) {
+                        int64_t D, float scale, bool kv_f16 = false) {
   if constexpr (detail::owns_attn_decode<Own>::value) {
-    if (detail::ran(Own::attn_decode(q, K, V, o, n_q_heads, n_kv_heads, ctx, kv_max, D, scale, kv_bf16))) {
+    if (detail::ran(Own::attn_decode(q, K, V, o, n_q_heads, n_kv_heads, ctx, kv_max, D, scale, kv_f16))) {
       return true;
     }
   }
   return generic::attn_decode(q, K, V, o, n_q_heads, n_kv_heads, ctx, kv_max, D,
-                              scale, kv_bf16);
+                              scale, kv_f16);
 }
 
 // Causal prefill: q, out [n_q_heads, T, D] against the cache rows
@@ -1227,15 +1227,15 @@ TL_GPU_DETECT_OWN(attn_prefill)
 template <class Own = own>
 inline bool attn_prefill(span q, span K, span V, span o, int64_t n_q_heads,
                          int64_t n_kv_heads, int64_t T, int64_t kv_max,
-                         int64_t D, float scale, bool kv_bf16 = false,
+                         int64_t D, float scale, bool kv_f16 = false,
                          int64_t pos0 = 0) {
   if constexpr (detail::owns_attn_prefill<Own>::value) {
-    if (detail::ran(Own::attn_prefill(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D, scale, kv_bf16, pos0))) {
+    if (detail::ran(Own::attn_prefill(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D, scale, kv_f16, pos0))) {
       return true;
     }
   }
   return generic::attn_prefill(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D,
-                               scale, kv_bf16, pos0);
+                               scale, kv_f16, pos0);
 }
 
 // The causal prefill for inference: a backend may round its operands to f16
@@ -1246,16 +1246,16 @@ TL_GPU_DETECT_OWN(attn_prefill_f16)
 template <class Own = own>
 inline bool attn_prefill_f16(span q, span K, span V, span o, int64_t n_q_heads,
                              int64_t n_kv_heads, int64_t T, int64_t kv_max,
-                             int64_t D, float scale, bool kv_bf16 = false,
+                             int64_t D, float scale, bool kv_f16 = false,
                              int64_t pos0 = 0) {
   if constexpr (detail::owns_attn_prefill_f16<Own>::value) {
     if (detail::ran(Own::attn_prefill_f16(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D,
-                                          scale, kv_bf16, pos0))) {
+                                          scale, kv_f16, pos0))) {
       return true;
     }
   }
   return attn_prefill<Own>(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D, scale,
-                           kv_bf16, pos0);
+                           kv_f16, pos0);
 }
 
 // The causal prefill's pullback, query half then key/value half.
@@ -1330,9 +1330,9 @@ inline bool rope_dpos(span x, span o, int64_t rows, int64_t T, int64_t D,
 TL_GPU_DETECT_OWN(kv_append_dpos)
 template <class Own = own>
 inline bool kv_append_dpos(span Kc, span Vc, span k_new, span v_new, span d_pos,
-                           int64_t kv_max, int64_t n_kv_heads, int64_t D) {
+                           int64_t kv_max, int64_t n_kv_heads, int64_t D, bool kv_f16 = false) {
   if constexpr (detail::owns_kv_append_dpos<Own>::value) {
-    return detail::ran(Own::kv_append_dpos(Kc, Vc, k_new, v_new, d_pos, kv_max, n_kv_heads, D));
+    return detail::ran(Own::kv_append_dpos(Kc, Vc, k_new, v_new, d_pos, kv_max, n_kv_heads, D, kv_f16));
   } else {
     return false;
   }
@@ -1342,9 +1342,9 @@ TL_GPU_DETECT_OWN(attn_decode_dpos)
 template <class Own = own>
 inline bool attn_decode_dpos(span q, span K, span V, span o, int64_t n_q_heads,
                              int64_t n_kv_heads, span d_pos, int64_t kv_max,
-                             int64_t D, float scale, span partials) {
+                             int64_t D, float scale, span partials, bool kv_f16 = false) {
   if constexpr (detail::owns_attn_decode_dpos<Own>::value) {
-    return detail::ran(Own::attn_decode_dpos(q, K, V, o, n_q_heads, n_kv_heads, d_pos, kv_max, D, scale, partials));
+    return detail::ran(Own::attn_decode_dpos(q, K, V, o, n_q_heads, n_kv_heads, d_pos, kv_max, D, scale, partials, kv_f16));
   } else {
     return false;
   }

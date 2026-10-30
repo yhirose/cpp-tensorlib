@@ -2,7 +2,7 @@
 // The decode-token time is dominated by attention (bench_llm: ~72%), but that
 // cost is launch/materialize overhead — the array path runs q·Kᵀ, softmax, ·V
 // as 3 separate kernels with 2 intermediate materializations, per head per
-// layer (heads×layers ≈ 1024 times). tl_attn_decode_f32 fuses them with the
+// layer (heads×layers ≈ 1024 times). tl_attn_decode_f32_* fuses them with the
 // online-softmax recurrence: the ctx-long scores never touch memory and K,V are
 // read exactly once, so the kernel runs at the decode floor (KV bandwidth).
 //
@@ -44,19 +44,19 @@ int main() {
 
   std::printf("fused decode attention — H=%lld heads, D=%lld, scale=1/sqrt(D)\n",
               (long long)H, (long long)D);
-  std::printf("f32 = 4B K,V (baseline); bf16 = 2B K,V (M9 KV bandwidth lever, "
+  std::printf("f32 = 4B K,V (baseline); f16 = 2B K,V (M9 KV bandwidth lever, "
               "~2x the KV floor). maxrel is vs the f32 CPU reference.\n");
   std::printf("%-8s %9s %9s %8s   %9s %9s %9s   %10s\n", "ctx", "f32 ms",
-              "bf16 ms", "f32/bf16", "f32 GB/s", "bf16 GB/s", "bf16 maxrel",
-              "model bf16");
+              "f16 ms", "f32/f16", "f32 GB/s", "f16 GB/s", "f16 maxrel",
+              "model f16");
   for (int64_t ctx : ctxs) {
     float *hq = nullptr, *hK = nullptr, *hV = nullptr, *ho = nullptr;
     void* q = alloc(H * D * 4, &hq);
     void* K = alloc(H * ctx * D * 4, &hK);
     void* V = alloc(H * ctx * D * 4, &hV);
     void* o = alloc(H * D * 4, &ho);
-    // bf16 K,V cache holding the same values (narrowed): filled once via kv_fill
-    // (f32 in -> bf16 out), the exact write path the model uses.
+    // f16 K,V cache holding the same values (narrowed): filled once via kv_fill
+    // (f32 in -> f16 out), the exact write path the model uses.
     void* Kb = alloc(H * ctx * D * 2, nullptr);
     void* Vb = alloc(H * ctx * D * 2, nullptr);
 
@@ -72,20 +72,20 @@ int main() {
       hK[i] = rnd();
       hV[i] = rnd();
     }
-    // Narrow the f32 K,V into the bf16 cache buffers (kv_fill: [H,ctx,D] -> cache
+    // Narrow the f32 K,V into the f16 cache buffers (kv_fill: [H,ctx,D] -> cache
     // rows [0,ctx), kv_max=ctx so no padding). H_kv = H here (no GQA).
-    tl::gpu::kv_fill({Kb, 0}, {Vb, 0}, {K, 0}, {V, 0}, ctx, ctx, H, D, /*kv_bf16=*/true);
+    tl::gpu::kv_fill({Kb, 0}, {Vb, 0}, {K, 0}, {V, 0}, ctx, ctx, H, D, /*kv_f16=*/true);
     flush();
 
-    auto run = [&](bool bf16) {
-      tl::gpu::attn_decode({q, 0}, {bf16 ? Kb : K, 0}, {bf16 ? Vb : V, 0}, {o, 0}, H, H, ctx, ctx, D, scale, bf16);
+    auto run = [&](bool f16) {
+      tl::gpu::attn_decode({q, 0}, {f16 ? Kb : K, 0}, {f16 ? Vb : V, 0}, {o, 0}, H, H, ctx, ctx, D, scale, f16);
     };
     run(true);
     flush();
     sync_to_host(o, false);
 
     // CPU reference per head: softmax(scale·q·Kᵀ)·V (f32 values). Compared to the
-    // bf16-cache run below — so maxrel is the bf16 quantization error, end to end.
+    // f16-cache run below — so maxrel is the f16 quantization error, end to end.
     double maxrel = 0;
     std::vector<float> scores(ctx);
     for (int64_t h = 0; h < H; h++) {
@@ -114,23 +114,23 @@ int main() {
       }
     }
 
-    auto time = [&](bool bf16) {
+    auto time = [&](bool f16) {
       std::vector<double> ms;
       for (int r = 0; r < ROUNDS; r++) {
         auto t0 = clk::now();
-        for (int i = 0; i < R; i++) run(bf16);
+        for (int i = 0; i < R; i++) run(f16);
         flush();
         ms.push_back(
             std::chrono::duration<double, std::milli>(clk::now() - t0).count() / R);
       }
       return median(ms);
     };
-    double f32_ms = time(false), bf16_ms = time(true);
+    double f32_ms = time(false), f16_ms = time(true);
     double f32_gbs = 2.0 * H * ctx * D * 4 / (f32_ms * 1e6);
-    double bf16_gbs = 2.0 * H * ctx * D * 2 / (bf16_ms * 1e6);
+    double f16_gbs = 2.0 * H * ctx * D * 2 / (f16_ms * 1e6);
     std::printf("%-8lld %9.4f %9.4f %8.2f   %9.1f %9.1f %9.1e   %8.2f ms\n",
-                (long long)ctx, f32_ms, bf16_ms, f32_ms / bf16_ms, f32_gbs,
-                bf16_gbs, maxrel, bf16_ms * LAYERS);
+                (long long)ctx, f32_ms, f16_ms, f32_ms / f16_ms, f32_gbs,
+                f16_gbs, maxrel, f16_ms * LAYERS);
 
     release(q, 0, nullptr);
     release(K, 0, nullptr);
@@ -144,7 +144,7 @@ int main() {
 
   // ---- REAL Qwen2.5-0.5B decode shape: HQ=14, HKV=2, D=64 (the actual target).
   // Tiny KV footprint (2 kv heads x ctx x 64) at short chat contexts, so this is
-  // the honest test of whether bf16 KV moves the needle on THIS model vs the
+  // the honest test of whether f16 KV moves the needle on THIS model vs the
   // llama-7B ceiling above. Per-layer attn ms x24 layers = the full-model delta.
   {
     const int64_t HQ = 14, HKV = 2, D = 64;
@@ -154,8 +154,8 @@ int main() {
     std::printf("\nQwen2.5-0.5B decode attn — %lld q / %lld kv heads, D=%lld, "
                 "x%lld layers\n", (long long)HQ, (long long)HKV, (long long)D,
                 (long long)LY);
-    std::printf("%-8s %9s %9s %8s   %11s %11s\n", "ctx", "f32 us", "bf16 us",
-                "f32/bf16", "f32 model", "bf16 model");
+    std::printf("%-8s %9s %9s %8s   %11s %11s\n", "ctx", "f32 us", "f16 us",
+                "f32/f16", "f32 model", "f16 model");
     for (int64_t ctx : qctxs) {
       float *hq = nullptr, *hK = nullptr, *hV = nullptr;
       void* q = alloc(HQ * D * 4, &hq);
@@ -171,15 +171,15 @@ int main() {
       for (int64_t i = 0; i < HKV * ctx * D; i++) { hK[i] = rnd(); hV[i] = rnd(); }
       tl::gpu::kv_fill({Kb, 0}, {Vb, 0}, {K, 0}, {V, 0}, ctx, ctx, HKV, D, true);
       flush();
-      auto run = [&](bool bf16) {
-        tl::gpu::attn_decode({q, 0}, {bf16 ? Kb : K, 0}, {bf16 ? Vb : V, 0}, {o, 0}, HQ, HKV, ctx, ctx, D, sc, bf16);
+      auto run = [&](bool f16) {
+        tl::gpu::attn_decode({q, 0}, {f16 ? Kb : K, 0}, {f16 ? Vb : V, 0}, {o, 0}, HQ, HKV, ctx, ctx, D, sc, f16);
       };
-      auto time = [&](bool bf16) {
-        run(bf16); flush();
+      auto time = [&](bool f16) {
+        run(f16); flush();
         std::vector<double> ms;
         for (int r = 0; r < ROUNDS; r++) {
           auto t0 = clk::now();
-          for (int i = 0; i < R; i++) run(bf16);
+          for (int i = 0; i < R; i++) run(f16);
           flush();
           ms.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count() / R);
         }

@@ -6,9 +6,11 @@
 // natively; every other op widens it to an F32 copy first (correct on all
 // backends, no kernel changes). Activations, results and scalars stay F32.
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace tl {
 
@@ -66,6 +68,38 @@ inline float bf16_to_f32(uint16_t h) {
   float f;
   std::memcpy(&f, &x, 4);
   return f;
+}
+// IEEE half: round to nearest even, subnormals and overflow to inf as the GPU's
+// __float2half_rn rounds them (a host twin for the KV cache's f16 and the f16
+// operands, which only device code holds).
+inline uint16_t f32_to_f16(float f) {
+  uint32_t x;
+  std::memcpy(&x, &f, 4);
+  const uint32_t sign = (x >> 16) & 0x8000u, ax = x & 0x7fffffffu;
+  if (ax >= 0x7f800000u) return static_cast<uint16_t>(sign | 0x7c00u | (ax > 0x7f800000u ? 0x200u : 0u));
+  const int e = static_cast<int>(ax >> 23) - 127 + 15;
+  if (e >= 31) return static_cast<uint16_t>(sign | 0x7c00u);  // past the largest half
+  uint32_t m = ax & 0x7fffffu, h;
+  int sh;
+  if (e <= 0) {  // a subnormal half (or zero)
+    if (e < -10) return static_cast<uint16_t>(sign);
+    m |= 0x800000u;
+    sh = 14 - e;
+    h = m >> sh;
+  } else {
+    sh = 13;
+    h = (static_cast<uint32_t>(e) << 10) | (m >> 13);
+  }
+  const uint32_t rem = m & ((1u << sh) - 1), half = 1u << (sh - 1);
+  if (rem > half || (rem == half && (h & 1u))) h++;  // a carry rounds into the exponent
+  return static_cast<uint16_t>(sign | h);
+}
+inline float f16_to_f32(uint16_t h) {
+  const int e = (h >> 10) & 31, m = h & 1023;
+  const float v = e == 0 ? std::ldexp(static_cast<float>(m), -24)
+                  : e == 31 ? (m ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity())
+                            : std::ldexp(static_cast<float>(m | 1024), e - 25);
+  return (h & 0x8000u) ? -v : v;
 }
 
 enum class device_type { cpu, gpu, auto_ };
