@@ -5,9 +5,6 @@
 
 #include "doctest.h"
 
-#include <ggml_quant.h>
-#include <gguf.h>
-#include <kv_cache.h>
 #include <tensorlib.h>
 
 #include <algorithm>
