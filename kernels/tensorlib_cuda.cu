@@ -2335,23 +2335,46 @@ extern "C" __global__ void tl_dequant_f16_q80(const unsigned char* W, __half* ou
 // scales S[group][Mpad] as float2 (d, d * sum of the group's int8), so a tile's
 // scales for one group are contiguous (bank-free reads, 16-byte loads). Rows
 // from M to Mpad (a multiple of the tile) are zero.
+// A thread rounds 8 values (16 bytes of the f16 row), four threads a group of 32, so a
+// warp reads a whole super-block of a row at once.
 extern "C" __global__ void tl_quant_act_mmq(const __half* __restrict__ a, signed char* __restrict__ q,
                                             float2* __restrict__ S, unsigned M, unsigned Mpad,
                                             unsigned K) {
-  const unsigned lane = threadIdx.x & 31u, m = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
-  const unsigned g = blockIdx.y;
-  if (m >= Mpad) return;
-  const float x = m < M ? __half2float(a[(size_t)m * K + g * 32u + lane]) : 0.0f;
-  float amax = fabsf(x);
+  const unsigned t = blockIdx.x * blockDim.x + threadIdx.x, per_row = K / 8;
+  if (t >= Mpad * per_row) return;  // whole groups of 4 lanes: K % 256 == 0
+  const unsigned m = t / per_row, k0 = (t % per_row) * 8, g = k0 / 32;
+  float x[8];
+  if (m < M) {
+    const uint4 v = *reinterpret_cast<const uint4*>(a + (size_t)m * K + k0);
+    const __half2* h = reinterpret_cast<const __half2*>(&v);
 #pragma unroll
-  for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    for (int i = 0; i < 4; i++) {
+      const float2 f = __half22float2(h[i]);
+      x[2 * i] = f.x;
+      x[2 * i + 1] = f.y;
+    }
+  } else {
+#pragma unroll
+    for (int i = 0; i < 8; i++) x[i] = 0.0f;
+  }
+  float amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 8; i++) amax = fmaxf(amax, fabsf(x[i]));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
   const float d = amax / 127.0f;
-  const int qi = d == 0.0f ? 0 : __float2int_rn(x / d);
-  int sum = qi;
+  int sum = 0;
+  unsigned packed[2] = {0u, 0u};
 #pragma unroll
-  for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
-  q[(size_t)m * K + g * 32u + lane] = (signed char)qi;
-  if (lane == 0) S[(size_t)g * Mpad + m] = make_float2(d, d * (float)sum);
+  for (int i = 0; i < 8; i++) {
+    const int qi = d == 0.0f ? 0 : __float2int_rn(x[i] / d);
+    sum += qi;
+    packed[i / 4] |= (unsigned)(qi & 0xFF) << (8 * (i % 4));
+  }
+  sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+  sum += __shfl_xor_sync(0xffffffffu, sum, 2);
+  *reinterpret_cast<uint2*>(q + (size_t)m * K + k0) = make_uint2(packed[0], packed[1]);
+  if ((t & 3) == 0) S[(size_t)g * Mpad + m] = make_float2(d, d * (float)sum);
 }
 __device__ __forceinline__ void tc_mma_s8_(int* c, const unsigned* a, unsigned b0, unsigned b1) {
   asm volatile(

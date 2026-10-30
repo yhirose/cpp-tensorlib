@@ -1929,7 +1929,9 @@ inline bool own::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::s
     if (!scr || !quant || !gemm) return false;
     void* ps = reinterpret_cast<void*>(scr);
     void* pq = reinterpret_cast<char*>(ps) + scales;
-    if (!c.launch_(quant, {mpad / 8, uK / 32}, {256}, 0, pa, pq, ps, uM, mpad, uK)) return false;
+    if (!c.launch_(quant, {(unsigned)(((size_t)mpad * (uK / 8) + 255) / 256)}, {256}, 0, pa, pq, ps, uM,
+                   mpad, uK))
+      return false;
     // A tile a block and one block an SM: a grid short of the SMs (a narrow projection,
     // N ~ 1K) leaves some idle, so K is split into as many parts as still fit in one
     // wave (rounding down: a part past it would start a second, nearly empty wave), each
