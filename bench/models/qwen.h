@@ -604,7 +604,7 @@ struct Model {
                               // stays bf16 as the array-path oracle
   qmat qout;                  // the lm_head as block-quantized blocks (Model.quant); outwT is empty
   bool q8act = false;         // Q4_K GEMVs read the activation as int8 (dp4a); else float
-  bool mmq = false;           // prefill Q4_K / Q8_0 GEMMs on the int8 tensor cores (opt-in: TL_MMQ=1)
+  bool mmq = false;           // prefill Q4_K / Q8_0 GEMMs on the int8 tensor cores (TL_NO_MMQ: f16)
   bool quant = false;         // the projections are block-quantized blocks, read as such
   std::vector<Layer> layers;
   Scratch scratch;
@@ -980,7 +980,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
           q4lm ? load_w_T(m, c.output_name(), c.NE, c.VOCAB, f32).to_q4() : array{},
       .qout = nat ? load_q_cat(m, {{c.output_name(), c.VOCAB}}, c.NE) : qmat{},
       .q8act = nat && gpu::int8_activations && !std::getenv("TL_NO_Q8ACT"),
-      .mmq = nat && gpu::has_gemm_quant && std::getenv("TL_MMQ") != nullptr,
+      .mmq = nat && gpu::has_gemm_quant && !std::getenv("TL_NO_MMQ"),
       .quant = nat,
       .row = row,
       .q4_mlp = q4m,

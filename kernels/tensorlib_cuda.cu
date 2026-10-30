@@ -2382,8 +2382,9 @@ extern "C" __global__ void tl_dequant_f16_q80(const unsigned char* W, __half* ou
 // Nothing is dequantized to f16: each tile of the weight is unpacked to int8 (and its
 // group scales to f32) once, as it is staged, and both operands are then read with
 // ldmatrix by the same loop for every format. The price is the 8-bit rounding of the
-// activation (the decode's Q8 GEMV makes it too), and it is the only reason this is
-// not the default prefill GEMM.
+// activation, as llama.cpp's MMQ and the decode's Q8 GEMV round it; it is the default
+// prefill GEMM for these formats, and TL_NO_MMQ=1 takes the f16 path (the weight
+// dequantized to f16, the activation f16) instead.
 //
 // tl_quant_act_mmq lays the activation out for it: int8 [Mpad][K], and the
 // scales S[group][Mpad] as float2 (d, d * sum of the group's int8), so a tile's

@@ -59,22 +59,23 @@ chunk.
 
 A GGUF whose projections are Q4_K, Q6_K or Q8_0 blocks keeps them as blocks on
 the device (uploaded from the file's mapping, never through a host copy): the
-decode GEMVs and the prefill GEMM's B staging dequantize as they read, as ggml
-does (bit for bit, checked over every quantized value of Qwen3.8-27B's file). The
-decode is bound by the bytes it reads, so this is what lets a 27B model's 17.7 GiB
-sit on a 24 GB card. Each row is one invocation of each engine (3 rounds), not
-alternated, so a few percent of noise is in the ratios.
+decode GEMVs read them as they lie, dequantizing as ggml does (bit for bit,
+checked over every quantized value of Qwen3.8-27B's file), and the prefill
+multiplies Q4_K and Q8_0 on the int8 tensor cores (MMQ, below). The decode is
+bound by the bytes it reads, so this is what lets a 27B model's 17.7 GiB sit on a
+24 GB card. The tg rows are one invocation of each engine (3 rounds), not
+alternated; the pp rows are the alternated runs of the MMQ table below.
 
 | model (GGUF) | test | tensorlib | llama.cpp | ratio |
 |---|---|---:|---:|---:|
 | Qwen3-0.6B Q4_K_M | tg128 | 519 | 528 | 0.98 |
-| | pp512 | 37,300 | 28,900 | 1.29 |
+| | pp512 | 41,400-41,500 | 32,000-32,500 | 1.27-1.30 |
 | Qwen3.5-0.8B Q4_K_M | tg128 | 500 | 439 | 1.14 |
-| | pp512 | 28,800 | 26,700 | 1.08 |
+| | pp512 | 32,600-33,200 | 26,700-28,600 | 1.14-1.24 |
 | Qwen3.5-0.8B Q8_0 | tg128 | 469 | 389 | 1.20 |
-| | pp512 | 26,300 | 28,300 | 0.93 |
+| | pp512 | 31,900-34,700 | 30,100-30,500 | 1.05-1.15 |
 | Qwen3.8-27B Q4_K_M | tg128 | 35.6 | 38.1 | 0.93 |
-| | pp512 | 1,150 | 1,660 | 0.69 |
+| | pp512 | 1,534-1,605 | 1,334-1,684 | ~1.0 |
 
 Qwen3.8-27B is a Qwen3.5 architecture: 64 layers, 48 of them Gated DeltaNet with
 16 q / k heads for 48 value heads (value head h reads key head h % 16, the order
@@ -88,39 +89,40 @@ the weights alone stream at ~850; on int8 it runs at ~750 and the 27B's decode
 goes from 24.9 to 35.6 tok/s. The price is the 8-bit rounding of the activation
 (`TL_NO_Q8ACT=1` turns it off; `check_quant` bounds both against the dequantized
 oracle). The Q8_0 and Q6_K GEMVs already ran at 700-850 GB/s on float activations
-and are unchanged. The prefill dequantizes each projection to f16 once per chunk
+and are unchanged. Without MMQ (`TL_NO_MMQ=1`, and for Q6_K always) the prefill
+dequantizes each projection to f16 once per chunk
 (a slab of rows at a time, ahead of the GEMM) rather than in the staging of every
 row block of the activation, which lets the GEMM stream plain f16: 23.7k to
 37.3k tok/s on Qwen3-0.6B Q4_K_M, with bit-identical results. On the 27B the
 f16 GEMM uses a 256x128 tile (BK 32, three `cp.async` stages, 16 warps) for these
 long-K shapes, 86 TFLOPS against 63 for the 128x128 tile, cuBLAS's ~95; the
 dequantization slab is 192 MB so that no projection is split into GEMMs too small
-to fill the GPU. The prefill is then 61% GEMM, 21% dequantization. llama.cpp's
-1,564 is more than an f16 GEMM can reach (the 27B's 26.6 TFLOP take 310 ms at 86
-TFLOPS): it multiplies the quantized weights on the int8 tensor cores (twice the
-f16 rate, and no dequantization pass), which is what is left of the 0.69 and what
-`TL_MMQ=1` below does.
+to fill the GPU. That prefill is then 61% GEMM, 21% dequantization, and reaches
+0.69 of llama.cpp: its pp512 is more than an f16 GEMM can reach (the 27B's 26.6
+TFLOP take 310 ms at 86 TFLOPS). llama.cpp multiplies the quantized weights on the
+int8 tensor cores instead (twice the f16 rate, and no dequantization pass).
 
-`TL_MMQ=1` multiplies the Q4_K and Q8_0 projections as llama.cpp's MMQ does: the
+So does the default prefill here, for Q4_K and Q8_0, as llama.cpp's MMQ does: the
 activation is rounded to int8 (a scale per 32 values) and multiplied with the
 weight's own integers on `mma.m16n8k32` s8, so nothing is dequantized and no f16
 copy of the weight is written and read back. As in llama.cpp's Ampere kernel, a
 128 x 128 tile of 8 warps unpacks the weight to int8 rows in shared memory once
 as it stages (the multiply loop is then the same for every format), K is split
 where the grid would leave SMs idle, and the fused gate|up projection writes
-silu(gate) * up in its epilogue. It is off by default because the activation's
-8 bits change the logits (a greedy reply departs from the default path's after a
-few hundred tokens; `check_cuda` holds the kernels to the int8-activation
-reference at 1e-7 and bounds the rounding's cost at 4e-3). At the shape
+silu(gate) * up in its epilogue. The price is the activation's 8 bits, as in
+llama.cpp: they change the logits (a greedy reply departs from the f16 path's
+after a few hundred tokens; `check_cuda` holds the kernels to the int8-activation
+reference at 1e-7 and bounds the rounding's cost at 4e-3), and `TL_NO_MMQ=1`
+takes the f16 path instead. At the shape
 llama.cpp's own perf test has (4096 x 14336, 512 tokens) its Q4_K and Q8_0 MMQ
 run at 83 TFLOPS, the activation's rounding included; these run at 83 and 85
 without it (it adds 4%). Alternated, pp512:
 
-| model (GGUF) | default | `TL_MMQ=1` | llama.cpp |
+| model (GGUF) | `TL_NO_MMQ=1` (f16) | MMQ (default) | llama.cpp |
 |---|---:|---:|---:|
-| Qwen3-0.6B Q4_K_M | 33.2-35.4k | 38.6-40.5k | 28.9k |
+| Qwen3-0.6B Q4_K_M | 36.2-36.6k | 41.4-41.5k | 32.0-32.5k |
 | Qwen3.5-0.8B Q4_K_M | 28.3-29.4k | 32.6-33.2k | 26.7-28.6k |
-| Qwen3.5-0.8B Q8_0 | 30.0-30.7k | 34.3-34.8k | 28.3k |
+| Qwen3.5-0.8B Q8_0 | 30.4-30.5k | 31.9-34.7k | 30.1-30.5k |
 | Qwen3.8-27B Q4_K_M | 1,105-1,199 | 1,534-1,605 | 1,334-1,684 (median ~1,585) |
 
 On the 27B a 64-token chunk goes from 314 to 605 tok/s, where the dequantization

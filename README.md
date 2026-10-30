@@ -356,7 +356,10 @@ Qwen2.5, Qwen3 and Qwen3.5, with or without 2048 tokens cached, and prefill
 is at parity at 512 tokens and up to 1.3x behind with 2048 cached (both sum the
 prefill's products in f16 by default):
 [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md) has the numbers,
-what differs between the two runs, and how to reproduce them.
+what differs between the two runs, and how to reproduce them. Quantized files
+prefill their Q4_K and Q8_0 projections on the int8 tensor cores, the activation
+rounded to 8 bits as llama.cpp's MMQ does (`TL_NO_MMQ=1` takes an f16 path
+instead), and are level with or ahead of llama.cpp there, Qwen3.8-27B included.
 
 Prefill is a different regime and was slower than decode for a long time,
 because the prompt was fed through the decode path one token at a time. Its

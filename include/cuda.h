@@ -968,7 +968,7 @@ struct own {
   // (the exact form). K % 256 == 0 (Q8_0: % 32), n even. mmq (with a16, Q4_K, or Q8_0 with
   // K % 256 == 0):
   // A is quantized to int8 and the product runs on the int8 tensor cores, nothing
-  // dequantized (tl_gemm_mmq_q4k, _q80): faster, and lossy by the activation's 8 bits.
+  // dequantized (tl_gemm_mmq_q4k, _q80): faster, and the activation rounded to 8 bits.
   static bool gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
                           int64_t n, int64_t k, int64_t ldc, bool mmq = false);
   // H16[m, ff] = silu(A16 . Wg^T) * (A16 . Wu^T) in f16, W the fused [Wg | Wu] (2 ff rows of
