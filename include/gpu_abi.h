@@ -29,56 +29,64 @@
 namespace tl {
 namespace gpu {
 
-// Kernel ids. The shared ops name the ones every backend may implement.
+// Kernel ids, by layer. Each list is the one place its ids are named; the
+// enum, the names and kop_layer() below are made from them.
+//   core  the array ops of numpy/cupy proper: every backend has a kernel
+//   nn    fused ops over plain tensors, the ones any network uses: optional,
+//         an op without a kernel takes its generic composition or the CPU
+//   llm   what keeps a decoder's state (the KV cache writes): optional
 // Metal's own kernels -- the GEMM tiles and the attention variants, neither
 // touched by another backend's dispatch -- are keyed privately in metal.h's
 // own `gtile` and `attn_op` instead, not here.
-enum class kop {
-  add, sub, mul, div, pow_, exp_, log_, sqrt_, sigmoid, relu, affine,
-  badd, bsub, bmul, bdiv, bpow,  // rank-2 broadcast binary (strided operands)
-  softmax, row_sum, row_max, pad, fold,
-  index_select, index_add, scatter_axis,
-  badd_nd, bsub_nd, bmul_nd, bdiv_nd, bpow_nd,  // N-D broadcast binary
-  where_nd, copy_nd,             // N-D select / clone()'s strided gather
-  gt_, lt_, ge_, le_, eq_, ne_,  // comparisons -- cmp_op maps onto these
-  tanh_, sin_, cos_,             // unary_ext_op maps onto these
-  clamp_, sum_to_, sum_to_blocked_,  // dedicated ops, mirroring cuda.h's own
-  concat_part_, rope_,           // ditto -- Tensor.concat / RoPE's own dispatch
-  pow_s_, gt_s_, lt_s_, ge_s_, le_s_, eq_s_, ne_s_,  // scalar_op maps onto these
-  layer_norm_,                                       // the fused layer norm
-  layer_norm_bwd_dx_, layer_norm_bwd_gb_, layer_norm_bwd_gb_fold_,  // its pullback
-  kv_append_, kv_append_f16_, kv_fill_, kv_fill_f16_,  // the KV cache's writes
-  argmax_, rmsnorm_, add_rmsnorm_, swiglu_, split_heads_, merge_heads_,  // decode's rest
-  gemv_f32_, gemv_bf16_, gemv_q4_,   // decode GEMVs, per weight dtype
-  gemv_combine_,                     // their split-K partials
-  gemv_bf16_row_,                    // ... and the [N,K] weight layout's own
-  gemm_bf16_nt_, gemm_bf16_nt32_,    // the prefill's bf16 GEMM, per M tile
-  gather_axis_, row_logsumexp_, xent_bwd_, adam_step_,  // cross-entropy, Adam
-  ssm_conv_, gated_delta_  // Gated DeltaNet (Qwen3.5): its conv and its rule
-};
-inline constexpr size_t kKopCount = static_cast<size_t>(kop::gated_delta_) + 1;
+#define TL_KOPS_CORE(X)                                                        \
+  X(add) X(sub) X(mul) X(div) X(pow_) X(exp_) X(log_) X(sqrt_) X(sigmoid)      \
+  X(relu) X(affine)                                                            \
+  X(badd) X(bsub) X(bmul) X(bdiv) X(bpow) /* rank-2 broadcast (strided) */     \
+  X(row_sum) X(row_max) X(pad) X(fold)                                         \
+  X(index_select) X(index_add) X(scatter_axis)                                 \
+  X(badd_nd) X(bsub_nd) X(bmul_nd) X(bdiv_nd) X(bpow_nd) /* N-D broadcast */   \
+  X(where_nd) X(copy_nd) /* N-D select / clone()'s strided gather */           \
+  X(gt_) X(lt_) X(ge_) X(le_) X(eq_) X(ne_) /* cmp_op maps onto these */       \
+  X(tanh_) X(sin_) X(cos_)                  /* unary_ext_op maps onto these */ \
+  X(clamp_) X(sum_to_) X(sum_to_blocked_) X(concat_part_)                      \
+  X(pow_s_) X(gt_s_) X(lt_s_) X(ge_s_) X(le_s_) X(eq_s_) X(ne_s_) /* scalar */ \
+  X(argmax_) X(gather_axis_)
+#define TL_KOPS_NN(X)                                                          \
+  X(softmax) X(rope_) X(layer_norm_)                                           \
+  X(layer_norm_bwd_dx_) X(layer_norm_bwd_gb_) X(layer_norm_bwd_gb_fold_)       \
+  X(rmsnorm_) X(add_rmsnorm_) X(swiglu_) X(split_heads_) X(merge_heads_)       \
+  X(gemv_f32_) X(gemv_bf16_) X(gemv_q4_) /* decode GEMVs, per weight dtype */  \
+  X(gemv_combine_)   /* their split-K partials */                              \
+  X(gemv_bf16_row_)  /* ... and the [N,K] weight layout's own */               \
+  X(gemm_bf16_nt_) X(gemm_bf16_nt32_) /* bf16-weight GEMM, per M tile */       \
+  X(row_logsumexp_) X(xent_bwd_) X(adam_step_) /* cross-entropy, Adam */       \
+  X(ssm_conv_) X(gated_delta_) /* Gated DeltaNet: its conv and its rule */
+#define TL_KOPS_LLM(X)                                                         \
+  X(kv_append_) X(kv_append_f16_) X(kv_fill_) X(kv_fill_f16_) /* KV writes */
+
+#define TL_KOP_ID_(n) n,
+enum class kop { TL_KOPS_CORE(TL_KOP_ID_) TL_KOPS_NN(TL_KOP_ID_) TL_KOPS_LLM(TL_KOP_ID_) };
+#undef TL_KOP_ID_
+#define TL_KOP_ONE_(n) +1
+inline constexpr size_t kKopCoreCount = 0 TL_KOPS_CORE(TL_KOP_ONE_);
+inline constexpr size_t kKopNnCount = 0 TL_KOPS_NN(TL_KOP_ONE_);
+inline constexpr size_t kKopCount = kKopCoreCount + kKopNnCount + (0 TL_KOPS_LLM(TL_KOP_ONE_));
+#undef TL_KOP_ONE_
 
 // The ids' names, for what reports by kernel (the census, tl::profile).
+#define TL_KOP_NAME_(n) #n,
 inline constexpr const char* kKopNames[] = {
-    "add", "sub", "mul", "div", "pow_", "exp_", "log_", "sqrt_", "sigmoid",
-    "relu", "affine", "badd", "bsub", "bmul", "bdiv", "bpow", "softmax",
-    "row_sum", "row_max", "pad", "fold", "index_select", "index_add",
-    "scatter_axis",
-    "badd_nd", "bsub_nd", "bmul_nd", "bdiv_nd", "bpow_nd", "where_nd",
-    "copy_nd", "gt_", "lt_", "ge_", "le_", "eq_", "ne_", "tanh_", "sin_",
-    "cos_", "clamp_", "sum_to_", "sum_to_blocked_", "concat_part_", "rope_",
-    "pow_s_", "gt_s_", "lt_s_", "ge_s_", "le_s_", "eq_s_", "ne_s_",
-    "layer_norm_", "layer_norm_bwd_dx_", "layer_norm_bwd_gb_",
-    "layer_norm_bwd_gb_fold_", "kv_append_",
-    "kv_append_f16_", "kv_fill_", "kv_fill_f16_", "argmax_", "rmsnorm_",
-    "add_rmsnorm_", "swiglu_", "split_heads_", "merge_heads_", "gemv_f32_",
-    "gemv_bf16_", "gemv_q4_", "gemv_combine_", "gemv_bf16_row_",
-    "gemm_bf16_nt_", "gemm_bf16_nt32_", "gather_axis_", "row_logsumexp_",
-    "xent_bwd_", "adam_step_", "ssm_conv_", "gated_delta_",
-};
-static_assert(sizeof(kKopNames) / sizeof(kKopNames[0]) == kKopCount,
-              "kKopNames lists every kop, in order");
+    TL_KOPS_CORE(TL_KOP_NAME_) TL_KOPS_NN(TL_KOP_NAME_) TL_KOPS_LLM(TL_KOP_NAME_)};
+#undef TL_KOP_NAME_
 inline const char* kop_name(kop k) { return kKopNames[static_cast<size_t>(k)]; }
+
+enum class layer { core, nn, llm };
+inline constexpr layer kop_layer(kop k) {
+  const size_t i = static_cast<size_t>(k);
+  return i < kKopCoreCount ? layer::core
+         : i < kKopCoreCount + kKopNnCount ? layer::nn
+                                           : layer::llm;
+}
 
 // Comparisons (gt/lt/ge/le/eq/ne), the extra unaries and the tensor-scalar
 // ops are their own small vocabularies rather than kop values: each arrived
