@@ -230,7 +230,6 @@ inline const char* kernel_name_(kop op) {
     case kop::kv_fill_bf16_: return "tl_kv_fill_bf16";
     case kop::merge_heads_: return "tl_merge_heads";
     case kop::split_heads_: return "tl_split_heads";
-    case kop::argmax_: return "tl_argmax";
     default: return nullptr;  // no kernel here: dispatch declines
   }
 }
@@ -694,11 +693,18 @@ struct context {
                    : cached_(attn_split_dpos_fn, "tl_attn_decode_split_dpos");
   }
 
-  // GPU argmax (greedy last-mile): a persistent 4-byte device result buffer, so
-  // the per-token result is a 4-byte D2H, not the 608KB logits copy.
+  // GPU argmax (greedy last-mile, tl_argmax): a persistent device buffer, so the
+  // per-token result is a 4-byte D2H, not the 608KB logits copy. The index at 0,
+  // the count of finished blocks at 4 (zero between calls: the last block puts it
+  // back), then a (value, index) pair a block, argmax_blocks of each.
+  static constexpr unsigned argmax_blocks = 128, argmax_pairs_at = 16;
   CUdeviceptr argmax_res = 0;
+  CUfunction argmax_fn = nullptr;
   CUdeviceptr argmax_res_() {
-    if (!argmax_res && d.MemAlloc(&argmax_res, 16) != 0) argmax_res = 0;
+    if (!argmax_res) {
+      const size_t bytes = argmax_pairs_at + 8 * argmax_blocks;
+      if (d.MemAlloc(&argmax_res, bytes) != 0 || d.MemsetD8(argmax_res, 0, bytes) != 0) argmax_res = 0;
+    }
     return argmax_res;
   }
 
@@ -1236,20 +1242,22 @@ inline bool own::split_heads(gpu::span src, gpu::span bias, gpu::span dst,
                   gpu::policy::per_head(H, T, D));
 }
 
-// One int comes back through a 4-byte device buffer the context keeps; the
-// reduction carries a (value, index) pair per thread.
+// One int comes back through the device buffer the context keeps (argmax_res_);
+// a block of 256 threads for every 256 values, up to argmax_blocks.
 inline bool own::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
   auto& c = context::get();
-  if (!c.ready) return false;
+  if (!c.ready || n <= 0 || n > INT32_MAX) return false;
   CUdeviceptr res = c.argmax_res_();
-  if (!res) return false;
-  const uint32_t p = static_cast<uint32_t>(n);
-  const gpu::arg args[] = {gpu::in(a),
-                           gpu::out({reinterpret_cast<void*>(res), 0})};
-  const uint32_t block = 256;
-  if (!dispatch(kop::argmax_, args, 2, &p, sizeof(p),
-                {1, 1, 1, block, 1, 1,
-                 block * uint32_t(sizeof(float) + sizeof(int))})) {
+  CUfunction f = c.cached_(c.argmax_fn, "tl_argmax");
+  if (!res || !f) return false;
+  c.device_read_(a.buf);
+  const unsigned un = static_cast<unsigned>(n), threads = 256;
+  const unsigned blocks = std::min(context::argmax_blocks, (un + threads - 1) / threads);
+  char* r = reinterpret_cast<char*>(res);
+  float* pv = reinterpret_cast<float*>(r + context::argmax_pairs_at);
+  int* pi = reinterpret_cast<int*>(r + context::argmax_pairs_at + 4 * context::argmax_blocks);
+  if (!c.launch_(f, {blocks}, {threads}, 0, context::off_(a.buf, a.off), reinterpret_cast<int*>(r), un, pv, pi,
+                 reinterpret_cast<unsigned*>(r + 4))) {
     return false;
   }
   flush();  // the result index must be ready before the 4-byte D2H

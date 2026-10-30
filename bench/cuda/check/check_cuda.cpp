@@ -415,6 +415,55 @@ int main() {
     for (void* b : {o, z, w, f, h, zc, zn, r, rh}) release(b, 0, nullptr);
   }
 
+  // ---- argmax: the host loop's index (the largest value, the first one on ties; NaN
+  // never wins; nothing above -FLT_MAX gives 0), over lengths a block short of, at and
+  // past one block's 256 and a vocabulary's, with ties, NaN and -inf. Two vectors a
+  // case, one call after the other: the grid's finished-block count must be back at 0.
+  {
+    auto host_argmax = [](const float* v, int64_t n) {
+      float best = -3.402823466e+38f;
+      int64_t bi = 0;
+      for (int64_t i = 0; i < n; i++)
+        if (v[i] > best) best = v[i], bi = i;
+      return bi;
+    };
+    int64_t bad = 0, cases = 0;
+    bool launched = true;
+    for (const int64_t n : {1, 255, 257, 70000, 151936, 248320}) {
+      for (int pattern = 0; pattern < 6; pattern++) {
+        float* cv[2] = {nullptr, nullptr};
+        void* v[2] = {alloc(n * 4, &cv[0]), alloc(n * 4, &cv[1])};
+        for (int s = 0; s < 2; s++) {
+          float* x = cv[s];
+          for (int64_t i = 0; i < n; i++) x[i] = d(g) * 10.0f;
+          const int64_t r = (int64_t)(g() % (uint32_t)n);
+          if (pattern == 1) {  // the maximum several times, the first copy anywhere
+            for (int k = 0; k < 4; k++) x[(r + k * (n / 4 + 1)) % n] = 50.0f;
+          } else if (pattern == 2) {  // NaN everywhere around a finite maximum
+            for (int64_t i = 0; i < n; i += 3) x[i] = std::nanf("");
+            if (r - r % 3 + 1 < n) x[r - r % 3 + 1] = 60.0f;  // a slot the NaNs left
+          } else if (pattern == 3) {  // nothing above the floor
+            for (int64_t i = 0; i < n; i++) x[i] = -INFINITY;
+          } else if (pattern == 4) {
+            x[0] = 70.0f;
+          } else if (pattern == 5) {
+            x[n - 1] = 70.0f;
+          }
+        }
+        for (int s = 0; s < 2; s++) {
+          int64_t idx = -1;
+          launched = launched && tl::gpu::argmax({v[s], 0}, n, &idx);
+          bad += idx != host_argmax(cv[s], n);
+          cases++;
+        }
+        release(v[0], 0, nullptr);
+        release(v[1], 0, nullptr);
+      }
+    }
+    std::printf("  argmax: %lld of %lld calls disagree with the host loop\n", (long long)bad, (long long)cases);
+    check(launched && bad == 0, "argmax");
+  }
+
   std::printf(failures ? "CUDA cuda.h: FAILED\n" : "CUDA cuda.h: ALL OK\n");
   return failures ? 1 : 0;
 }

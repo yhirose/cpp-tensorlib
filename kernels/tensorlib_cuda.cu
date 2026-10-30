@@ -340,39 +340,73 @@ TL_ROW_REDUCE(tl_row_max, -3.402823466e+38f, (acc > v ? acc : v))
 
 // ---- argmax over a single length-n vector -> one int index (out[0]) ----
 // Greedy decoding's last mile: reduce logits[VOCAB] on-device so only a 4-byte
-// index crosses PCIe (vs the 608KB logits D2H the host argmax needed). One
-// block, grid-stride load, tree reduction carrying (value,index). Tie-break
-// matches the host `v[i] > v[bi]` loop exactly — the SMALLEST index wins on
-// ties — so greedy output stays bit-identical to the CPU reference.
-extern "C" __global__ void tl_argmax(const float* __restrict__ in, int* out,
-                                     unsigned n) {
-  extern __shared__ float smem[];
-  float* sval = smem;
-  int* sidx = reinterpret_cast<int*>(smem + blockDim.x);
-  unsigned t = threadIdx.x, T = blockDim.x;
-  float best = -3.402823466e+38f;
-  int besti = 0;
-  // Strict '>' so within a thread's stripe the first (smallest) index wins.
-  for (unsigned i = t; i < n; i += T) {
-    float v = in[i];
-    if (v > best) { best = v; besti = (int)i; }
+// index crosses PCIe (vs the 608KB logits D2H the host argmax needed). The
+// largest value wins and the SMALLEST index on ties, the host `v[i] > v[bi]`
+// loop's choice, so greedy output stays bit-identical to the CPU reference; NaN
+// never wins, and with nothing above -FLT_MAX the index is 0.
+// One launch over the GPU: each block reduces a grid-stride stripe to a (value,
+// index) pair in pv / pi, and the last block to finish (`done` counts them)
+// reduces the blocks' pairs, writes out[0] and puts the counter back to 0 for
+// the next call. One block alone took ~110 us over a 152k vocabulary, waiting on
+// one load at a time, every decode step; this takes ~9.
+__device__ __forceinline__ void argmax_take_(float& v, int& i, float ov, int oi) {
+  if (ov > v || (ov == v && oi < i)) {
+    v = ov;
+    i = oi;
   }
-  sval[t] = best;
-  sidx[t] = besti;
+}
+__device__ __forceinline__ void argmax_warp_(float& v, int& i) {
+#pragma unroll
+  for (int o = 16; o >= 1; o >>= 1)
+    argmax_take_(v, i, __shfl_xor_sync(0xffffffffu, v, o), __shfl_xor_sync(0xffffffffu, i, o));
+}
+// The block's pair, in thread 0 (blockDim.x a multiple of 32, at most 1024).
+__device__ __forceinline__ void argmax_block_(float& v, int& i) {
+  __shared__ float sv[32];
+  __shared__ int si[32];
+  const unsigned lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+  argmax_warp_(v, i);
+  if (lane == 0) sv[wid] = v, si[wid] = i;
   __syncthreads();
-  for (unsigned s = T >> 1; s > 0; s >>= 1) {
-    if (t < s) {
-      float ov = sval[t + s];
-      int oi = sidx[t + s];
-      // Take the other half if strictly greater, or equal with a smaller index.
-      if (ov > sval[t] || (ov == sval[t] && oi < sidx[t])) {
-        sval[t] = ov;
-        sidx[t] = oi;
-      }
-    }
-    __syncthreads();
+  if (wid == 0) {
+    const bool live = lane < (blockDim.x >> 5);
+    v = live ? sv[lane] : -3.402823466e+38f;
+    i = live ? si[lane] : 0x7fffffff;
+    argmax_warp_(v, i);
   }
-  if (t == 0) out[0] = sidx[0];
+}
+extern "C" __global__ void tl_argmax(const float* __restrict__ in, int* out, unsigned n,
+                                     float* pv, int* pi, unsigned* done) {
+  __shared__ bool last;
+  float v = -3.402823466e+38f;
+  int i = 0x7fffffff;  // no index yet: loses every tie
+  // Strict '>' within a thread's ascending stripe: its first maximum.
+  for (unsigned k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += gridDim.x * blockDim.x) {
+    const float x = in[k];
+    if (x > v) {
+      v = x;
+      i = (int)k;
+    }
+  }
+  argmax_block_(v, i);
+  if (threadIdx.x == 0) {
+    pv[blockIdx.x] = v;
+    pi[blockIdx.x] = i;
+    __threadfence();  // the pair is visible before the count says so
+    last = atomicAdd(done, 1u) == gridDim.x - 1;
+  }
+  __syncthreads();
+  if (!last) return;
+  __threadfence();
+  v = -3.402823466e+38f;
+  i = 0x7fffffff;
+  for (unsigned b = threadIdx.x; b < gridDim.x; b += blockDim.x)
+    argmax_take_(v, i, reinterpret_cast<volatile float*>(pv)[b], reinterpret_cast<volatile int*>(pi)[b]);
+  argmax_block_(v, i);
+  if (threadIdx.x == 0) {
+    out[0] = i == 0x7fffffff ? 0 : i;
+    *done = 0;
+  }
 }
 
 // ---- Row-wise fused RMSNorm / SwiGLU. One block per row (grid.x = rows), so
