@@ -21,7 +21,7 @@ flags=(-std=c++23 -O0 -w -DTENSORLIB_CUDA -I/tree/include -I"$build")
 # CUDA branch of the headers (a minute, against the full trace's two).
 if [ "${TL_CUDA_TRACE_CHECK:-0}" = 1 ]; then
   pids=()
-  for src in /tree/test/test_array.cpp /tree/bench/cuda/check/*.cpp \
+  for src in /tree/test/test_*.cpp /tree/bench/cuda/check/*.cpp \
              /tree/bench/cuda/speed/*.cpp /tree/bench/models/*.cpp; do
     grep -q '#include <cu' "$src" && continue  # needs the CUDA toolkit's headers
     g++ "${flags[@]}" -I/tree/bench/cuda -fsyntax-only "$src" & pids+=($!)
@@ -38,7 +38,7 @@ compile() {  # name, sources...
 }
 sweep=/tree/bench/cuda/check/trace_sweep.cpp
 pids=()
-compile tensorlib_test /tree/test/test_basic.cpp /tree/test/test_array.cpp & pids+=($!)
+compile tensorlib_test /tree/test/test_*.cpp & pids+=($!)
 compile check_cuda /tree/bench/cuda/check/check_cuda.cpp & pids+=($!)
 compile check_llm_decode /tree/bench/cuda/check/check_llm_decode.cpp & pids+=($!)
 compile check_attn64 /tree/bench/cuda/check/check_attn64.cpp & pids+=($!)
