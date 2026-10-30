@@ -810,7 +810,7 @@ struct context {
   CUdeviceptr mmq_scratch_(size_t bytes) {
     return grow_scratch_(mmq_scratch, mmq_scratch_bytes, bytes);
   }
-  CUfunction mmq_quant_fn = nullptr, mmq_fn[2] = {}, mmq_reduce_fn = nullptr;
+  CUfunction mmq_quant_fn = nullptr, mmq_fn[2][2] = {}, mmq_reduce_fn = nullptr;
   // The partial products of a split-K MMQ GEMM (tl_mmq_reduce sums them into C).
   CUdeviceptr mmq_part_scratch = 0;
   size_t mmq_part_scratch_bytes = 0;
@@ -821,10 +821,12 @@ struct context {
   // shared memory (TL_MMQ_SMEM in tensorlib_cuda.cu, change them together), raised on first
   // lookup.
   static constexpr unsigned mmq_tile = 128, mmq_threads = 256, mmq_smem = (128 + 128) * (272 + 64);
-  CUfunction mmq_(int type) {
-    CUfunction& slot = mmq_fn[type == 12 ? 0 : 1];
+  CUfunction mmq_(int type, bool glu) {
+    static const char* const names[2][2] = {{"tl_gemm_mmq_q4k", "tl_gemm_mmq_q80"},
+                                            {"tl_gemm_mmq_glu_q4k", "tl_gemm_mmq_glu_q80"}};
+    CUfunction& slot = mmq_fn[glu][type == 12 ? 0 : 1];
     if (!slot) {
-      slot = load_(type == 12 ? "tl_gemm_mmq_q4k" : "tl_gemm_mmq_q80");
+      slot = load_(names[glu][type == 12 ? 0 : 1]);
       if (slot && d.FuncSetAttribute)
         d.FuncSetAttribute(slot, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, static_cast<int>(mmq_smem));
     }
@@ -968,6 +970,11 @@ struct own {
   // dequantized (tl_gemm_mmq_q4k, _q80): faster, and lossy by the activation's 8 bits.
   static bool gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
                           int64_t n, int64_t k, int64_t ldc, bool mmq = false);
+  // H16[m, ff] = silu(A16 . Wg^T) * (A16 . Wu^T) in f16, W the fused [Wg | Wu] (2 ff rows of
+  // Q4_K or Q8_0, K % 256 == 0) on the int8 tensor cores, as gemm_quant(mmq) then
+  // swiglu_h16 would make it. False where it does not apply (the caller does those two).
+  static bool gemm_quant_glu(int type, gpu::span A16, gpu::span W, gpu::span H16, int64_t m,
+                             int64_t ff, int64_t k);
   // y[n] = W[n,K] . a over GGUF block-quantized rows (type: the ggml_type code, 12 Q4_K
   // 14 Q6_K or 8 Q8_0), the blocks read where they lie. K a whole number of blocks.
   static bool gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n, int64_t k);
@@ -1902,6 +1909,47 @@ inline bool own::gemm_bf16_nt_f16acc_a16(gpu::span a, gpu::span B, gpu::span out
   return f16acc_run_(context::tc_form::f16h, a, B, out, m, n, k);
 }
 
+// The MMQ GEMM (tl_gemm_mmq_*): A (f16, M x K) rounded to int8 into a scratch, then the
+// product with the Q4_K / Q8_0 rows at W into out (f32 C columns, or with glu f16
+// silu(gate) * up of a fused gate|up W, n the outputs). False where glu would need K
+// split (the caller then takes the unfused path).
+inline bool mmq_run_(context& c, int type, bool glu, void* pa, void* pw, void* out, unsigned uM,
+                     unsigned uN, unsigned uK, unsigned ldc) {
+  constexpr unsigned tile = context::mmq_tile;
+  // A tile a block and one block an SM: a grid short of the SMs (a narrow projection,
+  // N ~ 1K) leaves some idle, so K is split into as many parts as still fit in one
+  // wave (rounding down: a part past it would start a second, nearly empty wave), each
+  // at least two super-blocks. The parts' sums go through a scratch and are added in order.
+  const unsigned mpad = (uM + tile - 1) / tile * tile, nk = uK / 256;
+  const unsigned gx = glu ? (uN + tile / 2 - 1) / (tile / 2) : (uN + tile - 1) / tile, gy = mpad / tile;
+  constexpr unsigned sms = traits::fill_groups / 2;
+  const unsigned parts = std::max(1u, std::min(sms / (gx * gy), nk / 2));
+  if (glu && parts > 1) return false;
+  const unsigned kchunk = (nk + parts - 1) / parts;
+  const unsigned z = (nk + kchunk - 1) / kchunk;
+  const size_t scales = (size_t)(uK / 32) * mpad * 8;  // float2 (d, d * sum) a group and row
+  const CUdeviceptr scr = c.mmq_scratch_(scales + (size_t)mpad * uK);
+  CUfunction quant = c.cached_(c.mmq_quant_fn, "tl_quant_act_mmq");
+  CUfunction gemm = c.mmq_(type, glu);
+  if (!scr || !quant || !gemm) return false;
+  void* ps = reinterpret_cast<void*>(scr);
+  void* pq = reinterpret_cast<char*>(ps) + scales;
+  if (!c.launch_(quant, {(unsigned)(((size_t)mpad * (uK / 8) + 255) / 256)}, {256}, 0, pa, pq, ps, uM,
+                 mpad, uK))
+    return false;
+  if (z == 1)
+    return c.launch_(gemm, {gx, gy}, {context::mmq_threads}, context::mmq_smem, pq, ps, pw, out, uM, uN,
+                     uK, mpad, ldc, kchunk, 0u);
+  const unsigned stride = uM * uN;
+  const CUdeviceptr part = c.mmq_part_scratch_((size_t)z * stride * sizeof(float));
+  CUfunction reduce = c.cached_(c.mmq_reduce_fn, "tl_mmq_reduce");
+  if (!part || !reduce) return false;
+  float* pp = reinterpret_cast<float*>(part);
+  return c.launch_(gemm, {gx, gy, z}, {context::mmq_threads}, context::mmq_smem, pq, ps, pw, pp, uM, uN,
+                   uK, mpad, uN, kchunk, stride) &&
+         c.launch_(reduce, {(uM * (uN / 2) + 255) / 256}, {256}, 0, pp, out, uM, uN, ldc, z, stride);
+}
+
 inline bool own::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
                              int64_t n, int64_t k, int64_t ldc, bool mmq) {
   auto& c = context::get();
@@ -1918,42 +1966,8 @@ inline bool own::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::s
   c.device_rmw_(C.buf);  // a part writes some columns of a shared output
   const context::tc_weight qw = type == 12 ? context::tc_weight::q4k
                                 : type == 14 ? context::tc_weight::q6k : context::tc_weight::q80;
-  if (mmq && a16 && (type == 12 || type == 8) && k % 256 == 0) {
-    constexpr unsigned tile = context::mmq_tile;
-    const unsigned uM = (unsigned)m, uN = (unsigned)n, uK = (unsigned)k;
-    const unsigned mpad = (uM + tile - 1) / tile * tile;
-    const size_t scales = (size_t)(uK / 32) * mpad * 8;  // float2 (d, d * sum) a group and row
-    const CUdeviceptr scr = c.mmq_scratch_(scales + (size_t)mpad * uK);
-    CUfunction quant = c.cached_(c.mmq_quant_fn, "tl_quant_act_mmq");
-    CUfunction gemm = c.mmq_(type);
-    if (!scr || !quant || !gemm) return false;
-    void* ps = reinterpret_cast<void*>(scr);
-    void* pq = reinterpret_cast<char*>(ps) + scales;
-    if (!c.launch_(quant, {(unsigned)(((size_t)mpad * (uK / 8) + 255) / 256)}, {256}, 0, pa, pq, ps, uM,
-                   mpad, uK))
-      return false;
-    // A tile a block and one block an SM: a grid short of the SMs (a narrow projection,
-    // N ~ 1K) leaves some idle, so K is split into as many parts as still fit in one
-    // wave (rounding down: a part past it would start a second, nearly empty wave), each
-    // at least two super-blocks. The parts' sums go through a scratch and are added in order.
-    const unsigned gx = (uN + tile - 1) / tile, gy = mpad / tile, nk = uK / 256;
-    constexpr unsigned sms = traits::fill_groups / 2;
-    const unsigned parts = std::max(1u, std::min(sms / (gx * gy), nk / 2));
-    const unsigned kchunk = (nk + parts - 1) / parts;
-    const unsigned z = (nk + kchunk - 1) / kchunk;
-    if (z == 1)
-      return c.launch_(gemm, {gx, gy}, {context::mmq_threads}, context::mmq_smem, pq, ps, pw, pc, uM,
-                       uN, uK, mpad, (unsigned)ldc, kchunk, 0u);
-    const unsigned stride = uM * uN;
-    const CUdeviceptr part = c.mmq_part_scratch_((size_t)z * stride * sizeof(float));
-    CUfunction reduce = c.cached_(c.mmq_reduce_fn, "tl_mmq_reduce");
-    if (!part || !reduce) return false;
-    float* pp = reinterpret_cast<float*>(part);
-    return c.launch_(gemm, {gx, gy, z}, {context::mmq_threads}, context::mmq_smem, pq, ps, pw, pp, uM,
-                     uN, uK, mpad, uN, kchunk, stride) &&
-           c.launch_(reduce, {(uM * (uN / 2) + 255) / 256}, {256}, 0, pp, pc, uM, uN, (unsigned)ldc, z,
-                     stride);
-  }
+  if (mmq && a16 && (type == 12 || type == 8) && k % 256 == 0)
+    return mmq_run_(c, type, false, pa, pw, pc, (unsigned)m, (unsigned)n, (unsigned)k, (unsigned)ldc);
   if (!a16) {  // the exact form dequantizes in the GEMM's staging
     return gemm_tc_run_(c, context::tc_form::f32, pa, pw, pc, (unsigned)m, (unsigned)n, (unsigned)k,
                         (unsigned)ldc, qw);
@@ -1984,6 +1998,20 @@ inline bool own::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::s
       return false;
   }
   return true;
+}
+
+inline bool own::gemm_quant_glu(int type, gpu::span A16, gpu::span W, gpu::span H16, int64_t m,
+                                 int64_t ff, int64_t k) {
+  auto& c = context::get();
+  if (!c.ready || m <= 0 || ff <= 0 || ff % 2 || k % 256 || (type != 12 && type != 8)) return false;
+  void* pa = context::off_(A16.buf, A16.off);
+  void* pw = context::off_(W.buf, W.off);
+  void* ph = context::off_(H16.buf, H16.off);
+  if ((uintptr_t)pa % 16 || (uintptr_t)pw % 16 || (uintptr_t)ph % 4) return false;
+  c.device_read_(A16.buf);
+  c.device_read_(W.buf);
+  c.device_write_(H16.buf);
+  return mmq_run_(c, type, true, pa, pw, ph, (unsigned)m, (unsigned)ff, (unsigned)k, (unsigned)ff);
 }
 
 inline bool own::quantize_act_q8(gpu::span a, gpu::span qa, int64_t k) {

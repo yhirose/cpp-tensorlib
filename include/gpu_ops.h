@@ -1086,6 +1086,18 @@ inline bool gemm_quant(int type, bool a16, span A, span W, span C, int64_t m, in
   }
 }
 
+// silu(gate) * up of a fused gate|up block-quantized projection in one MMQ GEMM (see
+// own::gemm_quant_glu in cuda.h). False where the backend has none or it does not apply.
+TL_GPU_DETECT_OWN(gemm_quant_glu)
+template <class Own = own>
+inline bool gemm_quant_glu(int type, span A16, span W, span H16, int64_t m, int64_t ff, int64_t k) {
+  if constexpr (detail::owns_gemm_quant_glu<Own>::value) {
+    return detail::ran(Own::gemm_quant_glu(type, A16, W, H16, m, ff, k));
+  } else {
+    return false;
+  }
+}
+
 // The activation quantized to int8 blocks (see own::quantize_act_q8 in cuda.h) and
 // the Q4_K GEMV that reads it; false where the backend has no such pair.
 TL_GPU_DETECT_OWN(quantize_act_q8)

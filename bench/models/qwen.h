@@ -826,9 +826,16 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       gemm(ao, sp(P.at16), L.wo_row, L.qo, ro, c.NE, Q);
     }
     norm_res(ro, x, sp(L.fn), ro, sp(P.h2), sp(P.h216), false);
-    gemm(sp(P.h2), sp(P.h216), L.wgu, L.qgu, sp(P.gu), 2 * c.FF, c.NE);
-    if (a16) gpu::swiglu_h16(sp(P.gu), sp(P.mb16), c.FF, T);
-    else gpu::swiglu(sp(P.gu), sp(P.mb), c.FF, T);
+    // With MMQ, gate|up of one format is one GEMM whose epilogue is the swiglu.
+    const bool glu = M.mmq && a16 && L.qgu.parts.size() == 1 &&
+                     gpu::gemm_quant_glu(L.qgu.parts[0].type, sp(P.h216),
+                                         sp(L.qgu.raw).at(L.qgu.parts[0].byte_off), sp(P.mb16), T, c.FF,
+                                         c.NE);
+    if (!glu) {
+      gemm(sp(P.h2), sp(P.h216), L.wgu, L.qgu, sp(P.gu), 2 * c.FF, c.NE);
+      if (a16) gpu::swiglu_h16(sp(P.gu), sp(P.mb16), c.FF, T);
+      else gpu::swiglu(sp(P.gu), sp(P.mb), c.FF, T);
+    }
     gemm(sp(P.mb), sp(P.mb16), L.wd_row, L.qd, sp(P.md), c.NE, c.FF);
     const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
     norm_res(ro, sp(P.md), nextw, ro, sp(P.h), sp(P.h16), l + 1 == c.NL);  // the logits read the last

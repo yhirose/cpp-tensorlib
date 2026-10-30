@@ -325,6 +325,56 @@ int main() {
     release(o, 0, nullptr);
   }
 
+  // ---- the same GEMM over a fused gate|up weight with the swiglu in its epilogue ----
+  // (gemm_quant_glu): it must be bit for bit the plain MMQ GEMM followed by swiglu_h16's
+  // f16 rounding of silu(gate) * up. FF = 150 leaves a partial 64-output tile; K = 512
+  // keeps the grid unsplit (glu does not split K).
+  for (const int type : {12, 8}) {
+    const int64_t M = 200, FF = 150, N = 2 * FF, K = 512;
+    const size_t blk = type == 12 ? 144 : 34, rowb = (size_t)K / (type == 12 ? 256 : 32) * blk;
+    std::vector<uint8_t> W((size_t)N * rowb);
+    for (auto& v : W) v = (uint8_t)(g() >> 8);
+    for (size_t b = 0; b < W.size() / blk; b++) {
+      const uint16_t dh = to_half(0.002f + 0.001f * (float)(g() % 8)), mh = to_half(0.001f * (float)(g() % 8));
+      W[b * blk] = (uint8_t)dh;
+      W[b * blk + 1] = (uint8_t)(dh >> 8);
+      if (type == 12) {
+        W[b * blk + 2] = (uint8_t)mh;
+        W[b * blk + 3] = (uint8_t)(mh >> 8);
+      }
+    }
+    float* cw = nullptr;
+    float* ca = nullptr;
+    float* cc = nullptr;
+    float* ch = nullptr;
+    float* cr = nullptr;
+    void* w = alloc(W.size(), &cw);
+    void* a = alloc(M * K * 2, &ca);
+    void* o = alloc(M * N * 4, &cc);
+    void* h = alloc(M * FF * 2, &ch);
+    void* r = alloc(M * FF * 2, &cr);
+    std::memcpy(cw, W.data(), W.size());
+    uint16_t* ah = reinterpret_cast<uint16_t*>(ca);
+    for (int64_t i = 0; i < M * K; i++) ah[i] = to_half(d(g) * 2.0f);
+    const bool launched = tl::gpu::gemm_quant(type, true, {a, 0}, {w, 0}, {o, 0}, M, N, K, N, true) &&
+                          tl::gpu::swiglu_h16({o, 0}, {r, 0}, FF, M) &&
+                          tl::gpu::gemm_quant_glu(type, {a, 0}, {w, 0}, {h, 0}, M, FF, K);
+    sync_to_host(r, false);
+    sync_to_host(h, false);
+    const uint16_t* hh = reinterpret_cast<const uint16_t*>(ch);
+    const uint16_t* rr = reinterpret_cast<const uint16_t*>(cr);
+    int64_t mismatches = 0;
+    for (int64_t i = 0; i < M * FF; i++) mismatches += hh[i] != rr[i];
+    std::printf("  mmq %s glu: %lld of %lld outputs differ from gemm + swiglu\n", type == 12 ? "Q4_K" : "Q8_0",
+                (long long)mismatches, (long long)(M * FF));
+    check(launched && mismatches == 0, type == 12 ? "mmq Q4_K glu" : "mmq Q8_0 glu");
+    release(w, 0, nullptr);
+    release(a, 0, nullptr);
+    release(o, 0, nullptr);
+    release(h, 0, nullptr);
+    release(r, 0, nullptr);
+  }
+
   std::printf(failures ? "CUDA cuda.h: FAILED\n" : "CUDA cuda.h: ALL OK\n");
   return failures ? 1 : 0;
 }

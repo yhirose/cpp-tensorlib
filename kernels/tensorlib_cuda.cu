@@ -2392,16 +2392,21 @@ __device__ __forceinline__ void tc_mma_s8_(int* c, const unsigned* a, unsigned b
 // small to fill the GPU splits K over blockIdx.z, kchunk super-blocks a part, part z writing
 // its own copy of C zstride floats on (tl_mmq_reduce sums them, in order, so the result
 // does not depend on scheduling).
+//
+// GLU: W is a fused gate|up projection (rows [0, N) the gate, [N, 2N) the up) and the
+// output is silu(gate) * up in f16, [M][N] ldc apart, as tl_swiglu_h16 rounds it: a
+// block's 128 weight rows are the gate and up rows of the same 64 outputs, a warp's
+// 64 columns 32 of each, so a thread holds both halves of its outputs. Not split.
 #define TL_MMQ_BM 128
 #define TL_MMQ_BN 128
 #define TL_MMQ_THREADS 256
 #define TL_MMQ_LDK 272  // a staged row: 256 int8 + 16, so ldmatrix's 8 rows hit distinct banks
 #define TL_MMQ_SMEM ((TL_MMQ_BM + TL_MMQ_BN) * (TL_MMQ_LDK + 64))  // int8 rows and 8 float2 scales a row
-template <int WF>  // 1 Q4_K, 3 Q8_0
+template <int WF, bool GLU = false>  // WF: 1 Q4_K, 3 Q8_0
 __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq,
                                               const float2* __restrict__ As_g,
                                               const unsigned char* __restrict__ W,
-                                              float* __restrict__ C, unsigned M, unsigned N,
+                                              void* __restrict__ Cv, unsigned M, unsigned N,
                                               unsigned K, unsigned Mpad, unsigned ldc,
                                               unsigned kchunk, unsigned zstride) {
   constexpr int BM = TL_MMQ_BM, BN = TL_MMQ_BN, NT = TL_MMQ_THREADS, LDK = TL_MMQ_LDK;
@@ -2419,7 +2424,17 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
   const unsigned nk = K / 256;
   const size_t wrow = (size_t)nk * (WF == 1 ? 144 : 272);  // bytes a weight row
   const unsigned kt0 = blockIdx.z * kchunk, kt1 = min(nk, kt0 + kchunk);
-  C += (size_t)blockIdx.z * zstride;
+  float* C = static_cast<float*>(Cv) + (size_t)blockIdx.z * zstride;
+  // The weight row a tile row stages: the next 128, or (GLU) gate rows of 32 outputs then
+  // the same outputs' up rows, twice over 64 outputs.
+  auto wrow_of = [&](unsigned r) {
+    if constexpr (GLU) {
+      const unsigned o = min(blockIdx.x * (BN / 2) + (r / 64) * 32 + (r & 31), N - 1);
+      return (r & 32) ? o + N : o;
+    } else {
+      return min(col0 + r, N - 1);
+    }
+  };
   float acc[FM][FN][4];
 #pragma unroll
   for (int i = 0; i < FM; i++)
@@ -2443,7 +2458,7 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
     }
 #pragma unroll
     for (int v = 0; v < NB; v++) {
-      const unsigned id = tid + v * NT, r = id >> 3, c = id & 7, gn = min(col0 + r, N - 1);
+      const unsigned id = tid + v * NT, r = id >> 3, c = id & 7, gn = wrow_of(r);
       if constexpr (WF == 1) {  // chunk c of the nibbles; the header for group c's scales
         const unsigned char* b = W + gn * wrow + (size_t)kt * 144;
         rb[v] = *reinterpret_cast<const uint4*>(b + 16 + c * 16);
@@ -2546,25 +2561,48 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
     }
     __syncthreads();  // everyone is done with the stage before the next one overwrites it
   }
+  if constexpr (GLU) {  // columns j < FN / 2 the gate, j + FN / 2 the up of the same outputs
+    __half* H = static_cast<__half*>(Cv);
+    auto glu = [](float g, float u) { return (g / (1.0f + expf(-g))) * u; };
 #pragma unroll
-  for (int i = 0; i < FM; i++)
+    for (int i = 0; i < FM; i++)
 #pragma unroll
-    for (int j = 0; j < FN; j++) {
-      const unsigned gr = row0 + wm + 16 * i + g8, gc = col0 + wn + 8 * j + t2;
-      if (gc >= N) continue;
-      if (gr < M) *reinterpret_cast<float2*>(C + (size_t)gr * ldc + gc) = make_float2(acc[i][j][0], acc[i][j][1]);
-      if (gr + 8 < M) *reinterpret_cast<float2*>(C + (size_t)(gr + 8) * ldc + gc) = make_float2(acc[i][j][2], acc[i][j][3]);
-    }
+      for (int j = 0; j < FN / 2; j++) {
+        const unsigned gr = row0 + wm + 16 * i + g8;
+        const unsigned o = blockIdx.x * (BN / 2) + (wn / WN) * 32 + 8 * j + t2;
+        if (o >= N) continue;
+        const float* gt = acc[i][j];
+        const float* up = acc[i][j + FN / 2];
+        if (gr < M)
+          *reinterpret_cast<__half2*>(H + (size_t)gr * ldc + o) =
+              __floats2half2_rn(glu(gt[0], up[0]), glu(gt[1], up[1]));
+        if (gr + 8 < M)
+          *reinterpret_cast<__half2*>(H + (size_t)(gr + 8) * ldc + o) =
+              __floats2half2_rn(glu(gt[2], up[2]), glu(gt[3], up[3]));
+      }
+  } else {
+#pragma unroll
+    for (int i = 0; i < FM; i++)
+#pragma unroll
+      for (int j = 0; j < FN; j++) {
+        const unsigned gr = row0 + wm + 16 * i + g8, gc = col0 + wn + 8 * j + t2;
+        if (gc >= N) continue;
+        if (gr < M) *reinterpret_cast<float2*>(C + (size_t)gr * ldc + gc) = make_float2(acc[i][j][0], acc[i][j][1]);
+        if (gr + 8 < M) *reinterpret_cast<float2*>(C + (size_t)(gr + 8) * ldc + gc) = make_float2(acc[i][j][2], acc[i][j][3]);
+      }
+  }
 }
-#define TL_GEMM_MMQ(NAME, WF)                                                                   \
+#define TL_GEMM_MMQ(NAME, WF, GLU)                                                                   \
   extern "C" __global__ void __launch_bounds__(TL_MMQ_THREADS, 1)                              \
   NAME(const signed char* __restrict__ Aq, const float2* __restrict__ As_g,                    \
-       const unsigned char* __restrict__ W, float* __restrict__ C, unsigned M, unsigned N,     \
+       const unsigned char* __restrict__ W, void* __restrict__ C, unsigned M, unsigned N,      \
        unsigned K, unsigned Mpad, unsigned ldc, unsigned kchunk, unsigned zstride) {            \
-    gemm_mmq_core<WF>(Aq, As_g, W, C, M, N, K, Mpad, ldc, kchunk, zstride);                     \
+    gemm_mmq_core<WF, GLU>(Aq, As_g, W, C, M, N, K, Mpad, ldc, kchunk, zstride);                \
   }
-TL_GEMM_MMQ(tl_gemm_mmq_q4k, 1)
-TL_GEMM_MMQ(tl_gemm_mmq_q80, 3)
+TL_GEMM_MMQ(tl_gemm_mmq_q4k, 1, false)
+TL_GEMM_MMQ(tl_gemm_mmq_q80, 3, false)
+TL_GEMM_MMQ(tl_gemm_mmq_glu_q4k, 1, true)
+TL_GEMM_MMQ(tl_gemm_mmq_glu_q80, 3, true)
 #undef TL_GEMM_MMQ
 // C[M, N columns ldc apart] = the sum of z partial products, each M x N, stride apart.
 extern "C" __global__ void tl_mmq_reduce(const float* __restrict__ part, float* __restrict__ C,
