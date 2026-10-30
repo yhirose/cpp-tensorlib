@@ -3,6 +3,9 @@
 
 #include "test_util.h"
 
+#include <gguf.h>
+#include <kv_cache.h>
+
 // A BF16 tensor (ggml type 30, as BF16 GGUFs ship their weights) is read with
 // its size and bytes as the file has them. The smallest GGUF v3 that holds
 // one: no metadata, one 1-D tensor of four values, the data section aligned

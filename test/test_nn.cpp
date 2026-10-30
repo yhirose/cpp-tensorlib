@@ -5,6 +5,8 @@
 
 #include "test_util.h"
 
+#include <ggml_quant.h>
+
 TEST_CASE("softmax: own CPU rows across the pool match the ref oracle") {
   // rank 1, 2 and 3, a transposed (strided) view, and a shape big enough to
   // split across threads

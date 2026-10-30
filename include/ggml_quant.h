@@ -12,9 +12,42 @@
 #include <cstring>
 #include <limits>
 
-#include "gguf.h"
+#include <stdexcept>
+#include <string>
 
 namespace tl::gguf {
+
+// GGML tensor storage codes, verbatim from the file (subset we recognize).
+enum class ggml_type : uint32_t {
+  f32 = 0, f16 = 1, q4_0 = 2, q4_1 = 3, q5_0 = 6, q5_1 = 7, q8_0 = 8,
+  q8_1 = 9, q2_k = 10, q3_k = 11, q4_k = 12, q5_k = 13, q6_k = 14, q8_k = 15,
+  bf16 = 30,
+};
+
+// Per-type block geometry: how many elements one block packs and its byte
+// size. nbytes = n_elements / block_elems * block_bytes (f32/f16/bf16 are the
+// degenerate 1-element "block").
+inline void ggml_block(ggml_type t, uint64_t& elems, uint64_t& bytes) {
+  switch (t) {
+    case ggml_type::f32:  elems = 1;   bytes = 4;   return;
+    case ggml_type::f16:  elems = 1;   bytes = 2;   return;
+    case ggml_type::bf16: elems = 1;   bytes = 2;   return;
+    case ggml_type::q4_0: elems = 32;  bytes = 18;  return;
+    case ggml_type::q4_1: elems = 32;  bytes = 20;  return;
+    case ggml_type::q5_0: elems = 32;  bytes = 22;  return;
+    case ggml_type::q5_1: elems = 32;  bytes = 24;  return;
+    case ggml_type::q8_0: elems = 32;  bytes = 34;  return;
+    case ggml_type::q8_1: elems = 32;  bytes = 36;  return;
+    case ggml_type::q2_k: elems = 256; bytes = 84;  return;
+    case ggml_type::q3_k: elems = 256; bytes = 110; return;
+    case ggml_type::q4_k: elems = 256; bytes = 144; return;
+    case ggml_type::q5_k: elems = 256; bytes = 176; return;
+    case ggml_type::q6_k: elems = 256; bytes = 210; return;
+    case ggml_type::q8_k: elems = 256; bytes = 292; return;
+  }
+  throw std::runtime_error("gguf: unknown ggml type " +
+                           std::to_string(static_cast<uint32_t>(t)));
+}
 
 // half -> float, the exact conversion (subnormals included).
 inline float half_to_float(uint16_t h) {

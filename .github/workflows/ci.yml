@@ -46,6 +46,11 @@ jobs:
         run: cmake --build build --config Release --target tensorlib_test
       - name: Test (cpu / gpu / auto)
         run: ctest --test-dir build -C Release --output-on-failure -R '^(cpu|gpu|auto)$'
+      # The layers (include/gpu_abi.h): includes only go down a layer, and the
+      # GPU layer compiles with each upper layer left out.
+      - name: Layers
+        if: runner.os == 'Linux'
+        run: python3 tools/check_layers.py
 
   # Build verification for the CUDA toolchain. Hosted runners have no NVIDIA
   # driver, so the kernels are only compiled and linked. Running the tests here
@@ -83,6 +88,10 @@ jobs:
         run: cmake --build build --config Release
       - name: Test (CPU fallback — no driver on hosted runners)
         run: ctest --test-dir build -C Release --output-on-failure
+      # The CUDA kernels by layer: core alone, then core + nn, must compile.
+      - name: Layers (CUDA kernels)
+        if: runner.os == 'Linux'
+        run: python3 tools/check_layers.py --nvcc
 
   # WebGPU (wasm) backend. Unlike cuda-build this does not stop at building —
   # it runs the suite.
