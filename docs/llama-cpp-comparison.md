@@ -98,25 +98,34 @@ dequantization slab is 192 MB so that no projection is split into GEMMs too smal
 to fill the GPU. The prefill is then 61% GEMM, 21% dequantization. llama.cpp's
 1,564 is more than an f16 GEMM can reach (the 27B's 26.6 TFLOP take 310 ms at 86
 TFLOPS): it multiplies the quantized weights on the int8 tensor cores (twice the
-f16 rate, and no dequantization pass), which is what is left of the 0.69.
+f16 rate, and no dequantization pass), which is what is left of the 0.69 and what
+`TL_MMQ=1` below does.
 
-`TL_MMQ=1` does the same for the Q4_K projections (the MLP): the activation is
-rounded to int8 (a scale per 32 values) and multiplied with the Q4_K nibbles on
-`mma.m16n8k32` s8, as llama.cpp's MMQ does, so nothing is dequantized and no f16
-copy of the weight is written and read back. It is off by default because the
-activation's 8 bits change the logits (a greedy reply departs from the default
-path's after a few hundred tokens; `check_cuda` holds the kernel to the
-int8-activation reference at 1e-7 and bounds the rounding's cost at 4e-3).
-Alternated, pp512 with and without it:
+`TL_MMQ=1` multiplies the Q4_K and Q8_0 projections as llama.cpp's MMQ does: the
+activation is rounded to int8 (a scale per 32 values) and multiplied with the
+weight's own integers on `mma.m16n8k32` s8, so nothing is dequantized and no f16
+copy of the weight is written and read back. As in llama.cpp's Ampere kernel, a
+128 x 128 tile of 8 warps unpacks the weight to int8 rows in shared memory once
+as it stages (the multiply loop is then the same for every format), K is split
+where the grid would leave SMs idle, and the fused gate|up projection writes
+silu(gate) * up in its epilogue. It is off by default because the activation's
+8 bits change the logits (a greedy reply departs from the default path's after a
+few hundred tokens; `check_cuda` holds the kernels to the int8-activation
+reference at 1e-7 and bounds the rounding's cost at 4e-3). At the shape
+llama.cpp's own perf test has (4096 x 14336, 512 tokens) its Q4_K and Q8_0 MMQ
+run at 83 TFLOPS, the activation's rounding included; these run at 83 and 85
+without it (it adds 4%). Alternated, pp512:
 
-| model (GGUF) | default | `TL_MMQ=1` |
-|---|---:|---:|
-| Qwen3-0.6B Q4_K_M | 33.9-35.9k | 37.7-39.1k |
-| Qwen3.5-0.8B Q4_K_M | 27.8-28.2k | 29.9-30.0k |
-| Qwen3.8-27B Q4_K_M | 1,165-1,180 | 1,336-1,339 (llama.cpp 1,660) |
+| model (GGUF) | default | `TL_MMQ=1` | llama.cpp |
+|---|---:|---:|---:|
+| Qwen3-0.6B Q4_K_M | 33.2-35.4k | 38.6-40.5k | 28.9k |
+| Qwen3.5-0.8B Q4_K_M | 28.3-29.4k | 32.6-33.2k | 26.7-28.6k |
+| Qwen3.5-0.8B Q8_0 | 30.0-30.7k | 34.3-34.8k | 28.3k |
+| Qwen3.8-27B Q4_K_M | 1,105-1,199 | 1,534-1,605 | 1,334-1,684 (median ~1,585) |
 
 On the 27B a 64-token chunk goes from 314 to 605 tok/s, where the dequantization
-is most of the work.
+is most of the work. llama.cpp's 27B pp512 moves by a quarter between runs here,
+so the ratio there is level, not better or worse.
 
 ## Accumulation precision
 
