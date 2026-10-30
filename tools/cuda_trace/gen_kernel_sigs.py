@@ -70,7 +70,8 @@ def layout(name, params):
 def main():
     text = preprocess(sys.argv[1])
     rows = {}
-    for m in re.finditer(r"__global__\s+void\s+(\w+)\s*\(", text):
+    # A kernel may carry __launch_bounds__(...) between `void` and its name.
+    for m in re.finditer(r"__global__\s+void\s+(?:__launch_bounds__\s*\([^)]*\)\s*)?(\w+)\s*\(", text):
         rows[m.group(1)] = layout(m.group(1), params_of(text, m.end() - 1))
     if not rows:
         sys.exit("gen_kernel_sigs: no kernels found")
