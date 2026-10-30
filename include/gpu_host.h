@@ -503,6 +503,22 @@ inline bool dispatch(kop k, const gpu::arg* v, size_t /*n*/, const void* params,
 // form in gpu_ops.h that the conformance test expects of every backend. Each
 // is the definition of its op, as a loop.
 struct own {
+  // The argmax of a length-n vector, the smallest index on ties: the device
+  // kernels' scan (cuda's tl_argmax, metal's argmax_) as one loop.
+  static bool argmax(gpu::span a, int64_t n, int64_t* out_idx) {
+    const float* A = view<const float>(a);
+    float best = -3.402823466e+38f;
+    int64_t besti = 0;
+    for (int64_t i = 0; i < n; i++) {
+      if (A[i] > best) {
+        best = A[i];
+        besti = i;
+      }
+    }
+    *out_idx = besti;
+    gpu::launched("argmax");
+    return true;
+  }
   // C(m,n) = (A @ B) * scale + offset; a transposed operand is read in place.
   static bool gemm(gpu::span a, int64_t lda, bool ta, gpu::span b, int64_t ldb,
                    bool tb, gpu::span out, int64_t m, int64_t n, int64_t k,

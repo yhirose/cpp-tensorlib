@@ -782,6 +782,58 @@ fn index_select(@builtin(global_invocation_id) gid : vec3<u32>) {
   out2[gs.v.v2 + i] = in0[gs.v.v0 + src_row * gs.row_size + col];
 }
 
+// Views: src, idx -> out. Params: gpu_abi.h's gather_axis_params. The element
+// each position labels: out[i] = src[i * size + idx[i]] (cuda's tl_gather_axis).
+struct GatherAxisArgs { v : Views, size : u32, n : u32 };
+@group(0) @binding(3) var<uniform> gx : GatherAxisArgs;
+
+@compute @workgroup_size(256, 1, 1)
+fn gather_axis(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= gx.n) { return; }
+  out2[gx.v.v2 + i] = in0[gx.v.v0 + i * gx.size + u32(in1[gx.v.v1 + i] + 0.5)];
+}
+
+// Views: a -> out (one value). The argmax of a length-n vector in one
+// workgroup, the smallest index on ties: a strided scan per thread, then a
+// tree that takes the other side when it is greater, or equal with a smaller
+// index (cuda's tl_argmax, metal's argmax_). The index is written as an f32,
+// exact up to 2^24, which webgpu.h's own::argmax checks n against.
+struct ArgmaxArgs { v : Views, n : u32 };
+@group(0) @binding(2) var<uniform> am : ArgmaxArgs;
+var<workgroup> am_val : array<f32, 256>;
+var<workgroup> am_idx : array<u32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn argmax(@builtin(local_invocation_index) lid : u32) {
+  var best = -3.402823466e+38;
+  var besti = 0u;
+  for (var i = lid; i < am.n; i += 256u) {
+    let v = in0[am.v.v0 + i];
+    if (v > best) {
+      best = v;
+      besti = i;
+    }
+  }
+  am_val[lid] = best;
+  am_idx[lid] = besti;
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (lid < s) {
+      let ov = am_val[lid + s];
+      let oi = am_idx[lid + s];
+      if (ov > am_val[lid] || (ov == am_val[lid] && oi < am_idx[lid])) {
+        am_val[lid] = ov;
+        am_idx[lid] = oi;
+      }
+    }
+    workgroupBarrier();
+  }
+  if (lid == 0u) {
+    out1[am.v.v1] = f32(am_idx[0]);
+  }
+}
+
 // Views: idx, values -> out. Params: webgpu.h's index_add_params (n = the
 // output's element count, k = the source rows to scan).
 struct IndexAddArgs { v : Views, n : u32, row_size : u32, k : u32 };

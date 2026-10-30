@@ -128,6 +128,7 @@ inline kernel kernel_(kop k) {
     case kop::clamp_: return {"clamp_", -1};
     case kop::layer_norm_: return {"layer_norm", -1};
     case kop::index_select: return {"index_select", -1};
+    case kop::gather_axis_: return {"gather_axis", -1};
     default: return {};
   }
 }
@@ -160,7 +161,8 @@ inline constexpr const char* kEntryPoints[] = {
     "softmax",      "row_reduce",  "pad",          "fold",
     "index_select", "index_add",  "scatter_axis", "ew_bcast_nd",
     "where_nd",     "cmp",        "clamp_",       "sum_to",
-    "concat_part",  "rope",        "ew_scalar",    "layer_norm"};
+    "concat_part",  "rope",        "ew_scalar",    "layer_norm",
+    "gather_axis",  "argmax"};
 
 // emscripten_webgpu_get_device() does not report "no device" — it hands
 // Module.preinitializedWebGPUDevice straight to importJsDevice, which reads
@@ -459,6 +461,7 @@ inline bool available() { return context::get().ready; }
 // these exist (TL_GPU_DETECT_OWN) and answers false for the rest, so a backend
 // declares what it has and nothing else. Defined below, among their helpers.
 struct own {
+  static bool argmax(gpu::span a, int64_t n, int64_t* out_idx);
   static bool binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
                               gpu::span b, const int64_t* b_strides,
                               gpu::span out, const int64_t* out_shape, int rank,
@@ -913,6 +916,27 @@ inline bool own::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
       "rope", -1, {gpu::in(x), gpu::out(out)},
       detail_::rope_params{u32(n), u32(T), u32(D), u32(pos), u32(half), base},
       gpu::policy::flat(n));
+}
+
+// The argmax of a length-n vector (the WGSL argmax: one workgroup, the
+// smallest index on ties): one value comes back rather than the n floats the
+// generic composition reads. The index travels as an f32, exact up to 2^24.
+inline bool own::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
+  if (n <= 0 || n > (int64_t(1) << 24)) return false;
+  float* host = nullptr;
+  void* res = alloc(4, &host);
+  if (!res) return false;
+  struct {
+    uint32_t n;
+  } p{static_cast<uint32_t>(n)};
+  gpu::grid g;  // one workgroup
+  const bool ok = detail_::launch_own_("argmax", -1, {gpu::in(a), gpu::out({res, 0})}, p, g);
+  if (ok) {
+    sync_to_host(res, false);
+    *out_idx = static_cast<int64_t>(host[0]);
+  }
+  release(res, 4, host);
+  return ok;
 }
 
 // What a model may ask of this backend beyond the kernel contract (gpu.h),
