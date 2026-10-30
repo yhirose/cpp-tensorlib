@@ -604,7 +604,7 @@ struct Model {
                               // stays bf16 as the array-path oracle
   qmat qout;                  // the lm_head as block-quantized blocks (Model.quant); outwT is empty
   bool q8act = false;         // Q4_K GEMVs read the activation as int8 (dp4a); else float
-  bool mmq = false;           // prefill Q4_K GEMMs on the int8 tensor cores (opt-in: TL_MMQ=1)
+  bool mmq = false;           // prefill Q4_K / Q8_0 GEMMs on the int8 tensor cores (opt-in: TL_MMQ=1)
   bool quant = false;         // the projections are block-quantized blocks, read as such
   std::vector<Layer> layers;
   Scratch scratch;

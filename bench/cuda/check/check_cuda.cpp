@@ -56,6 +56,10 @@ static float q4k_value(const uint8_t* b, int k) {
   const uint8_t byte = b[16 + 32 * (g / 2) + (k % 32)];
   return d * sc * (float)((g & 1) ? byte >> 4 : byte & 15) - dmin * mn;
 }
+// One Q8_0 weight: a block is d (f16) then 32 int8.
+static float q80_value(const uint8_t* b, int k) {
+  return from_half((uint16_t)(b[0] | b[1] << 8)) * (float)(int8_t)b[2 + k];
+}
 
 static int failures = 0;
 static void check(bool ok, const char* what) {
@@ -239,21 +243,32 @@ int main() {
     release(o, 0, nullptr);
   }
 
-  // ---- the prefill GEMM over Q4_K weights on the int8 tensor cores (gemm_quant, mmq) ----
-  // Rows past the 64-row tile (M = 200), columns past the 128-column one (N = 300) and a
-  // wider output row (ldc), K two super-blocks. Two references: the exact product of the
+  // ---- the prefill GEMM over Q4_K and Q8_0 weights on the int8 tensor cores (gemm_quant, mmq) ----
+  // Rows past the 128-row tile (M = 200), columns past the 128-column one (N = 300) and a
+  // wider output row (ldc); K four super-blocks, which a grid this small splits in two
+  // (the partial products' reduction is checked with the rest). Two references: the exact product of the
   // dequantized weights with the activation rounded to int8 as the kernel does (the
   // kernel must reproduce it to f32 rounding), and the same with the activation as given
   // (what the rounding costs).
-  {
-    const int64_t M = 200, N = 300, K = 512, ldc = N + 8, nsb = K / 256;
-    std::vector<uint8_t> W((size_t)N * nsb * 144);
+  for (const int type : {12, 8}) {
+    const char* name = type == 12 ? "Q4_K" : "Q8_0";
+    const int64_t M = 200, N = 300, K = 1024, ldc = N + 8;
+    const size_t blk = type == 12 ? 144 : 34, rowb = (size_t)K / (type == 12 ? 256 : 32) * blk;
+    std::vector<uint8_t> W((size_t)N * rowb);
     for (auto& v : W) v = (uint8_t)(g() >> 8);
-    for (size_t b = 0; b < W.size() / 144; b++) {  // sane d and dmin
+    for (size_t b = 0; b < W.size() / blk; b++) {  // sane d (and dmin)
       const uint16_t dh = to_half(0.002f + 0.001f * (float)(g() % 8)), mh = to_half(0.001f * (float)(g() % 8));
-      W[b * 144] = (uint8_t)dh; W[b * 144 + 1] = (uint8_t)(dh >> 8);
-      W[b * 144 + 2] = (uint8_t)mh; W[b * 144 + 3] = (uint8_t)(mh >> 8);
+      W[b * blk] = (uint8_t)dh;
+      W[b * blk + 1] = (uint8_t)(dh >> 8);
+      if (type == 12) {
+        W[b * blk + 2] = (uint8_t)mh;
+        W[b * blk + 3] = (uint8_t)(mh >> 8);
+      }
     }
+    auto weight = [&](int64_t n, int64_t k) {
+      return type == 12 ? q4k_value(&W[(size_t)n * rowb + (size_t)(k / 256) * 144], (int)(k % 256))
+                        : q80_value(&W[(size_t)n * rowb + (size_t)(k / 32) * 34], (int)(k % 32));
+    };
     float* cw = nullptr;
     float* ca = nullptr;
     float* cc = nullptr;
@@ -270,12 +285,12 @@ int main() {
         x[m * K + k] = from_half(h);
       }
     std::fill(cc, cc + M * ldc, -777.0f);
-    const bool launched = tl::gpu::gemm_quant(12, true, {a, 0}, {w, 0}, {o, 0}, M, N, K, ldc, true);
+    const bool launched = tl::gpu::gemm_quant(type, true, {a, 0}, {w, 0}, {o, 0}, M, N, K, ldc, true);
     sync_to_host(o, false);
     double e_kernel = 0, e_round = 0, norm = 0;
     bool untouched = true;
     for (int64_t m = 0; m < M; m++) {
-      float xq[512];  // the activation rounded to int8 a group of 32 at a time
+      std::vector<float> xq(K);  // the activation rounded to int8 a group of 32 at a time
       for (int64_t gr = 0; gr < K / 32; gr++) {
         float amax = 0;
         for (int k = 0; k < 32; k++) amax = std::max(amax, std::fabs(x[m * K + gr * 32 + k]));
@@ -286,7 +301,7 @@ int main() {
       for (int64_t n = 0; n < N; n++) {
         double r_q = 0, r_x = 0;
         for (int64_t k = 0; k < K; k++) {
-          const double wv = q4k_value(&W[((size_t)n * nsb + k / 256) * 144], (int)(k % 256));
+          const double wv = weight(n, k);
           r_q += wv * xq[k];
           r_x += wv * x[m * K + k];
         }
@@ -296,11 +311,15 @@ int main() {
       }
       for (int64_t n = N; n < ldc; n++) untouched = untouched && cc[m * ldc + n] == -777.0f;
     }
-    std::printf("  mmq: kernel vs int8-activation reference rel L2 %.2e, the rounding's cost %.2e\n",
-                std::sqrt(e_kernel / norm), std::sqrt(e_round / norm));
-    check(launched && untouched, "mmq launch, ldc gap");
-    check(std::sqrt(e_kernel / norm) < 1e-5, "mmq vs int8 reference");
-    check(std::sqrt(e_round / norm) < 1e-2, "mmq activation rounding");
+    std::printf("  mmq %s: kernel vs int8-activation reference rel L2 %.2e, the rounding's cost %.2e\n",
+                name, std::sqrt(e_kernel / norm), std::sqrt(e_round / norm));
+    char what[64];
+    std::snprintf(what, sizeof what, "mmq %s launch, ldc gap", name);
+    check(launched && untouched, what);
+    std::snprintf(what, sizeof what, "mmq %s vs int8 ref", name);
+    check(std::sqrt(e_kernel / norm) < 1e-5, what);
+    std::snprintf(what, sizeof what, "mmq %s act rounding", name);
+    check(std::sqrt(e_round / norm) < 1e-2, what);
     release(w, 0, nullptr);
     release(a, 0, nullptr);
     release(o, 0, nullptr);

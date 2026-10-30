@@ -2317,19 +2317,23 @@ extern "C" __global__ void tl_dequant_f16_q80(const unsigned char* W, __half* ou
   dequant_f16_core<3>(W, out, rows, K);
 }
 
-// ---- The prefill GEMM over Q4_K weights on the int8 tensor cores (llama.cpp's MMQ).
-// C[M,N] = A[M,K] . W[N,K]^T with W kept as Q4_K blocks and A quantized to int8, a
-// scale d = max|a| / 127 per 32 values: a Q4_K block is 8 groups of 32 weights q in
-// 0..15 with value d_w sc q - dmin_w mn, so the group's dot with the activation is
-//   d_a (d_w sc sum q a  -  dmin_w mn sum a)
-// and sum q a is one m16n8k32 s8 mma. Nothing is dequantized: the nibbles are
-// unpacked from shared memory straight into the B fragment. The price is the 8-bit
-// rounding of the activation (the decode's Q8 GEMV makes it too), and it is the
-// only reason this is not the default prefill GEMM.
+// ---- The prefill GEMM over block-quantized weights on the int8 tensor cores (llama.cpp's MMQ).
+// C[M,N] = A[M,K] . W[N,K]^T with W kept as GGUF blocks and A quantized to int8, a
+// scale d_a = max|a| / 127 per 32 values. Every format here is int8-like a group of 32
+// weights at a time, w = d_w q - m_w, so the group's dot with the activation is
+//   d_a (d_w sum q a  -  m_w sum a)
+// and sum q a is one m16n8k32 s8 mma:
+//   Q4_K: q the nibbles 0..15, d_w = d sc and m_w = dmin mn of the group's 6-bit scales;
+//   Q8_0: q the int8s, d_w the block's d, m_w = 0.
+// Nothing is dequantized to f16: each tile of the weight is unpacked to int8 (and its
+// group scales to f32) once, as it is staged, and both operands are then read with
+// ldmatrix by the same loop for every format. The price is the 8-bit rounding of the
+// activation (the decode's Q8 GEMV makes it too), and it is the only reason this is
+// not the default prefill GEMM.
 //
 // tl_quant_act_mmq lays the activation out for it: int8 [Mpad][K], and the
 // scales S[group][Mpad] as float2 (d, d * sum of the group's int8), so a tile's
-// scales for one group are contiguous (bank-free reads, 16-byte copies). Rows
+// scales for one group are contiguous (bank-free reads, 16-byte loads). Rows
 // from M to Mpad (a multiple of the tile) are zero.
 extern "C" __global__ void tl_quant_act_mmq(const __half* __restrict__ a, signed char* __restrict__ q,
                                             float2* __restrict__ S, unsigned M, unsigned Mpad,
@@ -2356,34 +2360,43 @@ __device__ __forceinline__ void tc_mma_s8_(int* c, const unsigned* a, unsigned b
       : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0), "r"(0), "r"(0), "r"(0));
 }
-// A 64 x 128 tile, four warps of 32 x 64, one Q4_K super-block (256 of K) a step:
-// its raw 144-byte rows and the activation's int8 and scales are copied in, the
-// B scales (d sc, dmin mn a group) decoded to shared memory, and each of the 8
-// groups is an int8 mma whose int32 sums are scaled into f32 accumulators. One
-// stage of 47 KB so two blocks share an SM (that beat two stages of one block).
-// N is even; K % 256 == 0; the A side is padded to Mpad rows (a multiple of 64).
-#define TL_MMQ_BM 64
+// 128 activation rows x 128 weight rows a block, 8 warps of 32 x 64, one super-block (256
+// of K) a step, as llama.cpp's Ampere MMQ. The next step's activation, its scales and the
+// raw weight bytes are loaded into registers while this step multiplies; the step then
+// unpacks them into shared memory (one stage, 84 KB: one block an SM). Unpacking at the
+// stage rather than in the multiply loop does it once a block instead of once a warp.
+// N is even; K % 256 == 0; the A side is padded to Mpad rows (a multiple of 128). A grid too
+// small to fill the GPU splits K over blockIdx.z, kchunk super-blocks a part, part z writing
+// its own copy of C zstride floats on (tl_mmq_reduce sums them, in order, so the result
+// does not depend on scheduling).
+#define TL_MMQ_BM 128
 #define TL_MMQ_BN 128
-#define TL_MMQ_THREADS 128
-#define TL_MMQ_SMEM (TL_MMQ_BM * 272 + TL_MMQ_BM * 64 + TL_MMQ_BN * 144 + TL_MMQ_BN * 64)
-extern "C" __global__ void __launch_bounds__(TL_MMQ_THREADS, 2)
-tl_gemm_mmq_q4k(const signed char* __restrict__ Aq, const float2* __restrict__ As_g,
-                const unsigned char* __restrict__ W, float* __restrict__ C, unsigned M,
-                unsigned N, unsigned K, unsigned Mpad, unsigned ldc) {
-  constexpr int BM = TL_MMQ_BM, BN = TL_MMQ_BN, NT = TL_MMQ_THREADS, WM = 32, WN = 64;
-  constexpr int FM = WM / 16, FN = WN / 8;
-  constexpr int ALD = 256 + 16;  // padded int8 row: ldmatrix lanes hit distinct banks
-  constexpr int SZ_A = BM * ALD, SZ_AS = BM * 8 * 8, SZ_B = BN * 144;
-  __shared__ __align__(16) unsigned char sm[TL_MMQ_SMEM];
-  const signed char* a = reinterpret_cast<const signed char*>(sm);
-  const float2* ASs = reinterpret_cast<const float2*>(sm + SZ_A);          // [group][row]
-  const unsigned char* Braw = sm + SZ_A + SZ_AS;                           // [row][144]
-  float2* Bs = reinterpret_cast<float2*>(sm + SZ_A + SZ_AS + SZ_B);        // [group][col]
+#define TL_MMQ_THREADS 256
+#define TL_MMQ_LDK 272  // a staged row: 256 int8 + 16, so ldmatrix's 8 rows hit distinct banks
+#define TL_MMQ_SMEM ((TL_MMQ_BM + TL_MMQ_BN) * (TL_MMQ_LDK + 64))  // int8 rows and 8 float2 scales a row
+template <int WF>  // 1 Q4_K, 3 Q8_0
+__device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq,
+                                              const float2* __restrict__ As_g,
+                                              const unsigned char* __restrict__ W,
+                                              float* __restrict__ C, unsigned M, unsigned N,
+                                              unsigned K, unsigned Mpad, unsigned ldc,
+                                              unsigned kchunk, unsigned zstride) {
+  constexpr int BM = TL_MMQ_BM, BN = TL_MMQ_BN, NT = TL_MMQ_THREADS, LDK = TL_MMQ_LDK;
+  constexpr int WM = 32, WN = 64, FM = WM / 16, FN = WN / 8;
+  constexpr int NB = BN * 8 / NT;  // weight items a thread: (row, 16 B of nibbles) or (row, Q8_0 block)
+  static_assert((BM / WM) * (BN / WN) * 32 == NT, "a warp a 32 x 64 tile");
+  extern __shared__ __align__(16) unsigned char mmq_sm[];
+  signed char* As = reinterpret_cast<signed char*>(mmq_sm);                       // [BM][LDK]
+  float2* ASs = reinterpret_cast<float2*>(mmq_sm + BM * LDK);                     // [group][BM]
+  signed char* Bs = reinterpret_cast<signed char*>(mmq_sm + BM * LDK + BM * 64);  // [BN][LDK]
+  float2* BSs = reinterpret_cast<float2*>(mmq_sm + (BM + BN) * LDK + BM * 64);    // [group][BN]
   const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const unsigned wm = (warp / (BN / WN)) * WM, wn = (warp % (BN / WN)) * WN;
   const unsigned row0 = blockIdx.y * BM, col0 = blockIdx.x * BN;
   const unsigned nk = K / 256;
-  const size_t wrow = (size_t)nk * 144;
+  const size_t wrow = (size_t)nk * (WF == 1 ? 144 : 272);  // bytes a weight row
+  const unsigned kt0 = blockIdx.z * kchunk, kt1 = min(nk, kt0 + kchunk);
+  C += (size_t)blockIdx.z * zstride;
   float acc[FM][FN][4];
 #pragma unroll
   for (int i = 0; i < FM; i++)
@@ -2391,50 +2404,96 @@ tl_gemm_mmq_q4k(const signed char* __restrict__ Aq, const float2* __restrict__ A
     for (int j = 0; j < FN; j++)
 #pragma unroll
       for (int e = 0; e < 4; e++) acc[i][j][e] = 0.0f;
-  const unsigned la_r = lane & 15, la_c = (lane >> 4) * 16;
-  const unsigned g8 = lane >> 2, kq = lane & 3, t2 = (lane & 3) * 2;
-  for (unsigned kt = 0; kt < nk; kt++) {
-    __syncthreads();  // the previous step is done with the tile
-    for (int id = tid; id < BM * 16; id += NT) {  // A: 16 chunks of 16 B a row
-      const unsigned r = id >> 4, c = id & 15;
-      tc_cp16_(sm + r * ALD + c * 16, Aq + (size_t)(row0 + r) * K + kt * 256 + c * 16, true);
+  uint4 ra[BM * 16 / NT], rs[BM * 4 / NT];  // the activation's int8 rows and scales
+  uint4 rb[WF == 1 ? NB : 1], rh[WF == 1 ? NB : 1];  // Q4_K: 16 B of nibbles, the header
+  unsigned rw[WF == 3 ? NB : 1][9];                  // Q8_0: the 9 words a block lies in
+  auto fetch = [&](unsigned kt) {
+#pragma unroll
+    for (int v = 0; v < BM * 16 / NT; v++) {
+      const unsigned id = tid + v * NT, r = id >> 4, c = id & 15;
+      ra[v] = *reinterpret_cast<const uint4*>(Aq + (size_t)(row0 + r) * K + kt * 256 + c * 16);
     }
-    for (int id = tid; id < BM * 4; id += NT) {  // the scales, [group][row]: BM / 2 chunks a group
-      const unsigned g = id / (BM / 2), c = id % (BM / 2);
-      tc_cp16_(sm + SZ_A + g * BM * 8 + c * 16, As_g + (size_t)(kt * 8 + g) * Mpad + row0 + c * 2, true);
+#pragma unroll
+    for (int v = 0; v < BM * 4 / NT; v++) {
+      const unsigned id = tid + v * NT, g = id / (BM / 2), c = id % (BM / 2);
+      rs[v] = *reinterpret_cast<const uint4*>(As_g + (size_t)(kt * 8 + g) * Mpad + row0 + c * 2);
     }
-    for (int id = tid; id < BN * 9; id += NT) {  // B: 9 chunks of 16 B a row
-      const unsigned r = id / 9, c = id % 9, gn = min(col0 + r, N - 1);
-      tc_cp16_(sm + SZ_A + SZ_AS + r * 144 + c * 16, W + gn * wrow + (size_t)kt * 144 + c * 16, true);
+#pragma unroll
+    for (int v = 0; v < NB; v++) {
+      const unsigned id = tid + v * NT, r = id >> 3, c = id & 7, gn = min(col0 + r, N - 1);
+      if constexpr (WF == 1) {  // chunk c of the nibbles; the header for group c's scales
+        const unsigned char* b = W + gn * wrow + (size_t)kt * 144;
+        rb[v] = *reinterpret_cast<const uint4*>(b + 16 + c * 16);
+        rh[v] = *reinterpret_cast<const uint4*>(b);
+      } else {  // block c: rows are whole words and W 16-aligned, so an odd block starts 2 B into one
+        const unsigned* w = reinterpret_cast<const unsigned*>(W + gn * wrow + (size_t)(kt * 8 + c) * 34 - 2 * (c & 1));
+#pragma unroll
+        for (int i = 0; i < 9; i++) rw[v][i] = w[i];
+      }
     }
-    asm volatile("cp.async.commit_group;\n");
-    asm volatile("cp.async.wait_group 0;\n");
+  };
+  auto stage = [&]() {
+#pragma unroll
+    for (int v = 0; v < BM * 16 / NT; v++) {
+      const unsigned id = tid + v * NT, r = id >> 4, c = id & 15;
+      *reinterpret_cast<uint4*>(As + r * LDK + c * 16) = ra[v];
+    }
+#pragma unroll
+    for (int v = 0; v < BM * 4 / NT; v++) {
+      const unsigned id = tid + v * NT, g = id / (BM / 2), c = id % (BM / 2);
+      *reinterpret_cast<uint4*>(&ASs[g * BM + c * 2]) = rs[v];
+    }
+#pragma unroll
+    for (int v = 0; v < NB; v++) {
+      const unsigned id = tid + v * NT, r = id >> 3, c = id & 7;
+      if constexpr (WF == 1) {
+        // 16 bytes of pair c / 2: low nibbles are group 2 (c / 2), high the next one.
+        const unsigned p = c >> 1, h = c & 1;
+        const uint4 x = rb[v];
+        *reinterpret_cast<uint4*>(Bs + r * LDK + 64 * p + 16 * h) =
+            make_uint4(x.x & 0x0F0F0F0Fu, x.y & 0x0F0F0F0Fu, x.z & 0x0F0F0F0Fu, x.w & 0x0F0F0F0Fu);
+        *reinterpret_cast<uint4*>(Bs + r * LDK + 64 * p + 32 + 16 * h) =
+            make_uint4((x.x >> 4) & 0x0F0F0F0Fu, (x.y >> 4) & 0x0F0F0F0Fu, (x.z >> 4) & 0x0F0F0F0Fu,
+                       (x.w >> 4) & 0x0F0F0F0Fu);
+        // Group c's d sc and dmin mn, from d, dmin and the 12 bytes of 6-bit scales.
+        unsigned char hb[16];
+        memcpy(hb, &rh[v], 16);
+        const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(hb));
+        const unsigned char* q = hb + 4;
+        const unsigned sc = c < 4 ? (q[c] & 63) : ((q[c + 4] & 0xF) | ((q[c - 4] >> 6) << 4));
+        const unsigned mn = c < 4 ? (q[c + 4] & 63) : ((q[c + 4] >> 4) | ((q[c] >> 6) << 4));
+        BSs[c * BN + r] = make_float2(dd.x * (float)sc, dd.y * (float)mn);
+      } else {
+        const unsigned* w = rw[v];
+        const bool odd = c & 1;
+        const float d = __half2float(__ushort_as_half((unsigned short)(odd ? w[0] >> 16 : w[0] & 0xFFFFu)));
+        unsigned q[8];
+#pragma unroll
+        for (int i = 0; i < 8; i++) q[i] = odd ? w[i + 1] : __funnelshift_r(w[i], w[i + 1], 16);
+        *reinterpret_cast<uint4*>(Bs + r * LDK + c * 32) = make_uint4(q[0], q[1], q[2], q[3]);
+        *reinterpret_cast<uint4*>(Bs + r * LDK + c * 32 + 16) = make_uint4(q[4], q[5], q[6], q[7]);
+        BSs[c * BN + r] = make_float2(d, 0.0f);
+      }
+    }
+  };
+  const unsigned la_r = lane & 15, la_c = (lane >> 4) * 16;  // A: 16 rows x two 16-byte halves
+  const unsigned lb_r = (lane & 7) + ((lane >> 4) << 3), lb_c = ((lane >> 3) & 1) * 16;  // B: two n8 x two halves
+  const unsigned g8 = lane >> 2, t2 = (lane & 3) * 2;
+  fetch(kt0);
+  for (unsigned kt = kt0; kt < kt1; kt++) {
+    stage();
     __syncthreads();
-    for (int id = tid; id < BN * 8; id += NT) {  // d sc and dmin mn of every (column, group)
-      const unsigned r = id >> 3, g = id & 7;
-      const unsigned char* b = Braw + r * 144;
-      const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(b));
-      const unsigned char* q = b + 4;
-      const unsigned sc = g < 4 ? (q[g] & 63) : ((q[g + 4] & 0xF) | ((q[g - 4] >> 6) << 4));
-      const unsigned mn = g < 4 ? (q[g + 4] & 63) : ((q[g + 4] >> 4) | ((q[g] >> 6) << 4));
-      Bs[g * BN + r] = make_float2(dd.x * (float)sc, dd.y * (float)mn);
-    }
-    __syncthreads();
+    if (kt + 1 < kt1) fetch(kt + 1);  // in flight while this step multiplies
 #pragma unroll
     for (int g = 0; g < 8; g++) {
       unsigned fa[FM][4], fb[FN][2];
 #pragma unroll
       for (int i = 0; i < FM; i++)
-        tc_ldsm4_(fa[i][0], fa[i][1], fa[i][2], fa[i][3], a + (wm + 16 * i + la_r) * ALD + g * 32 + la_c);
+        tc_ldsm4_(fa[i][0], fa[i][1], fa[i][2], fa[i][3], As + (wm + 16 * i + la_r) * LDK + g * 32 + la_c);
 #pragma unroll
-      for (int j = 0; j < FN; j++) {  // the nibbles of group g: low for even, high for odd
-        const unsigned char* qs = Braw + (wn + 8 * j + g8) * 144 + 16 + 32 * (g >> 1) + kq * 4;
-        unsigned w0 = *reinterpret_cast<const unsigned*>(qs), w1 = *reinterpret_cast<const unsigned*>(qs + 16);
-        if (g & 1) { w0 >>= 4; w1 >>= 4; }
-        fb[j][0] = w0 & 0x0F0F0F0Fu;
-        fb[j][1] = w1 & 0x0F0F0F0Fu;
-      }
-      float2 as[FM][2];
+      for (int j = 0; j < FN; j += 2)
+        tc_ldsm4_(fb[j][0], fb[j][1], fb[j + 1][0], fb[j + 1][1], Bs + (wn + 8 * j + lb_r) * LDK + g * 32 + lb_c);
+      float2 as[FM][2];  // (d_a, d_a sum a) of rows g8 and g8 + 8
 #pragma unroll
       for (int i = 0; i < FM; i++) {
         as[i][0] = ASs[g * BM + wm + 16 * i + g8];
@@ -2442,20 +2501,27 @@ tl_gemm_mmq_q4k(const signed char* __restrict__ Aq, const float2* __restrict__ A
       }
 #pragma unroll
       for (int j = 0; j < FN; j++) {
-        const float4 bb = *reinterpret_cast<const float4*>(&Bs[g * BN + wn + 8 * j + t2]);
-        const float2 b0 = make_float2(bb.x, bb.y), b1 = make_float2(bb.z, bb.w);
+        // (d_w, m_w) of columns t2 and t2 + 1.
+        const float4 bs = *reinterpret_cast<const float4*>(&BSs[g * BN + wn + 8 * j + t2]);
 #pragma unroll
         for (int i = 0; i < FM; i++) {
           int c[4];
           tc_mma_s8_(c, fa[i], fb[j][0], fb[j][1]);
           // c0, c1: row g8, columns t2, t2 + 1; c2, c3: row g8 + 8.
-          acc[i][j][0] = fmaf(-as[i][0].y, b0.y, fmaf((float)c[0], as[i][0].x * b0.x, acc[i][j][0]));
-          acc[i][j][1] = fmaf(-as[i][0].y, b1.y, fmaf((float)c[1], as[i][0].x * b1.x, acc[i][j][1]));
-          acc[i][j][2] = fmaf(-as[i][1].y, b0.y, fmaf((float)c[2], as[i][1].x * b0.x, acc[i][j][2]));
-          acc[i][j][3] = fmaf(-as[i][1].y, b1.y, fmaf((float)c[3], as[i][1].x * b1.x, acc[i][j][3]));
+          acc[i][j][0] = fmaf((float)c[0], as[i][0].x * bs.x, acc[i][j][0]);
+          acc[i][j][1] = fmaf((float)c[1], as[i][0].x * bs.z, acc[i][j][1]);
+          acc[i][j][2] = fmaf((float)c[2], as[i][1].x * bs.x, acc[i][j][2]);
+          acc[i][j][3] = fmaf((float)c[3], as[i][1].x * bs.z, acc[i][j][3]);
+          if constexpr (WF == 1) {  // the min term
+            acc[i][j][0] = fmaf(-as[i][0].y, bs.y, acc[i][j][0]);
+            acc[i][j][1] = fmaf(-as[i][0].y, bs.w, acc[i][j][1]);
+            acc[i][j][2] = fmaf(-as[i][1].y, bs.y, acc[i][j][2]);
+            acc[i][j][3] = fmaf(-as[i][1].y, bs.w, acc[i][j][3]);
+          }
         }
       }
     }
+    __syncthreads();  // everyone is done with the stage before the next one overwrites it
   }
 #pragma unroll
   for (int i = 0; i < FM; i++)
@@ -2466,6 +2532,31 @@ tl_gemm_mmq_q4k(const signed char* __restrict__ Aq, const float2* __restrict__ A
       if (gr < M) *reinterpret_cast<float2*>(C + (size_t)gr * ldc + gc) = make_float2(acc[i][j][0], acc[i][j][1]);
       if (gr + 8 < M) *reinterpret_cast<float2*>(C + (size_t)(gr + 8) * ldc + gc) = make_float2(acc[i][j][2], acc[i][j][3]);
     }
+}
+#define TL_GEMM_MMQ(NAME, WF)                                                                   \
+  extern "C" __global__ void __launch_bounds__(TL_MMQ_THREADS, 1)                              \
+  NAME(const signed char* __restrict__ Aq, const float2* __restrict__ As_g,                    \
+       const unsigned char* __restrict__ W, float* __restrict__ C, unsigned M, unsigned N,     \
+       unsigned K, unsigned Mpad, unsigned ldc, unsigned kchunk, unsigned zstride) {            \
+    gemm_mmq_core<WF>(Aq, As_g, W, C, M, N, K, Mpad, ldc, kchunk, zstride);                     \
+  }
+TL_GEMM_MMQ(tl_gemm_mmq_q4k, 1)
+TL_GEMM_MMQ(tl_gemm_mmq_q80, 3)
+#undef TL_GEMM_MMQ
+// C[M, N columns ldc apart] = the sum of z partial products, each M x N, stride apart.
+extern "C" __global__ void tl_mmq_reduce(const float* __restrict__ part, float* __restrict__ C,
+                                         unsigned M, unsigned N, unsigned ldc, unsigned z,
+                                         unsigned stride) {
+  const unsigned i = blockIdx.x * blockDim.x + threadIdx.x, half = N / 2;
+  if (i >= M * half) return;
+  const unsigned r = i / half, c = (i % half) * 2;
+  float2 s = *reinterpret_cast<const float2*>(part + (size_t)r * N + c);
+  for (unsigned p = 1; p < z; p++) {
+    const float2 v = *reinterpret_cast<const float2*>(part + (size_t)p * stride + (size_t)r * N + c);
+    s.x += v.x;
+    s.y += v.y;
+  }
+  *reinterpret_cast<float2*>(C + (size_t)r * ldc + c) = s;
 }
 #undef TL_GEMM_TC
 extern "C" {  // reopen: the remaining kernels rely on the file-level C linkage

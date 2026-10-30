@@ -1073,7 +1073,7 @@ inline bool gemm_bf16_nt_f16acc(span A, span B, span C, int64_t M, int64_t N,
 }
 
 // The prefill's GEMM over block-quantized rows (see own::gemm_quant in cuda.h): C columns
-// [0, n) of rows ldc apart, A f16 (a16) or f32. mmq: Q4_K on the int8 tensor cores,
+// [0, n) of rows ldc apart, A f16 (a16) or f32. mmq: Q4_K and Q8_0 on the int8 tensor cores,
 // A rounded to 8 bits. False where the backend has none.
 TL_GPU_DETECT_OWN(gemm_quant)
 template <class Own = own>
