@@ -143,6 +143,12 @@ struct driver {
   CUresult (*EventSynchronize)(CUevent) = nullptr;
   CUresult (*EventElapsedTime)(float*, CUevent, CUevent) = nullptr;
   CUresult (*FuncSetAttribute)(CUfunction, int, int) = nullptr;
+  // A kernel's resources and the module's kernels, for check_cuda's look over all of
+  // them; optional (drivers from CUDA 12.4), nothing launches through them.
+  CUresult (*FuncGetAttribute)(int*, int, CUfunction) = nullptr;
+  CUresult (*FuncGetName)(const char**, CUfunction) = nullptr;
+  CUresult (*ModuleGetFunctionCount)(unsigned*, CUmodule) = nullptr;
+  CUresult (*ModuleEnumerateFunctions)(CUfunction*, unsigned, CUmodule) = nullptr;
 
   bool ok() const {
     return Init && DeviceGet && DevicePrimaryCtxRetain && CtxSetCurrent &&
@@ -415,6 +421,11 @@ struct context {
     d.EventElapsedTime =
         (CUresult(*)(float*, CUevent, CUevent))S("cuEventElapsedTime");
     d.FuncSetAttribute = (CUresult(*)(CUfunction, int, int))S("cuFuncSetAttribute");
+    d.FuncGetAttribute = (CUresult(*)(int*, int, CUfunction))S("cuFuncGetAttribute");
+    d.FuncGetName = (CUresult(*)(const char**, CUfunction))S("cuFuncGetName");
+    d.ModuleGetFunctionCount = (CUresult(*)(unsigned*, CUmodule))S("cuModuleGetFunctionCount");
+    d.ModuleEnumerateFunctions =
+        (CUresult(*)(CUfunction*, unsigned, CUmodule))S("cuModuleEnumerateFunctions");
     if (!d.ok()) return;
 
     if (d.Init(0) != 0) return;

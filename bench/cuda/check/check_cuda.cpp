@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace tl::cuda;
@@ -499,6 +500,38 @@ int main() {
     }
     std::printf("  argmax: %lld of %lld calls disagree with the host loop\n", (long long)bad, (long long)cases);
     check(launched && bad == 0, "argmax");
+  }
+
+  // ---- no kernel keeps an array in local memory, as the module was JIT-compiled here:
+  // indexing a byte copy of the Q4_K scales put it there and cost the decode GEMV a fifth
+  // of its speed. The kernels below still have a frame, each for the reason given; any
+  // other one fails this.
+  {
+    static const char* const allowed[] = {
+        "tl_ssm_conv", "tl_ssm_conv_state",       // the conv window, indexed by the runtime width
+        "tl_fold", "tl_sum_to", "tl_sum_to_blocked",  // per-axis shape and stride arrays
+    };
+    auto& cx = context::get();
+    unsigned count = 0;
+    if (!cx.d.FuncGetAttribute || !cx.d.FuncGetName || !cx.d.ModuleGetFunctionCount ||
+        !cx.d.ModuleEnumerateFunctions || cx.d.ModuleGetFunctionCount(&count, cx.mod) != 0) {
+      std::printf("  local memory: this driver cannot list a module's kernels, not checked\n");
+    } else {
+      std::vector<CUfunction> fns(count);
+      std::string framed;
+      bool listed = cx.d.ModuleEnumerateFunctions(fns.data(), count, cx.mod) == 0;
+      for (CUfunction f : fns) {
+        int bytes = 0;
+        const char* name = nullptr;
+        listed = listed && cx.d.FuncGetAttribute(&bytes, 3 /* LOCAL_SIZE_BYTES */, f) == 0 &&
+                 cx.d.FuncGetName(&name, f) == 0;
+        if (!listed || bytes == 0) continue;
+        if (std::none_of(std::begin(allowed), std::end(allowed), [&](const char* a) { return !std::strcmp(a, name); }))
+          framed += std::string(" ") + name + " (" + std::to_string(bytes) + " B)";
+      }
+      std::printf("  local memory: %u kernels, framed outside the list:%s\n", count, framed.empty() ? " none" : framed.c_str());
+      check(listed && framed.empty(), "no local memory");
+    }
   }
 
   std::printf(failures ? "CUDA cuda.h: FAILED\n" : "CUDA cuda.h: ALL OK\n");
