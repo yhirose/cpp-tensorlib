@@ -12,6 +12,7 @@ P = pointer, u = 4-byte integer, f = float. Anything else is an error: the
 launch contract is "a pointer or a 4-byte scalar", and a kernel that breaks it
 should fail here, loudly, not shift its arguments at run time.
 """
+import os
 import re
 import shutil
 import subprocess
@@ -20,10 +21,24 @@ import sys
 INT4 = {"unsigned", "int", "unsigned int", "uint32_t", "int32_t"}
 
 
+def inline_local(path, seen=()):
+    # The .cu reads its layers (#include "cuda_core.cuh" ...) from beside it:
+    # splice those in, so the kernels they define are in the table too.
+    out = []
+    for line in open(path).read().split("\n"):
+        m = re.match(r'^\s*#\s*include\s+"([^"]+)"', line)
+        inc = os.path.join(os.path.dirname(path), m.group(1)) if m else None
+        if inc and os.path.exists(inc) and inc not in seen:
+            out.append(inline_local(inc, seen + (inc,)))
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
 def preprocess(path):
-    src = open(path).read()
-    # The only #include is a CUDA header this host does not have; nothing in a
-    # signature needs it, and g++ stops preprocessing at a missing include.
+    src = inline_local(path)
+    # What is left are CUDA headers this host does not have; nothing in a
+    # signature needs them, and g++ stops preprocessing at a missing include.
     src = re.sub(r"^\s*#\s*include[^\n]*$", "", src, flags=re.M)
     cc = next((c for c in ("c++", "g++", "clang++") if shutil.which(c)), None)
     if not cc:
