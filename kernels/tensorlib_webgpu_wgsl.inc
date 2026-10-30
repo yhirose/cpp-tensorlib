@@ -209,6 +209,15 @@ fn binary_op(op : u32, av : f32, bv : f32) -> f32 {
   }
 }
 
+// tanh out of exp(-2|x|) rather than the builtin: WGSL leaves tanh's accuracy
+// to the platform, and D3D12 on NVIDIA gives ~1e-5 relative (6e-6 absolute on
+// [-1, 1]) where this form stays within ~1.2e-7. TF.js and ONNX Runtime's
+// WebGPU backends compute it the same way. Large |x| makes e 0, so +-1.
+fn tanh_exp(x : f32) -> f32 {
+  let e = exp(-2.0 * abs(x));
+  return sign(x) * (1.0 - e) / (1.0 + e);
+}
+
 fn unary_op(op : u32, v : f32) -> f32 {
   switch (op) {
     case 1u: { return log(v); }
@@ -216,7 +225,7 @@ fn unary_op(op : u32, v : f32) -> f32 {
     case 3u: { return 1.0 / (1.0 + exp(-v)); }
     case 4u: { return max(v, 0.0); }
     case 5u: { return v; }
-    case 6u: { return tanh(v); }
+    case 6u: { return tanh_exp(v); }
     case 7u: { return sin(v); }
     case 8u: { return cos(v); }
     default: { return exp(v); }
