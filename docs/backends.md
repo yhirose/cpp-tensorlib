@@ -2,9 +2,10 @@
 
 How the GPU layer is put together, how to add an op to it, and how to add a
 backend. The code is `include/gpu.h`, `gpu_abi.h`, `gpu_ops.h`, `gpu_null.h`
-and one header per backend (`metal.h`, `cuda.h`, `webgpu.h`, `gpu_host.h`).
+and one header per backend (`metal.h`, `cuda.h`, `webgpu.h`, `gpu_host.h`),
+each split by layer (core, nn, llm; see below).
 
-## Layers
+## The stack
 
 ```
 array.h / storage.h / kv_cache.h / models     name no backend; call tl::gpu
@@ -153,32 +154,63 @@ error, not a silent fallback.
 Prefer the single-kernel form. Reach for `own` when the kernels genuinely
 differ, not to avoid reordering a params struct.
 
-## Tiers
+## Layers: core, nn, llm
 
-The ops fall in two tiers. Tier 0 — elementwise, broadcast, reduction, GEMM,
-copy and index — closes the array surface: a backend with those kernels runs
-every graph. Tier 1 is the fused ops — the model path's `rmsnorm`, `swiglu`,
-the decode GEMV, the cache writes, `rope`, the attention, `split_heads` /
-`merge_heads`, `argmax`, Gated DeltaNet's `ssm_conv` and
-`gated_delta`, plus two training ops off that path, `xent_bwd` and
-`adam_step` — each a kernel a backend *may* have. Under each of them
-`gpu_ops.h` holds one generic composition out of tier 0 (`gpu::generic`), and
-the op
-takes it when the shared launch declines or `own` has no member: several
-launches and a scratch buffer or two where the kernel is one launch, so a
-backend that cares writes the kernel, and a backend that has only tier 0
-still runs the whole model path — and, for `adam_step`, still updates its
-state on the device rather than a host round trip. The compositions are f32:
-an operand the tier has no reader for — a bf16 cache or weight, int4 weights
-— still declines, and a model keeps to the array ops there
-(`caps::row_gemv`, `caps::bf16_gemm`). A composition names no backend and no
-array: spans, tier-0 ops, and the device core's `alloc` / `release` /
+The ops fall in three layers, and every file of the library, its kernels and
+its tests belongs to one of them:
+
+| layer | what | a backend | files |
+|-------|------|-----------|-------|
+| core | the array ops of numpy and cupy proper: elementwise, comparison, broadcast, reductions, argmax, the f32 GEMM, copy, index / gather / scatter, pad / fold, concat | has a kernel for each | `gpu_abi.h`, `gpu_ops.h`, `cuda.h`, `kernels/cuda_core.cuh`, `metal.h`, `metal_kernels.metal`, `array.h`, `test/test_array.cpp` |
+| nn | fused ops over plain tensors, the ones any network uses: softmax and logsumexp, layer norm and its pullback, `rmsnorm`, `swiglu`, RoPE, attention and its pullback, the GEMVs and GEMMs over bf16 / f16 / block-quantized weights, Gated DeltaNet, `xent_bwd`, `adam_step` | may have a kernel for each | `gpu_abi_nn.h`, `gpu_ops_nn.h`, `cuda_nn.h`, `kernels/cuda_nn.cuh`, `metal_nn.h`, `metal_kernels_nn.metal`, `array_nn.h`, `ggml_quant.h`, `test/test_nn.cpp` |
+| llm | what keeps a decoder's state: the KV cache's writes, the graph-capture forms that read the decode position from the device, the GGUF reader, the tokenizer, the cache | may have a kernel for each | `gpu_abi_llm.h`, `gpu_ops_llm.h`, `cuda_llm.h`, `kernels/cuda_llm.cuh`, `metal_kernels_llm.metal`, `kv_cache.h`, `gguf.h`, `tokenizer.h`, `test/test_llm.cpp` |
+
+The line between nn and llm is whether an op handles inference state, not
+whether it is fused: a norm or an attention over tensors serves any network;
+a write into a cache at the decode position serves a decoder. The kernel ids
+are named once, one list per layer (`TL_KOPS_CORE` / `_NN` / `_LLM` in
+`gpu_abi.h`), and `kop_layer(k)` says which.
+
+A layer builds only on the ones below it. The one way up is a binder, a file
+that joins the layers for its users at its end: `gpu.h` includes
+`gpu_ops.h`, then `gpu_ops_nn.h`, then `gpu_ops_llm.h`; `cuda.h` keeps the
+device core and `own_core`, includes `cuda_nn.h` and `cuda_llm.h` at its
+end, and joins them as `struct own : own_core, own_nn, own_llm`
+(`TL_GPU_DETECT_OWN` finds a member of any base); `metal.h` likewise, and
+`#embed`s the three MSL files in order into the one source it compiles;
+`tensorlib_cuda.cu` includes the three `.cuh` into one PTX; `array.h` keeps
+the declarations and the evaluator's dispatch and includes `array_nn.h` at
+its end. WebGPU and the host backend keep every layer in one file each.
+`tools/check_layers.py` holds this: an include that goes up anywhere but a
+listed binder fails, the GPU layer has to compile with the llm ops left out
+and with the nn ops too, and with `--nvcc` the CUDA kernels have to compile
+core alone and core + nn. CI runs it.
+
+Under each nn and llm op that a composition can express, `gpu_ops_nn.h` /
+`gpu_ops_llm.h` hold one generic composition out of the core ops
+(`gpu::generic`), and the op takes it when the shared launch declines or
+`own` has no member: several launches and a scratch buffer or two where the
+kernel is one launch, so a backend that cares writes the kernel, and a
+backend that has only the core layer still runs the whole f32 model path
+(and, for `adam_step`, still updates its state on the device rather than a
+host round trip). The compositions are f32: an operand the core layer has no
+reader for (an f16 cache, a bf16 or block-quantized weight) still
+declines, and a model keeps to the array ops there (`caps::row_gemv`,
+`caps::bf16_gemm`) or refuses the weights. A composition names no backend
+and no array: spans, core ops, and the device core's `alloc` / `release` /
 `cpu_barrier` / `sync_to_host`.
 
 Two tests hold the two routes together: the model-path test (and, for the two
 training ops off that path, their own eager tests) checks the op, however it
 ran, against the array oracle, and a second runs each composition beside the
 backend's kernel and requires the same numbers.
+
+What each backend covers: CUDA has kernels in all three layers; Metal in the
+core and nn layers (no block-quantized weights or head width 256 yet, no
+graph capture); WebGPU is general tensor computation (the core layer, plus
+the nn kernels that pay off in a browser: softmax, layer norm, RoPE) and
+leaves the llm layer to the compositions; the host backend states every id
+as a plain loop.
 
 ## Launch policy
 
@@ -230,13 +262,20 @@ which never reaches the evaluator, is profiled from its first kernel.
 
 ## Adding an op
 
-1. If every backend can run it as one kernel with the same buffers: add its
-   params struct to `gpu_abi.h`, the function to `gpu_ops.h`, the kernel to each
-   backend's source with that layout, and the id to each backend's kernel table
-   (`kernel_name_` in `metal.h` and `cuda.h`, `kernel_` in `webgpu.h`).
-2. Otherwise add the detecting wrapper to `gpu_ops.h` and the member to the
-   `own` struct of each backend that implements it.
-3. A backend that gets neither simply declines the op. Nothing else changes.
+1. Decide its layer (above), and keep to that layer's files: the id to its
+   list in `gpu_abi.h`, the params struct to `gpu_abi.h` / `gpu_abi_nn.h` /
+   `gpu_abi_llm.h`, the function to `gpu_ops.h` / `gpu_ops_nn.h` /
+   `gpu_ops_llm.h`, the kernels to that layer's `.cuh` and `.metal`.
+2. If every backend can run it as one kernel with the same buffers: add the
+   kernel with that layout to each backend's source and the id to each
+   backend's kernel table (`kernel_name_` in `metal.h` and `cuda.h`, `kernel_`
+   in `webgpu.h`).
+3. Otherwise add the detecting wrapper and the member to the layer's `own`
+   base of each backend that implements it (`own_core` / `own_nn` /
+   `own_llm`).
+4. An nn or llm op gets a composition of the core ops in `gpu::generic` where
+   one can express it. A backend that has neither kernel nor composition
+   declines the op. Nothing else changes.
 
 ## Adding a backend
 
@@ -246,10 +285,11 @@ which never reaches the evaluator, is profiled from its first kernel.
    `caps` and the graph-capture plumbing.
 2. Gate the header whole on the platform it builds for, and add one branch to
    the selection in `gpu.h`.
-3. Write `dispatch` against the kernel ABI, and kernels that follow it. Start
-   with the elementwise, broadcast, reduction, GEMM, copy and index families:
-   they close the array surface. Every op the backend has no kernel for falls
-   back to the CPU, so the suite passes from the first kernel on.
+3. Write `dispatch` against the kernel ABI, and kernels that follow it. Write
+   the core layer's first: it closes the array surface, and with it the nn and
+   llm layers run through their compositions. Every op the backend has no
+   kernel for falls back to the CPU, so the suite passes from the first kernel
+   on. Then add the nn and llm kernels that pay off on the device.
 4. Declare in `own` whatever the backend runs its own way.
 5. Run the suite in `--gpu` and `--auto` mode and check `gpu::census`: the
    suite's oracle comparisons pass whether or not the GPU engaged.
@@ -283,6 +323,7 @@ All of these run on a development Mac.
 | CUDA's host side | `tools/cuda_trace/compare.sh <base-ref>` |
 | no backend | a Linux build without `TENSORLIB_CUDA`: `gpu.h` selects `gpu_null.h` |
 | the shared layer, with no GPU | `cmake -B build-host -DTENSORLIB_HOST_GPU=ON`, then `ctest` |
+| the layers point down | `tools/check_layers.py` (`--nvcc` for the CUDA kernels too) |
 
 No machine here runs CUDA kernels, and CI compiles them without running them.
 `tools/cuda_trace` puts a stand-in `libcuda.so.1` in front of the backend (it
