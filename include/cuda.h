@@ -28,6 +28,7 @@
 #include <cstdint>
 
 #include "gpu_abi.h"  // the op vocabulary and the launch contract
+#include "gpu_abi_nn.h"
 #include "profile.h"  // tl::profile (per-launch attribution and timing)
 #include "shape.h"  // tl::contiguous_strides_into (pad/fold meta upload)
 #include "types.h"  // tl::dtype (KV cache storage width)

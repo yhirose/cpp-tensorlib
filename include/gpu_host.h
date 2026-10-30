@@ -27,6 +27,8 @@
 #include <vector>
 
 #include "gpu_abi.h"
+#include "gpu_abi_nn.h"
+#include "gpu_abi_llm.h"
 #include "profile.h"
 #include "types.h"  // bf16 <-> f32
 
