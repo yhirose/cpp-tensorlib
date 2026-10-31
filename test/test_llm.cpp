@@ -266,19 +266,24 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       tl::gpu::flush();
       CHECK(same(C, A.dot(Wt), 1e-4f));
       // A, then C, from a base off the tensor cores' vectors (and A off the
-      // SIMT tiles' float4s): refused, or computed as above.
+      // SIMT tiles' float4s), then W one bf16 off (off the 4 bytes any wider
+      // load needs): computed as above, never refused, since the prefill
+      // ignores the result and a refusal would leave its chunk unwritten.
       const std::vector<float> want = host_values(C);
-      array As = dev(with_lead(A, 1));
-      for (const bool shift_a : {true, false}) {
+      array As = dev(with_lead(A, 1)), Ws = dev(with_lead(W, 1).to_bf16());
+      for (const int shift : {0, 1, 2}) {  // A, C, W
         array Cs = dev(array::zeros({M * N + 1}));
+        static const char* what[] = {"prefill GEMM, A off 16 bytes", "prefill GEMM, C off 8 bytes",
+                                     "prefill GEMM, W off 4 bytes"};
         check_misaligned(
-            shift_a ? "prefill GEMM, A off 16 bytes" : "prefill GEMM, C off 8 bytes",
+            what[shift],
             [&] {
-              return gpu::gemm_bf16_nt(shift_a ? As.device_span().at(4) : A.device_span(),
-                                       Wb.device_span(), Cs.device_span().at(shift_a ? 0 : 4), M,
-                                       N, K);
+              return gpu::gemm_bf16_nt(shift == 0 ? As.device_span().at(4) : A.device_span(),
+                                       shift == 2 ? Ws.device_span().at(2) : Wb.device_span(),
+                                       Cs.device_span().at(shift == 1 ? 4 : 0), M, N, K);
             },
-            [&] { return host_close(after_lead(Cs, shift_a ? 0 : 1, M * N), want, 1e-4f); });
+            [&] { return host_close(after_lead(Cs, shift == 1 ? 1 : 0, M * N), want, 1e-4f); },
+            true);
       }
       // A product past one 64-row band, and K not a multiple of 8 (Metal's
       // vectorized STEEL loader takes whole 8-element vectors of W's rows,
