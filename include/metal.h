@@ -264,10 +264,10 @@ struct context {
     bound = name;
   }
 
-  // psos is one cache for all three: a kop's id is never negative, gtile's
-  // (gtile_key_) counts down from -1, attn_op's (attn_op_key_) from -101 --
-  // a gap wide enough that neither range reaches the other (the static_assert
-  // above checks it).
+  // psos is one cache for every family: a kop's id is never negative, gtile's
+  // (gtile_key_) counts down from -1, attn_op's (attn_op_key_) from -101,
+  // metal_nn.h's nn_kernel from -201 -- gaps wide enough that no range reaches
+  // the next (static_asserts here and in metal_nn.h check them).
   objc::id pso_id_(int id, const char* name) {
     auto it = psos.find(id);
     if (it != psos.end()) return it->second;
