@@ -268,6 +268,15 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
                                   k2));
         tl::gpu::flush();
         CHECK(same(C2, A2.dot(W2t), 1e-4f));
+        // The f16-sum form (below) past one band too (K = 76 isn't whole
+        // vectors: Metal declines it, and this is the f32 fallback). Its
+        // 136-term sums, up to 16 in size, round by up to about 0.06 in f16;
+        // a misplaced tile would be off by the products themselves.
+        array C2h = array::empty({M2, N2});
+        REQUIRE(gpu::gemm_bf16_nt_f16acc(A2.device_span(), W2b.device_span(), C2h.device_span(),
+                                         M2, N2, k2));
+        tl::gpu::flush();
+        CHECK(same(C2h, A2.dot(W2t), 0.25f));
       }
       // The f16-sum form: the same exact inputs (bf16 values sit inside f16),
       // so only the f16 sums' rounding is left. A backend without the form

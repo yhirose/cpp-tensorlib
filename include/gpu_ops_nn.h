@@ -608,9 +608,10 @@ inline bool gemm_bf16_nt(span A, span B, span C, int64_t M, int64_t N,
 
 // The same product summed in f16, for an inference prefill that takes the
 // trade: f16 sums run at twice the f32 rate on tensor cores that have them
-// (CUDA's gemm_bf16_nt_f16acc), at a small cost in precision and with f16's
-// range — an activation or partial sum past 65504 turns to inf, which the
-// caller must check for. A backend without the form sums in f32.
+// (CUDA's gemm_bf16_nt_f16acc), and somewhat faster where the two rates
+// match (Metal's), at a small cost in precision and with f16's range — an
+// activation or partial sum past 65504 turns to inf, which the caller must
+// check for. A backend without the form sums in f32.
 TL_GPU_DETECT_OWN(gemm_bf16_nt_f16acc)
 template <class Own = own>
 inline bool gemm_bf16_nt_f16acc(span A, span B, span C, int64_t M, int64_t N,

@@ -18,7 +18,7 @@ enum class nn_kernel {
   gemv_q4k, gemv_q6k, gemv_q80,
   gemm_q4k, gemm_q4k_32, gemm_q6k, gemm_q6k_32, gemm_q80, gemm_q80_32,
   rmsnorm_rope_64, rmsnorm_rope_128, rmsnorm_rope_256, gated_rmsnorm,
-  gemm_bf16_steel, gemm_bf16_steel_32,
+  gemm_bf16_steel, gemm_bf16_steel_32, gemm_bf16_f16acc, gemm_bf16_f16acc_32,
 };
 constexpr int nn_kernel_key_(nn_kernel t) { return -201 - static_cast<int>(t); }
 inline const char* nn_kernel_name_(nn_kernel t) {
@@ -38,6 +38,8 @@ inline const char* nn_kernel_name_(nn_kernel t) {
     case nn_kernel::gated_rmsnorm: return "gated_rmsnorm_";
     case nn_kernel::gemm_bf16_steel: return "gemm_bf16_steel_";
     case nn_kernel::gemm_bf16_steel_32: return "gemm_bf16_steel32_";
+    case nn_kernel::gemm_bf16_f16acc: return "gemm_bf16_f16acc_";
+    case nn_kernel::gemm_bf16_f16acc_32: return "gemm_bf16_f16acc32_";
   }
   return "";
 }
@@ -76,6 +78,8 @@ struct own_nn {
                                float scale);
   static bool gemm_bf16_nt(gpu::span A, gpu::span B, gpu::span C, int64_t M,
                            int64_t N, int64_t K);
+  static bool gemm_bf16_nt_f16acc(gpu::span A, gpu::span B, gpu::span C,
+                                  int64_t M, int64_t N, int64_t K);
   static bool gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y,
                          int64_t n, int64_t k);
   static bool gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
@@ -277,6 +281,10 @@ struct gemv_combine_params {
   uint32_t n, parts;
 };
 
+// A bf16 W the vectorized STEEL loader reads (SteelLoaderT's 16-byte runs of
+// eight): K whole runs, W on 16 bytes.
+inline bool bf16_rows_vec_(int64_t K, gpu::span W) { return K % 8 == 0 && W.off % 16 == 0; }
+
 // The quantized weights this backend reads natively: ggml type codes 12 Q4_K,
 // 14 Q6_K and 8 Q8_0, K a whole number of their blocks, and W aligned for the
 // kernels' loads (32-bit into a Q4_K block, 16-bit into the others).
@@ -409,11 +417,25 @@ inline bool own_nn::gemm_bf16_nt(gpu::span A, gpu::span B, gpu::span C, int64_t 
   auto& c = context::get();
   if (!c.device || M <= 0 || N <= 0 || K <= 0) return false;
   const detail_::steel_grid g = detail_::steel_grid_(M, N);
-  if (K % 8 == 0 && B.off % 16 == 0) {
+  if (detail_::bf16_rows_vec_(K, B)) {
     detail_::bind_(c, g.band32 ? nn_kernel::gemm_bf16_steel_32 : nn_kernel::gemm_bf16_steel);
   } else {
     c.bind_(g.band32 ? kop::gemm_bf16_nt32_ : kop::gemm_bf16_nt_);
   }
+  detail_::gemm_nt_launch_(c, g, A, B, C, M, N, K, N);
+  return true;
+}
+
+// The same summed in f16, cuda.h's contract: STEEL's body over half tiles,
+// for a W the vectorized loader reads (K % 8 == 0, on 16 bytes); otherwise
+// false, and the caller's f32 GEMM.
+inline bool own_nn::gemm_bf16_nt_f16acc(gpu::span A, gpu::span B, gpu::span C,
+                                        int64_t M, int64_t N, int64_t K) {
+  auto& c = context::get();
+  if (!c.device || M <= 0 || N <= 0 || K <= 0 || !detail_::bf16_rows_vec_(K, B))
+    return false;
+  const detail_::steel_grid g = detail_::steel_grid_(M, N);
+  detail_::bind_(c, g.band32 ? nn_kernel::gemm_bf16_f16acc_32 : nn_kernel::gemm_bf16_f16acc);
   detail_::gemm_nt_launch_(c, g, A, B, C, M, N, K, N);
   return true;
 }
