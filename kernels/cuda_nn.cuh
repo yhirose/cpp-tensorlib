@@ -378,6 +378,7 @@ __device__ __forceinline__ void mma3_tf32_(float* c, const unsigned* ah, const u
   mma_tf32_(c, ah, bl[0], bl[1]);
   mma_tf32_(c, ah, bh[0], bh[1]);
 }
+TL_ALIGN(tl_gated_delta_chunk_prep, 4, 4, 4, 4, 4, 8, 8)  // W, U by float2
 extern "C" __global__ void tl_gated_delta_chunk_prep(
     const float* __restrict__ qkv, const float* __restrict__ ab,
     const float* __restrict__ adt, float* __restrict__ Qn, float* __restrict__ Kn,
@@ -527,6 +528,7 @@ extern "C" __global__ void tl_gated_delta_chunk_prep(
 // four schedulers where R = 32 left one each (the scan took 260 us against 170
 // at T = 512). The tile is dynamic shared memory, TL_GDC_SCAN_SMEM bytes; the
 // launcher (own::gated_delta_chunked) must raise the limit and match R.
+TL_ALIGN(tl_gated_delta_chunk_scan, 16, 16, 16)  // Qn, Kn, W by float4
 extern "C" __global__ void tl_gated_delta_chunk_scan(
     const float* __restrict__ Qn, const float* __restrict__ Kn,
     const float* __restrict__ W, const float* __restrict__ U,
@@ -935,9 +937,9 @@ __global__ void tl_layer_norm_bwd_gb_fold(const float* partials, float* dg,
 // the friendliest layout for tiling.
 //
 // A and B tiles are staged transposed in shared memory so the inner loop reads
-// each operand as float4s. Requires K % 8 == 0 (every transformer dim; the
-// launcher checks) — so there is no K tail, only M/N edges, which the loads and
-// the epilogue predicate.
+// each operand as float4s. Any K and any operand alignment: the loads take
+// vectors where they can and predicate the K tail as they do the M/N edges
+// (the launcher sends the aligned, K % 8 == 0 case to the tensor cores).
 // The block tile is templated: 256 threads always, tile BM x BM, K-slab
 // BK = 1024/BM (so each thread stages exactly one 4-wide chunk of each operand),
 // microtile (BM/16) x (BM/16) held as G = BM/64 float4 GROUPS per axis, 64 apart.
@@ -997,17 +999,44 @@ __device__ __forceinline__ void gemm_bf16_nt_core(const float* __restrict__ A,
   float acc[G][4][G][4] = {};
   float4 pa;
   float2 p0, p1;
+  // A thread's 4 elements of each operand load as one vector (A a float4, B
+  // 8 bytes of bf16) where they lie whole on that width; otherwise one at a
+  // time, zero past k1. So any K and any operand alignment run, and the zeros
+  // a ragged last slab adds leave the sums as they were.
+  const bool vecA = K % 4 == 0 && (size_t)A % 16 == 0;
+  const bool vecB = K % 4 == 0 && (size_t)B % 8 == 0;
   // Stage the K slab at `kt` into registers (global -> reg), then into shared.
   auto load = [&](unsigned kt) {
-    pa = make_float4(0.f, 0.f, 0.f, 0.f);
-    if (gA < M) pa = *reinterpret_cast<const float4*>(&A[(size_t)gA * K + kt + ldK]);
-    p0 = make_float2(0.f, 0.f);
-    p1 = make_float2(0.f, 0.f);
-    if (gB < N) {
-      uint2 raw = *reinterpret_cast<const uint2*>(&B[(size_t)gB * K + kt + ldK]);
-      p0 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.x));
-      p1 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.y));
+    const unsigned k = kt + ldK;
+    const bool whole = k + 4 <= k1;
+    float a[4] = {}, b[4] = {};
+    if (gA < M) {
+      const float* src = &A[(size_t)gA * K + k];
+      if (vecA && whole) {
+        *reinterpret_cast<float4*>(a) = *reinterpret_cast<const float4*>(src);
+      } else {
+#pragma unroll
+        for (int e = 0; e < 4; e++)
+          if (k + e < k1) a[e] = src[e];
+      }
     }
+    if (gB < N) {
+      const __nv_bfloat16* src = &B[(size_t)gB * K + k];
+      if (vecB && whole) {
+        const uint2 raw = *reinterpret_cast<const uint2*>(src);
+        *reinterpret_cast<float2*>(b) =
+            __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(raw.x));
+        *reinterpret_cast<float2*>(b + 2) =
+            __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(raw.y));
+      } else {
+#pragma unroll
+        for (int e = 0; e < 4; e++)
+          if (k + e < k1) b[e] = __bfloat162float(src[e]);
+      }
+    }
+    pa = make_float4(a[0], a[1], a[2], a[3]);
+    p0 = make_float2(b[0], b[1]);
+    p1 = make_float2(b[2], b[3]);
   };
   auto store = [&]() {
     As[ldK + 0][ldRow] = pa.x;
@@ -1366,7 +1395,10 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
 // Three tiles, picked by how well the grid fills the GPU (gemm_tc_run_ in cuda.h):
 // L 128x128 for wide outputs, M 64x128 and S 64x64 for narrow ones. Dynamic
 // shared memory, (BM+BN)*(BK+8)*2 stages*2 bytes: 40/55/37 KB.
+// A and a bf16 / f16 B by 16-byte vectors, Q4_K's nibbles by 8, Q6_K's and Q8_0's
+// halves by 2; C by float2 stores.
 #define TL_GEMM_TC(NAME, BM, BN, BK, WM, WN, F16, AH, WF)                            \
+  TL_ALIGN(NAME, 16, (WF) == 1 ? 8 : (WF) == 2 || (WF) == 3 ? 2 : 16, 8)              \
   extern "C" __global__ void NAME(const void* __restrict__ A,                        \
       const void* __restrict__ B, float* __restrict__ C, unsigned M, unsigned N,     \
       unsigned K, unsigned ldc) {                                                    \
@@ -1485,6 +1517,7 @@ __device__ __forceinline__ void gemm_nt_tc_cp_core(const __half* __restrict__ A,
       if (gr + 8 < M) *reinterpret_cast<float2*>(C + (size_t)(gr + 8) * ldc + gc) = tc_pair_(acc[i][j], 1);
     }
 }
+TL_ALIGN(tl_gemm_tc_f16h_f16w_xl, 16, 16, 8)
 extern "C" __global__ void tl_gemm_tc_f16h_f16w_xl(const void* __restrict__ A,
     const void* __restrict__ B, float* __restrict__ C, unsigned M, unsigned N, unsigned K,
     unsigned ldc) {
@@ -1508,6 +1541,9 @@ __device__ __forceinline__ void dequant_f16_core(const unsigned char* __restrict
   const uint4 v = WF == 1 ? tc_dq8_q4k_<true>(r, gk) : WF == 2 ? tc_dq8_q6k_<true>(r, gk) : tc_dq8_q80_<true>(r, gk);
   *reinterpret_cast<uint4*>(out + (size_t)row * K + gk) = v;
 }
+TL_ALIGN(tl_dequant_f16_q4k, 8, 16)
+TL_ALIGN(tl_dequant_f16_q6k, 2, 16)
+TL_ALIGN(tl_dequant_f16_q80, 2, 16)
 extern "C" __global__ void tl_dequant_f16_q4k(const unsigned char* W, __half* out, unsigned rows, unsigned K) {
   dequant_f16_core<1>(W, out, rows, K);
 }
@@ -1539,6 +1575,7 @@ extern "C" __global__ void tl_dequant_f16_q80(const unsigned char* W, __half* ou
 // from M to Mpad (a multiple of the tile) are zero.
 // A thread rounds 8 values (16 bytes of the f16 row), four threads a group of 32, so a
 // warp reads a whole super-block of a row at once.
+TL_ALIGN(tl_quant_act_mmq, 16, 8, 8)
 extern "C" __global__ void tl_quant_act_mmq(const __half* __restrict__ a, signed char* __restrict__ q,
                                             float2* __restrict__ S, unsigned M, unsigned Mpad,
                                             unsigned K) {
@@ -1798,7 +1835,10 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
       }
   }
 }
+// The int8 rows and their scales by 16 bytes, Q4_K by uint4 and Q8_0 by words; C by
+// float2 (GLU: __half2).
 #define TL_GEMM_MMQ(NAME, WF, GLU)                                                                   \
+  TL_ALIGN(NAME, 16, 16, (WF) == 1 ? 16 : 4, (GLU) ? 4 : 8)                                   \
   extern "C" __global__ void __launch_bounds__(TL_MMQ_THREADS, 1)                              \
   NAME(const signed char* __restrict__ Aq, const float2* __restrict__ As_g,                    \
        const unsigned char* __restrict__ W, void* __restrict__ C, unsigned M, unsigned N,      \
@@ -1811,6 +1851,7 @@ TL_GEMM_MMQ(tl_gemm_mmq_glu_q4k, 1, true)
 TL_GEMM_MMQ(tl_gemm_mmq_glu_q80, 3, true)
 #undef TL_GEMM_MMQ
 // C[M, N columns ldc apart] = the sum of z partial products, each M x N, stride apart.
+TL_ALIGN(tl_mmq_reduce, 8, 8)
 extern "C" __global__ void tl_mmq_reduce(const float* __restrict__ part, float* __restrict__ C,
                                          unsigned M, unsigned N, unsigned ldc, unsigned z,
                                          unsigned stride) {
@@ -1869,7 +1910,8 @@ TL_GEMV_SPLITK(tl_gemv_bf16, __nv_bfloat16,
 // so each thread issues f32-width memory transactions instead of scalar 2-byte
 // loads — closes the bandwidth gap to the f32 kernel. Requires n % 8 == 0 (all
 // transformer dims are; the host gates on it and falls back to the scalar kernel
-// otherwise), which also guarantees the 16-byte alignment of every row's load.
+// otherwise), which keeps every row's load on 16 bytes when B's base is (TL_ALIGN).
+TL_ALIGN(tl_gemv_bf16v8, 4, 16)  // B: 8 bf16 a uint4
 __global__ void tl_gemv_bf16v8(const float* __restrict__ a,
                                const __nv_bfloat16* __restrict__ B,
                                float* __restrict__ y, unsigned n, unsigned k,
@@ -1947,6 +1989,7 @@ static __device__ __forceinline__ void gemv_row_block_store(
 // the pair's 32 (8 weights: 4 low nibbles of group 2*pair, 4 high of 2*pair+1)
 // and the 4 + 4 activations they multiply.
 // y_n = sum d*sc*q*a - dmin*m*a.
+TL_ALIGN(tl_gemv_q4k_row, 16, 4)  // a by float4; Q4_K by words
 __global__ void tl_gemv_q4k_row(const float* __restrict__ a, const unsigned char* __restrict__ W,
                                 float* __restrict__ y, unsigned N, unsigned K) {
   const unsigned n = blockIdx.x;
@@ -1985,6 +2028,7 @@ __global__ void tl_gemv_q4k_row(const float* __restrict__ a, const unsigned char
 // ~750 GB/s. The price is the rounding of the activation to 8 bits, as in
 // llama.cpp: ~0.5% relative error on a random matvec.
 // Layout of the quantized activation: K int8, then K/32 float2 (d, sum).
+TL_ALIGN(tl_quant_act_q8, 4, 1, 8)
 __global__ void tl_quant_act_q8(const float* __restrict__ a, signed char* __restrict__ qs,
                                 float2* __restrict__ ds, unsigned nblk) {
   const unsigned lane = threadIdx.x & 31u;
@@ -2006,6 +2050,7 @@ __global__ void tl_quant_act_q8(const float* __restrict__ a, signed char* __rest
 // bytes of its superblock (16 low-nibble weights of group 2*pair and 16 high of
 // group 2*pair+1, positions 16*half..) and the 16 + 16 int8 activations they meet.
 // The group's min term (dmin * m * sum of the group) is taken by the half-0 lane.
+TL_ALIGN(tl_gemv_q4k_q8_row, 16, 8, 16)
 __global__ void tl_gemv_q4k_q8_row(const signed char* __restrict__ qa, const float2* __restrict__ ds,
                                    const unsigned char* __restrict__ W, float* __restrict__ y,
                                    unsigned N, unsigned K) {
@@ -2048,6 +2093,7 @@ __global__ void tl_gemv_q4k_q8_row(const signed char* __restrict__ qa, const flo
 // Q8_0, 34 bytes a block of 32 (2-byte aligned only): a warp takes eight blocks
 // at a time, lane = 4 * which + j reading the 8 bytes 8j.. of its block and the
 // 8 activations they multiply. y_n = sum d * q * a.
+TL_ALIGN(tl_gemv_q80_row, 16, 2)  // a by float4; Q8_0 by halves
 __global__ void tl_gemv_q80_row(const float* __restrict__ a, const unsigned char* __restrict__ W,
                                 float* __restrict__ y, unsigned N, unsigned K) {
   const unsigned n = blockIdx.x;
@@ -2082,6 +2128,7 @@ __device__ __forceinline__ unsigned ld32_h(const unsigned char* p) {
   return (unsigned)*reinterpret_cast<const unsigned short*>(p) |
          ((unsigned)*reinterpret_cast<const unsigned short*>(p + 2) << 16);
 }
+TL_ALIGN(tl_gemv_q6k_row, 16, 2)  // a by float4; Q6_K by halves
 __global__ void tl_gemv_q6k_row(const float* __restrict__ a, const unsigned char* __restrict__ W,
                                 float* __restrict__ y, unsigned N, unsigned K) {
   const unsigned n = blockIdx.x;
@@ -2131,6 +2178,7 @@ __global__ void tl_gemv_q6k_row(const float* __restrict__ a, const unsigned char
 // get one block per SM instead of leaving most of the GPU idle. Requires
 // K % 8 == 0 (every transformer dim); the last partial block is handled by the
 // per-thread k0 < K guard (tail threads simply skip — no K % 256 requirement).
+TL_ALIGN(tl_gemv_bf16_row, 4, 16)  // B: 8 bf16 a uint4
 __global__ void tl_gemv_bf16_row(const float* __restrict__ a,
                                  const __nv_bfloat16* __restrict__ B,
                                  float* __restrict__ y, unsigned N, unsigned K) {
@@ -2598,7 +2646,9 @@ __device__ void attn_prefill_tiled_core(const float* __restrict__ q,
 // tl_attn_prefill_tiled_{f32,f16}_{64,128}, and f16 at 256 (QPT 1, 8-key tiles): the
 // exact prefill of an f16 cache at that width (an f32 one takes gpu::attn_prefill's
 // GEMM form there, as it always has).
+// K and V by four elements at once (f32: float4, f16: uint2).
 #define TL_ATTN_TILED(AD, QPT, KT, TN)                                                             \
+  TL_ALIGN(tl_attn_prefill_tiled_##TN##_##AD, 4, 4 * sizeof(KT), 4 * sizeof(KT))                \
   extern "C" __global__ void tl_attn_prefill_tiled_##TN##_##AD(                                    \
       const float* q, const KT* K, const KT* V, float* out, unsigned T, unsigned kv_stride,         \
       unsigned group, float scale, unsigned pos0) {                                                \
@@ -2940,7 +2990,10 @@ __device__ void attn_prefill_tc_core_smem(const float* __restrict__ q, const KT*
   }
 }
 // tl_attn_prefill_tc_{f32,f16}_{64,128,256}
+// q by float2 (D = 256: float4), K and V by four elements, out by float2.
 #define TL_ATTN_TC(AD, CORE, BK, KT, TN)                                                           \
+  TL_ALIGN(tl_attn_prefill_tc_##TN##_##AD, (AD) == 256 ? 16 : 8, 4 * sizeof(KT),            \
+           4 * sizeof(KT), 8)                                                               \
   extern "C" __global__ void tl_attn_prefill_tc_##TN##_##AD(                                       \
       const float* q, const KT* K, const KT* V, float* out, unsigned T, unsigned kv_stride,        \
       unsigned group, float scale, unsigned pos0) {                                                \
@@ -3124,6 +3177,8 @@ __device__ void attn_bwd_dq_core(const float* __restrict__ q,
     }
   }
 }
+TL_ALIGN(tl_attn_bwd_dq_f32, 4, 16, 16)  // K and V by float4
+TL_ALIGN(tl_attn_bwd_dq_f32_64, 4, 16, 16)
 extern "C" __global__ void tl_attn_bwd_dq_f32(const float* q, const float* K,
     const float* V, const float* dO, const float* O, float* dq, float* stats,
     unsigned T, float scale) {

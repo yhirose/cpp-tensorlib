@@ -26,8 +26,9 @@ struct own_nn {
   static bool quantize_act_q8(gpu::span a, gpu::span qa, int64_t k);
   static bool gemv_q4k_q8(gpu::span qa, gpu::span W, gpu::span y, int64_t n, int64_t k);
   // C[m, ldc-strided n columns] = A[m,K] . W[n,K]^T over GGUF block-quantized rows (type 12
-  // Q4_K, 14 Q6_K, 8 Q8_0). a16: A is f16 and the sums f16, else A is f32 and the sums f32
-  // (the exact form). K % 256 == 0 (Q8_0: % 32), n even. mmq (with a16, Q4_K, or Q8_0 with
+  // Q4_K, 14 Q6_K, 8 Q8_0). a16: A is f16 and the sums f16, else A f32, the operands
+  // rounded to bf16 and the sums f32 (the exact form: no f16 range to overflow). K % 256 == 0
+  // (Q8_0: % 32), n even. mmq (with a16, Q4_K, or Q8_0 with
   // K % 256 == 0):
   // A is quantized to int8 and the product runs on the int8 tensor cores, nothing
   // dequantized (tl_gemm_mmq_q4k, _q80): faster, and the activation rounded to 8 bits.
@@ -173,12 +174,14 @@ inline bool own_nn::gemv_bf16(gpu::span a, gpu::span B, gpu::span y, int64_t n,
   c.device_read_(a.buf);
   c.device_read_(B.buf);  // B reinterpreted as __nv_bfloat16* in-kernel
   c.device_write_(y.buf);
-  // Vectorized 8-cols/thread path when n%8==0 (all transformer dims) — 16-byte
-  // bf16 loads close the bandwidth gap to f32; scalar fallback otherwise.
-  bool v8 = (n % 8) == 0;
-  return gemv_run_(v8 ? c.gemv_bf16v8_() : c.gemv_bf16_(),
-                   context::off_(a.buf, a.off), context::off_(B.buf, B.off),
-                   context::off_(y.buf, y.off), static_cast<unsigned>(n),
+  // Vectorized 8-cols/thread path when n%8==0 (all transformer dims) and B fits
+  // its 16-byte loads — they close the bandwidth gap to f32; scalar otherwise.
+  float* pa = context::off_(a.buf, a.off);
+  float* pB = context::off_(B.buf, B.off);
+  CUfunction f = c.gemv_bf16v8_();
+  const bool v8 = n % 8 == 0 && c.fits_(f, pa, pB);
+  if (!v8) f = c.gemv_bf16_();
+  return gemv_run_(f, pa, pB, context::off_(y.buf, y.off), static_cast<unsigned>(n),
                    static_cast<unsigned>(k), v8 ? 8u : 1u);
 }
 
@@ -209,9 +212,12 @@ inline unsigned gemv_row_smem(unsigned block) {
 // there; the 64x128 doubles that and the 64x64 doubles it again. "Busy" is
 // two thirds of a block per SM (a third of fill_groups, which counts two):
 // the tiles share an SM two at a time, and the threshold was swept at M=512.
-inline bool gemm_tc_run_(context& c, context::tc_form form, void* pa, void* pB, float* po,
-                         unsigned m, unsigned n, unsigned k, unsigned ldc,
-                         context::tc_weight w = context::tc_weight::bf16) {
+struct tc_plan_ {
+  CUfunction f;
+  unsigned gx, gy, threads, smem;
+};
+inline tc_plan_ gemm_tc_plan_(context& c, context::tc_form form, unsigned m, unsigned n,
+                              unsigned k, context::tc_weight w = context::tc_weight::bf16) {
   using tile = context::tc_tile;
   constexpr int64_t busy = traits::fill_groups / 3;
   auto grid = [&](tile t) {
@@ -231,17 +237,25 @@ inline bool gemm_tc_run_(context& c, context::tc_form form, void* pa, void* pB, 
                  : blocks(tile::m) >= busy ? tile::m
                                            : tile::s;
   const auto sh = context::gemm_tc_shape(t);
-  return c.launch_(c.gemm_tc_(form, t, w), {grid(t).first, grid(t).second}, {sh.threads}, sh.smem(),
-                   pa, pB, po, m, n, k, ldc);
+  return {c.gemm_tc_(form, t, w), grid(t).first, grid(t).second, sh.threads, sh.smem()};
+}
+inline bool gemm_tc_launch_(context& c, const tc_plan_& p, void* pa, void* pB, float* po,
+                            unsigned m, unsigned n, unsigned k, unsigned ldc) {
+  return c.launch_(p.f, {p.gx, p.gy}, {p.threads}, p.smem, pa, pB, po, m, n, k, ldc);
+}
+inline bool gemm_tc_run_(context& c, context::tc_form form, void* pa, void* pB, float* po,
+                         unsigned m, unsigned n, unsigned k, unsigned ldc,
+                         context::tc_weight w = context::tc_weight::bf16) {
+  return gemm_tc_launch_(c, gemm_tc_plan_(c, form, m, n, k, w), pa, pB, po, m, n, k, ldc);
 }
 
 // M9 batched-prefill GEMM: C(M,N) = A(M,K) @ W[N,K]^T, W the same row-major
 // bf16 weight gemv_bf16_row consumes — so a batched prompt reuses the decode
-// weights as-is. Requires K % 8 == 0. See tl_gemm_bf16_nt.
+// weights as-is. Any K and alignment (see tl_gemm_bf16_nt).
 inline bool own_nn::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
                               int64_t m, int64_t n, int64_t k) {
   auto& c = context::get();
-  if (!c.ready || (k % 8) != 0 || m <= 0 || n <= 0) return false;
+  if (!c.ready || m <= 0 || n <= 0 || k <= 0) return false;
   c.device_read_(a.buf);
   c.device_read_(B.buf);  // B reinterpreted as __nv_bfloat16* [N][K] in-kernel
   c.device_write_(out.buf);
@@ -249,14 +263,18 @@ inline bool own_nn::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
   float* pB = context::off_(B.buf, B.off);
   float* po = context::off_(out.buf, out.off);
   unsigned uM = (unsigned)m, uN = (unsigned)n, uK = (unsigned)k;
-  // The tensor cores read 16-byte vectors of both operands, so their rows must
-  // start on 16 bytes (and N be even: a thread stores two columns at once).
-  const bool aligned = ((uintptr_t)pa % 16 == 0) && ((uintptr_t)pB % 16 == 0) && n % 2 == 0;
-  if (aligned) return gemm_tc_run_(c, context::tc_form::f32, pa, pB, po, uM, uN, uK, uN);
+  // The tensor cores read 16-byte vectors of both operands' rows (K % 8 == 0)
+  // and store two columns at once (N even), from bases their kernel declares;
+  // the rest runs on the SIMT tiles below. The plan is asked first, not the
+  // launch: a launch's false is also a driver failure, which no fallback fixes.
+  if (k % 8 == 0 && n % 2 == 0) {
+    const tc_plan_ tc = gemm_tc_plan_(c, context::tc_form::f32, uM, uN, uK);
+    if (c.fits_(tc.f, pa, pB, po)) return gemm_tc_launch_(c, tc, pa, pB, po, uM, uN, uK, uN);
+  }
   // Tile choice by fill (big_tile_): a prefill chunk is only a few hundred
   // tokens, so a narrow projection (N=896, M=512) is 28 big blocks against 82
-  // SMs and 112 small ones. The big tile needs K % 8 == 0, the small K % 16.
-  bool big = big_tile_(m, n, k);
+  // SMs and 112 small ones.
+  bool big = big_tile_(m, n);
   unsigned t = big ? 128u : 64u;
   unsigned gx = (unsigned)((n + t - 1) / t), gy = (unsigned)((m + t - 1) / t);
   unsigned blocks = gx * gy;
@@ -288,19 +306,16 @@ inline bool own_nn::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
 }
 
 // The prefill GEMM summed in f16 (tl_gemm_tc_f16*, the tensor-core tiles'
-// f16 form): operands on 16 bytes and K % 8 == 0, as there; otherwise the
-// caller's f32 GEMM.
-// Both f16-sum forms: operands on 16 bytes, K % 8 == 0 and N even, else false
-// (the caller's f32 GEMM, or for an f16 activation nothing: it must be sized
-// for these, see prefill_chunk_).
+// f16 form), in both its forms: K % 8 == 0, N even and operands where the
+// kernel declares them, else false (the caller's f32 GEMM, or for an f16
+// activation nothing: it must be sized for these, see prefill_chunk_).
 inline bool f16acc_run_(context::tc_form form, gpu::span a, gpu::span B, gpu::span out,
                         int64_t m, int64_t n, int64_t k) {
   auto& c = context::get();
-  if (!c.ready || (k % 8) != 0 || m <= 0 || n <= 0) return false;
+  if (!c.ready || (k % 8) != 0 || m <= 0 || n <= 0 || n % 2) return false;
   float* pa = context::off_(a.buf, a.off);
   float* pB = context::off_(B.buf, B.off);
   float* po = context::off_(out.buf, out.off);
-  if ((uintptr_t)pa % 16 || (uintptr_t)pB % 16 || n % 2) return false;
   c.device_read_(a.buf);
   c.device_read_(B.buf);
   c.device_write_(out.buf);
@@ -369,7 +384,6 @@ inline bool own_nn::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu
   float* pa = context::off_(A.buf, A.off);
   float* pw = context::off_(W.buf, W.off);
   float* pc = context::off_(C.buf, C.off);
-  if ((uintptr_t)pa % 16 || (uintptr_t)pw % 16) return false;
   c.device_read_(A.buf);
   c.device_read_(W.buf);
   c.device_rmw_(C.buf);  // a part writes some columns of a shared output
@@ -416,7 +430,6 @@ inline bool own_nn::gemm_quant_glu(int type, gpu::span A16, gpu::span W, gpu::sp
   void* pa = context::off_(A16.buf, A16.off);
   void* pw = context::off_(W.buf, W.off);
   void* ph = context::off_(H16.buf, H16.off);
-  if ((uintptr_t)pa % 16 || (uintptr_t)pw % 16 || (uintptr_t)ph % 4) return false;
   c.device_read_(A16.buf);
   c.device_read_(W.buf);
   c.device_write_(H16.buf);
@@ -428,7 +441,6 @@ inline bool own_nn::quantize_act_q8(gpu::span a, gpu::span qa, int64_t k) {
   if (!c.ready || k <= 0 || k % 256) return false;
   float* pa = context::off_(a.buf, a.off);
   float* pq = context::off_(qa.buf, qa.off);
-  if ((uintptr_t)pa % 16 || (uintptr_t)pq % 16) return false;
   c.device_read_(a.buf);
   c.device_write_(qa.buf);
   const unsigned nblk = (unsigned)(k / 32);
@@ -441,7 +453,7 @@ inline bool own_nn::gemv_q4k_q8(gpu::span qa, gpu::span W, gpu::span y, int64_t 
   auto& c = context::get();
   if (!c.ready || n <= 0 || k <= 0 || k % 256) return false;
   float* pq = context::off_(qa.buf, qa.off);
-  if ((uintptr_t)pq % 16) return false;
+  float* pw = context::off_(W.buf, W.off);
   c.device_read_(qa.buf);
   c.device_read_(W.buf);
   c.device_write_(y.buf);
@@ -450,8 +462,8 @@ inline bool own_nn::gemv_q4k_q8(gpu::span qa, gpu::span W, gpu::span y, int64_t 
                    {((unsigned)n + rows_per_block - 1) / rows_per_block}, {rows_per_block * 32}, 0,
                    reinterpret_cast<signed char*>(pq),
                    reinterpret_cast<void*>(reinterpret_cast<char*>(pq) + k),
-                   reinterpret_cast<unsigned char*>(context::off_(W.buf, W.off)),
-                   context::off_(y.buf, y.off), (unsigned)n, (unsigned)k);
+                   reinterpret_cast<unsigned char*>(pw), context::off_(y.buf, y.off), (unsigned)n,
+                   (unsigned)k);
 }
 
 inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n,
@@ -460,7 +472,7 @@ inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, 
   if (!c.ready || n <= 0 || k <= 0 || k % (type == 8 ? 32 : 256) || (type != 12 && type != 14 && type != 8))
     return false;
   float* pa = context::off_(a.buf, a.off);
-  if ((uintptr_t)pa % 16) return false;
+  float* pw = context::off_(W.buf, W.off);
   c.device_read_(a.buf);
   c.device_read_(W.buf);
   c.device_write_(y.buf);
@@ -469,7 +481,7 @@ inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, 
                    : type == 14 ? c.cached_(c.gemv_q6k_fn, "tl_gemv_q6k_row")
                                 : c.cached_(c.gemv_q80_fn, "tl_gemv_q80_row"),
                    {(unsigned)n}, {threads}, threads / 32 * sizeof(float), pa,
-                   reinterpret_cast<unsigned char*>(context::off_(W.buf, W.off)),
+                   reinterpret_cast<unsigned char*>(pw),
                    context::off_(y.buf, y.off), (unsigned)n, (unsigned)k);
 }
 
@@ -714,7 +726,8 @@ inline bool own_nn::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
 
 // The same causal prefill on the tensor cores (tl_attn_prefill_tc_*), its
 // operands rounded to f16 as staged (an f16 cache's K and V already are): head
-// width 64, 128 or 256, operands on 16 bytes. Inference only (gpu::attn_prefill_f16).
+// width 64, 128 or 256, operands where the kernel declares them. Inference only
+// (gpu::attn_prefill_f16).
 inline bool own_nn::attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V,
                                   gpu::span out, int64_t n_q_heads,
                                   int64_t n_kv_heads, int64_t T, int64_t kv_max,
@@ -728,7 +741,6 @@ inline bool own_nn::attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V,
   float* pk = context::off_(K.buf, K.off);
   float* pv = context::off_(V.buf, V.off);
   float* po = context::off_(out.buf, out.off);
-  if ((uintptr_t)pq % 16 || (uintptr_t)pk % 16 || (uintptr_t)pv % 16) return false;
   c.device_read_(q.buf);
   c.device_read_(K.buf);
   c.device_read_(V.buf);

@@ -205,9 +205,10 @@ training ops off that path, their own eager tests) checks the op, however it
 ran, against the array oracle, and a second runs each composition beside the
 backend's kernel and requires the same numbers.
 
-What each backend covers: CUDA has kernels in all three layers; Metal in the
-core and nn layers (no block-quantized weights or head width 256 yet, no
-graph capture); WebGPU is general tensor computation (the core layer, plus
+What each backend covers: CUDA has kernels in all three layers; so does
+Metal, short of the graph-capture forms, the forms over f16 activations
+(`gemm_quant_glu` among them) and the int8 ones (`quantize_act_q8`,
+`gemv_q4k_q8`); WebGPU is general tensor computation (the core layer, plus
 the nn kernels that pay off in a browser: softmax, layer norm, RoPE) and
 leaves the llm layer to the compositions; the host backend states every id
 as a plain loop.

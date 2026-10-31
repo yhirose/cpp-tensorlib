@@ -73,34 +73,46 @@ inline const char* gtile_name_(gtile t) {
   return "";
 }
 
-// The attention kernels' variant, by D (an f32 KV cache; caps::kv_f16 is false
-// here): also no other backend's, so also kept out of kop. Offset far enough past
-// gtile_key_'s range that the two never collide either.
-enum class attn_op {
-  prefill_64, prefill_128,
-  bwd_dq_64, bwd_dq_128, bwd_dkv_64, bwd_dkv_128,
-  decode_64, decode_128, decode_split_64, decode_split_128,
-  combine_64, combine_128,
+// The attention kernels, by kind, head width and the KV cache's element type
+// (f32, or f16 with caps::kv_f16): also no other backend's, so also kept out of
+// kop. attn_kernel_ names the instantiated ones and is the one place that says
+// which exist: an op asks it, and refuses a combination it has no name for.
+// Keyed from -101, far enough past gtile_key_'s range that the two never
+// collide either.
+enum class attn_op { prefill, decode, decode_split, combine, bwd_dq, bwd_dkv, count_ };
+struct attn_kernel {
+  int key;
+  const char* name;  // nullptr: not instantiated
+  explicit operator bool() const { return name != nullptr; }
 };
-constexpr int attn_op_key_(attn_op t) { return -101 - static_cast<int>(t); }
-inline const char* attn_op_name_(attn_op t) {
-  switch (t) {
-    case attn_op::prefill_64: return "attn_prefill_64_";
-    case attn_op::prefill_128: return "attn_prefill_128_";
-    case attn_op::bwd_dq_64: return "attn_bwd_dq_64_";
-    case attn_op::bwd_dq_128: return "attn_bwd_dq_128_";
-    case attn_op::bwd_dkv_64: return "attn_bwd_dkv_64_";
-    case attn_op::bwd_dkv_128: return "attn_bwd_dkv_128_";
-    case attn_op::decode_64: return "attn_decode_64_";
-    case attn_op::decode_128: return "attn_decode_128_";
-    case attn_op::decode_split_64: return "attn_decode_split_64_";
-    case attn_op::decode_split_128: return "attn_decode_split_128_";
-    case attn_op::combine_64: return "attn_combine_64_";
-    case attn_op::combine_128: return "attn_combine_128_";
-  }
-  return "";
+// The table's shape, which also sets the keys' range: op, head width (64 / 128
+// / 256), cache (f32 / f16).
+constexpr int attn_ops_ = static_cast<int>(attn_op::count_), attn_widths_ = 3,
+              attn_caches_ = 2;
+constexpr int attn_key_last_ = -101 - (attn_ops_ * attn_widths_ * attn_caches_ - 1);
+inline attn_kernel attn_kernel_(attn_op op, int64_t D, bool f16) {
+  static const char* const names[attn_ops_][attn_widths_][attn_caches_] = {
+      {{"attn_prefill_64_", "attn_prefill_64_f16_"},
+       {"attn_prefill_128_", "attn_prefill_128_f16_"},
+       {nullptr, "attn_prefill_256_f16_"}},
+      {{"attn_decode_64_", "attn_decode_64_f16_"},
+       {"attn_decode_128_", "attn_decode_128_f16_"},
+       {"attn_decode_256_", "attn_decode_256_f16_"}},
+      {{"attn_decode_split_64_", "attn_decode_split_64_f16_"},
+       {"attn_decode_split_128_", "attn_decode_split_128_f16_"},
+       {"attn_decode_split_256_", "attn_decode_split_256_f16_"}},
+      {{"attn_combine_64_", nullptr},
+       {"attn_combine_128_", nullptr},
+       {"attn_combine_256_", nullptr}},
+      {{"attn_bwd_dq_64_", nullptr}, {"attn_bwd_dq_128_", nullptr}, {nullptr, nullptr}},
+      {{"attn_bwd_dkv_64_", nullptr}, {"attn_bwd_dkv_128_", nullptr}, {nullptr, nullptr}},
+  };
+  const int w = D == 64 ? 0 : D == 128 ? 1 : D == 256 ? 2 : -1;
+  if (w < 0) return {0, nullptr};
+  const int o = static_cast<int>(op), c = f16 ? 1 : 0;
+  return {-101 - ((o * attn_widths_ + w) * attn_caches_ + c), names[o][w][c]};
 }
-static_assert(gtile_key_(gtile::steel32x64_tb) > attn_op_key_(attn_op::prefill_64),
+static_assert(gtile_key_(gtile::steel32x64_tb) > -101,
               "gtile and attn_op pipeline keys must stay in disjoint ranges");
 
 struct mtl_size {
@@ -227,8 +239,12 @@ struct context {
       case kop::layer_norm_bwd_dx_: return "layer_norm_bwd_dx_";
       case kop::layer_norm_bwd_gb_: return "layer_norm_bwd_gb_";
       case kop::layer_norm_bwd_gb_fold_: return "layer_norm_bwd_gb_fold_";
+      case kop::ssm_conv_: return "ssm_conv_";
+      case kop::gated_delta_: return "gated_delta_";
       case kop::kv_append_: return "kv_append_";
+      case kop::kv_append_f16_: return "kv_append_f16_";
       case kop::kv_fill_: return "kv_fill_";
+      case kop::kv_fill_f16_: return "kv_fill_f16_";
       case kop::argmax_: return "argmax_";
       case kop::rmsnorm_: return "rmsnorm_";
       case kop::add_rmsnorm_: return "add_rmsnorm_";
@@ -254,7 +270,7 @@ struct context {
   // pending encoder, opened if there is none.
   void bind_(kop op) { bind_id_(static_cast<int>(op), kernel_name_(op)); }
   void bind_(gtile t) { bind_id_(gtile_key_(t), gtile_name_(t)); }
-  void bind_(attn_op t) { bind_id_(attn_op_key_(t), attn_op_name_(t)); }
+  void bind_(attn_kernel k) { bind_id_(k.key, k.name); }
 
   void bind_id_(int id, const char* name) {
     objc::id pso = pso_id_(id, name);
@@ -264,10 +280,10 @@ struct context {
     bound = name;
   }
 
-  // psos is one cache for all three: a kop's id is never negative, gtile's
-  // (gtile_key_) counts down from -1, attn_op's (attn_op_key_) from -101 --
-  // a gap wide enough that neither range reaches the other (the static_assert
-  // above checks it).
+  // psos is one cache for every family: a kop's id is never negative, gtile's
+  // (gtile_key_) counts down from -1, attn_kernel_'s from -101,
+  // metal_nn.h's nn_kernel from -201 -- gaps wide enough that no range reaches
+  // the next (static_asserts here and in metal_nn.h check them).
   objc::id pso_id_(int id, const char* name) {
     auto it = psos.find(id);
     if (it != psos.end()) return it->second;
@@ -366,6 +382,11 @@ struct own_core {
   static bool gemm(gpu::span a, int64_t lda, bool ta, gpu::span b, int64_t ldb,
                    bool tb, gpu::span out, int64_t m, int64_t n, int64_t k,
                    float scale, float offset);
+  static bool gemm_batched(gpu::span a, int64_t lda, bool ta, int64_t sa,
+                           gpu::span b, int64_t ldb, bool tb, int64_t sb,
+                           gpu::span out, int64_t m, int64_t n, int64_t k,
+                           int64_t batch, float scale, float offset,
+                           gpu::span bias = {});
 };
 
 inline bool pending() { return context::get().pending; }
@@ -513,6 +534,8 @@ struct gemm_params {
   uint32_t M, N, K, lda, ldb, trans_a, trans_b;
   uint32_t a_fast, b_fast;  // float4 loader eligibility, verified host-side
   float scale, offset;
+  uint32_t sa, sb;  // batch slices' strides in floats; C's is M * N
+  uint32_t ldc;     // C's row stride for STEEL (N but for a GEMM into columns)
 };
 
 inline void set_buf_(objc::id enc, void* buf, int64_t off, unsigned long idx) {
@@ -529,46 +552,77 @@ inline void set_bytes_(objc::id enc, const P& p, unsigned long idx) {
              static_cast<unsigned long>(sizeof(p)), idx);
 }
 
+// STEEL's tiling of an m x n product: 64-wide column tiles in bands of 32 rows
+// below m 97 (silarray's band, more blocks for a short product) or 64, and a
+// threadgroup swizzle for L2 reuse whose log rides in gemm_params' a_fast.
+struct steel_grid {
+  bool band32;
+  uint32_t swizzle_log;
+  unsigned long gx, gy;
+};
+inline steel_grid steel_grid_(int64_t m, int64_t n) {
+  const bool band32 = m < 97;
+  const unsigned long bm = band32 ? 32 : 64, bn = 64;
+  const unsigned long tiles_n = (static_cast<unsigned long>(n) + bn - 1) / bn;
+  const unsigned long tiles_m = (static_cast<unsigned long>(m) + bm - 1) / bm;
+  uint32_t swizzle_log = 0;
+  while ((tiles_n >> (swizzle_log + 1)) >= 1 && swizzle_log < 3) swizzle_log++;
+  return {band32, swizzle_log, tiles_n << swizzle_log,
+          (tiles_m + ((1ul << swizzle_log) - 1)) >> swizzle_log};
+}
+
+// The f32 gemm families' launch, STEEL's and the simple tiles': A, B and C at
+// buffers 0-2, the params at 3, 128 threads a threadgroup, grid z the batch.
+inline void gemm_launch_(context& c, gpu::span a, gpu::span b, gpu::span out,
+                         const gemm_params& p, unsigned long gx,
+                         unsigned long gy, unsigned long gz) {
+  set_buf_(c.enc, a, 0ul);
+  set_buf_(c.enc, b, 1ul);
+  set_buf_(c.enc, out, 2ul);
+  set_bytes_(c.enc, p, 3ul);
+  dispatch_grid_(c.enc, {gx, gy, gz}, {128, 1, 1});
+}
+
 }  // namespace detail_
 
-// C(m,n) = (A @ B) * scale + offset. lda/ldb are row strides; trans flags
-// let a transposed view be read in place. Buffers are raw MTLBuffers; byte
-// offsets fold the view offset in. Encodes without committing.
-inline bool own_core::gemm(gpu::span a, int64_t lda, bool ta, gpu::span b,
-                      int64_t ldb, bool tb, gpu::span out, int64_t m, int64_t n,
-                      int64_t k, float scale, float offset) {
+// `batch` products C(m,n) = (A @ B) * scale + offset in one launch: slice z
+// (grid z) reads A / B z * sa / z * sb floats past slice 0's and writes C
+// z * m * n past (a stride of 0 broadcasts one operand slice). lda/ldb are row
+// strides; trans flags let a transposed view be read in place. Buffers are
+// raw MTLBuffers; byte offsets fold the view offset in. Encodes without
+// committing. No row bias yet: one declines.
+inline bool own_core::gemm_batched(gpu::span a, int64_t lda, bool ta,
+                                   int64_t sa, gpu::span b, int64_t ldb,
+                                   bool tb, int64_t sb, gpu::span out,
+                                   int64_t m, int64_t n, int64_t k,
+                                   int64_t batch, float scale, float offset,
+                                   gpu::span bias) {
   auto& c = context::get();
-  if (!c.device) return false;
+  if (!c.device || bias.buf || batch < 1 || sa < 0 || sb < 0 ||
+      sa > UINT32_MAX || sb > UINT32_MAX) {
+    return false;
+  }
   // Dispatch ladder. STEEL (BN=64 bands) covers NN and single-transposed
   // shapes with enough width (the transposing loader reads the view in
-  // place); BM band follows silarray (M < 97 → 32×64 tiles). TT or narrow
-  // shapes take the simple-tile family, which reads transposed views in
-  // place. Gates are provisional pending a full census vs PyTorch-MPS.
+  // place), tiled by steel_grid_. TT or narrow shapes take the simple-tile
+  // family, which reads transposed views in place. Gates are provisional
+  // pending a full census vs PyTorch-MPS.
   bool steel = !(ta && tb) && m >= 16 && n >= 48 && k >= 16;
   gtile kk_;
-  unsigned long bm, bn;
   uint32_t fast_a, fast_b;  // STEEL reuses the a_fast slot for swizzle_log
   unsigned long gx, gy;
   if (steel) {
-    bool band32 = m < 97;
-    kk_ = band32 ? (ta ? gtile::steel32x64_ta
-                       : tb ? gtile::steel32x64_tb : gtile::steel32x64)
-                 : (ta ? gtile::steel_ta : tb ? gtile::steel_tb : gtile::steel);
-    bm = band32 ? 32 : 64;
-    bn = 64;
-    unsigned long tiles_n = (static_cast<unsigned long>(n) + bn - 1) / bn;
-    unsigned long tiles_m = (static_cast<unsigned long>(m) + bm - 1) / bm;
-    uint32_t swizzle_log = 0;  // threadgroup swizzle for L2 reuse
-    while ((tiles_n >> (swizzle_log + 1)) >= 1 && swizzle_log < 3)
-      swizzle_log++;
-    fast_a = swizzle_log;
+    const detail_::steel_grid g = detail_::steel_grid_(m, n);
+    kk_ = g.band32 ? (ta ? gtile::steel32x64_ta
+                         : tb ? gtile::steel32x64_tb : gtile::steel32x64)
+                   : (ta ? gtile::steel_ta : tb ? gtile::steel_tb : gtile::steel);
+    fast_a = g.swizzle_log;
     fast_b = 0;
-    gx = tiles_n << swizzle_log;
-    gy = (tiles_m + ((1ul << swizzle_log) - 1)) >> swizzle_log;
+    gx = g.gx;
+    gy = g.gy;
   } else {
     kk_ = m >= 64 ? gtile::sgemm64x32 : gtile::sgemm32;
-    bm = m >= 64 ? 64 : 32;
-    bn = 32;
+    const unsigned long bm = m >= 64 ? 64 : 32, bn = 32;
     // float4 loader eligibility: row-major operand only (Apple GPUs handle
     // the unaligned vector loads; transposed operands use the strided path).
     fast_a = !ta ? 1u : 0u;
@@ -577,19 +631,24 @@ inline bool own_core::gemm(gpu::span a, int64_t lda, bool ta, gpu::span b,
     gy = (static_cast<unsigned long>(m) + bm - 1) / bm;
   }
   c.bind_(kk_);
-  detail_::set_buf_(c.enc, a, 0ul);
-  detail_::set_buf_(c.enc, b, 1ul);
-  detail_::set_buf_(c.enc, out, 2ul);
-  detail_::gemm_params p{static_cast<uint32_t>(m),   static_cast<uint32_t>(n),
+  const detail_::gemm_params p{static_cast<uint32_t>(m),   static_cast<uint32_t>(n),
                          static_cast<uint32_t>(k),   static_cast<uint32_t>(lda),
                          static_cast<uint32_t>(ldb), ta ? 1u : 0u,
                          tb ? 1u : 0u,               fast_a,
                          fast_b,                     scale,
-                         offset};
-  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
-             static_cast<unsigned long>(sizeof(p)), 3ul);
-  detail_::dispatch_grid_(c.enc, {gx, gy, 1}, {128, 1, 1});
+                         offset,                     static_cast<uint32_t>(sa),
+                         static_cast<uint32_t>(sb),  static_cast<uint32_t>(n)};
+  detail_::gemm_launch_(c, a, b, out, p, gx, gy,
+                        static_cast<unsigned long>(batch));
   return true;
+}
+
+// C(m,n) = (A @ B) * scale + offset: the batch == 1 case of gemm_batched.
+inline bool own_core::gemm(gpu::span a, int64_t lda, bool ta, gpu::span b,
+                      int64_t ldb, bool tb, gpu::span out, int64_t m, int64_t n,
+                      int64_t k, float scale, float offset) {
+  return gemm_batched(a, lda, ta, 0, b, ldb, tb, 0, out, m, n, k, 1, scale,
+                      offset);
 }
 
 // Rank cap for pad_/fold_'s GPU dispatch — matches cuda.h's kPadFoldMaxRank
@@ -985,7 +1044,7 @@ struct caps {
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = true;   // gemv_bf16_row: weights as [N,K]
   static constexpr bool bf16_gemm = true;  // gemm_bf16_nt: a bf16-weight GEMM
-  static constexpr bool kv_f16 = false;    // the KV cache is f32
+  static constexpr bool kv_f16 = true;     // an f16 KV cache, every head width and path
 };
 
 // The capture group, cuda.h's contracts: absent here, so each answers false

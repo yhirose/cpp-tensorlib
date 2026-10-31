@@ -810,7 +810,7 @@ var<workgroup> am_idx : array<u32, 256>;
 fn argmax(@builtin(local_invocation_index) lid : u32) {
   var best = -3.402823466e+38;
   var besti = 0u;
-  for (var i = lid; i < am.n; i += 256u) {
+  for (var i = lid; i < am.n; i += T) {
     let v = in0[am.v.v0 + i];
     if (v > best) {
       best = v;
@@ -820,7 +820,7 @@ fn argmax(@builtin(local_invocation_index) lid : u32) {
   am_val[lid] = best;
   am_idx[lid] = besti;
   workgroupBarrier();
-  for (var s = 128u; s > 0u; s >>= 1u) {
+  for (var s = T / 2u; s > 0u; s >>= 1u) {
     if (lid < s) {
       let ov = am_val[lid + s];
       let oi = am_idx[lid + s];

@@ -379,9 +379,12 @@ struct context {
   // whole float.
   //
   // Two inputs may be the same buffer: read-only bindings may alias. A buffer
-  // bound as an output may not be bound again in the same launch — WebGPU
+  // bound as an output may not be bound again in the same launch (WebGPU
   // invalidates the whole encoder for it, and with it every launch batched
-  // since the last flush — so no caller hands one over twice.
+  // since the last flush), so such a launch declines here like the others: an
+  // op with a composition in the shared layer (rope(x, x), say) takes that,
+  // none of whose launches writes a buffer it reads, and a core op falls back
+  // to the CPU.
   bool launch_(const pipeline* p, const gpu::arg* args, size_t n,
                const void* params, size_t params_bytes, uint32_t gx,
                uint32_t gy) {
@@ -391,6 +394,12 @@ struct context {
     }
     if (gx == 0 || gy == 0 || gx > kMaxWorkgroups || gy > kMaxWorkgroups) {
       return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+      if (args[i].a == gpu::access::in) continue;
+      for (size_t j = 0; j < n; j++) {
+        if (j != i && args[j].s.buf == args[i].s.buf) return false;
+      }
     }
     mirror* views[kMaxViews];
     uint32_t offs[kMaxViews] = {};
@@ -639,6 +648,7 @@ struct rope_params {
   uint32_t n, t, d, pos, half;
   float base;
 };
+struct argmax_params { uint32_t n; };
 
 inline uint32_t u32(int64_t v) { return static_cast<uint32_t>(v); }
 
@@ -926,11 +936,9 @@ inline bool own::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
   float* host = nullptr;
   void* res = alloc(4, &host);
   if (!res) return false;
-  struct {
-    uint32_t n;
-  } p{static_cast<uint32_t>(n)};
-  gpu::grid g;  // one workgroup
-  const bool ok = detail_::launch_own_("argmax", -1, {gpu::in(a), gpu::out({res, 0})}, p, g);
+  const bool ok = detail_::launch_own_("argmax", -1, {gpu::in(a), gpu::out({res, 0})},
+                                       detail_::argmax_params{detail_::u32(n)},
+                                       gpu::grid{});  // one workgroup
   if (ok) {
     sync_to_host(res, false);
     *out_idx = static_cast<int64_t>(host[0]);

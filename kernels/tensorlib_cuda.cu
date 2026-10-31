@@ -21,6 +21,16 @@
 #include <cuda_fp16.h>
 #include <type_traits>  // __half: the prefill attention's tensor-core operands
 
+// TL_ALIGN(kernel, a0, a1, ...): the byte alignment each leading pointer
+// parameter of `kernel` needs, written beside the kernel wherever its loads or
+// stores are wider than an element (a float4 read: 16; a float2 store: 8; a
+// Q4_K word: 4). The host reads it from the PTX (cuda.h, parse_align_decls_)
+// and declines a launch off it, so a misaligned view is refused, never
+// misread. Pointers past the last one listed, and every pointer of a kernel
+// without one, need only their element's width.
+#define TL_ALIGN(kernel, ...) \
+  extern "C" __device__ const unsigned char kernel##_ptr_align[] = {__VA_ARGS__};
+
 // The kernels by layer (gpu_abi.h): each file builds on the ones before it.
 // Kernels sit in extern "C" blocks for a stable, unmangled symbol each (the
 // driver loads them by name); a block closes around the __device__ templates,

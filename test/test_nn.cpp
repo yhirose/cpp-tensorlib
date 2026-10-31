@@ -537,6 +537,22 @@ static void check_attn_bwd_dq(bool on_gpu, int64_t D = 64) {
   const array& stats = got->second;
   CHECK(dq.shape() == tl::shape_t{H, T, D});
   CHECK(stats.shape() == tl::shape_t{2, H, T});
+  if (on_gpu) {
+    // K and V from bases off the kernel's float4 loads: refused, or read right.
+    const std::vector<float> want = host_values(dq);
+    array qd = dev(q), dOd = dev(dO), Od = dev(out);
+    array Ks = dev(with_lead(K, 1)), Vs = dev(with_lead(V, 1));
+    array dq2 = array::empty({H, T, D}), st2 = array::empty({2, H, T});
+    check_misaligned(
+        "attention dq, K and V off 16 bytes",
+        [&] {
+          return tl::gpu::attn_prefill_dq(qd.device_span(), Ks.device_span().at(4),
+                                          Vs.device_span().at(4), dOd.device_span(),
+                                          Od.device_span(), dq2.device_span(), st2.device_span(),
+                                          H, T, D, scale);
+        },
+        [&] { return host_close(host_values(dq2), want, 1e-5f); });
+  }
 
   // Row t of head h, spelled out: the causal softmax of its scores, then
   // dq_t = scale · Σ_j P_tj (dP_tj − Δ_t) k_j with dP_tj = dO_t·v_j and
@@ -914,6 +930,47 @@ TEST_CASE("partial rope rotates the first rot dims and keeps the rest") {
   tl::device_ = prev;
 }
 
+// N rows of K weights in a GGUF block format (ggml type 12 Q4_K, 14 Q6_K, 8
+// Q8_0) as one buffer (for the caller to move to the device), and the same rows
+// dequantized by the CPU reference. Random bytes are valid blocks; only the half scales are set
+// (a random one could be inf or NaN): Q4_K d, dmin at the start, Q6_K d at
+// byte 208, Q8_0 d at the start, each a small positive half ~ 2^-5 .. 2^-4.
+struct quant_rows {
+  array W;               // the blocks, packed into floats
+  std::vector<float> w;  // [N,K], dequantized
+};
+static quant_rows random_quant_rows(int type, int64_t N, int64_t K, unsigned seed) {
+  const auto t = static_cast<tl::gguf::ggml_type>(type);
+  const bool q4 = t == tl::gguf::ggml_type::q4_k, q8 = t == tl::gguf::ggml_type::q8_0;
+  uint64_t elems, block_bytes;
+  tl::gguf::ggml_block(t, elems, block_bytes);
+  const int64_t nb = K / (int64_t)elems, bb = (int64_t)block_bytes;
+  std::mt19937 rng(seed);
+  std::vector<unsigned char> bytes((size_t)N * nb * bb);
+  for (auto& b : bytes) b = (unsigned char)rng();
+  auto set_half = [&](size_t at) {
+    const uint16_t h = (uint16_t)(0x2800 + (rng() & 0x3ff));
+    std::memcpy(&bytes[at], &h, 2);
+  };
+  for (int64_t i = 0; i < N * nb; i++) {
+    if (q4) {
+      set_half((size_t)i * bb);
+      set_half((size_t)i * bb + 2);
+    } else {
+      set_half((size_t)i * bb + (q8 ? 0 : 208));
+    }
+  }
+  quant_rows r;
+  r.w.resize((size_t)N * K);
+  for (int64_t n = 0; n < N; n++)
+    tl::gguf::dequant_range(t, bytes.data() + (size_t)n * nb * bb, 0, (size_t)K,
+                            &r.w[(size_t)n * K]);
+  std::vector<float> packed((bytes.size() + 3) / 4);
+  std::memcpy(packed.data(), bytes.data(), bytes.size());
+  r.W = array::from(std::move(packed), {(int64_t)((bytes.size() + 3) / 4)});
+  return r;
+}
+
 // The generic compositions (gpu_ops.h, tier 1 out of tier 0) against the op
 // as the backend runs it. Where the backend has the fused kernel the two are
 // different programs that must agree; where it does not, the op is the
@@ -925,14 +982,6 @@ TEST_CASE("generic compositions agree with the fused kernels") {
   tl::use_gpu();
   namespace gpu = tl::gpu;
   namespace gen = tl::gpu::generic;
-  auto dev = [](const array& a) {
-    array c = a.clone();
-    c.eval();
-    return c;
-  };
-  auto same = [](const array& got, const array& want, float tol) {
-    return tl::allclose(got, want, tol, tol);
-  };
 
   SUBCASE("rmsnorm, rmsnorm_res and swiglu") {
     const int64_t rows = 3, n = 896, ff = 512;
@@ -979,6 +1028,61 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     CHECK(same(ya, yb, 1e-3f));
   }
 
+  SUBCASE("rmsnorm_rope against rmsnorm then rope, and the gated norm") {
+    // Qwen3's full turn (D 128) and Qwen3.5's partial one (D 256, 64 dims), a
+    // chunk of T tokens per head. Where the backend fuses them the two routes
+    // are different programs that agree to an ulp (Metal's fast math rounds
+    // each kernel's products its own way); where it does not,
+    // the fused call is the two ops and this is them against themselves.
+    struct shape { int64_t D, rot; };
+    for (const shape s : {shape{128, 128}, shape{256, 64}}) {
+      const int64_t H = 6, T = 5, rows = H * T, pos = 17;
+      const float base = 1e6f, eps = 1e-6f;
+      array x = random_array({rows, s.D}, 1090), w = dev(random_array({s.D}, 1091));
+      // Each side flushed on its own, the reference's norm into a buffer of
+      // its own: both turn in place, which a backend whose launches cannot
+      // write what they read (WebGPU) must route around, not drop with its
+      // batch and leave a side as it was.
+      array xa = dev(x), xd = dev(x), xn = array::empty({rows, s.D});
+      REQUIRE(gpu::rmsnorm(xd.device_span(), w.device_span(), xn.device_span(), s.D, eps, rows));
+      REQUIRE(gpu::rope(xn.device_span(), xn.device_span(), rows, T, s.D, pos, base, {}, s.rot));
+      tl::gpu::flush();
+      REQUIRE(gpu::rmsnorm_rope(xa.device_span(), w.device_span(), rows, T, s.D, pos, base,
+                                s.rot, eps));
+      tl::gpu::flush();
+      CHECK(same(xa, xn, 1e-7f));
+    }
+    // silu(z) * rmsnorm(o) * w over o [T*H, D], the gate a row's head of z.
+    // The fused form against the composition a decoder runs without it
+    // (qwen.h): the gate rows gathered ahead of o into one [z | o] buffer,
+    // rmsnorm on o, then swiglu over the pair, to an ulp as rmsnorm_rope;
+    // D 300 takes a row past one 256-wide pass, unevenly over the lanes.
+    if (gpu::has_gated_rmsnorm) {
+      for (const int64_t D : {128, 300}) {
+        const int64_t T = 3, H = 4, n = T * H * D, ldz = H * D + 9;
+        const float eps = 1e-6f;
+        array o = random_array({T * H, D}, 1092), z = random_array({T, ldz}, 1093);
+        o.eval();
+        z.eval();
+        std::vector<float> zo((size_t)(2 * n));
+        for (int64_t r = 0; r < T * H; r++)
+          for (int64_t d = 0; d < D; d++)
+            zo[r * D + d] = z.raw()[(r / H) * ldz + (r % H) * D + d];
+        std::copy(o.raw(), o.raw() + n, zo.begin() + n);
+        array od = dev(o), zd = dev(z), w = dev(random_array({D}, 1094));
+        array buf = dev(array::from(std::move(zo), {2 * n}));
+        array oa = array::empty({T * H, D}), ob = array::empty({T * H, D});
+        REQUIRE(gpu::gated_rmsnorm(od.device_span(), zd.device_span(), ldz, w.device_span(),
+                                   oa.device_span(), false, T, H, D, eps));
+        const gpu::span op = buf.device_span().at(n * 4);
+        REQUIRE(gpu::rmsnorm(op, w.device_span(), op, D, eps, T * H));
+        REQUIRE(gpu::swiglu(buf.device_span(), ob.device_span(), n));
+        tl::gpu::flush();
+        CHECK(same(oa, ob, 1e-7f));
+      }
+    }
+  }
+
   SUBCASE("the cache: fill, append, decode and prefill attention") {
     const int64_t D = 64, HKV = 2, HQ = 14, MAXC = 64, T = 20, T2 = 7;
     const float scale = 1.0f / std::sqrt((float)D);
@@ -1021,6 +1125,19 @@ TEST_CASE("generic compositions agree with the fused kernels") {
                               pb.device_span(), HQ, HKV, T2, MAXC, D, scale, false, T + 1));
     tl::gpu::flush();
     CHECK(same(pa, pb, 1e-4f));
+    // K and V from bases off the tiles' vector loads: refused (the op then
+    // composes it), never misread.
+    const std::vector<float> want = host_values(pb);
+    array Ks = dev(with_lead(Ka, 1)), Vs = dev(with_lead(Va, 1));
+    array pc = array::empty({HQ, T2, D});
+    check_misaligned(
+        "prefill attention, K and V off their vectors",
+        [&] {
+          return gpu::attn_prefill(qp.device_span(), Ks.device_span().at(4),
+                                   Vs.device_span().at(4), pc.device_span(), HQ, HKV, T2, MAXC, D,
+                                   scale, false, T + 1);
+        },
+        [&] { return host_close(host_values(pc), want, 1e-4f); }, true);
   }
 
   SUBCASE("the inference prefill (tensor cores, f16 operands) at each head width") {
@@ -1040,6 +1157,18 @@ TEST_CASE("generic compositions agree with the fused kernels") {
                                 pb.device_span(), HQ, HKV, T, MAXC, D, scale, false, P0));
       tl::gpu::flush();
       CHECK(same(pa, pb, 2e-3f));
+      // The output off the kernel's float2 stores: refused (the op then runs
+      // the exact form), never misplaced.
+      const std::vector<float> want = host_values(pb);
+      array ps = dev(array::zeros({HQ * T * D + 1}));
+      check_misaligned(
+          "f16 prefill attention, out off 8 bytes",
+          [&] {
+            return gpu::attn_prefill_f16(qp.device_span(), Kc.device_span(), Vc.device_span(),
+                                         ps.device_span().at(4), HQ, HKV, T, MAXC, D, scale, false,
+                                         P0);
+          },
+          [&] { return host_close(after_lead(ps, 1, HQ * T * D), want, 2e-3f); }, true);
     }
   }
 
@@ -1279,52 +1408,97 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     // Only a backend that reads block-quantized rows natively runs this; no
     // composition stands in for it, and a model refuses such weights without it.
     if (gpu::has_gemv_quant) {
-      // Random bytes are valid blocks; only the half scales are set (a random
-      // one could be inf or NaN). Q4_K: d, dmin at the start; Q6_K: d at byte
-      // 208; Q8_0: d at the start.
       for (int type : {12, 14, 8}) {
-        const bool q4 = type == 12, q8 = type == 8;
-        const int64_t N = 37, K = 1024, nb = q8 ? K / 32 : K / 256, bb = q4 ? 144 : q8 ? 34 : 210;
-        std::mt19937 rng(7 + type);
-        std::vector<unsigned char> bytes((size_t)N * nb * bb);
-        for (auto& b : bytes) b = (unsigned char)rng();
-        auto set_half = [&](size_t at, float v) {  // a small positive half, built by hand
-          const uint16_t h = (uint16_t)(0x2800 + (rng() & 0x3ff));  // ~ 2^-5 .. 2^-4
-          std::memcpy(&bytes[at], &h, 2);
-          (void)v;
-        };
-        for (int64_t i = 0; i < N * nb; i++) {
-          if (q4) {
-            set_half((size_t)i * bb, 0);
-            set_half((size_t)i * bb + 2, 0);
-          } else if (q8) {
-            set_half((size_t)i * bb, 0);
-          } else {
-            set_half((size_t)i * bb + 208, 0);
-          }
-        }
+        const int64_t N = 37, K = 1024;
+        const quant_rows q = random_quant_rows(type, N, K, 7 + type);
         array a = random_array({K}, 1040 + type);
         a.eval();
         std::vector<double> ref(N, 0.0);
-        std::vector<float> w((size_t)K);
-        for (int64_t n = 0; n < N; n++) {
-          tl::gguf::dequant_range(q4   ? tl::gguf::ggml_type::q4_k
-                                  : q8 ? tl::gguf::ggml_type::q8_0
-                                       : tl::gguf::ggml_type::q6_k,
-                                  bytes.data() + (size_t)n * nb * bb, 0, (size_t)K, w.data());
-          for (int64_t k = 0; k < K; k++) ref[n] += (double)w[k] * a.raw()[k];
-        }
-        std::vector<float> packed((bytes.size() + 3) / 4);
-        std::memcpy(packed.data(), bytes.data(), bytes.size());
-        array W = dev(array::from(std::move(packed), {(int64_t)((bytes.size() + 3) / 4)}));
-        array ad = dev(a), y = array::empty({N});
+        for (int64_t n = 0; n < N; n++)
+          for (int64_t k = 0; k < K; k++) ref[n] += (double)q.w[(size_t)n * K + k] * a.raw()[k];
+        array W = dev(q.W), ad = dev(a), y = array::empty({N});
         REQUIRE(gpu::gemv_quant(type, ad.device_span(), W.device_span(), y.device_span(), N, K));
+        // A Q4_K weight off its 4-byte alignment is refused, not misread.
+        if (type == 12)
+          CHECK_FALSE(gpu::gemv_quant(type, ad.device_span(), W.device_span().at(2),
+                                      y.device_span(), N, K));
+        // So is an activation off 16 bytes (the kernels' vector loads).
+        CHECK_FALSE(gpu::gemv_quant(type, ad.device_span().at(4), W.device_span(),
+                                    y.device_span(), N, K));
         tl::gpu::flush();
         y.eval();
         double worst = 0;
         for (int64_t n = 0; n < N; n++)
           worst = std::max(worst, std::fabs(y.raw()[n] - ref[n]) / (1.0 + std::fabs(ref[n])));
         CHECK(worst < 1e-5);
+      }
+    }
+  }
+
+  SUBCASE("GEMM over block-quantized rows against the dequantized weights") {
+    // The prefill's form: C's columns [off, off + n) of rows ldc apart, the
+    // columns around them left as they were. M on both sides of the
+    // backend's tile choice.
+    if (gpu::has_gemm_quant) {
+      for (int type : {12, 14, 8}) {
+        for (int64_t M : {37, 100}) {
+          const int64_t N = 70, K = 512, ldc = N + 6, off = 2;
+          const quant_rows q = random_quant_rows(type, N, K, 70 + type);
+          array a = random_array({M, K}, 1060 + type);
+          a.eval();
+          array W = dev(q.W), ad = dev(a);
+          array C = dev(array::from(std::vector<float>((size_t)(M * ldc), 7.0f), {M, ldc}));
+          REQUIRE(gpu::gemm_quant(type, false, ad.device_span(), W.device_span(),
+                                  C.device_span().at(off * 4), M, N, K, ldc));
+          tl::gpu::flush();
+          // The product and its terms' magnitude, and the worst error of an
+          // output's N columns from col0 (rows ldc apart) relative to it. f32
+          // sums over operands at least bf16-exact (CUDA's tensor cores round
+          // both to bf16, Metal's keep f32): each term is off by at most 2^-8
+          // of itself, so the sum by 4e-3 of the terms' magnitude. A misread
+          // weight is off by whole terms.
+          std::vector<double> ref((size_t)(M * N)), mag((size_t)(M * N));
+          for (int64_t i = 0; i < M; i++)
+            for (int64_t j = 0; j < N; j++)
+              for (int64_t k = 0; k < K; k++) {
+                const double t = (double)q.w[(size_t)(j * K + k)] * a.raw()[i * K + k];
+                ref[(size_t)(i * N + j)] += t;
+                mag[(size_t)(i * N + j)] += std::fabs(t);
+              }
+          auto worst_rel = [&](const std::vector<float>& got, int64_t col0) {
+            double worst = 0;
+            for (int64_t i = 0; i < M; i++)
+              for (int64_t j = 0; j < N; j++) {
+                const size_t r = (size_t)(i * N + j);
+                const float g = got[(size_t)(i * ldc + col0 + j)];
+                worst = std::max(worst, std::fabs(g - ref[r]) / mag[r]);
+              }
+            return worst;
+          };
+          constexpr double bound = 4e-3;
+          const std::vector<float> got = host_values(C);
+          bool kept = true;
+          for (int64_t i = 0; i < M; i++)
+            for (int64_t j = 0; j < ldc; j++)
+              if (j < off || j >= off + N) kept = kept && got[(size_t)(i * ldc + j)] == 7.0f;
+          CHECK(worst_rel(got, off) < bound);
+          CHECK(kept);
+          // C one column off its float2 stores, and the weight 4 bytes off its
+          // base (a Q6_K or Q8_0 row's halves still fit; Q4_K's vectors do
+          // not): each refused or computed as above, never misplaced.
+          array Wl = dev(with_lead(q.W, 1));
+          for (const bool shift_w : {false, true}) {
+            array C1 = dev(array::zeros({M * ldc + 1}));
+            check_misaligned(
+                shift_w ? "quantized GEMM, W off its base" : "quantized GEMM, C off 8 bytes",
+                [&] {
+                  return gpu::gemm_quant(type, false, ad.device_span(),
+                                         shift_w ? Wl.device_span().at(4) : W.device_span(),
+                                         C1.device_span().at(shift_w ? 0 : 4), M, N, K, ldc);
+                },
+                [&] { return worst_rel(after_lead(C1, shift_w ? 0 : 1, M * ldc), 0) < bound; });
+          }
+        }
       }
     }
   }
@@ -1364,6 +1538,16 @@ TEST_CASE("generic compositions agree with the fused kernels") {
       }
       CHECK(std::sqrt(sq / ref) < 2e-2);
       CHECK(std::sqrt(sq / ref) > 0);  // it is a different computation, not a copy
+      // The weight 4 bytes off the kernel's 16-byte vectors: refused, or read right.
+      const std::vector<float> want = host_values(yq);
+      array Wl = dev(with_lead(W, 1)), yl = dev(array::zeros({N}));
+      check_misaligned(
+          "int8 Q4_K GEMV, W off 16 bytes",
+          [&] {
+            return gpu::gemv_q4k_q8(qa.device_span(), Wl.device_span().at(4), yl.device_span(), N,
+                                    K);
+          },
+          [&] { return host_close(host_values(yl), want, 1e-5f); });
     }
   }
 

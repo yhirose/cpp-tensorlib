@@ -868,6 +868,7 @@ __device__ __forceinline__ void sgemm_cp_core(const float* __restrict__ A,
 // (extern "C" for a stable symbol the host looks up by name — cuda.h
 // context::sgemm_).
 #define TL_SGEMM_KERNEL(NAME, TA, TB, BM, BIAS)                                  \
+  TL_ALIGN(NAME, 16, 16) /* A and B by cp.async's 16 bytes */                  \
   extern "C" __global__ void NAME(                                             \
       const float* __restrict__ A, const float* __restrict__ B,                \
       float* __restrict__ C, const float* __restrict__ bias, unsigned m,       \

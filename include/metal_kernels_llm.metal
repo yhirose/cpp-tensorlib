@@ -27,6 +27,9 @@ kernel void kv_append_(device KT* Kc             [[buffer(0)]],
 template [[host_name("kv_append_")]] kernel void
 kv_append_<float>(device float*, device float*, device const float*,
                   device const float*, constant kv_append_params&, uint, uint, uint);
+template [[host_name("kv_append_f16_")]] kernel void
+kv_append_<half>(device half*, device half*, device const float*,
+                 device const float*, constant kv_append_params&, uint, uint, uint);
 
 // A prefill's k/v ([n_kv_heads, T, D]) into cache rows [pos, pos + T); grid
 // (n_kv_heads, T), D threads.
@@ -48,3 +51,6 @@ kernel void kv_fill_(device KT* Kc             [[buffer(0)]],
 template [[host_name("kv_fill_")]] kernel void
 kv_fill_<float>(device float*, device float*, device const float*,
                 device const float*, constant kv_fill_params&, uint2, uint, uint2);
+template [[host_name("kv_fill_f16_")]] kernel void
+kv_fill_<half>(device half*, device half*, device const float*,
+               device const float*, constant kv_fill_params&, uint2, uint, uint2);
