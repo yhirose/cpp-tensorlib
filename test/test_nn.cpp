@@ -1020,6 +1020,56 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     CHECK(same(ya, yb, 1e-3f));
   }
 
+  SUBCASE("rmsnorm_rope against rmsnorm then rope, and the gated norm") {
+    // Qwen3's full turn (D 128) and Qwen3.5's partial one (D 256, 64 dims), a
+    // chunk of T tokens per head. Where the backend fuses them the two routes
+    // are different programs that agree to an ulp (Metal's fast math rounds
+    // each kernel's products its own way); where it does not,
+    // the fused call is the two ops and this is them against themselves.
+    struct shape { int64_t D, rot; };
+    for (const shape s : {shape{128, 128}, shape{256, 64}}) {
+      const int64_t H = 6, T = 5, rows = H * T, pos = 17;
+      const float base = 1e6f, eps = 1e-6f;
+      array x = random_array({rows, s.D}, 1090), w = dev(random_array({s.D}, 1091));
+      array xa = dev(x), xb = dev(x);
+      REQUIRE(gpu::rmsnorm_rope(xa.device_span(), w.device_span(), rows, T, s.D, pos, base,
+                                s.rot, eps));
+      REQUIRE(gpu::rmsnorm(xb.device_span(), w.device_span(), xb.device_span(), s.D, eps, rows));
+      REQUIRE(gpu::rope(xb.device_span(), xb.device_span(), rows, T, s.D, pos, base, {}, s.rot));
+      tl::gpu::flush();
+      CHECK(same(xa, xb, 1e-7f));
+    }
+    // silu(z) * rmsnorm(o) * w over o [T*H, D], the gate a row's head of z.
+    // The fused form against the composition a decoder runs without it
+    // (qwen.h): the gate rows gathered ahead of o into one [z | o] buffer,
+    // rmsnorm on o, then swiglu over the pair, to an ulp as rmsnorm_rope;
+    // D 300 takes a row past one 256-wide pass, unevenly over the lanes.
+    if (gpu::has_gated_rmsnorm) {
+      for (const int64_t D : {128, 300}) {
+        const int64_t T = 3, H = 4, n = T * H * D, ldz = H * D + 9;
+        const float eps = 1e-6f;
+        array o = random_array({T * H, D}, 1092), z = random_array({T, ldz}, 1093);
+        o.eval();
+        z.eval();
+        std::vector<float> zo((size_t)(2 * n));
+        for (int64_t r = 0; r < T * H; r++)
+          for (int64_t d = 0; d < D; d++)
+            zo[r * D + d] = z.raw()[(r / H) * ldz + (r % H) * D + d];
+        std::copy(o.raw(), o.raw() + n, zo.begin() + n);
+        array od = dev(o), zd = dev(z), w = dev(random_array({D}, 1094));
+        array buf = dev(array::from(std::move(zo), {2 * n}));
+        array oa = array::empty({T * H, D}), ob = array::empty({T * H, D});
+        REQUIRE(gpu::gated_rmsnorm(od.device_span(), zd.device_span(), ldz, w.device_span(),
+                                   oa.device_span(), false, T, H, D, eps));
+        const gpu::span op = buf.device_span().at(n * 4);
+        REQUIRE(gpu::rmsnorm(op, w.device_span(), op, D, eps, T * H));
+        REQUIRE(gpu::swiglu(buf.device_span(), ob.device_span(), n));
+        tl::gpu::flush();
+        CHECK(same(oa, ob, 1e-7f));
+      }
+    }
+  }
+
   SUBCASE("the cache: fill, append, decode and prefill attention") {
     const int64_t D = 64, HKV = 2, HQ = 14, MAXC = 64, T = 20, T2 = 7;
     const float scale = 1.0f / std::sqrt((float)D);

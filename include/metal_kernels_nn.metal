@@ -224,16 +224,32 @@ kernel void layer_norm_bwd_gb_fold_(device const float* partials [[buffer(0)]],
 // convention -- mirrors tensorlib_cuda.cu's own tl_rope. `a` is [rows, D]
 // contiguous (rows = H*T: a [H,T,D] tensor flattened, or [H,D] with T=1);
 // row r's head-dim vector sits at position `pos + (r % T)`; pairs
-// (j, j+D/2) rotate by angle = position * base^(-2j/D). Dispatched flat
-// over rows*(D/2), one invocation per (r, j) pair (CUDA instead grids by
-// row, blocks by D/2 -- every kernel in this file is flat-1D).
+// (j, j+D/2) rotate by angle = position * base^(-2j/D). Only the first `rot`
+// dims rotate (rot == D: all of them), as pairs (j, j + rot/2) at angle
+// position * base^(-2j/rot), the rest copied through: Qwen3.5's partial RoPE,
+// cuda's rope_core. Dispatched flat over rows*(D/2), one invocation per
+// (r, j) (CUDA instead grids by row, blocks by D/2 -- every kernel in this
+// file is flat-1D); invocation j turns pair j when j < rot/2 and copies dims
+// rot + j, rot + j + D/2, ...
 struct rope_params {
   uint T, D, pos;
   uint half_;
   float base;
   uint n;
   uint has_bias;
+  uint rot;
 };
+
+// The turn of the pair (x0, x1) at dims (j, j + rot/2) of a row at `position`:
+// every rotation in this file goes through it (rope_, rmsnorm_rope_).
+static inline void rope_pair_(float position, uint j, uint rot, float base,
+                              thread float& x0, thread float& x1) {
+  const float ang = position * pow(base, -2.0f * float(j) / float(rot));
+  const float c = cos(ang), s = sin(ang);
+  const float r0 = x0 * c - x1 * s;
+  x1 = x0 * s + x1 * c;
+  x0 = r0;
+}
 
 // `bias` is [rows, D] like x, added before the rotation when has_bias: the
 // decode step's q/k bias folded in (at T == 1 a [H, D] bias is that shape).
@@ -243,23 +259,21 @@ kernel void rope_(device const float* x [[buffer(0)]],
                   device const float* bias [[buffer(3)]],
                   uint i [[thread_position_in_grid]]) {
   if (i >= p.n) return;
-  uint r = i / p.half_;
-  uint j = i % p.half_;
-  uint t = p.T > 0 ? (r % p.T) : 0u;
-  float position = float(p.pos + t);
-  float theta = pow(p.base, -2.0f * float(j) / float(p.D));
-  float ang = position * theta;
-  float c = cos(ang);
-  float s = sin(ang);
-  uint bi = r * p.D;
+  const uint r = i / p.half_, j = i % p.half_, bi = r * p.D;
+  for (uint d = p.rot + j; d < p.D; d += p.half_)
+    out[bi + d] = p.has_bias ? x[bi + d] + bias[bi + d] : x[bi + d];
+  const uint h = p.rot >> 1;
+  if (j >= h) return;
+  const uint t = p.T > 0 ? (r % p.T) : 0u;
   float x0 = x[bi + j];
-  float x1 = x[bi + j + p.half_];
+  float x1 = x[bi + j + h];
   if (p.has_bias) {
     x0 += bias[bi + j];
-    x1 += bias[bi + j + p.half_];
+    x1 += bias[bi + j + h];
   }
-  out[bi + j] = x0 * c - x1 * s;
-  out[bi + j + p.half_] = x0 * s + x1 * c;
+  rope_pair_(float(p.pos + t), j, p.rot, p.base, x0, x1);
+  out[bi + j] = x0;
+  out[bi + j + h] = x1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1406,7 +1420,7 @@ kernel void ssm_conv_(device const float* x      [[buffer(0)]],
     const float xc = x[(ulong)t * p.ld + c];
     float acc = xc * wk[p.K - 1];
     for (uint k = 0; k + 1 < p.K; k++) acc += win[k] * wk[k];
-    out[(ulong)t * p.C + c] = acc / (1.0f + exp(-acc));
+    out[(ulong)t * p.C + c] = silu_(acc);
     for (uint k = 0; k + 2 < p.K; k++) win[k] = win[k + 1];
     win[p.K - 2] = xc;
   }
@@ -1563,6 +1577,101 @@ kernel void add_rmsnorm_(device const float* x         [[buffer(0)]],
   rmsnorm_core_<true>(x, delta, w, xout, hout, p, red, row, tid, nt, sgid, lane);
 }
 
+// rmsnorm_core_'s 1/sqrt(mean(x^2) + eps) of a row of n, taken by one
+// simdgroup in the same order: acc[k] is what its thread lane + 32 k summed
+// over elements lane + 32 k, + 256, ..., simd_sum gives simdgroup k's
+// partial, and the eight add in order (cuda's rmsnorm_sum_warp_, which keeps
+// its fusions bit for bit with the ops they replace). Fast math lets each
+// kernel order its products its own way, so here the fused forms agree with
+// rmsnorm_ and the ops after it to an ulp or so, not bit for bit.
+static inline float rmsnorm_inv_lane_(device const float* row, uint n, float eps,
+                                      uint lane) {
+  float ss = 0.0f;
+  for (uint k = 0; k < 8; k++) {
+    float acc = 0.0f;
+    for (uint i = lane + 32 * k; i < n; i += 256) acc += row[i] * row[i];
+    ss += simd_sum(acc);
+  }
+  return 1.0f / sqrt(ss / float(n) + eps);
+}
+
+// Qwen3's q / k head rows RMS-normalized and then rotated, in place: rmsnorm_
+// then rope_ in one pass, a simdgroup a row and eight a threadgroup, row r =
+// head * T + token. D = 64, 128 or 256 and rot a multiple of 64, so a lane's
+// values x[lane + 32 k] hold both halves of its rotation pairs (the host
+// refuses other shapes, and gpu::rmsnorm_rope runs the two ops).
+struct rmsnorm_rope_params {
+  uint rows, T, pos;
+  float base;
+  uint rot;
+  float eps;
+};
+template <uint D>
+kernel void rmsnorm_rope_(device float* x                  [[buffer(0)]],
+                          device const float* w            [[buffer(1)]],
+                          constant rmsnorm_rope_params& p  [[buffer(2)]],
+                          uint tg   [[threadgroup_position_in_grid]],
+                          uint sgid [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint E = D / 32;
+  const uint row = tg * 8 + sgid;
+  if (row >= p.rows) return;
+  device float* xr = x + (ulong)row * D;
+  const float inv = rmsnorm_inv_lane_(xr, D, p.eps, lane);
+  float v[E];
+  for (uint k = 0; k < E; k++) {
+    const uint d = lane + 32 * k;
+    v[k] = xr[d] * inv * w[d];
+  }
+  const uint h = p.rot >> 1, P = h / 32;  // rotation pairs a lane
+  const float position = float(p.pos + row % p.T);
+  for (uint k = 0; k < E; k++) {
+    const uint d = lane + 32 * k;
+    if (d >= p.rot) xr[d] = v[k];
+  }
+  for (uint k = 0; k < P; k++) {
+    const uint t = lane + 32 * k;
+    float x0 = v[k], x1 = v[k + P];
+    rope_pair_(position, t, p.rot, p.base, x0, x1);
+    xr[t] = x0;
+    xr[t + h] = x1;
+  }
+}
+template [[host_name("rmsnorm_rope_64_")]] kernel void rmsnorm_rope_<64>(
+    device float*, device const float*, constant rmsnorm_rope_params&, uint, uint, uint);
+template [[host_name("rmsnorm_rope_128_")]] kernel void rmsnorm_rope_<128>(
+    device float*, device const float*, constant rmsnorm_rope_params&, uint, uint, uint);
+template [[host_name("rmsnorm_rope_256_")]] kernel void rmsnorm_rope_<256>(
+    device float*, device const float*, constant rmsnorm_rope_params&, uint, uint, uint);
+
+// Qwen3.5's gated norm, silu(z) * (rmsnorm(o) * w), a simdgroup a row and
+// eight a threadgroup: rmsnorm_ and swiglu_ in one pass, with their sum and
+// their silu_. Row r = token * H + head of o [T*H, D]; its
+// gate is row `token` of z (rows ldz apart), at head * D.
+struct gated_rmsnorm_params {
+  uint rows, H, D, ldz;
+  float eps;
+};
+kernel void gated_rmsnorm_(device const float* o               [[buffer(0)]],
+                           device const float* z               [[buffer(1)]],
+                           device const float* w               [[buffer(2)]],
+                           device float* out                   [[buffer(3)]],
+                           constant gated_rmsnorm_params& p    [[buffer(4)]],
+                           uint tg   [[threadgroup_position_in_grid]],
+                           uint sgid [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+  const uint r = tg * 8 + sgid;
+  if (r >= p.rows) return;
+  const uint t = r / p.H, h = r % p.H;
+  device const float* orow = o + (ulong)r * p.D;
+  device const float* zrow = z + (ulong)t * p.ldz + (ulong)h * p.D;
+  const float inv = rmsnorm_inv_lane_(orow, p.D, p.eps, lane);
+  for (uint d = lane; d < p.D; d += 32) {
+    const float y = orow[d] * inv * w[d], g = zrow[d];
+    out[(ulong)r * p.D + d] = silu_(g) * y;
+  }
+}
+
 // out[row, f] = silu(gate) · up out of the fused gate|up projection
 // gu[row, 2·ff]; grid (ceil(ff / 256), rows).
 struct swiglu_params {
@@ -1577,7 +1686,7 @@ kernel void swiglu_(device const float* gu     [[buffer(0)]],
   if (f >= p.ff) return;
   const uint src = row * 2 * p.ff + f;
   const float g = gu[src];
-  out[row * p.ff + f] = (g / (1.0f + exp(-g))) * gu[src + p.ff];
+  out[row * p.ff + f] = silu_(g) * gu[src + p.ff];
 }
 
 // Token-major [T, ld] -> head-major [H, T, D] with an optional per-head bias
