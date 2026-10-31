@@ -266,24 +266,29 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       tl::gpu::flush();
       CHECK(same(C, A.dot(Wt), 1e-4f));
       // A, then C, from a base off the tensor cores' vectors (and A off the
-      // SIMT tiles' float4s), then W one bf16 off (off the 4 bytes any wider
-      // load needs): computed as above, never refused, since the prefill
-      // ignores the result and a refusal would leave its chunk unwritten.
+      // SIMT tiles' float4s), then W one bf16 off (off the 4 bytes Metal's
+      // wider loads need) and two (on them, off 16): computed as above, never
+      // refused, since the prefill ignores the result and a refusal would
+      // leave its chunk unwritten.
       const std::vector<float> want = host_values(C);
-      array As = dev(with_lead(A, 1)), Ws = dev(with_lead(W, 1).to_bf16());
-      for (const int shift : {0, 1, 2}) {  // A, C, W
+      array As = dev(with_lead(A, 1)), W2s = dev(with_lead(W, 1).to_bf16()),
+            W4s = dev(with_lead(W, 2).to_bf16());
+      const struct {
+        const char* what;
+        tl::gpu::span a, w;
+        int64_t c_lead;
+      } cases[] = {
+          {"prefill GEMM, A off 16 bytes", As.device_span().at(4), Wb.device_span(), 0},
+          {"prefill GEMM, C off 8 bytes", A.device_span(), Wb.device_span(), 1},
+          {"prefill GEMM, W off 4 bytes", A.device_span(), W2s.device_span().at(2), 0},
+          {"prefill GEMM, W off 16 bytes", A.device_span(), W4s.device_span().at(4), 0},
+      };
+      for (const auto& c : cases) {
         array Cs = dev(array::zeros({M * N + 1}));
-        static const char* what[] = {"prefill GEMM, A off 16 bytes", "prefill GEMM, C off 8 bytes",
-                                     "prefill GEMM, W off 4 bytes"};
         check_misaligned(
-            what[shift],
-            [&] {
-              return gpu::gemm_bf16_nt(shift == 0 ? As.device_span().at(4) : A.device_span(),
-                                       shift == 2 ? Ws.device_span().at(2) : Wb.device_span(),
-                                       Cs.device_span().at(shift == 1 ? 4 : 0), M, N, K);
-            },
-            [&] { return host_close(after_lead(Cs, shift == 1 ? 1 : 0, M * N), want, 1e-4f); },
-            true);
+            c.what,
+            [&] { return gpu::gemm_bf16_nt(c.a, c.w, Cs.device_span().at(4 * c.c_lead), M, N, K); },
+            [&] { return host_close(after_lead(Cs, c.c_lead, M * N), want, 1e-4f); }, true);
       }
       // A product past one 64-row band, and K not a multiple of 8 (Metal's
       // vectorized STEEL loader takes whole 8-element vectors of W's rows,
@@ -316,6 +321,19 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
                                        N, K));
       tl::gpu::flush();
       CHECK(same(C16, A.dot(Wt), 1e-2f));
+      // W off as above: the backend's f16 sums, or (where it declines) the
+      // f32 GEMM the op falls back to, so never refused; within the f16
+      // rounding of the f32 product either way.
+      for (const auto& c : {cases[2], cases[3]}) {
+        array C16s = array::empty({M, N});
+        const std::string what = std::string("f16-sum ") + c.what;
+        check_misaligned(
+            what.c_str(),
+            [&] {
+              return gpu::gemm_bf16_nt_f16acc(A.device_span(), c.w, C16s.device_span(), M, N, K);
+            },
+            [&] { return host_close(host_values(C16s), want, 1e-2f); }, true);
+      }
       // Row m of the GEMM is the GEMV of row m — the prefill and the decode
       // paths have to agree on the same weight, which is what makes a
       // prompt's last token continue into generation.

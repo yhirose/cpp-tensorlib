@@ -282,8 +282,8 @@ struct gemv_combine_params {
 };
 
 // A bf16 W the vectorized STEEL loader reads (SteelLoaderT's 16-byte runs of
-// eight): K whole runs, W on 16 bytes.
-inline bool bf16_rows_vec_(int64_t K, gpu::span W) { return K % 8 == 0 && W.off % 16 == 0; }
+// eight): K whole runs, W word_aligned_.
+inline bool bf16_rows_vec_(int64_t K, gpu::span W) { return K % 8 == 0 && word_aligned_(W); }
 
 // The quantized GEMVs' threadgroup: gemv_quant_sg_ simdgroups, each the
 // kernels' QROWS rows (metal_kernels_nn.metal).
@@ -292,10 +292,11 @@ inline constexpr unsigned long gemv_quant_qrows_ = 2, gemv_quant_sg_ = 2,
 
 // The quantized weights this backend reads natively: ggml type codes 12 Q4_K,
 // 14 Q6_K and 8 Q8_0, K a whole number of their blocks, and W aligned for the
-// kernels' loads (32-bit into a Q4_K block, 16-bit into the others).
+// kernels' loads (32-bit into a Q4_K block, so word_aligned_; 16-bit into the
+// others).
 inline bool quant_ok_(int type, int64_t k, gpu::span W) {
   return (type == 12 || type == 14 || type == 8) && k > 0 &&
-         k % (type == 8 ? 32 : 256) == 0 && W.off % (type == 12 ? 4 : 2) == 0;
+         k % (type == 8 ? 32 : 256) == 0 && (type == 12 ? word_aligned_(W) : W.off % 2 == 0);
 }
 
 // An NT GEMM's launch on STEEL's body (C[M,N] rows ldc apart, W [N,K] the
@@ -415,8 +416,8 @@ inline bool own_nn::gemv_bf16(gpu::span a, gpu::span B, gpu::span y, int64_t n,
 
 // C[M,N] = A[M,K] · B[N,K]ᵀ, B bf16: the batched prefill's projection, where
 // one weight serves a whole chunk of prompt tokens. STEEL's body (the f32
-// gemm's, metal.h), its vectorized loader where W's rows are whole 16-byte
-// vectors, the bf16 reader otherwise.
+// gemm's, metal.h), its vectorized loader where bf16_rows_vec_ holds, the bf16
+// reader otherwise.
 inline bool own_nn::gemm_bf16_nt(gpu::span A, gpu::span B, gpu::span C, int64_t M,
                               int64_t N, int64_t K) {
   auto& c = context::get();
@@ -432,7 +433,7 @@ inline bool own_nn::gemm_bf16_nt(gpu::span A, gpu::span B, gpu::span C, int64_t 
 }
 
 // The same summed in f16, cuda.h's contract: STEEL's body over half tiles,
-// for a W the vectorized loader reads (K % 8 == 0, on 16 bytes); otherwise
+// for a W the vectorized loader reads (bf16_rows_vec_); otherwise
 // false, and the caller's f32 GEMM.
 inline bool own_nn::gemm_bf16_nt_f16acc(gpu::span A, gpu::span B, gpu::span C,
                                         int64_t M, int64_t N, int64_t K) {
