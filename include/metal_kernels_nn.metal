@@ -881,7 +881,10 @@ kernel void gemv_q4_(device const float* a       [[buffer(0)]],
 // ---------------------------------------------------------------------------
 // bf16-weight NT GEMM: C[M,N] = A[M,K] · B[N,K]ᵀ, cuda's tl_gemm_bf16_nt —
 // the batched prefill's projection, where the same weight serves a whole
-// chunk of prompt tokens at once.
+// chunk of prompt tokens at once. The same body runs over a GGUF
+// block-quantized weight (cuda's gemm_quant, its exact form): only how a B
+// element is read differs, so that is the template's loader (`LB`), and each
+// weight is dequantized to f32 as it is staged.
 //
 // Its own body rather than a dtype parameter of sgemm_body_ because the
 // operand layout is what differs: that one stages B as [k][n], and reading
@@ -889,18 +892,26 @@ kernel void gemv_q4_(device const float* a       [[buffer(0)]],
 // both operands stage in their own row-major order, so every device read is
 // contiguous, and the B fragment is transposed on the way OUT of threadgroup
 // memory, which simdgroup_load does for free. Tiles, MMA shape and the
-// edge-tile store otherwise follow sgemm_body_.
+// edge-tile store otherwise follow sgemm_body_. C's rows are ldc apart, so a
+// run of a weight's rows can write its columns of a wider output.
 // ---------------------------------------------------------------------------
 
 struct gemm_nt_params {
-  uint M, N, K;
+  uint M, N, K, ldc;
 };
 
-template <uint BM, uint BN, uint BK>
-void gemm_nt_body_(device const float* A, device const ushort* B,
-                   device float* C, constant gemm_nt_params& p,
-                   threadgroup float* As, threadgroup float* Bs, uint3 tgid,
-                   uint tid, uint sid, uint lane) {
+// B[n,k] of a bf16 [N,K] weight.
+struct load_bf16_ {
+  device const ushort* B;
+  uint K;
+  float operator()(uint n, uint k) const { return widen_(B[(ulong)n * K + k]); }
+};
+
+template <uint BM, uint BN, uint BK, class LB>
+void gemm_nt_body_(device const float* A, LB B, device float* C,
+                   constant gemm_nt_params& p, threadgroup float* As,
+                   threadgroup float* Bs, uint3 tgid, uint tid, uint sid,
+                   uint lane) {
   constexpr uint N_SM = 2, N_SN = 2, TM = BM / N_SM, TN = BN / N_SN;
   constexpr uint FM = TM / 8, FN = TN / 8, THREADS = N_SM * N_SN * 32;
   constexpr uint S = BK + 4;  // both staged row-major in K; padding kills
@@ -919,8 +930,7 @@ void gemm_nt_body_(device const float* A, device const ushort* B,
     }
     for (uint i = tid; i < BN * BK; i += THREADS) {
       const uint r = i / BK, c = i % BK, gr = col0 + r, gc = k0 + c;
-      Bs[r * S + c] =
-          (gr < p.N && gc < p.K) ? widen_(B[(ulong)gr * p.K + gc]) : 0.0f;
+      Bs[r * S + c] = (gr < p.N && gc < p.K) ? B(gr, gc) : 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint kk = 0; kk < BK; kk += 8) {
@@ -944,14 +954,15 @@ void gemm_nt_body_(device const float* A, device const ushort* B,
     for (uint j = 0; j < FN; j++) {
       const uint r = row0 + wm * TM + i * 8, c = col0 + wn * TN + j * 8;
       if (r + 8 <= p.M && c + 8 <= p.N) {
-        simdgroup_store(acc[i][j], C + (ulong)r * p.N + c, p.N);
+        simdgroup_store(acc[i][j], C + (ulong)r * p.ldc + c, p.ldc);
       } else if (r < p.M && c < p.N) {
         threadgroup float* sc = As;  // per-simdgroup region, 4 × 64 floats
         simdgroup_store(acc[i][j], &sc[sid * 64], 8);
         simdgroup_barrier(mem_flags::mem_threadgroup);
         for (uint e = lane; e < 64; e += 32) {
           const uint er = r + e / 8, ec = c + e % 8;
-          if (er < p.M && ec < p.N) C[(ulong)er * p.N + ec] = sc[sid * 64 + e];
+          if (er < p.M && ec < p.N)
+            C[(ulong)er * p.ldc + ec] = sc[sid * 64 + e];
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
       }
@@ -959,9 +970,76 @@ void gemm_nt_body_(device const float* A, device const ushort* B,
   }
 }
 
-#define TL_GEMM_NT_KERNEL(name, BM, BN, BK)                                  \
+// ---- GGUF block-quantized weights ([N,K] rows of whole blocks, read where
+// they lie; include/ggml_quant.h has the formats in words and the CPU
+// reference). A Q4_K row is whole 144-byte blocks, so from a 4-byte aligned
+// weight (the host checks) its blocks take 32-bit loads; Q6_K's (210) and
+// Q8_0's (34) are only 2-byte aligned, hence their 16-bit loads.
+
+// Scale and min of a Q4_K group j (0..7) from the block's 12 scale bytes held
+// as three words: ggml's get_scale_min_k4, cuda's q4k_scale_min_.
+static inline void q4k_scale_min_(uint3 w, uint j, thread float& sc,
+                                  thread float& mn) {
+  const uint sh = 8u * (j & 3u), a = w.x >> sh, b = w.y >> sh, c = w.z >> sh;
+  sc = float(j < 4 ? a & 63u : (c & 0xFu) | ((a >> 2) & 0x30u));
+  mn = float(j < 4 ? b & 63u : ((c >> 4) & 0xFu) | ((b >> 2) & 0x30u));
+}
+static inline uint3 q4k_scale_words_(device const uchar* b) {
+  device const uint* s = reinterpret_cast<device const uint*>(b + 4);
+  return uint3(s[0], s[1], s[2]);
+}
+static inline float half_at_(device const uchar* b) {
+  return float(*reinterpret_cast<device const half*>(b));
+}
+
+// One weight, k of its row: the dequantization the CPU reference does, op for
+// op. Each format's block geometry (weights, bytes) is its loader's, which the
+// GEMVs below read too.
+struct load_q4k_ {
+  static constexpr constant uint ELEMS = 256, BYTES = 144;
+  device const uchar* W;
+  uint row_bytes;
+  float operator()(uint n, uint k) const {
+    device const uchar* b = W + (ulong)n * row_bytes + (k >> 8) * BYTES;
+    const uint o = k & 255u, g = o >> 5;
+    float sc, mn;
+    q4k_scale_min_(q4k_scale_words_(b), g, sc, mn);
+    const uint q = b[16 + 32 * (g >> 1) + (o & 31u)];
+    const float d1 = half_at_(b) * sc, m1 = half_at_(b + 2) * mn;
+    return d1 * float((g & 1u) ? q >> 4 : q & 0xFu) - m1;
+  }
+};
+struct load_q6k_ {
+  static constexpr constant uint ELEMS = 256, BYTES = 210;
+  device const uchar* W;
+  uint row_bytes;
+  float operator()(uint n, uint k) const {
+    device const uchar* b = W + (ulong)n * row_bytes + (k >> 8) * BYTES;
+    const uint o = k & 255u, h = o >> 7, r = o & 127u, quarter = r >> 5;
+    const uint l = r & 31u;
+    const uint ql = b[64 * h + l + ((quarter & 1u) ? 32u : 0u)];
+    const uint qh = b[128 + 32 * h + l];
+    const int q = int(((quarter >= 2 ? ql >> 4 : ql & 0xFu) |
+                       (((qh >> (2 * quarter)) & 3u) << 4))) - 32;
+    device const char* scales = reinterpret_cast<device const char*>(b + 192);
+    const float sc = float(scales[8 * h + l / 16 + 2 * quarter]);
+    return half_at_(b + 208) * sc * float(q);
+  }
+};
+struct load_q80_ {
+  static constexpr constant uint ELEMS = 32, BYTES = 34;
+  device const uchar* W;
+  uint row_bytes;
+  float operator()(uint n, uint k) const {
+    device const uchar* b = W + (ulong)n * row_bytes + (k >> 5) * BYTES;
+    device const char* qs = reinterpret_cast<device const char*>(b + 2);
+    return float(qs[k & 31u]) * half_at_(b);
+  }
+};
+
+#define TL_GEMM_NT_KERNEL(name, BM, BN, BK, WT, LOADER)                      \
   kernel void name(device const float* A [[buffer(0)]],                      \
-                   device const ushort* B [[buffer(1)]],                     \
+                   device const WT* B [[buffer(1)]],                         \
                    device float* C [[buffer(2)]],                            \
                    constant gemm_nt_params& p [[buffer(3)]],                 \
                    uint3 tgid [[threadgroup_position_in_grid]],              \
@@ -970,14 +1048,146 @@ void gemm_nt_body_(device const float* A, device const ushort* B,
                    uint lane [[thread_index_in_simdgroup]]) {                \
     threadgroup float As[BM * (BK + 4)];                                     \
     threadgroup float Bs[BN * (BK + 4)];                                     \
-    gemm_nt_body_<BM, BN, BK>(A, B, C, p, As, Bs, tgid, tid, sid, lane);     \
+    gemm_nt_body_<BM, BN, BK>(A, LOADER, C, p, As, Bs, tgid, tid, sid, lane); \
   }
+#define TL_LOAD_BF16 (load_bf16_{B, p.K})
+#define TL_LOAD_Q(L) (L{B, p.K / L::ELEMS * L::BYTES})
 
-TL_GEMM_NT_KERNEL(gemm_bf16_nt_, 64, 64, 16)
+TL_GEMM_NT_KERNEL(gemm_bf16_nt_, 64, 64, 16, ushort, TL_LOAD_BF16)
 // A prompt chunk is a few hundred rows, so a 64-row tile leaves most of the
 // grid on one M block; the 32-row one doubles the M blocks for short chunks.
-TL_GEMM_NT_KERNEL(gemm_bf16_nt32_, 32, 64, 16)
+TL_GEMM_NT_KERNEL(gemm_bf16_nt32_, 32, 64, 16, ushort, TL_LOAD_BF16)
+TL_GEMM_NT_KERNEL(gemm_q4k_nt_, 64, 64, 16, uchar, TL_LOAD_Q(load_q4k_))
+TL_GEMM_NT_KERNEL(gemm_q4k_nt32_, 32, 64, 16, uchar, TL_LOAD_Q(load_q4k_))
+TL_GEMM_NT_KERNEL(gemm_q6k_nt_, 64, 64, 16, uchar, TL_LOAD_Q(load_q6k_))
+TL_GEMM_NT_KERNEL(gemm_q6k_nt32_, 32, 64, 16, uchar, TL_LOAD_Q(load_q6k_))
+TL_GEMM_NT_KERNEL(gemm_q80_nt_, 64, 64, 16, uchar, TL_LOAD_Q(load_q80_))
+TL_GEMM_NT_KERNEL(gemm_q80_nt32_, 32, 64, 16, uchar, TL_LOAD_Q(load_q80_))
+#undef TL_LOAD_Q
+#undef TL_LOAD_BF16
 #undef TL_GEMM_NT_KERNEL
+
+// The decode GEMVs over the same rows: cuda's tl_gemv_q4k_row / _q6k_row /
+// _q80_row, one threadgroup of 4 simdgroups a row (gemv_bf16_row_'s shape and
+// params), each lane folding the weights it dequantizes straight into its dot
+// product.
+
+// Q4_K, a simdgroup a block: lane = 8 * pair + j reads 4 bytes of the pair's 32
+// (4 low nibbles of group 2*pair, 4 high of 2*pair+1) and the 4 + 4 activations
+// they multiply. y_n = sum d*sc*q*a - dmin*m*a.
+kernel void gemv_q4k_(device const float* a        [[buffer(0)]],
+                      device const uchar* W        [[buffer(1)]],
+                      device float* y              [[buffer(2)]],
+                      constant gemv_row_params& p  [[buffer(3)]],
+                      uint row  [[threadgroup_position_in_grid]],
+                      uint tid  [[thread_index_in_threadgroup]],
+                      uint sgid [[simdgroup_index_in_threadgroup]],
+                      uint nsg  [[simdgroups_per_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float red[8];
+  const uint nb = p.k / load_q4k_::ELEMS, pr = lane >> 3, j = lane & 7u;
+  device const uchar* wrow = W + (ulong)row * nb * load_q4k_::BYTES;
+  float acc = 0.0f;
+  for (uint ib = sgid; ib < nb; ib += nsg) {
+    device const uchar* b = wrow + (ulong)ib * load_q4k_::BYTES;
+    const uint w =
+        *reinterpret_cast<device const uint*>(b + 16 + 32 * pr + 4 * j);
+    device const float* ap = a + (ulong)ib * 256u + 64u * pr + 4u * j;
+    float sql = 0.0f, sqh = 0.0f, suml = 0.0f, sumh = 0.0f;
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < 4; i++) {
+      const float lo = ap[i], hi = ap[32 + i];
+      sql += float((w >> (8 * i)) & 0xFu) * lo;
+      sqh += float((w >> (8 * i + 4)) & 0xFu) * hi;
+      suml += lo;
+      sumh += hi;
+    }
+    const uint3 sw = q4k_scale_words_(b);
+    float s0, m0, s1, m1;
+    q4k_scale_min_(sw, 2 * pr, s0, m0);
+    q4k_scale_min_(sw, 2 * pr + 1, s1, m1);
+    acc += half_at_(b) * (s0 * sql + s1 * sqh) -
+           half_at_(b + 2) * (m0 * suml + m1 * sumh);
+  }
+  gemv_row_store_(acc, red, y + row, tid, sgid, nsg, lane);
+}
+
+// Q6_K, a simdgroup two blocks at a time: lane = 16 * which + 8 * half + j
+// reads the 4 consecutive positions 4j.. of its 128-weight half in each of the
+// four 32-weight quarters (4 + 4 bytes of ql, 4 of qh, 16 activations).
+static inline uint ld32_h_(device const uchar* b) {
+  device const ushort* s = reinterpret_cast<device const ushort*>(b);
+  return uint(s[0]) | (uint(s[1]) << 16);
+}
+kernel void gemv_q6k_(device const float* a        [[buffer(0)]],
+                      device const uchar* W        [[buffer(1)]],
+                      device float* y              [[buffer(2)]],
+                      constant gemv_row_params& p  [[buffer(3)]],
+                      uint row  [[threadgroup_position_in_grid]],
+                      uint tid  [[thread_index_in_threadgroup]],
+                      uint sgid [[simdgroup_index_in_threadgroup]],
+                      uint nsg  [[simdgroups_per_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float red[8];
+  const uint nb = p.k / load_q6k_::ELEMS, r = lane & 15u, h = r >> 3;
+  const uint j = r & 7u;
+  device const uchar* wrow = W + (ulong)row * nb * load_q6k_::BYTES;
+  float acc = 0.0f;
+  for (uint ib = sgid * 2u + (lane >> 4); ib < nb; ib += nsg * 2u) {
+    device const uchar* b = wrow + (ulong)ib * load_q6k_::BYTES;
+    const uint qa = ld32_h_(b + 64 * h + 4 * j);
+    const uint qb = ld32_h_(b + 64 * h + 32 + 4 * j);
+    const uint qh = ld32_h_(b + 128 + 32 * h + 4 * j);
+    device const char* sc =
+        reinterpret_cast<device const char*>(b + 192) + 8 * h + (j >> 2);
+    device const float* ap = a + (ulong)ib * 256u + 128u * h + 4u * j;
+    float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < 4; i++) {
+      const uint la = (qa >> (8 * i)) & 0xFFu, lb = (qb >> (8 * i)) & 0xFFu;
+      const uint hq = (qh >> (8 * i)) & 0xFFu;
+      s0 += float(int((la & 0xFu) | ((hq & 3u) << 4)) - 32) * ap[i];
+      s1 += float(int((lb & 0xFu) | (((hq >> 2) & 3u) << 4)) - 32) * ap[32 + i];
+      s2 += float(int((la >> 4) | (((hq >> 4) & 3u) << 4)) - 32) * ap[64 + i];
+      s3 += float(int((lb >> 4) | (((hq >> 6) & 3u) << 4)) - 32) * ap[96 + i];
+    }
+    acc += half_at_(b + 208) * (float(sc[0]) * s0 + float(sc[2]) * s1 +
+                                float(sc[4]) * s2 + float(sc[6]) * s3);
+  }
+  gemv_row_store_(acc, red, y + row, tid, sgid, nsg, lane);
+}
+
+// Q8_0, a simdgroup eight blocks at a time: lane = 4 * which + j reads the 8
+// bytes 8j.. of its block and the 8 activations they multiply. y_n = sum d*q*a.
+kernel void gemv_q80_(device const float* a        [[buffer(0)]],
+                      device const uchar* W        [[buffer(1)]],
+                      device float* y              [[buffer(2)]],
+                      constant gemv_row_params& p  [[buffer(3)]],
+                      uint row  [[threadgroup_position_in_grid]],
+                      uint tid  [[thread_index_in_threadgroup]],
+                      uint sgid [[simdgroup_index_in_threadgroup]],
+                      uint nsg  [[simdgroups_per_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float red[8];
+  const uint nb = p.k / load_q80_::ELEMS, j = lane & 3u;
+  device const uchar* wrow = W + (ulong)row * nb * load_q80_::BYTES;
+  float acc = 0.0f;
+  for (uint ib = sgid * 8u + (lane >> 2); ib < nb; ib += nsg * 8u) {
+    device const uchar* b = wrow + (ulong)ib * load_q80_::BYTES;
+    device const ushort* q16 =
+        reinterpret_cast<device const ushort*>(b + 2 + 8 * j);
+    device const float* ap = a + (ulong)ib * 32u + 8u * j;
+    float s = 0.0f;
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < 4; i++) {
+      const uint w = q16[i];
+      s += float(char(w & 0xFFu)) * ap[2 * i] +
+           float(char(w >> 8)) * ap[2 * i + 1];
+    }
+    acc += half_at_(b) * s;
+  }
+  gemv_row_store_(acc, red, y + row, tid, sgid, nsg, lane);
+}
 
 // ---------------------------------------------------------------------------
 // Fused decode attention: one query row against the whole cache. cuda's

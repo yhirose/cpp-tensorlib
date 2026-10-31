@@ -6,8 +6,41 @@
 //
 // Included by metal.h, after the device core.
 
+#include "gpu_abi_nn.h"
+
 namespace tl {
 namespace metal {
+
+// This layer's kernels that are neither a kop nor one of metal.h's families
+// (gtile, attn_op): keyed below attn_op's range in the one pipeline cache, so
+// a new nn kernel joins this list rather than starting another family.
+enum class nn_kernel {
+  gemv_q4k, gemv_q6k, gemv_q80,
+  gemm_q4k, gemm_q4k_32, gemm_q6k, gemm_q6k_32, gemm_q80, gemm_q80_32,
+};
+constexpr int nn_kernel_key_(nn_kernel t) { return -201 - static_cast<int>(t); }
+inline const char* nn_kernel_name_(nn_kernel t) {
+  switch (t) {
+    case nn_kernel::gemv_q4k: return "gemv_q4k_";
+    case nn_kernel::gemv_q6k: return "gemv_q6k_";
+    case nn_kernel::gemv_q80: return "gemv_q80_";
+    case nn_kernel::gemm_q4k: return "gemm_q4k_nt_";
+    case nn_kernel::gemm_q4k_32: return "gemm_q4k_nt32_";
+    case nn_kernel::gemm_q6k: return "gemm_q6k_nt_";
+    case nn_kernel::gemm_q6k_32: return "gemm_q6k_nt32_";
+    case nn_kernel::gemm_q80: return "gemm_q80_nt_";
+    case nn_kernel::gemm_q80_32: return "gemm_q80_nt32_";
+  }
+  return "";
+}
+static_assert(attn_op_key_(attn_op::combine_128) > nn_kernel_key_(nn_kernel::gemv_q4k),
+              "attn_op and nn_kernel pipeline keys must stay in disjoint ranges");
+
+namespace detail_ {
+inline void bind_(context& c, nn_kernel t) {
+  c.bind_id_(nn_kernel_key_(t), nn_kernel_name_(t));
+}
+}  // namespace detail_
 
 struct own_nn {
   static bool split_heads(gpu::span src, gpu::span bias, gpu::span dst,
@@ -35,6 +68,11 @@ struct own_nn {
                                float scale);
   static bool gemm_bf16_nt(gpu::span A, gpu::span B, gpu::span C, int64_t M,
                            int64_t N, int64_t K);
+  static bool gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y,
+                         int64_t n, int64_t k);
+  static bool gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
+                         gpu::span C, int64_t m, int64_t n, int64_t k,
+                         int64_t ldc, bool mmq);
   static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                    int64_t D, int64_t pos, float base, gpu::span bias = {});
   static bool layer_norm_bwd(gpu::span x, gpu::span g, gpu::span dy,
@@ -156,8 +194,33 @@ struct gemv_combine_params {
 };
 
 struct gemm_nt_params {
-  uint32_t M, N, K;
+  uint32_t M, N, K, ldc;
 };
+
+// The quantized weights this backend reads natively: ggml type codes 12 Q4_K,
+// 14 Q6_K and 8 Q8_0, K a whole number of their blocks, and W aligned for the
+// kernels' loads (32-bit into a Q4_K block, 16-bit into the others).
+inline bool quant_ok_(int type, int64_t k, gpu::span W) {
+  return (type == 12 || type == 14 || type == 8) && k > 0 &&
+         k % (type == 8 ? 32 : 256) == 0 && W.off % (type == 12 ? 4 : 2) == 0;
+}
+
+// The NT GEMM body's launch (C[M,N] rows ldc apart; A, B, C at buffers 0-2),
+// after the caller has bound its 32- or 64-row tile by gemm_nt_short_(M).
+inline bool gemm_nt_short_(int64_t M) { return M <= 64; }
+inline void gemm_nt_launch_(context& c, gpu::span A, gpu::span B, gpu::span C,
+                            int64_t M, int64_t N, int64_t K, int64_t ldc) {
+  const unsigned long BM = gemm_nt_short_(M) ? 32 : 64;
+  set_buf_(c.enc, A, 0ul);
+  set_buf_(c.enc, B, 1ul);
+  set_buf_(c.enc, C, 2ul);
+  gemm_nt_params p{static_cast<uint32_t>(M), static_cast<uint32_t>(N),
+                   static_cast<uint32_t>(K), static_cast<uint32_t>(ldc)};
+  set_bytes_(c.enc, p, 3ul);
+  const unsigned long gx = (static_cast<unsigned long>(N) + 63) / 64;
+  const unsigned long gy = (static_cast<unsigned long>(M) + BM - 1) / BM;
+  dispatch_grid_(c.enc, {gx, gy, 1}, {128, 1, 1});
+}
 
 struct attn_decode_params {
   uint32_t ctx, kv_stride, group, chunk;
@@ -269,17 +332,47 @@ inline bool own_nn::gemm_bf16_nt(gpu::span A, gpu::span B, gpu::span C, int64_t 
                               int64_t N, int64_t K) {
   auto& c = context::get();
   if (!c.device || M <= 0 || N <= 0 || K <= 0) return false;
-  const unsigned long BM = M <= 64 ? 32 : 64;
-  c.bind_(M <= 64 ? kop::gemm_bf16_nt32_ : kop::gemm_bf16_nt_);
-  detail_::set_buf_(c.enc, A, 0ul);
-  detail_::set_buf_(c.enc, B, 1ul);
-  detail_::set_buf_(c.enc, C, 2ul);
-  detail_::gemm_nt_params p{static_cast<uint32_t>(M), static_cast<uint32_t>(N),
-                            static_cast<uint32_t>(K)};
+  c.bind_(detail_::gemm_nt_short_(M) ? kop::gemm_bf16_nt32_ : kop::gemm_bf16_nt_);
+  detail_::gemm_nt_launch_(c, A, B, C, M, N, K, N);
+  return true;
+}
+
+// y[n] = W[n,K] . a over a GGUF block-quantized weight read where it lies:
+// cuda.h's contract, one threadgroup of 128 a row.
+inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y,
+                               int64_t n, int64_t k) {
+  auto& c = context::get();
+  if (!c.device || n <= 0 || !detail_::quant_ok_(type, k, W)) return false;
+  detail_::bind_(c, type == 12   ? nn_kernel::gemv_q4k
+                    : type == 14 ? nn_kernel::gemv_q6k
+                                 : nn_kernel::gemv_q80);
+  detail_::set_buf_(c.enc, a, 0ul);
+  detail_::set_buf_(c.enc, W, 1ul);
+  detail_::set_buf_(c.enc, y, 2ul);
+  gpu::gemv_row_params p{static_cast<uint32_t>(n), static_cast<uint32_t>(k)};
   detail_::set_bytes_(c.enc, p, 3ul);
-  const unsigned long gx = (static_cast<unsigned long>(N) + 63) / 64;
-  const unsigned long gy = (static_cast<unsigned long>(M) + BM - 1) / BM;
-  detail_::dispatch_grid_(c.enc, {gx, gy, 1}, {128, 1, 1});
+  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(n), 1, 1}, {128, 1, 1});
+  return true;
+}
+
+// C[m, 0..n) (rows ldc apart) = A[m,k] . W[n,k]ᵀ over a block-quantized
+// weight: cuda.h's contract in its exact form, the weight dequantized to f32 as
+// the bf16 GEMM's body stages it. Only that form: a16 is refused (the caller
+// never asks for it here, f16_activations being false on this backend), and
+// mmq, which CUDA applies only with a16, is ignored.
+inline bool own_nn::gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
+                               gpu::span C, int64_t m, int64_t n, int64_t k,
+                               int64_t ldc, bool mmq) {
+  (void)mmq;
+  auto& c = context::get();
+  if (!c.device || a16 || m <= 0 || n <= 0 || ldc < n ||
+      !detail_::quant_ok_(type, k, W))
+    return false;
+  const bool s = detail_::gemm_nt_short_(m);
+  detail_::bind_(c, type == 12   ? (s ? nn_kernel::gemm_q4k_32 : nn_kernel::gemm_q4k)
+                    : type == 14 ? (s ? nn_kernel::gemm_q6k_32 : nn_kernel::gemm_q6k)
+                                 : (s ? nn_kernel::gemm_q80_32 : nn_kernel::gemm_q80));
+  detail_::gemm_nt_launch_(c, A, W, C, m, n, k, ldc);
   return true;
 }
 

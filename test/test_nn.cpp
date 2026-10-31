@@ -914,6 +914,47 @@ TEST_CASE("partial rope rotates the first rot dims and keeps the rest") {
   tl::device_ = prev;
 }
 
+// N rows of K weights in a GGUF block format (ggml type 12 Q4_K, 14 Q6_K, 8
+// Q8_0) as one buffer (for the caller to move to the device), and the same rows
+// dequantized by the CPU reference. Random bytes are valid blocks; only the half scales are set
+// (a random one could be inf or NaN): Q4_K d, dmin at the start, Q6_K d at
+// byte 208, Q8_0 d at the start, each a small positive half ~ 2^-5 .. 2^-4.
+struct quant_rows {
+  array W;               // the blocks, packed into floats
+  std::vector<float> w;  // [N,K], dequantized
+};
+static quant_rows random_quant_rows(int type, int64_t N, int64_t K, unsigned seed) {
+  const auto t = static_cast<tl::gguf::ggml_type>(type);
+  const bool q4 = t == tl::gguf::ggml_type::q4_k, q8 = t == tl::gguf::ggml_type::q8_0;
+  uint64_t elems, block_bytes;
+  tl::gguf::ggml_block(t, elems, block_bytes);
+  const int64_t nb = K / (int64_t)elems, bb = (int64_t)block_bytes;
+  std::mt19937 rng(seed);
+  std::vector<unsigned char> bytes((size_t)N * nb * bb);
+  for (auto& b : bytes) b = (unsigned char)rng();
+  auto set_half = [&](size_t at) {
+    const uint16_t h = (uint16_t)(0x2800 + (rng() & 0x3ff));
+    std::memcpy(&bytes[at], &h, 2);
+  };
+  for (int64_t i = 0; i < N * nb; i++) {
+    if (q4) {
+      set_half((size_t)i * bb);
+      set_half((size_t)i * bb + 2);
+    } else {
+      set_half((size_t)i * bb + (q8 ? 0 : 208));
+    }
+  }
+  quant_rows r;
+  r.w.resize((size_t)N * K);
+  for (int64_t n = 0; n < N; n++)
+    tl::gguf::dequant_range(t, bytes.data() + (size_t)n * nb * bb, 0, (size_t)K,
+                            &r.w[(size_t)n * K]);
+  std::vector<float> packed((bytes.size() + 3) / 4);
+  std::memcpy(packed.data(), bytes.data(), bytes.size());
+  r.W = array::from(std::move(packed), {(int64_t)((bytes.size() + 3) / 4)});
+  return r;
+}
+
 // The generic compositions (gpu_ops.h, tier 1 out of tier 0) against the op
 // as the backend runs it. Where the backend has the fused kernel the two are
 // different programs that must agree; where it does not, the op is the
@@ -1279,52 +1320,70 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     // Only a backend that reads block-quantized rows natively runs this; no
     // composition stands in for it, and a model refuses such weights without it.
     if (gpu::has_gemv_quant) {
-      // Random bytes are valid blocks; only the half scales are set (a random
-      // one could be inf or NaN). Q4_K: d, dmin at the start; Q6_K: d at byte
-      // 208; Q8_0: d at the start.
       for (int type : {12, 14, 8}) {
-        const bool q4 = type == 12, q8 = type == 8;
-        const int64_t N = 37, K = 1024, nb = q8 ? K / 32 : K / 256, bb = q4 ? 144 : q8 ? 34 : 210;
-        std::mt19937 rng(7 + type);
-        std::vector<unsigned char> bytes((size_t)N * nb * bb);
-        for (auto& b : bytes) b = (unsigned char)rng();
-        auto set_half = [&](size_t at, float v) {  // a small positive half, built by hand
-          const uint16_t h = (uint16_t)(0x2800 + (rng() & 0x3ff));  // ~ 2^-5 .. 2^-4
-          std::memcpy(&bytes[at], &h, 2);
-          (void)v;
-        };
-        for (int64_t i = 0; i < N * nb; i++) {
-          if (q4) {
-            set_half((size_t)i * bb, 0);
-            set_half((size_t)i * bb + 2, 0);
-          } else if (q8) {
-            set_half((size_t)i * bb, 0);
-          } else {
-            set_half((size_t)i * bb + 208, 0);
-          }
-        }
+        const int64_t N = 37, K = 1024;
+        const quant_rows q = random_quant_rows(type, N, K, 7 + type);
         array a = random_array({K}, 1040 + type);
         a.eval();
         std::vector<double> ref(N, 0.0);
-        std::vector<float> w((size_t)K);
-        for (int64_t n = 0; n < N; n++) {
-          tl::gguf::dequant_range(q4   ? tl::gguf::ggml_type::q4_k
-                                  : q8 ? tl::gguf::ggml_type::q8_0
-                                       : tl::gguf::ggml_type::q6_k,
-                                  bytes.data() + (size_t)n * nb * bb, 0, (size_t)K, w.data());
-          for (int64_t k = 0; k < K; k++) ref[n] += (double)w[k] * a.raw()[k];
-        }
-        std::vector<float> packed((bytes.size() + 3) / 4);
-        std::memcpy(packed.data(), bytes.data(), bytes.size());
-        array W = dev(array::from(std::move(packed), {(int64_t)((bytes.size() + 3) / 4)}));
-        array ad = dev(a), y = array::empty({N});
+        for (int64_t n = 0; n < N; n++)
+          for (int64_t k = 0; k < K; k++) ref[n] += (double)q.w[(size_t)n * K + k] * a.raw()[k];
+        array W = dev(q.W), ad = dev(a), y = array::empty({N});
         REQUIRE(gpu::gemv_quant(type, ad.device_span(), W.device_span(), y.device_span(), N, K));
+        // A Q4_K weight off its 4-byte alignment is refused, not misread.
+        if (type == 12)
+          CHECK_FALSE(gpu::gemv_quant(type, ad.device_span(), W.device_span().at(2),
+                                      y.device_span(), N, K));
         tl::gpu::flush();
         y.eval();
         double worst = 0;
         for (int64_t n = 0; n < N; n++)
           worst = std::max(worst, std::fabs(y.raw()[n] - ref[n]) / (1.0 + std::fabs(ref[n])));
         CHECK(worst < 1e-5);
+      }
+    }
+  }
+
+  SUBCASE("GEMM over block-quantized rows against the dequantized weights") {
+    // The prefill's form: C's columns [off, off + n) of rows ldc apart, the
+    // columns around them left as they were. M on both sides of the
+    // backend's tile choice.
+    if (gpu::has_gemm_quant) {
+      for (int type : {12, 14, 8}) {
+        for (int64_t M : {37, 100}) {
+          const int64_t N = 70, K = 512, ldc = N + 6, off = 2;
+          const quant_rows q = random_quant_rows(type, N, K, 70 + type);
+          array a = random_array({M, K}, 1060 + type);
+          a.eval();
+          array W = dev(q.W), ad = dev(a);
+          array C = dev(array::from(std::vector<float>((size_t)(M * ldc), 7.0f), {M, ldc}));
+          REQUIRE(gpu::gemm_quant(type, false, ad.device_span(), W.device_span(),
+                                  C.device_span().at(off * 4), M, N, K, ldc));
+          tl::gpu::flush();
+          C.eval();
+          double worst = 0;
+          bool kept = true;
+          for (int64_t i = 0; i < M; i++) {
+            for (int64_t j = 0; j < ldc; j++) {
+              const float got = C.raw()[i * ldc + j];
+              if (j < off || j >= off + N) {
+                kept = kept && got == 7.0f;
+                continue;
+              }
+              double ref = 0, mag = 0;
+              for (int64_t k = 0; k < K; k++) {
+                const double t = (double)q.w[(size_t)(j - off) * K + k] * a.raw()[i * K + k];
+                ref += t;
+                mag += std::fabs(t);
+              }
+              worst = std::max(worst, std::fabs(got - ref) / mag);
+            }
+          }
+          // f32 sums, ~2e-7 of the terms' magnitude here; a misread weight
+          // is off by whole terms.
+          CHECK(worst < 2e-6);
+          CHECK(kept);
+        }
       }
     }
   }
