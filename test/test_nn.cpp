@@ -1389,6 +1389,9 @@ TEST_CASE("generic compositions agree with the fused kernels") {
         if (type == 12)
           CHECK_FALSE(gpu::gemv_quant(type, ad.device_span(), W.device_span().at(2),
                                       y.device_span(), N, K));
+        // So is an activation off 16 bytes (the kernels' vector loads).
+        CHECK_FALSE(gpu::gemv_quant(type, ad.device_span().at(4), W.device_span(),
+                                    y.device_span(), N, K));
         tl::gpu::flush();
         y.eval();
         double worst = 0;
