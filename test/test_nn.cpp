@@ -1437,9 +1437,11 @@ TEST_CASE("generic compositions agree with the fused kernels") {
               worst = std::max(worst, std::fabs(got - ref) / mag);
             }
           }
-          // f32 sums, ~2e-7 of the terms' magnitude here; a misread weight
-          // is off by whole terms.
-          CHECK(worst < 2e-6);
+          // f32 sums over operands at least bf16-exact (CUDA's tensor cores
+          // round both to bf16, Metal's keep f32): each term is off by at most
+          // 2^-8 of itself, so the sum by 4e-3 of the terms' magnitude. A
+          // misread weight is off by whole terms.
+          CHECK(worst < 4e-3);
           CHECK(kept);
         }
       }

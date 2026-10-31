@@ -998,14 +998,13 @@ struct traits {
 // efficient, but a few-hundred-row activation against a projection (256×768:
 // 12 blocks) leaves most SMs idle, and the 64² tile makes that 48 at half the
 // FMA per shared float and about half the registers per thread. Take the big
-// tile only when its grid (batch counted) already fills, or when K is not a
-// multiple of the small tile's 16-deep slab.
+// tile only when its grid (batch counted) already fills.
 // 128²-tile blocks a batch of m×n outputs takes: what the fill rules measure.
 inline long blocks128_(int64_t m, int64_t n, int64_t batch) {
   return (long)((n + 127) / 128) * ((m + 127) / 128) * batch;
 }
-inline bool big_tile_(int64_t m, int64_t n, int64_t k, int64_t batch = 1) {
-  return blocks128_(m, n, batch) >= traits::fill_groups || k % 16 != 0;
+inline bool big_tile_(int64_t m, int64_t n, int64_t batch = 1) {
+  return blocks128_(m, n, batch) >= traits::fill_groups;
 }
 
 // The wave plan. A launch places one block per SM up to kWaveSingles blocks

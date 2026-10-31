@@ -26,8 +26,9 @@ struct own_nn {
   static bool quantize_act_q8(gpu::span a, gpu::span qa, int64_t k);
   static bool gemv_q4k_q8(gpu::span qa, gpu::span W, gpu::span y, int64_t n, int64_t k);
   // C[m, ldc-strided n columns] = A[m,K] . W[n,K]^T over GGUF block-quantized rows (type 12
-  // Q4_K, 14 Q6_K, 8 Q8_0). a16: A is f16 and the sums f16, else A is f32 and the sums f32
-  // (the exact form). K % 256 == 0 (Q8_0: % 32), n even. mmq (with a16, Q4_K, or Q8_0 with
+  // Q4_K, 14 Q6_K, 8 Q8_0). a16: A is f16 and the sums f16, else A f32, the operands
+  // rounded to bf16 and the sums f32 (the exact form: no f16 range to overflow). K % 256 == 0
+  // (Q8_0: % 32), n even. mmq (with a16, Q4_K, or Q8_0 with
   // K % 256 == 0):
   // A is quantized to int8 and the product runs on the int8 tensor cores, nothing
   // dequantized (tl_gemm_mmq_q4k, _q80): faster, and the activation rounded to 8 bits.
@@ -237,11 +238,11 @@ inline bool gemm_tc_run_(context& c, context::tc_form form, void* pa, void* pB, 
 
 // M9 batched-prefill GEMM: C(M,N) = A(M,K) @ W[N,K]^T, W the same row-major
 // bf16 weight gemv_bf16_row consumes — so a batched prompt reuses the decode
-// weights as-is. Requires K % 8 == 0. See tl_gemm_bf16_nt.
+// weights as-is. Any K and alignment (see tl_gemm_bf16_nt).
 inline bool own_nn::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
                               int64_t m, int64_t n, int64_t k) {
   auto& c = context::get();
-  if (!c.ready || (k % 8) != 0 || m <= 0 || n <= 0) return false;
+  if (!c.ready || m <= 0 || n <= 0 || k <= 0) return false;
   c.device_read_(a.buf);
   c.device_read_(B.buf);  // B reinterpreted as __nv_bfloat16* [N][K] in-kernel
   c.device_write_(out.buf);
@@ -250,13 +251,15 @@ inline bool own_nn::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
   float* po = context::off_(out.buf, out.off);
   unsigned uM = (unsigned)m, uN = (unsigned)n, uK = (unsigned)k;
   // The tensor cores read 16-byte vectors of both operands, so their rows must
-  // start on 16 bytes (and N be even: a thread stores two columns at once).
-  const bool aligned = ((uintptr_t)pa % 16 == 0) && ((uintptr_t)pB % 16 == 0) && n % 2 == 0;
+  // start on 16 bytes (K % 8 == 0, and N even: a thread stores two columns at
+  // once). The rest runs on the SIMT tiles below.
+  const bool aligned = ((uintptr_t)pa % 16 == 0) && ((uintptr_t)pB % 16 == 0) && n % 2 == 0 &&
+                       k % 8 == 0;
   if (aligned) return gemm_tc_run_(c, context::tc_form::f32, pa, pB, po, uM, uN, uK, uN);
   // Tile choice by fill (big_tile_): a prefill chunk is only a few hundred
   // tokens, so a narrow projection (N=896, M=512) is 28 big blocks against 82
-  // SMs and 112 small ones. The big tile needs K % 8 == 0, the small K % 16.
-  bool big = big_tile_(m, n, k);
+  // SMs and 112 small ones.
+  bool big = big_tile_(m, n);
   unsigned t = big ? 128u : 64u;
   unsigned gx = (unsigned)((n + t - 1) / t), gy = (unsigned)((m + t - 1) / t);
   unsigned blocks = gx * gy;
@@ -440,8 +443,11 @@ inline bool own_nn::quantize_act_q8(gpu::span a, gpu::span qa, int64_t k) {
 inline bool own_nn::gemv_q4k_q8(gpu::span qa, gpu::span W, gpu::span y, int64_t n, int64_t k) {
   auto& c = context::get();
   if (!c.ready || n <= 0 || k <= 0 || k % 256) return false;
+  // Both operands are read as 16-byte vectors (a Q4_K block, 144 bytes, keeps
+  // its quants on 16 when the weight starts there).
   float* pq = context::off_(qa.buf, qa.off);
-  if ((uintptr_t)pq % 16) return false;
+  float* pw = context::off_(W.buf, W.off);
+  if ((uintptr_t)pq % 16 || (uintptr_t)pw % 16) return false;
   c.device_read_(qa.buf);
   c.device_read_(W.buf);
   c.device_write_(y.buf);
@@ -450,8 +456,8 @@ inline bool own_nn::gemv_q4k_q8(gpu::span qa, gpu::span W, gpu::span y, int64_t 
                    {((unsigned)n + rows_per_block - 1) / rows_per_block}, {rows_per_block * 32}, 0,
                    reinterpret_cast<signed char*>(pq),
                    reinterpret_cast<void*>(reinterpret_cast<char*>(pq) + k),
-                   reinterpret_cast<unsigned char*>(context::off_(W.buf, W.off)),
-                   context::off_(y.buf, y.off), (unsigned)n, (unsigned)k);
+                   reinterpret_cast<unsigned char*>(pw), context::off_(y.buf, y.off), (unsigned)n,
+                   (unsigned)k);
 }
 
 inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n,
@@ -459,8 +465,11 @@ inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, 
   auto& c = context::get();
   if (!c.ready || n <= 0 || k <= 0 || k % (type == 8 ? 32 : 256) || (type != 12 && type != 14 && type != 8))
     return false;
+  // The activation is read as float4s; the weight as Q4_K's 4-byte words and
+  // Q6_K's and Q8_0's 2-byte halves. A view off those is refused, not misread.
   float* pa = context::off_(a.buf, a.off);
-  if ((uintptr_t)pa % 16) return false;
+  float* pw = context::off_(W.buf, W.off);
+  if ((uintptr_t)pa % 16 || (uintptr_t)pw % (type == 12 ? 4 : 2)) return false;
   c.device_read_(a.buf);
   c.device_read_(W.buf);
   c.device_write_(y.buf);
@@ -469,7 +478,7 @@ inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, 
                    : type == 14 ? c.cached_(c.gemv_q6k_fn, "tl_gemv_q6k_row")
                                 : c.cached_(c.gemv_q80_fn, "tl_gemv_q80_row"),
                    {(unsigned)n}, {threads}, threads / 32 * sizeof(float), pa,
-                   reinterpret_cast<unsigned char*>(context::off_(W.buf, W.off)),
+                   reinterpret_cast<unsigned char*>(pw),
                    context::off_(y.buf, y.off), (unsigned)n, (unsigned)k);
 }
 

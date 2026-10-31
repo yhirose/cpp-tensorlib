@@ -935,9 +935,9 @@ __global__ void tl_layer_norm_bwd_gb_fold(const float* partials, float* dg,
 // the friendliest layout for tiling.
 //
 // A and B tiles are staged transposed in shared memory so the inner loop reads
-// each operand as float4s. Requires K % 8 == 0 (every transformer dim; the
-// launcher checks) — so there is no K tail, only M/N edges, which the loads and
-// the epilogue predicate.
+// each operand as float4s. Any K and any operand alignment: the loads take
+// vectors where they can and predicate the K tail as they do the M/N edges
+// (the launcher sends the aligned, K % 8 == 0 case to the tensor cores).
 // The block tile is templated: 256 threads always, tile BM x BM, K-slab
 // BK = 1024/BM (so each thread stages exactly one 4-wide chunk of each operand),
 // microtile (BM/16) x (BM/16) held as G = BM/64 float4 GROUPS per axis, 64 apart.
@@ -997,17 +997,36 @@ __device__ __forceinline__ void gemm_bf16_nt_core(const float* __restrict__ A,
   float acc[G][4][G][4] = {};
   float4 pa;
   float2 p0, p1;
+  // A thread's 4 elements load as one vector (A a float4, B 8 bytes of bf16)
+  // where they lie whole on that width; otherwise one at a time, zero past
+  // k1. So any K and any operand alignment run, and the zeros a ragged last
+  // slab adds leave the sums as they were.
+  const bool vec = K % 4 == 0 && (size_t)A % 16 == 0 && (size_t)B % 8 == 0;
   // Stage the K slab at `kt` into registers (global -> reg), then into shared.
   auto load = [&](unsigned kt) {
+    const unsigned k = kt + ldK;
     pa = make_float4(0.f, 0.f, 0.f, 0.f);
-    if (gA < M) pa = *reinterpret_cast<const float4*>(&A[(size_t)gA * K + kt + ldK]);
     p0 = make_float2(0.f, 0.f);
     p1 = make_float2(0.f, 0.f);
-    if (gB < N) {
-      uint2 raw = *reinterpret_cast<const uint2*>(&B[(size_t)gB * K + kt + ldK]);
-      p0 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.x));
-      p1 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.y));
+    if (vec && k + 4 <= k1) {
+      if (gA < M) pa = *reinterpret_cast<const float4*>(&A[(size_t)gA * K + k]);
+      if (gB < N) {
+        uint2 raw = *reinterpret_cast<const uint2*>(&B[(size_t)gB * K + k]);
+        p0 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.x));
+        p1 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.y));
+      }
+      return;
     }
+    float a[4] = {}, b[4] = {};
+#pragma unroll
+    for (int e = 0; e < 4; e++) {
+      if (k + e >= k1) break;
+      if (gA < M) a[e] = A[(size_t)gA * K + k + e];
+      if (gB < N) b[e] = __bfloat162float(B[(size_t)gB * K + k + e]);
+    }
+    pa = make_float4(a[0], a[1], a[2], a[3]);
+    p0 = make_float2(b[0], b[1]);
+    p1 = make_float2(b[2], b[3]);
   };
   auto store = [&]() {
     As[ldK + 0][ldRow] = pa.x;
