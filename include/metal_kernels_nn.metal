@@ -1106,45 +1106,58 @@ kernel void gemv_q_(device const float* a       [[buffer(0)]],
   }
 }
 
-// Q4_K, four blocks at a time: lane = 8 * blk + j reads 16 of block blk's
-// 128 quant bytes, the positions 16 * (j & 1).. of pair j / 2 (low nibbles
-// group 2 * pair, high 2 * pair + 1). y_n = sum d*sc*q*a - dmin*m*a.
+// Q4_K, four blocks at a time, llama.cpp's kernel_mul_mv_q4_K_f32: lane =
+// 8 * blk + 4 * iq + ir reads, of pairs iq and iq + 2 (64 weights each), the
+// 8 bytes at 8 * ir: their low nibbles are weights 8 * ir.. of the pair's
+// first group, the high ones of its second. A nibble is masked in place, not
+// shifted down (u & 0x0F00 is 256 q), and the powers of 16 come off with the
+// scales. y_n = sum d*sc*q*a - dmin*m*a.
 struct gemv_q4k_dot_ {
   using L = read_q4k_;
   static void accumulate(thread float* acc, device const float* a, gemv_q_rows_<L> w,
                          uint nb, uint lane) {
-    const uint j = lane & 7u, pr = j >> 1;
+    const uint it = lane & 7u, iq = it >> 2, ir = it & 3u;
+    float yl[16], yh[16];
     for (uint ib = lane >> 3; ib < nb; ib += 4) {
-      device const float4* ap = reinterpret_cast<device const float4*>(
-          a + (ulong)ib * 256u + 64u * pr + 16u * (j & 1u));
-      float4 lo[4], hi[4], sl = 0.0f, sh = 0.0f;
+      device const float* y4 = a + (ulong)ib * 256u + 64u * iq + 8u * ir;
+      float4 sumy = 0.0f;
       _Pragma("clang loop unroll(full)")
-      for (uint i = 0; i < 4; i++) {
-        lo[i] = ap[i];
-        hi[i] = ap[8 + i];
-        sl += lo[i];
-        sh += hi[i];
+      for (uint i = 0; i < 8; i++) {
+        yl[i] = y4[i];
+        yl[i + 8] = y4[i + 32];
+        yh[i] = y4[i + 128];
+        yh[i + 8] = y4[i + 160];
+        sumy += float4(yl[i], yl[i + 8], yh[i], yh[i + 8]);
       }
-      const float suml = sl.x + sl.y + sl.z + sl.w, sumh = sh.x + sh.y + sh.z + sh.w;
       _Pragma("clang loop unroll(full)")
       for (uint r = 0; r < QROWS; r++) {
         device const uchar* b = w.block(r, ib);
-        device const uint* q = reinterpret_cast<device const uint*>(b + 16 + 16 * j);
-        float sql = 0.0f, sqh = 0.0f;
+        // Groups 2iq, 2iq + 1 (scales 0, 1, mins 2, 3) and 2iq + 4, 2iq + 5
+        // (4, 5 and 6, 7): ggml's get_scale_min_k4, two groups a ushort.
+        device const ushort* sc = reinterpret_cast<device const ushort*>(b + 4) + iq;
+        ushort sc16[4];
+        sc16[0] = sc[0] & 0x3f3f;
+        sc16[1] = sc[2] & 0x3f3f;
+        sc16[2] = (sc[4] & 0x0f0f) | ((sc[0] & 0xc0c0) >> 2);
+        sc16[3] = ((sc[4] >> 4) & 0x0f0f) | ((sc[2] & 0xc0c0) >> 2);
+        thread const uchar* sc8 = reinterpret_cast<thread const uchar*>(sc16);
+        device const ushort* q1 =
+            reinterpret_cast<device const ushort*>(b + 16) + 16 * iq + 4 * ir;
+        device const ushort* q2 = q1 + 32;
+        float4 acc1 = 0.0f, acc2 = 0.0f;
         _Pragma("clang loop unroll(full)")
         for (uint i = 0; i < 4; i++) {
-          const uint v = q[i];
-          sql += dot(float4(v & 0xFu, (v >> 8) & 0xFu, (v >> 16) & 0xFu, (v >> 24) & 0xFu),
-                     lo[i]);
-          sqh += dot(float4((v >> 4) & 0xFu, (v >> 12) & 0xFu, (v >> 20) & 0xFu, v >> 28),
-                     hi[i]);
+          const ushort u = q1[i], v = q2[i];
+          acc1 += float4(yl[2 * i], yl[2 * i + 1], yl[2 * i + 8], yl[2 * i + 9]) *
+                  float4(u & 0x000F, u & 0x0F00, u & 0x00F0, u & 0xF000);
+          acc2 += float4(yh[2 * i], yh[2 * i + 1], yh[2 * i + 8], yh[2 * i + 9]) *
+                  float4(v & 0x000F, v & 0x0F00, v & 0x00F0, v & 0xF000);
         }
-        const uint3 sw = q4k_scale_words_(b);
-        float s0, m0, s1, m1;
-        q4k_scale_min_(sw, 2 * pr, s0, m0);
-        q4k_scale_min_(sw, 2 * pr + 1, s1, m1);
-        acc[r] += half_at_(b) * (s0 * sql + s1 * sqh) -
-                  half_at_(b + 2) * (m0 * suml + m1 * sumh);
+        acc[r] += half_at_(b) * ((acc1[0] + acc1[1] / 256.0f) * sc8[0] +
+                                 (acc1[2] + acc1[3] / 256.0f) * sc8[1] / 16.0f +
+                                 (acc2[0] + acc2[1] / 256.0f) * sc8[4] +
+                                 (acc2[2] + acc2[3] / 256.0f) * sc8[5] / 16.0f) -
+                  half_at_(b + 2) * dot(sumy, float4(sc8[2], sc8[3], sc8[6], sc8[7]));
       }
     }
   }
