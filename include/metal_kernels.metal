@@ -27,6 +27,9 @@ static inline float widen_(ushort h) { return as_type<float>(uint(h) << 16); }
 // An f16 KV cache's element (caps::kv_f16): read exactly, written rounded to
 // nearest even.
 static inline float widen_(half h) { return float(h); }
+// SiLU, g * sigmoid(g): one function for every kernel that applies it, so a
+// fused kernel and the ones it replaces round it the same.
+static inline float silu_(float g) { return g / (1.0f + exp(-g)); }
 static inline void narrow_(device float* dst, float v) { *dst = v; }
 static inline void narrow_(device half* dst, float v) { *dst = half(v); }
 // Four consecutive elements as a float4 (i4 counts float4s).

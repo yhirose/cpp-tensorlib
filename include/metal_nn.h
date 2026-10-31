@@ -17,6 +17,7 @@ namespace metal {
 enum class nn_kernel {
   gemv_q4k, gemv_q6k, gemv_q80,
   gemm_q4k, gemm_q4k_32, gemm_q6k, gemm_q6k_32, gemm_q80, gemm_q80_32,
+  rmsnorm_rope_64, rmsnorm_rope_128, rmsnorm_rope_256, gated_rmsnorm,
 };
 constexpr int nn_kernel_key_(nn_kernel t) { return -201 - static_cast<int>(t); }
 inline const char* nn_kernel_name_(nn_kernel t) {
@@ -30,6 +31,10 @@ inline const char* nn_kernel_name_(nn_kernel t) {
     case nn_kernel::gemm_q6k_32: return "gemm_q6k_nt32_";
     case nn_kernel::gemm_q80: return "gemm_q80_nt_";
     case nn_kernel::gemm_q80_32: return "gemm_q80_nt32_";
+    case nn_kernel::rmsnorm_rope_64: return "rmsnorm_rope_64_";
+    case nn_kernel::rmsnorm_rope_128: return "rmsnorm_rope_128_";
+    case nn_kernel::rmsnorm_rope_256: return "rmsnorm_rope_256_";
+    case nn_kernel::gated_rmsnorm: return "gated_rmsnorm_";
   }
   return "";
 }
@@ -75,6 +80,15 @@ struct own_nn {
                          int64_t ldc, bool mmq);
   static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                    int64_t D, int64_t pos, float base, gpu::span bias = {});
+  static bool rope_partial(gpu::span x, gpu::span out, int64_t rows, int64_t T,
+                           int64_t D, int64_t pos, float base, gpu::span bias,
+                           int64_t rot);
+  static bool rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T,
+                           int64_t D, int64_t pos, float base, int64_t rot,
+                           float eps);
+  static bool gated_rmsnorm(gpu::span o, gpu::span z, int64_t ldz, gpu::span w,
+                            gpu::span out, bool h16, int64_t T, int64_t H,
+                            int64_t D, float eps);
   static bool layer_norm_bwd(gpu::span x, gpu::span g, gpu::span dy,
                              gpu::span dx, gpu::span dg, gpu::span db,
                              gpu::span stats, gpu::span partials, int64_t rows,
@@ -138,6 +152,17 @@ struct rope_params {
   float base;
   uint32_t n;
   uint32_t has_bias;
+  uint32_t rot;
+};
+struct rmsnorm_rope_params {
+  uint32_t rows, T, pos;
+  float base;
+  uint32_t rot;
+  float eps;
+};
+struct gated_rmsnorm_params {
+  uint32_t rows, H, D, ldz;
+  float eps;
 };
 }  // namespace detail_
 
@@ -150,10 +175,18 @@ struct rope_params {
 // in; array.h's gpu_rope_ never passes one). Dispatched flat over rows*(D/2)
 // (CUDA instead grids by row, blocks by D/2 -- this file's own kernels are
 // all flat-1D, same as sum_to/compare/unary_ext above).
+// rope and rope_partial are one kernel: the first `rot` dims turn (rot == D
+// for the whole row) and the rest are copied through, as cuda's tl_rope.
 inline bool own_nn::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                       int64_t D, int64_t pos, float base, gpu::span bias) {
+  return rope_partial(x, out, rows, T, D, pos, base, bias, D);
+}
+inline bool own_nn::rope_partial(gpu::span x, gpu::span out, int64_t rows,
+                              int64_t T, int64_t D, int64_t pos, float base,
+                              gpu::span bias, int64_t rot) {
   auto& c = context::get();
-  if (!c.device || D <= 0 || (D & 1)) return false;
+  if (!c.device || D <= 0 || (D & 1) || rot <= 0 || (rot & 1) || rot > D)
+    return false;
   int64_t half = D / 2;
   int64_t n = rows * half;
   c.bind_(kop::rope_);
@@ -168,10 +201,58 @@ inline bool own_nn::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
   p.base = base;
   p.n = static_cast<uint32_t>(n);
   p.has_bias = bias.buf ? 1u : 0u;
-  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
-             static_cast<unsigned long>(sizeof(p)), 2ul);
+  p.rot = static_cast<uint32_t>(rot);
+  detail_::set_bytes_(c.enc, p, 2ul);
   unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
   detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
+  return true;
+}
+
+// x[rows, D] = rope(rmsnorm(x) * w) in place, a simdgroup a row: cuda.h's
+// contract and shapes (D 64, 128 or 256; rot a multiple of 64), rmsnorm_'s
+// sum and rope_'s turn. Other shapes are refused, and gpu::rmsnorm_rope runs
+// the two ops.
+inline bool own_nn::rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows,
+                              int64_t T, int64_t D, int64_t pos, float base,
+                              int64_t rot, float eps) {
+  auto& c = context::get();
+  if (!c.device || (D != 64 && D != 128 && D != 256) || rows <= 0 || T <= 0 ||
+      rot <= 0 || rot % 64 || rot > D || rows % T)
+    return false;
+  detail_::bind_(c, D == 64    ? nn_kernel::rmsnorm_rope_64
+                    : D == 128 ? nn_kernel::rmsnorm_rope_128
+                               : nn_kernel::rmsnorm_rope_256);
+  detail_::set_buf_(c.enc, x, 0ul);
+  detail_::set_buf_(c.enc, w, 1ul);
+  detail_::rmsnorm_rope_params p{static_cast<uint32_t>(rows), static_cast<uint32_t>(T),
+                                 static_cast<uint32_t>(pos), base,
+                                 static_cast<uint32_t>(rot), eps};
+  detail_::set_bytes_(c.enc, p, 2ul);
+  detail_::dispatch_grid_(c.enc, {(static_cast<unsigned long>(rows) + 7) / 8, 1, 1},
+                          {256, 1, 1});
+  return true;
+}
+
+// Qwen3.5's silu(z) * rmsnorm(o) * w over o [T*H, D], a simdgroup a row:
+// cuda.h's contract in f32 (h16, the f16 activations', is refused: this
+// backend has no f16_activations, so the caller never asks).
+inline bool own_nn::gated_rmsnorm(gpu::span o, gpu::span z, int64_t ldz,
+                               gpu::span w, gpu::span out, bool h16, int64_t T,
+                               int64_t H, int64_t D, float eps) {
+  auto& c = context::get();
+  if (!c.device || h16 || T <= 0 || H <= 0 || D <= 0) return false;
+  detail_::bind_(c, nn_kernel::gated_rmsnorm);
+  detail_::set_buf_(c.enc, o, 0ul);
+  detail_::set_buf_(c.enc, z, 1ul);
+  detail_::set_buf_(c.enc, w, 2ul);
+  detail_::set_buf_(c.enc, out, 3ul);
+  const int64_t rows = T * H;
+  detail_::gated_rmsnorm_params p{static_cast<uint32_t>(rows), static_cast<uint32_t>(H),
+                                  static_cast<uint32_t>(D), static_cast<uint32_t>(ldz),
+                                  eps};
+  detail_::set_bytes_(c.enc, p, 4ul);
+  detail_::dispatch_grid_(c.enc, {(static_cast<unsigned long>(rows) + 7) / 8, 1, 1},
+                          {256, 1, 1});
   return true;
 }
 
