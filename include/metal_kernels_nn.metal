@@ -1166,27 +1166,26 @@ struct gemv_q6k_dot_ {
       device const float4* ap = reinterpret_cast<device const float4*>(
           a + (ulong)ib * 256u + 128u * h + 4u * j);
       const float4 a0 = ap[0], a1 = ap[8], a2 = ap[16], a3 = ap[24];
+      // The -32 offset, once for both rows: sum (q - 32) a = q.a - 32 sum a.
+      const float4 o = 32.0f * float4(dot(a0, 1.0f), dot(a1, 1.0f), dot(a2, 1.0f),
+                                      dot(a3, 1.0f));
       _Pragma("clang loop unroll(full)")
       for (uint r = 0; r < QROWS; r++) {
         device const uchar* b = w.block(r, ib);
         const uint qa = ld32_h_(b + 64 * h + 4 * j);
         const uint qb = ld32_h_(b + 64 * h + 32 + 4 * j);
         const uint qh = ld32_h_(b + 128 + 32 * h + 4 * j);
-        float4 q0, q1, q2, q3;
-        _Pragma("clang loop unroll(full)")
-        for (uint i = 0; i < 4; i++) {
-          const uint la = (qa >> (8 * i)) & 0xFFu, lb = (qb >> (8 * i)) & 0xFFu;
-          const uint hq = (qh >> (8 * i)) & 0xFFu;
-          q0[i] = float(int((la & 0xFu) | ((hq & 3u) << 4)) - 32);
-          q1[i] = float(int((lb & 0xFu) | (((hq >> 2) & 3u) << 4)) - 32);
-          q2[i] = float(int((la >> 4) | (((hq >> 4) & 3u) << 4)) - 32);
-          q3[i] = float(int((lb >> 4) | (((hq >> 6) & 3u) << 4)) - 32);
-        }
+        // Each quarter's four 6-bit values, a byte each, decoded at once.
+        const uint lo = 0x0F0F0F0Fu;
+        const float4 q0 = float4(as_type<uchar4>((qa & lo) | ((qh & 0x03030303u) << 4)));
+        const float4 q1 = float4(as_type<uchar4>((qb & lo) | ((qh & 0x0C0C0C0Cu) << 2)));
+        const float4 q2 = float4(as_type<uchar4>(((qa >> 4) & lo) | (qh & 0x30303030u)));
+        const float4 q3 = float4(as_type<uchar4>(((qb >> 4) & lo) | ((qh >> 2) & 0x30303030u)));
         device const char* sc =
             reinterpret_cast<device const char*>(b + 192) + 8 * h + (j >> 2);
         acc[r] += half_at_(b + 208) *
-                  (float(sc[0]) * dot(q0, a0) + float(sc[2]) * dot(q1, a1) +
-                   float(sc[4]) * dot(q2, a2) + float(sc[6]) * dot(q3, a3));
+                  (float(sc[0]) * (dot(q0, a0) - o[0]) + float(sc[2]) * (dot(q1, a1) - o[1]) +
+                   float(sc[4]) * (dot(q2, a2) - o[2]) + float(sc[6]) * (dot(q3, a3) - o[3]));
       }
     }
   }
