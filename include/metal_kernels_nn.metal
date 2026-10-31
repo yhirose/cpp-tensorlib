@@ -896,96 +896,23 @@ kernel void gemv_q4_(device const float* a       [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
-// bf16-weight NT GEMM: C[M,N] = A[M,K] · B[N,K]ᵀ, cuda's tl_gemm_bf16_nt —
+// bf16-weight NT GEMM: C[M,N] = A[M,K] · B[N,K]ᵀ, cuda's tl_gemm_bf16_nt:
 // the batched prefill's projection, where the same weight serves a whole
-// chunk of prompt tokens at once. The same body runs over a GGUF
-// block-quantized weight (cuda's gemm_quant, its exact form): only how a B
-// element is read differs, so that is the template's loader (`LB`), and each
-// weight is dequantized to f32 as it is staged.
-//
-// Its own body rather than a dtype parameter of sgemm_body_ because the
-// operand layout is what differs: that one stages B as [k][n], and reading
-// this [N,K] weight into it costs one strided device read per element. Here
-// both operands stage in their own row-major order, so every device read is
-// contiguous, and the B fragment is transposed on the way OUT of threadgroup
-// memory, which simdgroup_load does for free. Tiles, MMA shape and the
-// edge-tile store otherwise follow sgemm_body_. C's rows are ldc apart, so a
-// run of a weight's rows can write its columns of a wider output.
+// chunk of prompt tokens at once. The same over a GGUF block-quantized
+// weight (cuda's gemm_quant, its exact form). All run STEEL's body
+// (metal_kernels.metal) with W [N,K] as the transposed B: a bf16 W whose K
+// is whole 8-element vectors through its vectorized loader, and the rest
+// through a reader f(n, k) (below), each weight dequantized to f32 as it is
+// staged. C's rows are p.ldc apart, so a run of a weight's rows can write its
+// columns of a wider output.
 // ---------------------------------------------------------------------------
 
-struct gemm_nt_params {
-  uint M, N, K, ldc;
-};
-
 // B[n,k] of a bf16 [N,K] weight.
-struct load_bf16_ {
+struct read_bf16_ {
   device const ushort* B;
   uint K;
   float operator()(uint n, uint k) const { return widen_(B[(ulong)n * K + k]); }
 };
-
-template <uint BM, uint BN, uint BK, class LB>
-void gemm_nt_body_(device const float* A, LB B, device float* C,
-                   constant gemm_nt_params& p, threadgroup float* As,
-                   threadgroup float* Bs, uint3 tgid, uint tid, uint sid,
-                   uint lane) {
-  constexpr uint N_SM = 2, N_SN = 2, TM = BM / N_SM, TN = BN / N_SN;
-  constexpr uint FM = TM / 8, FN = TN / 8, THREADS = N_SM * N_SN * 32;
-  constexpr uint S = BK + 4;  // both staged row-major in K; padding kills
-                              // the bank conflicts of the fragment reads
-
-  const uint wm = sid / N_SN, wn = sid % N_SN;
-  const uint row0 = tgid.y * BM, col0 = tgid.x * BN;
-  simdgroup_matrix<float, 8, 8> acc[FM][FN];
-  for (uint i = 0; i < FM; i++)
-    for (uint j = 0; j < FN; j++) acc[i][j] = simdgroup_matrix<float, 8, 8>(0);
-
-  for (uint k0 = 0; k0 < p.K; k0 += BK) {
-    for (uint i = tid; i < BM * BK; i += THREADS) {
-      const uint r = i / BK, c = i % BK, gr = row0 + r, gc = k0 + c;
-      As[r * S + c] = (gr < p.M && gc < p.K) ? A[(ulong)gr * p.K + gc] : 0.0f;
-    }
-    for (uint i = tid; i < BN * BK; i += THREADS) {
-      const uint r = i / BK, c = i % BK, gr = col0 + r, gc = k0 + c;
-      Bs[r * S + c] = (gr < p.N && gc < p.K) ? B(gr, gc) : 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint kk = 0; kk < BK; kk += 8) {
-      simdgroup_matrix<float, 8, 8> af[FM], bf[FN];
-      for (uint i = 0; i < FM; i++)
-        simdgroup_load(af[i], &As[(wm * TM + i * 8) * S + kk], S);
-      // Bs holds [n][k]; the MMA wants [k][n], which the transposing load
-      // produces without a second staging pass.
-      for (uint j = 0; j < FN; j++)
-        simdgroup_load(bf[j], &Bs[(wn * TN + j * 8) * S + kk], S, ulong2(0, 0),
-                       true);
-      for (uint i = 0; i < FM; i++)
-        for (uint j = 0; j < FN; j++)
-          simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
-    }
-    // Also guards the store below, which reuses As as scratch.
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-
-  for (uint i = 0; i < FM; i++) {
-    for (uint j = 0; j < FN; j++) {
-      const uint r = row0 + wm * TM + i * 8, c = col0 + wn * TN + j * 8;
-      if (r + 8 <= p.M && c + 8 <= p.N) {
-        simdgroup_store(acc[i][j], C + (ulong)r * p.ldc + c, p.ldc);
-      } else if (r < p.M && c < p.N) {
-        threadgroup float* sc = As;  // per-simdgroup region, 4 × 64 floats
-        simdgroup_store(acc[i][j], &sc[sid * 64], 8);
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint e = lane; e < 64; e += 32) {
-          const uint er = r + e / 8, ec = c + e % 8;
-          if (er < p.M && ec < p.N)
-            C[(ulong)er * p.ldc + ec] = sc[sid * 64 + e];
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-      }
-    }
-  }
-}
 
 // ---- GGUF block-quantized weights ([N,K] rows of whole blocks, read where
 // they lie; include/ggml_quant.h has the formats in words and the CPU
@@ -1010,9 +937,9 @@ static inline float half_at_(device const uchar* b) {
 }
 
 // One weight, k of its row: the dequantization the CPU reference does, op for
-// op. Each format's block geometry (weights, bytes) is its loader's, which the
+// op. Each format's block geometry (weights, bytes) is its reader's, which the
 // GEMVs below read too.
-struct load_q4k_ {
+struct read_q4k_ {
   static constexpr constant uint ELEMS = 256, BYTES = 144;
   device const uchar* W;
   uint row_bytes;
@@ -1026,7 +953,7 @@ struct load_q4k_ {
     return d1 * float((g & 1u) ? q >> 4 : q & 0xFu) - m1;
   }
 };
-struct load_q6k_ {
+struct read_q6k_ {
   static constexpr constant uint ELEMS = 256, BYTES = 210;
   device const uchar* W;
   uint row_bytes;
@@ -1043,7 +970,7 @@ struct load_q6k_ {
     return half_at_(b + 208) * sc * float(q);
   }
 };
-struct load_q80_ {
+struct read_q80_ {
   static constexpr constant uint ELEMS = 32, BYTES = 34;
   device const uchar* W;
   uint row_bytes;
@@ -1054,42 +981,24 @@ struct load_q80_ {
   }
 };
 
-#define TL_GEMM_NT_KERNEL(name, BM, BN, BK, WT, LOADER)                      \
-  kernel void name(device const float* A [[buffer(0)]],                      \
-                   device const WT* B [[buffer(1)]],                         \
-                   device float* C [[buffer(2)]],                            \
-                   constant gemm_nt_params& p [[buffer(3)]],                 \
-                   uint3 tgid [[threadgroup_position_in_grid]],              \
-                   uint tid [[thread_index_in_threadgroup]],                 \
-                   uint sid [[simdgroup_index_in_threadgroup]],              \
-                   uint lane [[thread_index_in_simdgroup]]) {                \
-    threadgroup float As[BM * (BK + 4)];                                     \
-    threadgroup float Bs[BN * (BK + 4)];                                     \
-    gemm_nt_body_<BM, BN, BK>(A, LOADER, C, p, As, Bs, tgid, tid, sid, lane); \
-  }
-#define TL_LOAD_BF16 (load_bf16_{B, p.K})
-#define TL_LOAD_Q(L) (L{B, p.K / L::ELEMS * L::BYTES})
+#define TL_READ_BF16 (read_bf16_{B, p.K})
+#define TL_READ_Q(L) (L{B, p.K / L::ELEMS * L::BYTES})
 
-// The bf16 weight's GEMM where K is whole 8-element vectors: STEEL's body
-// (metal_kernels.metal), its transposing loader reading W [N,K] as the B of
-// A . Wᵀ and widening the bf16 rows as it stages them. gemm_bf16_nt_ below
-// keeps the other K.
+// A bf16 W whose K is whole 8-element vectors: the vectorized loader.
 TL_STEEL_KERNEL(gemm_bf16_steel_, 64, false, true, ushort)
 TL_STEEL_KERNEL(gemm_bf16_steel32_, 32, false, true, ushort)
-
-TL_GEMM_NT_KERNEL(gemm_bf16_nt_, 64, 64, 16, ushort, TL_LOAD_BF16)
-// A prompt chunk is a few hundred rows, so a 64-row tile leaves most of the
-// grid on one M block; the 32-row one doubles the M blocks for short chunks.
-TL_GEMM_NT_KERNEL(gemm_bf16_nt32_, 32, 64, 16, ushort, TL_LOAD_BF16)
-TL_GEMM_NT_KERNEL(gemm_q4k_nt_, 64, 64, 16, uchar, TL_LOAD_Q(load_q4k_))
-TL_GEMM_NT_KERNEL(gemm_q4k_nt32_, 32, 64, 16, uchar, TL_LOAD_Q(load_q4k_))
-TL_GEMM_NT_KERNEL(gemm_q6k_nt_, 64, 64, 16, uchar, TL_LOAD_Q(load_q6k_))
-TL_GEMM_NT_KERNEL(gemm_q6k_nt32_, 32, 64, 16, uchar, TL_LOAD_Q(load_q6k_))
-TL_GEMM_NT_KERNEL(gemm_q80_nt_, 64, 64, 16, uchar, TL_LOAD_Q(load_q80_))
-TL_GEMM_NT_KERNEL(gemm_q80_nt32_, 32, 64, 16, uchar, TL_LOAD_Q(load_q80_))
-#undef TL_LOAD_Q
-#undef TL_LOAD_BF16
-#undef TL_GEMM_NT_KERNEL
+// The rest through a reader (steel_b_'s functor loader); the 32-row band for
+// a short chunk (steel_grid_).
+TL_STEEL_KERNEL_SRC(gemm_bf16_nt_, 64, false, true, ushort, TL_READ_BF16)
+TL_STEEL_KERNEL_SRC(gemm_bf16_nt32_, 32, false, true, ushort, TL_READ_BF16)
+TL_STEEL_KERNEL_SRC(gemm_q4k_nt_, 64, false, true, uchar, TL_READ_Q(read_q4k_))
+TL_STEEL_KERNEL_SRC(gemm_q4k_nt32_, 32, false, true, uchar, TL_READ_Q(read_q4k_))
+TL_STEEL_KERNEL_SRC(gemm_q6k_nt_, 64, false, true, uchar, TL_READ_Q(read_q6k_))
+TL_STEEL_KERNEL_SRC(gemm_q6k_nt32_, 32, false, true, uchar, TL_READ_Q(read_q6k_))
+TL_STEEL_KERNEL_SRC(gemm_q80_nt_, 64, false, true, uchar, TL_READ_Q(read_q80_))
+TL_STEEL_KERNEL_SRC(gemm_q80_nt32_, 32, false, true, uchar, TL_READ_Q(read_q80_))
+#undef TL_READ_Q
+#undef TL_READ_BF16
 
 // The decode GEMVs over the same rows: cuda's tl_gemv_q4k_row / _q6k_row /
 // _q80_row, one threadgroup of 4 simdgroups a row (gemv_bf16_row_'s shape and
@@ -1109,11 +1018,11 @@ kernel void gemv_q4k_(device const float* a        [[buffer(0)]],
                       uint nsg  [[simdgroups_per_threadgroup]],
                       uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float red[8];
-  const uint nb = p.k / load_q4k_::ELEMS, pr = lane >> 3, j = lane & 7u;
-  device const uchar* wrow = W + (ulong)row * nb * load_q4k_::BYTES;
+  const uint nb = p.k / read_q4k_::ELEMS, pr = lane >> 3, j = lane & 7u;
+  device const uchar* wrow = W + (ulong)row * nb * read_q4k_::BYTES;
   float acc = 0.0f;
   for (uint ib = sgid; ib < nb; ib += nsg) {
-    device const uchar* b = wrow + (ulong)ib * load_q4k_::BYTES;
+    device const uchar* b = wrow + (ulong)ib * read_q4k_::BYTES;
     const uint w =
         *reinterpret_cast<device const uint*>(b + 16 + 32 * pr + 4 * j);
     device const float* ap = a + (ulong)ib * 256u + 64u * pr + 4u * j;
@@ -1153,12 +1062,12 @@ kernel void gemv_q6k_(device const float* a        [[buffer(0)]],
                       uint nsg  [[simdgroups_per_threadgroup]],
                       uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float red[8];
-  const uint nb = p.k / load_q6k_::ELEMS, r = lane & 15u, h = r >> 3;
+  const uint nb = p.k / read_q6k_::ELEMS, r = lane & 15u, h = r >> 3;
   const uint j = r & 7u;
-  device const uchar* wrow = W + (ulong)row * nb * load_q6k_::BYTES;
+  device const uchar* wrow = W + (ulong)row * nb * read_q6k_::BYTES;
   float acc = 0.0f;
   for (uint ib = sgid * 2u + (lane >> 4); ib < nb; ib += nsg * 2u) {
-    device const uchar* b = wrow + (ulong)ib * load_q6k_::BYTES;
+    device const uchar* b = wrow + (ulong)ib * read_q6k_::BYTES;
     const uint qa = ld32_h_(b + 64 * h + 4 * j);
     const uint qb = ld32_h_(b + 64 * h + 32 + 4 * j);
     const uint qh = ld32_h_(b + 128 + 32 * h + 4 * j);
@@ -1193,11 +1102,11 @@ kernel void gemv_q80_(device const float* a        [[buffer(0)]],
                       uint nsg  [[simdgroups_per_threadgroup]],
                       uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float red[8];
-  const uint nb = p.k / load_q80_::ELEMS, j = lane & 3u;
-  device const uchar* wrow = W + (ulong)row * nb * load_q80_::BYTES;
+  const uint nb = p.k / read_q80_::ELEMS, j = lane & 3u;
+  device const uchar* wrow = W + (ulong)row * nb * read_q80_::BYTES;
   float acc = 0.0f;
   for (uint ib = sgid * 8u + (lane >> 2); ib < nb; ib += nsg * 8u) {
-    device const uchar* b = wrow + (ulong)ib * load_q80_::BYTES;
+    device const uchar* b = wrow + (ulong)ib * read_q80_::BYTES;
     device const ushort* q16 =
         reinterpret_cast<device const ushort*>(b + 2 + 8 * j);
     device const float* ap = a + (ulong)ib * 32u + 8u * j;
