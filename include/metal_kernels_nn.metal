@@ -335,7 +335,10 @@ static inline void attn_store_row_(device float* row,
 
 // q, out [H,T,D]; K/V a cache of kv_stride elements per kv head read over
 // [0, pos0+T); query p sits at pos0+p. BK keys per tile. KT is the cache's
-// element type (f32 is the one instantiated).
+// element type: f32, or half for an f16 cache (caps::kv_f16). Width 256 is
+// instantiated for the f16 cache only, as cuda's (an f32 cache there takes
+// gpu::attn_prefill's GEMM form); its two 16-key tiles fill the whole 32 KB of
+// threadgroup memory.
 template <int AD, int BK, typename KT>
 kernel void attn_prefill_(device const float* q   [[buffer(0)]],
                           device const KT* K      [[buffer(1)]],
@@ -435,16 +438,16 @@ kernel void attn_prefill_(device const float* q   [[buffer(0)]],
   const uint qi = qbase + sid * 8 + fm;
   if (qi < T) attn_store_row_(out + (h * T + qi) * AD + fn, of, 1.0f / l);
 }
-template [[host_name("attn_prefill_64_")]] kernel void
-attn_prefill_<64, 32, float>(device const float*, device const float*,
-                             device const float*, device float*,
-                             constant attn_params&, uint2, uint2, uint, uint,
-                             uint);
-template [[host_name("attn_prefill_128_")]] kernel void
-attn_prefill_<128, 16, float>(device const float*, device const float*,
-                              device const float*, device float*,
-                              constant attn_params&, uint2, uint2, uint, uint,
-                              uint);
+#define TL_ATTN_PREFILL(name, AD, BK, KT)                                    \
+  template [[host_name(name)]] kernel void attn_prefill_<AD, BK, KT>(        \
+      device const float*, device const KT*, device const KT*, device float*, \
+      constant attn_params&, uint2, uint2, uint, uint, uint);
+TL_ATTN_PREFILL("attn_prefill_64_", 64, 32, float)
+TL_ATTN_PREFILL("attn_prefill_128_", 128, 16, float)
+TL_ATTN_PREFILL("attn_prefill_64_f16_", 64, 32, half)
+TL_ATTN_PREFILL("attn_prefill_128_f16_", 128, 16, half)
+TL_ATTN_PREFILL("attn_prefill_256_f16_", 256, 16, half)
+#undef TL_ATTN_PREFILL
 
 // The query half of the pullback: dq and `stats` [2,H,T] (the row
 // logsumexp, then Δ = dO·O) for the key/value half. dq = scale·C·K / l with
@@ -1283,14 +1286,18 @@ kernel void attn_decode_(device const float* q          [[buffer(0)]],
                  p.ctx, p.scale, qs, sm, sl, sacc, tid, sgid, lane, gm, gl, o);
   out[h * AD + tid] = o / gl;
 }
-template [[host_name("attn_decode_64_")]] kernel void
-attn_decode_<64, float>(device const float*, device const float*,
-                        device const float*, device float*,
-                        constant attn_decode_params&, uint, uint, uint, uint);
-template [[host_name("attn_decode_128_")]] kernel void
-attn_decode_<128, float>(device const float*, device const float*,
-                         device const float*, device float*,
-                         constant attn_decode_params&, uint, uint, uint, uint);
+// Every head width (64, 128, 256) over either cache, as cuda's.
+#define TL_ATTN_DECODE(name, AD, KT)                                         \
+  template [[host_name(name)]] kernel void attn_decode_<AD, KT>(             \
+      device const float*, device const KT*, device const KT*, device float*, \
+      constant attn_decode_params&, uint, uint, uint, uint);
+TL_ATTN_DECODE("attn_decode_64_", 64, float)
+TL_ATTN_DECODE("attn_decode_128_", 128, float)
+TL_ATTN_DECODE("attn_decode_256_", 256, float)
+TL_ATTN_DECODE("attn_decode_64_f16_", 64, half)
+TL_ATTN_DECODE("attn_decode_128_f16_", 128, half)
+TL_ATTN_DECODE("attn_decode_256_f16_", 256, half)
+#undef TL_ATTN_DECODE
 
 // One key chunk of one head: partials pm[H*S] | pl[H*S] | pacc[H*S*AD], the
 // layout attn_combine_ reads (cuda's attn_partials).
@@ -1323,16 +1330,17 @@ kernel void attn_decode_split_(device const float* q          [[buffer(0)]],
   }
   parts[2 * hs + at * AD + tid] = o;
 }
-template [[host_name("attn_decode_split_64_")]] kernel void
-attn_decode_split_<64, float>(device const float*, device const float*,
-                              device const float*, device float*,
-                              constant attn_decode_params&, uint2, uint2, uint,
-                              uint, uint);
-template [[host_name("attn_decode_split_128_")]] kernel void
-attn_decode_split_<128, float>(device const float*, device const float*,
-                               device const float*, device float*,
-                               constant attn_decode_params&, uint2, uint2, uint,
-                               uint, uint);
+#define TL_ATTN_SPLIT(name, AD, KT)                                          \
+  template [[host_name(name)]] kernel void attn_decode_split_<AD, KT>(       \
+      device const float*, device const KT*, device const KT*, device float*, \
+      constant attn_decode_params&, uint2, uint2, uint, uint, uint);
+TL_ATTN_SPLIT("attn_decode_split_64_", 64, float)
+TL_ATTN_SPLIT("attn_decode_split_128_", 128, float)
+TL_ATTN_SPLIT("attn_decode_split_256_", 256, float)
+TL_ATTN_SPLIT("attn_decode_split_64_f16_", 64, half)
+TL_ATTN_SPLIT("attn_decode_split_128_f16_", 128, half)
+TL_ATTN_SPLIT("attn_decode_split_256_f16_", 256, half)
+#undef TL_ATTN_SPLIT
 
 // Merge one head's S partials, rescaling each by exp(m_s − max m).
 struct attn_combine_params {
@@ -1360,12 +1368,14 @@ kernel void attn_combine_(device const float* parts        [[buffer(0)]],
   }
   out[h * AD + tid] = o / gl;
 }
-template [[host_name("attn_combine_64_")]] kernel void
-attn_combine_<64>(device const float*, device float*,
-                  constant attn_combine_params&, uint, uint, uint);
-template [[host_name("attn_combine_128_")]] kernel void
-attn_combine_<128>(device const float*, device float*,
-                   constant attn_combine_params&, uint, uint, uint);
+#define TL_ATTN_COMBINE(name, AD)                                         \
+  template [[host_name(name)]] kernel void attn_combine_<AD>(             \
+      device const float*, device float*, constant attn_combine_params&, \
+      uint, uint, uint);
+TL_ATTN_COMBINE("attn_combine_64_", 64)
+TL_ATTN_COMBINE("attn_combine_128_", 128)
+TL_ATTN_COMBINE("attn_combine_256_", 256)
+#undef TL_ATTN_COMBINE
 
 // ---------------------------------------------------------------------------
 // The decode step's other kernels, cuda's tl_kv_append / tl_kv_fill /

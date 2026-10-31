@@ -12,7 +12,7 @@ namespace tl {
 namespace metal {
 
 // This layer's kernels that are neither a kop nor one of metal.h's families
-// (gtile, attn_op): keyed below attn_op's range in the one pipeline cache, so
+// (gtile, attn_kernel_): keyed below attn's range in the one pipeline cache, so
 // a new nn kernel joins this list rather than starting another family.
 enum class nn_kernel {
   gemv_q4k, gemv_q6k, gemv_q80,
@@ -33,8 +33,8 @@ inline const char* nn_kernel_name_(nn_kernel t) {
   }
   return "";
 }
-static_assert(attn_op_key_(attn_op::combine_128) > nn_kernel_key_(nn_kernel::gemv_q4k),
-              "attn_op and nn_kernel pipeline keys must stay in disjoint ranges");
+static_assert(attn_key_last_ > nn_kernel_key_(nn_kernel::gemv_q4k),
+              "attn and nn_kernel pipeline keys must stay in disjoint ranges");
 
 namespace detail_ {
 inline void bind_(context& c, nn_kernel t) {
@@ -255,16 +255,18 @@ inline void attn_dispatch_(objc::id enc, const attn_params& p,
 
 // q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D] cache read over
 // [0,pos0+T), query p at absolute position pos0+p. GQA via the head ratio.
-// D∈{64,128}; an f32 cache.
+// The head widths and caches attn_kernel_ names (cuda's: 64 and 128 over
+// either cache, 256 over an f16 one).
 inline bool own_nn::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
                               gpu::span out, int64_t n_q_heads,
                               int64_t n_kv_heads, int64_t T, int64_t kv_max,
                               int64_t D, float scale, bool kv_f16,
                               int64_t pos0) {
   auto& c = context::get();
-  if (!c.device || kv_f16 || (D != 64 && D != 128)) return false;
+  const attn_kernel k = attn_kernel_(attn_op::prefill, D, kv_f16);
+  if (!c.device || !k) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || T <= 0) return false;
-  c.bind_(D == 64 ? attn_op::prefill_64 : attn_op::prefill_128);
+  c.bind_(k);
   detail_::set_buf_(c.enc, q, 0ul);
   detail_::set_buf_(c.enc, K, 1ul);
   detail_::set_buf_(c.enc, V, 2ul);
@@ -377,15 +379,16 @@ inline bool own_nn::gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
 }
 
 // One decode step: q [n_q_heads,D] against a [n_kv_heads,kv_max,D] cache read
-// over [0,ctx). GQA via the head ratio; an f32 cache.
+// over [0,ctx). GQA via the head ratio; head width 64, 128 or 256 over either
+// cache.
 inline bool own_nn::attn_decode(gpu::span q, gpu::span K, gpu::span V,
                              gpu::span out, int64_t n_q_heads,
                              int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
                              int64_t D, float scale, bool kv_f16) {
   auto& c = context::get();
-  if (!c.device || kv_f16 || (D != 64 && D != 128)) return false;
+  const attn_kernel whole = attn_kernel_(attn_op::decode, D, kv_f16);
+  if (!c.device || !whole) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || ctx <= 0) return false;
-  const bool d64 = D == 64;
   unsigned long chunk = detail_::attn_split_chunk_(n_q_heads, ctx);
   const unsigned long splits =
       chunk ? (static_cast<unsigned long>(ctx) + chunk - 1) / chunk : 1;
@@ -397,8 +400,7 @@ inline bool own_nn::attn_decode(gpu::span q, gpu::span K, gpu::span V,
     if (!dst) chunk = 0, dst = out;
   }
   const bool split = chunk != 0;
-  c.bind_(split ? (d64 ? attn_op::decode_split_64 : attn_op::decode_split_128)
-                : (d64 ? attn_op::decode_64 : attn_op::decode_128));
+  c.bind_(split ? attn_kernel_(attn_op::decode_split, D, kv_f16) : whole);
   detail_::set_buf_(c.enc, q, 0ul);
   detail_::set_buf_(c.enc, K, 1ul);
   detail_::set_buf_(c.enc, V, 2ul);
@@ -413,7 +415,7 @@ inline bool own_nn::attn_decode(gpu::span q, gpu::span K, gpu::span V,
                            split ? splits : 1ul, 1},
                           {static_cast<unsigned long>(D), 1, 1});
   if (!split) return true;
-  c.bind_(d64 ? attn_op::combine_64 : attn_op::combine_128);
+  c.bind_(attn_kernel_(attn_op::combine, D, false));  // partials are f32
   detail_::set_buf_(c.enc, dst, 0ul);
   detail_::set_buf_(c.enc, out, 1ul);
   detail_::attn_combine_params cp{static_cast<uint32_t>(splits)};
@@ -433,8 +435,9 @@ inline bool own_nn::attn_prefill_dq(gpu::span q, gpu::span K, gpu::span V,
                                  gpu::span stats, int64_t H, int64_t T,
                                  int64_t D, float scale) {
   auto& c = context::get();
-  if (!c.device || (D != 64 && D != 128) || H <= 0 || T <= 0) return false;
-  c.bind_(D == 64 ? attn_op::bwd_dq_64 : attn_op::bwd_dq_128);
+  const attn_kernel k = attn_kernel_(attn_op::bwd_dq, D, false);
+  if (!c.device || !k || H <= 0 || T <= 0) return false;
+  c.bind_(k);
   const gpu::span views[] = {q, K, V, dO, O, dq, stats};
   for (unsigned long i = 0; i < 7; i++) detail_::set_buf_(c.enc, views[i], i);
   detail_::attn_params p{static_cast<uint32_t>(T), 0, 0, 0, scale};
@@ -448,8 +451,9 @@ inline bool own_nn::attn_prefill_dkv(gpu::span q, gpu::span K, gpu::span V,
                                   gpu::span dV, int64_t H, int64_t T, int64_t D,
                                   float scale) {
   auto& c = context::get();
-  if (!c.device || (D != 64 && D != 128) || H <= 0 || T <= 0) return false;
-  c.bind_(D == 64 ? attn_op::bwd_dkv_64 : attn_op::bwd_dkv_128);
+  const attn_kernel k = attn_kernel_(attn_op::bwd_dkv, D, false);
+  if (!c.device || !k || H <= 0 || T <= 0) return false;
+  c.bind_(k);
   const gpu::span views[] = {q, K, V, dO, stats, dK, dV};
   for (unsigned long i = 0; i < 7; i++) detail_::set_buf_(c.enc, views[i], i);
   detail_::attn_params p{static_cast<uint32_t>(T), 0, 0, 0, scale};
