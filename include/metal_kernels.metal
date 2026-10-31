@@ -699,16 +699,19 @@ void steel_body_(device const float* A, device const float* B,
   constexpr short BN = 64, BK = 16, WM = 2, WN = 2, pad = 4;
   constexpr short tgp_size = WM * WN * 32;
 
-  short swizzle = short(p.a_fast);
-  short tiles_n = short((p.N + BN - 1) / BN);
-  short tiles_m = short((p.M + BM - 1) / BM);
-  short tid_y = short((tgid.y << swizzle) + (tgid.x & ((1 << swizzle) - 1)));
-  short tid_x = short(tgid.x >> swizzle);
+  // The tile's origin and the operands' starts in 32 and 64 bits, so a
+  // product past 32767 rows or columns (an lm_head over a vocabulary) reaches
+  // its far tiles; within a tile, short and int suffice.
+  uint swizzle = p.a_fast;
+  uint tiles_n = (p.N + BN - 1) / BN;
+  uint tiles_m = (p.M + BM - 1) / BM;
+  uint tid_y = (tgid.y << swizzle) + (tgid.x & ((1u << swizzle) - 1));
+  uint tid_x = tgid.x >> swizzle;
   if (tid_x >= tiles_n || tid_y >= tiles_m) return;
 
-  short row0 = tid_y * BM, col0 = tid_x * BN;
-  A += TA ? int(row0) : row0 * int(p.lda);
-  B += TB ? col0 * int(p.ldb) : int(col0);
+  uint row0 = tid_y * BM, col0 = tid_x * BN;
+  A += TA ? size_t(row0) : size_t(row0) * p.lda;
+  B += TB ? size_t(col0) * p.ldb : size_t(col0);
 
   constexpr short lda_nn = BK + pad, ldb_nn = BN + pad;
   typename select_type<TA, SteelLoaderT<BK, BM, lda_nn, false, tgp_size>,
@@ -721,8 +724,8 @@ void steel_body_(device const float* A, device const float* B,
 
   int k_iters = int(p.K / BK);
   short lbk = short(p.K) - short(k_iters * BK);
-  short tgp_bm = min(short(BM), short(p.M - row0));
-  short tgp_bn = min(short(BN), short(p.N - col0));
+  short tgp_bm = short(min(uint(BM), p.M - row0));
+  short tgp_bn = short(min(uint(BN), p.N - col0));
   bool is_interior = (tgp_bm == BM && tgp_bn == BN);
 
   if (lbk > 0) {
@@ -794,15 +797,12 @@ void steel_body_(device const float* A, device const float* B,
   }
 
   int ldd = int(p.N);
-  C += row0 * ldd + col0;
+  C += size_t(row0) * p.N + col0;
   if (is_interior) {
     mma_op.store_affine(C, ldd, p.scale, p.offset);
   } else {
-    mma_op.store_affine_safe(
-        C, ldd,
-        short2(min(short(BN), short(p.N - col0)),
-               min(short(BM), short(p.M - row0))),
-        p.scale, p.offset);
+    mma_op.store_affine_safe(C, ldd, short2(tgp_bn, tgp_bm), p.scale,
+                             p.offset);
   }
 }
 

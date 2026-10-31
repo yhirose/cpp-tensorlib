@@ -551,6 +551,25 @@ inline void set_bytes_(objc::id enc, const P& p, unsigned long idx) {
              static_cast<unsigned long>(sizeof(p)), idx);
 }
 
+// STEEL's tiling of an m x n product: 64-wide column tiles in bands of 32 rows
+// below m 97 (silarray's band, more blocks for a short product) or 64, and a
+// threadgroup swizzle for L2 reuse whose log rides in gemm_params' a_fast.
+struct steel_grid {
+  bool band32;
+  uint32_t swizzle_log;
+  unsigned long gx, gy;
+};
+inline steel_grid steel_grid_(int64_t m, int64_t n) {
+  const bool band32 = m < 97;
+  const unsigned long bm = band32 ? 32 : 64, bn = 64;
+  const unsigned long tiles_n = (static_cast<unsigned long>(n) + bn - 1) / bn;
+  const unsigned long tiles_m = (static_cast<unsigned long>(m) + bm - 1) / bm;
+  uint32_t swizzle_log = 0;
+  while ((tiles_n >> (swizzle_log + 1)) >= 1 && swizzle_log < 3) swizzle_log++;
+  return {band32, swizzle_log, tiles_n << swizzle_log,
+          (tiles_m + ((1ul << swizzle_log) - 1)) >> swizzle_log};
+}
+
 }  // namespace detail_
 
 // `batch` products C(m,n) = (A @ B) * scale + offset in one launch: slice z
@@ -572,34 +591,25 @@ inline bool own_core::gemm_batched(gpu::span a, int64_t lda, bool ta,
   }
   // Dispatch ladder. STEEL (BN=64 bands) covers NN and single-transposed
   // shapes with enough width (the transposing loader reads the view in
-  // place); BM band follows silarray (M < 97 → 32×64 tiles). TT or narrow
-  // shapes take the simple-tile family, which reads transposed views in
-  // place. Gates are provisional pending a full census vs PyTorch-MPS.
+  // place), tiled by steel_grid_. TT or narrow shapes take the simple-tile
+  // family, which reads transposed views in place. Gates are provisional
+  // pending a full census vs PyTorch-MPS.
   bool steel = !(ta && tb) && m >= 16 && n >= 48 && k >= 16;
   gtile kk_;
-  unsigned long bm, bn;
   uint32_t fast_a, fast_b;  // STEEL reuses the a_fast slot for swizzle_log
   unsigned long gx, gy;
   if (steel) {
-    bool band32 = m < 97;
-    kk_ = band32 ? (ta ? gtile::steel32x64_ta
-                       : tb ? gtile::steel32x64_tb : gtile::steel32x64)
-                 : (ta ? gtile::steel_ta : tb ? gtile::steel_tb : gtile::steel);
-    bm = band32 ? 32 : 64;
-    bn = 64;
-    unsigned long tiles_n = (static_cast<unsigned long>(n) + bn - 1) / bn;
-    unsigned long tiles_m = (static_cast<unsigned long>(m) + bm - 1) / bm;
-    uint32_t swizzle_log = 0;  // threadgroup swizzle for L2 reuse
-    while ((tiles_n >> (swizzle_log + 1)) >= 1 && swizzle_log < 3)
-      swizzle_log++;
-    fast_a = swizzle_log;
+    const detail_::steel_grid g = detail_::steel_grid_(m, n);
+    kk_ = g.band32 ? (ta ? gtile::steel32x64_ta
+                         : tb ? gtile::steel32x64_tb : gtile::steel32x64)
+                   : (ta ? gtile::steel_ta : tb ? gtile::steel_tb : gtile::steel);
+    fast_a = g.swizzle_log;
     fast_b = 0;
-    gx = tiles_n << swizzle_log;
-    gy = (tiles_m + ((1ul << swizzle_log) - 1)) >> swizzle_log;
+    gx = g.gx;
+    gy = g.gy;
   } else {
     kk_ = m >= 64 ? gtile::sgemm64x32 : gtile::sgemm32;
-    bm = m >= 64 ? 64 : 32;
-    bn = 32;
+    const unsigned long bm = m >= 64 ? 64 : 32, bn = 32;
     // float4 loader eligibility: row-major operand only (Apple GPUs handle
     // the unaligned vector loads; transposed operands use the strided path).
     fast_a = !ta ? 1u : 0u;

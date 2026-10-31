@@ -330,6 +330,18 @@ TEST_CASE("batched dot: GPU dispatch matches the ref oracle") {
   }));
 }
 
+TEST_CASE("dot past 32767 rows or columns matches the ref oracle") {
+  // A GPU gemm's tiling can keep its tile origins in 16 bits (Metal's STEEL
+  // does): a product wider or taller than that, plain and with B transposed,
+  // must take a path that reaches its far columns and rows.
+  auto A = random_array({16, 64}, 1400);
+  auto B = random_array({64, 32800}, 1401), Bt = random_array({32800, 64}, 1402);
+  auto Am = random_array({32800, 32}, 1403), Bm = random_array({32, 64}, 1404);
+  CHECK(matches_gpu_oracle([&] { return A.dot(B); }));
+  CHECK(matches_gpu_oracle([&] { return A.dot(Bt.transpose()); }));
+  CHECK(matches_gpu_oracle([&] { return Am.dot(Bm); }));
+}
+
 TEST_CASE("batched dot: one-launch GPU gemm matches the ref oracle") {
   // Shapes the register-blocked kernel takes whole, with the batch folded into
   // its grid: a whole tile per slice; m and n off the tile; an underfilled
