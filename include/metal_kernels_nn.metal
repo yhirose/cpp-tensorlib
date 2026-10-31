@@ -926,8 +926,9 @@ struct read_bf16_ {
 // ---- GGUF block-quantized weights ([N,K] rows of whole blocks, read where
 // they lie; include/ggml_quant.h has the formats in words and the CPU
 // reference). A Q4_K row is whole 144-byte blocks, so from a 4-byte aligned
-// weight (the host checks) its blocks take 32-bit loads; Q6_K's (210) and
-// Q8_0's (34) are only 2-byte aligned, hence their 16-bit loads.
+// weight (the host checks) its reader takes 32-bit loads (the decode GEMV,
+// llama.cpp's, 16-bit ones); Q6_K's (210) and Q8_0's (34) are only 2-byte
+// aligned, hence their 16-bit loads.
 
 // Scale and min of a Q4_K group j (0..7) from the block's 12 scale bytes held
 // as three words: ggml's get_scale_min_k4, cuda's q4k_scale_min_.
@@ -961,7 +962,7 @@ struct read_q4k_ {
     const float d1 = half_at_(b) * sc, m1 = half_at_(b + 2) * mn;
     return d1 * float((g & 1u) ? q >> 4 : q & 0xFu) - m1;
   }
-  // Two 32-bit loads (the block and its quants 4-byte aligned, as gemv_q4k_'s).
+  // Two 32-bit loads (the block and its quants 4-byte aligned: quant_ok_).
   void vec(uint n, uint k, thread float* v) const {
     device const uchar* b = W + (ulong)n * row_bytes + (k >> 8) * BYTES;
     const uint o = k & 255u, g = o >> 5;
@@ -1068,7 +1069,8 @@ TL_STEEL_KERNEL_SRC(gemm_q80_nt32_, 32, false, true, uchar, TL_READ_Q(read_q80_)
 // these short rows (a 1024-wide Q4_K row is four blocks) to the launch and
 // the reduction, at under a third of the bf16 GEMV's bandwidth. Each format
 // is an accumulate over its blocks (F, with its reader's geometry as F::L);
-// the activation is on 16 bytes (the host checks) for its float4 loads.
+// the activation is on 16 bytes (the host checks) for Q6_K's and Q8_0's
+// float4 loads.
 constant constexpr uint QROWS = 2;
 
 // A simdgroup's QROWS rows of W: row r's block ib. A ragged last simdgroup
@@ -1117,17 +1119,17 @@ struct gemv_q4k_dot_ {
   static void accumulate(thread float* acc, device const float* a, gemv_q_rows_<L> w,
                          uint nb, uint lane) {
     const uint it = lane & 7u, iq = it >> 2, ir = it & 3u;
-    float yl[16], yh[16];
+    float al[16], ah[16];
     for (uint ib = lane >> 3; ib < nb; ib += 4) {
-      device const float* y4 = a + (ulong)ib * 256u + 64u * iq + 8u * ir;
-      float4 sumy = 0.0f;
+      device const float* ap = a + (ulong)ib * 256u + 64u * iq + 8u * ir;
+      float4 suma = 0.0f;
       _Pragma("clang loop unroll(full)")
       for (uint i = 0; i < 8; i++) {
-        yl[i] = y4[i];
-        yl[i + 8] = y4[i + 32];
-        yh[i] = y4[i + 128];
-        yh[i + 8] = y4[i + 160];
-        sumy += float4(yl[i], yl[i + 8], yh[i], yh[i + 8]);
+        al[i] = ap[i];
+        al[i + 8] = ap[i + 32];
+        ah[i] = ap[i + 128];
+        ah[i + 8] = ap[i + 160];
+        suma += float4(al[i], al[i + 8], ah[i], ah[i + 8]);
       }
       _Pragma("clang loop unroll(full)")
       for (uint r = 0; r < QROWS; r++) {
@@ -1148,16 +1150,16 @@ struct gemv_q4k_dot_ {
         _Pragma("clang loop unroll(full)")
         for (uint i = 0; i < 4; i++) {
           const ushort u = q1[i], v = q2[i];
-          acc1 += float4(yl[2 * i], yl[2 * i + 1], yl[2 * i + 8], yl[2 * i + 9]) *
+          acc1 += float4(al[2 * i], al[2 * i + 1], al[2 * i + 8], al[2 * i + 9]) *
                   float4(u & 0x000F, u & 0x0F00, u & 0x00F0, u & 0xF000);
-          acc2 += float4(yh[2 * i], yh[2 * i + 1], yh[2 * i + 8], yh[2 * i + 9]) *
+          acc2 += float4(ah[2 * i], ah[2 * i + 1], ah[2 * i + 8], ah[2 * i + 9]) *
                   float4(v & 0x000F, v & 0x0F00, v & 0x00F0, v & 0xF000);
         }
         acc[r] += half_at_(b) * ((acc1[0] + acc1[1] / 256.0f) * sc8[0] +
                                  (acc1[2] + acc1[3] / 256.0f) * sc8[1] / 16.0f +
                                  (acc2[0] + acc2[1] / 256.0f) * sc8[4] +
                                  (acc2[2] + acc2[3] / 256.0f) * sc8[5] / 16.0f) -
-                  half_at_(b + 2) * dot(sumy, float4(sc8[2], sc8[3], sc8[6], sc8[7]));
+                  half_at_(b + 2) * dot(suma, float4(sc8[2], sc8[3], sc8[6], sc8[7]));
       }
     }
   }
