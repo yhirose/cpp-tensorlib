@@ -1042,6 +1042,10 @@ struct read_q80_ {
 // A bf16 W whose K is whole 8-element vectors: the vectorized loader.
 TL_STEEL_KERNEL(gemm_bf16_steel_, 64, false, true, ushort)
 TL_STEEL_KERNEL(gemm_bf16_steel32_, 32, false, true, ushort)
+// The same summed in f16 (cuda's gemm_bf16_nt_f16acc): A and W rounded to
+// half as they are staged, and the MMA's sums half.
+TL_STEEL_KERNEL_ST(gemm_bf16_f16acc_, 64, false, true, ushort, B, half)
+TL_STEEL_KERNEL_ST(gemm_bf16_f16acc32_, 32, false, true, ushort, B, half)
 // The rest through a reader (steel_b_'s functor loader); the 32-row band for
 // a short chunk (steel_grid_).
 TL_STEEL_KERNEL_SRC(gemm_bf16_nt_, 64, false, true, ushort, TL_READ_BF16)
