@@ -15,6 +15,8 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 using namespace tl::cuda;
@@ -506,6 +508,56 @@ int main() {
       std::printf("  local memory: %u kernels, framed outside the list:%s\n", count, framed.empty() ? " none" : framed.c_str());
       check(listed && framed.empty(), "no local memory");
     }
+  }
+
+  // The alignment declarations (TL_ALIGN), against the PTX's own entries in one pass:
+  // each names a kernel, covers no more than its leading pointer (.u64) parameters and
+  // asks a power of two up to a uint4's 16 (a misspelt name or a miscounted list would
+  // otherwise go unchecked, or read a scalar argument as a pointer); and every kernel
+  // that moves global memory by vectors (ld/st.global .v2/.v4, cp.async) has one, or
+  // guards its alignment itself and is listed here.
+  {
+    static const char* const self_guarded[] = {
+        "tl_gemm_bf16_nt", "tl_gemm_bf16_nt_s", "tl_gemm_bf16_nt_sk",  // vecA / vecB in-kernel
+    };
+    struct entry {
+      size_t ptrs = 0;
+      bool vectors = false;
+    };
+    const std::string ptx = tl::cuda::ptx_source_();
+    std::unordered_map<std::string, entry> entries;
+    for (size_t e = ptx.find(".entry "); e != std::string::npos;) {
+      const size_t open = ptx.find('(', e), close = ptx.find(')', open);
+      const size_t next = ptx.find(".entry ", close);
+      entry& info = entries[ptx.substr(e + 7, open - e - 7)];
+      for (size_t p = ptx.find(".param .", open); p < close && !ptx.compare(p + 8, 3, "u64");
+           p = ptx.find(".param .", p + 8))
+        info.ptrs++;
+      const std::string_view body(ptx.data() + close, (next == std::string::npos ? ptx.size() : next) - close);
+      for (const char* op : {"ld.global", "st.global"})
+        for (size_t at = body.find(op); at != std::string_view::npos && !info.vectors; at = body.find(op, at + 1)) {
+          const std::string_view ins = body.substr(at, body.find_first_of(" \t", at) - at);
+          info.vectors = ins.find(".v2") != std::string_view::npos || ins.find(".v4") != std::string_view::npos;
+        }
+      info.vectors = info.vectors || body.find("cp.async.") != std::string_view::npos;
+      e = next;
+    }
+    std::string bad, undeclared;
+    for (const auto& [name, bytes] : tl::cuda::align_decls_()) {
+      const auto it = entries.find(name);
+      bool ok = it != entries.end() && !bytes.empty() && bytes.size() <= it->second.ptrs;
+      for (unsigned char b : bytes) ok = ok && b >= 1 && b <= 16 && (b & (b - 1)) == 0;
+      if (!ok) bad += " " + name;
+    }
+    for (const auto& [name, info] : entries)
+      if (info.vectors && !tl::cuda::align_decls_().count(name) &&
+          std::none_of(std::begin(self_guarded), std::end(self_guarded), [&](const char* g) { return name == g; }))
+        undeclared += " " + name;
+    std::printf("  alignment declarations: %zu of %zu kernels, malformed:%s, vector access undeclared:%s\n",
+                tl::cuda::align_decls_().size(), entries.size(), bad.empty() ? " none" : bad.c_str(),
+                undeclared.empty() ? " none" : undeclared.c_str());
+    check(!tl::cuda::align_decls_().empty() && bad.empty() && undeclared.empty(),
+          "every vector-accessing kernel declares its alignment");
   }
 
   std::printf(failures ? "CUDA cuda.h: FAILED\n" : "CUDA cuda.h: ALL OK\n");

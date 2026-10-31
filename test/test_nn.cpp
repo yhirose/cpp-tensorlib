@@ -537,6 +537,22 @@ static void check_attn_bwd_dq(bool on_gpu, int64_t D = 64) {
   const array& stats = got->second;
   CHECK(dq.shape() == tl::shape_t{H, T, D});
   CHECK(stats.shape() == tl::shape_t{2, H, T});
+  if (on_gpu) {
+    // K and V from bases off the kernel's float4 loads: refused, or read right.
+    const std::vector<float> want = host_values(dq);
+    array qd = dev(q), dOd = dev(dO), Od = dev(out);
+    array Ks = dev(with_lead(K, 1)), Vs = dev(with_lead(V, 1));
+    array dq2 = array::empty({H, T, D}), st2 = array::empty({2, H, T});
+    check_misaligned(
+        "attention dq, K and V off 16 bytes",
+        [&] {
+          return tl::gpu::attn_prefill_dq(qd.device_span(), Ks.device_span().at(4),
+                                          Vs.device_span().at(4), dOd.device_span(),
+                                          Od.device_span(), dq2.device_span(), st2.device_span(),
+                                          H, T, D, scale);
+        },
+        [&] { return host_close(host_values(dq2), want, 1e-5f); });
+  }
 
   // Row t of head h, spelled out: the causal softmax of its scores, then
   // dq_t = scale · Σ_j P_tj (dP_tj − Δ_t) k_j with dP_tj = dO_t·v_j and
@@ -966,14 +982,6 @@ TEST_CASE("generic compositions agree with the fused kernels") {
   tl::use_gpu();
   namespace gpu = tl::gpu;
   namespace gen = tl::gpu::generic;
-  auto dev = [](const array& a) {
-    array c = a.clone();
-    c.eval();
-    return c;
-  };
-  auto same = [](const array& got, const array& want, float tol) {
-    return tl::allclose(got, want, tol, tol);
-  };
 
   SUBCASE("rmsnorm, rmsnorm_res and swiglu") {
     const int64_t rows = 3, n = 896, ff = 512;
@@ -1117,6 +1125,19 @@ TEST_CASE("generic compositions agree with the fused kernels") {
                               pb.device_span(), HQ, HKV, T2, MAXC, D, scale, false, T + 1));
     tl::gpu::flush();
     CHECK(same(pa, pb, 1e-4f));
+    // K and V from bases off the tiles' vector loads: refused (the op then
+    // composes it), never misread.
+    const std::vector<float> want = host_values(pb);
+    array Ks = dev(with_lead(Ka, 1)), Vs = dev(with_lead(Va, 1));
+    array pc = array::empty({HQ, T2, D});
+    check_misaligned(
+        "prefill attention, K and V off their vectors",
+        [&] {
+          return gpu::attn_prefill(qp.device_span(), Ks.device_span().at(4),
+                                   Vs.device_span().at(4), pc.device_span(), HQ, HKV, T2, MAXC, D,
+                                   scale, false, T + 1);
+        },
+        [&] { return host_close(host_values(pc), want, 1e-4f); }, true);
   }
 
   SUBCASE("the inference prefill (tensor cores, f16 operands) at each head width") {
@@ -1136,6 +1157,18 @@ TEST_CASE("generic compositions agree with the fused kernels") {
                                 pb.device_span(), HQ, HKV, T, MAXC, D, scale, false, P0));
       tl::gpu::flush();
       CHECK(same(pa, pb, 2e-3f));
+      // The output off the kernel's float2 stores: refused (the op then runs
+      // the exact form), never misplaced.
+      const std::vector<float> want = host_values(pb);
+      array ps = dev(array::zeros({HQ * T * D + 1}));
+      check_misaligned(
+          "f16 prefill attention, out off 8 bytes",
+          [&] {
+            return gpu::attn_prefill_f16(qp.device_span(), Kc.device_span(), Vc.device_span(),
+                                         ps.device_span().at(4), HQ, HKV, T, MAXC, D, scale, false,
+                                         P0);
+          },
+          [&] { return host_close(after_lead(ps, 1, HQ * T * D), want, 2e-3f); }, true);
     }
   }
 
@@ -1418,31 +1451,53 @@ TEST_CASE("generic compositions agree with the fused kernels") {
           REQUIRE(gpu::gemm_quant(type, false, ad.device_span(), W.device_span(),
                                   C.device_span().at(off * 4), M, N, K, ldc));
           tl::gpu::flush();
-          C.eval();
-          double worst = 0;
-          bool kept = true;
-          for (int64_t i = 0; i < M; i++) {
-            for (int64_t j = 0; j < ldc; j++) {
-              const float got = C.raw()[i * ldc + j];
-              if (j < off || j >= off + N) {
-                kept = kept && got == 7.0f;
-                continue;
-              }
-              double ref = 0, mag = 0;
+          // The product and its terms' magnitude, and the worst error of an
+          // output's N columns from col0 (rows ldc apart) relative to it. f32
+          // sums over operands at least bf16-exact (CUDA's tensor cores round
+          // both to bf16, Metal's keep f32): each term is off by at most 2^-8
+          // of itself, so the sum by 4e-3 of the terms' magnitude. A misread
+          // weight is off by whole terms.
+          std::vector<double> ref((size_t)(M * N)), mag((size_t)(M * N));
+          for (int64_t i = 0; i < M; i++)
+            for (int64_t j = 0; j < N; j++)
               for (int64_t k = 0; k < K; k++) {
-                const double t = (double)q.w[(size_t)(j - off) * K + k] * a.raw()[i * K + k];
-                ref += t;
-                mag += std::fabs(t);
+                const double t = (double)q.w[(size_t)(j * K + k)] * a.raw()[i * K + k];
+                ref[(size_t)(i * N + j)] += t;
+                mag[(size_t)(i * N + j)] += std::fabs(t);
               }
-              worst = std::max(worst, std::fabs(got - ref) / mag);
-            }
-          }
-          // f32 sums over operands at least bf16-exact (CUDA's tensor cores
-          // round both to bf16, Metal's keep f32): each term is off by at most
-          // 2^-8 of itself, so the sum by 4e-3 of the terms' magnitude. A
-          // misread weight is off by whole terms.
-          CHECK(worst < 4e-3);
+          auto worst_rel = [&](const std::vector<float>& got, int64_t col0) {
+            double worst = 0;
+            for (int64_t i = 0; i < M; i++)
+              for (int64_t j = 0; j < N; j++) {
+                const size_t r = (size_t)(i * N + j);
+                const float g = got[(size_t)(i * ldc + col0 + j)];
+                worst = std::max(worst, std::fabs(g - ref[r]) / mag[r]);
+              }
+            return worst;
+          };
+          constexpr double bound = 4e-3;
+          const std::vector<float> got = host_values(C);
+          bool kept = true;
+          for (int64_t i = 0; i < M; i++)
+            for (int64_t j = 0; j < ldc; j++)
+              if (j < off || j >= off + N) kept = kept && got[(size_t)(i * ldc + j)] == 7.0f;
+          CHECK(worst_rel(got, off) < bound);
           CHECK(kept);
+          // C one column off its float2 stores, and the weight 4 bytes off its
+          // base (a Q6_K or Q8_0 row's halves still fit; Q4_K's vectors do
+          // not): each refused or computed as above, never misplaced.
+          array Wl = dev(with_lead(q.W, 1));
+          for (const bool shift_w : {false, true}) {
+            array C1 = dev(array::zeros({M * ldc + 1}));
+            check_misaligned(
+                shift_w ? "quantized GEMM, W off its base" : "quantized GEMM, C off 8 bytes",
+                [&] {
+                  return gpu::gemm_quant(type, false, ad.device_span(),
+                                         shift_w ? Wl.device_span().at(4) : W.device_span(),
+                                         C1.device_span().at(shift_w ? 0 : 4), M, N, K, ldc);
+                },
+                [&] { return worst_rel(after_lead(C1, shift_w ? 0 : 1, M * ldc), 0) < bound; });
+          }
         }
       }
     }
@@ -1483,6 +1538,16 @@ TEST_CASE("generic compositions agree with the fused kernels") {
       }
       CHECK(std::sqrt(sq / ref) < 2e-2);
       CHECK(std::sqrt(sq / ref) > 0);  // it is a different computation, not a copy
+      // The weight 4 bytes off the kernel's 16-byte vectors: refused, or read right.
+      const std::vector<float> want = host_values(yq);
+      array Wl = dev(with_lead(W, 1)), yl = dev(array::zeros({N}));
+      check_misaligned(
+          "int8 Q4_K GEMV, W off 16 bytes",
+          [&] {
+            return gpu::gemv_q4k_q8(qa.device_span(), Wl.device_span().at(4), yl.device_span(), N,
+                                    K);
+          },
+          [&] { return host_close(host_values(yl), want, 1e-5f); });
     }
   }
 

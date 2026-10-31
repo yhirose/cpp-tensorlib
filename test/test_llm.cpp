@@ -91,14 +91,6 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
   namespace gpu = tl::gpu;
 
   // A device buffer from host values, evaluated so native() is valid.
-  auto dev = [](const array& a) {
-    array c = a.clone();
-    c.eval();
-    return c;
-  };
-  auto same = [](const array& got, const array& want, float tol) {
-    return tl::allclose(got, want, tol, tol);
-  };
 
   SUBCASE("kv_cache: append + attn, prefill, in f32 and f16") {
     // K and V as an f16 cache holds them (the reference reads those values).
@@ -245,6 +237,24 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       REQUIRE(gpu::gemv_bf16_row(a.device_span(), Wb.device_span(), y.device_span(), N, K));
       tl::gpu::flush();
       CHECK(same(y, a.dot(Wt), 1e-4f));
+      // W from a base off the kernel's 16-byte loads, and the column-major
+      // form's ([K,N], N % 8 == 0: the 8-wide path) likewise.
+      const std::vector<float> want = host_values(y);
+      array Ws = dev(with_lead(W, 2).to_bf16()), ys = dev(array::zeros({1, N}));
+      check_misaligned(
+          "row GEMV, W off 16 bytes",
+          [&] {
+            return gpu::gemv_bf16_row(a.device_span(), Ws.device_span().at(4), ys.device_span(), N,
+                                      K);
+          },
+          [&] { return host_close(host_values(ys), want, 1e-4f); });
+      array Bs = dev(with_lead(Wt, 2).to_bf16()), yc = dev(array::zeros({1, N}));
+      check_misaligned(
+          "column GEMV, B off 16 bytes",
+          [&] {
+            return gpu::gemv_bf16(a.device_span(), Bs.device_span().at(4), yc.device_span(), N, K);
+          },
+          [&] { return host_close(host_values(yc), want, 1e-4f); });
     }
     if (gpu::caps::bf16_gemm) {
       // The GEMM may round its activations to bf16 too (CUDA's runs on the
@@ -255,6 +265,21 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       REQUIRE(gpu::gemm_bf16_nt(A.device_span(), Wb.device_span(), C.device_span(), M, N, K));
       tl::gpu::flush();
       CHECK(same(C, A.dot(Wt), 1e-4f));
+      // A, then C, from a base off the tensor cores' vectors (and A off the
+      // SIMT tiles' float4s): refused, or computed as above.
+      const std::vector<float> want = host_values(C);
+      array As = dev(with_lead(A, 1));
+      for (const bool shift_a : {true, false}) {
+        array Cs = dev(array::zeros({M * N + 1}));
+        check_misaligned(
+            shift_a ? "prefill GEMM, A off 16 bytes" : "prefill GEMM, C off 8 bytes",
+            [&] {
+              return gpu::gemm_bf16_nt(shift_a ? As.device_span().at(4) : A.device_span(),
+                                       Wb.device_span(), Cs.device_span().at(shift_a ? 0 : 4), M,
+                                       N, K);
+            },
+            [&] { return host_close(after_lead(Cs, shift_a ? 0 : 1, M * N), want, 1e-4f); });
+      }
       // A product past one 64-row band, and K not a multiple of 8 (Metal's
       // vectorized STEEL loader takes whole 8-element vectors of W's rows,
       // its reader the rest): both raggedly against the tiles as above.

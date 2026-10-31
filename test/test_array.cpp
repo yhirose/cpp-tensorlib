@@ -2049,14 +2049,6 @@ TEST_CASE("shared gpu ops: views at non-zero offsets, counted by the census") {
   auto prev = tl::device_;
   tl::use_gpu();
   namespace gpu = tl::gpu;
-  auto dev = [](const array& a) {
-    array c = a.clone();
-    c.eval();
-    return c;
-  };
-  auto same = [](const array& got, const array& want, float tol) {
-    return tl::allclose(got, want, tol, tol);
-  };
   const int64_t n = 1000, pa = 3, pb = 7, po = 11;  // elements of slack in front
   array A = dev(random_array({n + pa}, 940)), B = dev(random_array({n + pb}, 941));
   array a = A.slice(0, pa, n), b = B.slice(0, pb, n);
