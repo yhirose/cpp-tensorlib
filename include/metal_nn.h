@@ -18,6 +18,7 @@ enum class nn_kernel {
   gemv_q4k, gemv_q6k, gemv_q80,
   gemm_q4k, gemm_q4k_32, gemm_q6k, gemm_q6k_32, gemm_q80, gemm_q80_32,
   rmsnorm_rope_64, rmsnorm_rope_128, rmsnorm_rope_256, gated_rmsnorm,
+  gemm_bf16_steel, gemm_bf16_steel_32,
 };
 constexpr int nn_kernel_key_(nn_kernel t) { return -201 - static_cast<int>(t); }
 inline const char* nn_kernel_name_(nn_kernel t) {
@@ -35,6 +36,8 @@ inline const char* nn_kernel_name_(nn_kernel t) {
     case nn_kernel::rmsnorm_rope_128: return "rmsnorm_rope_128_";
     case nn_kernel::rmsnorm_rope_256: return "rmsnorm_rope_256_";
     case nn_kernel::gated_rmsnorm: return "gated_rmsnorm_";
+    case nn_kernel::gemm_bf16_steel: return "gemm_bf16_steel_";
+    case nn_kernel::gemm_bf16_steel_32: return "gemm_bf16_steel32_";
   }
   return "";
 }
@@ -415,6 +418,17 @@ inline bool own_nn::gemm_bf16_nt(gpu::span A, gpu::span B, gpu::span C, int64_t 
                               int64_t N, int64_t K) {
   auto& c = context::get();
   if (!c.device || M <= 0 || N <= 0 || K <= 0) return false;
+  // STEEL's body (the f32 gemm's, metal.h) where its loaders read A's and W's
+  // rows as whole 16-byte vectors; the simple NT tile below for the rest.
+  if (K % 8 == 0 && A.off % 16 == 0 && B.off % 16 == 0) {
+    const detail_::steel_grid g = detail_::steel_grid_(M, N);
+    detail_::bind_(c, g.band32 ? nn_kernel::gemm_bf16_steel_32 : nn_kernel::gemm_bf16_steel);
+    const auto u = [](int64_t v) { return static_cast<uint32_t>(v); };
+    const detail_::gemm_params p{u(M), u(N), u(K), u(K), u(K), 0u, 1u, g.swizzle_log, 0u,
+                                 1.0f, 0.0f, 0u, 0u};
+    detail_::gemm_launch_(c, A, B, C, p, g.gx, g.gy, 1);
+    return true;
+  }
   c.bind_(detail_::gemm_nt_short_(M) ? kop::gemm_bf16_nt32_ : kop::gemm_bf16_nt_);
   detail_::gemm_nt_launch_(c, A, B, C, M, N, K, N);
   return true;

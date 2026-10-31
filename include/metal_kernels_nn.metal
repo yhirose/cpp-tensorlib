@@ -1070,6 +1070,13 @@ struct load_q80_ {
 #define TL_LOAD_BF16 (load_bf16_{B, p.K})
 #define TL_LOAD_Q(L) (L{B, p.K / L::ELEMS * L::BYTES})
 
+// The bf16 weight's GEMM where K is whole 8-element vectors: STEEL's body
+// (metal_kernels.metal), its transposing loader reading W [N,K] as the B of
+// A . Wᵀ and widening the bf16 rows as it stages them. gemm_bf16_nt_ below
+// keeps the other K.
+TL_STEEL_KERNEL(gemm_bf16_steel_, 64, false, true, ushort)
+TL_STEEL_KERNEL(gemm_bf16_steel32_, 32, false, true, ushort)
+
 TL_GEMM_NT_KERNEL(gemm_bf16_nt_, 64, 64, 16, ushort, TL_LOAD_BF16)
 // A prompt chunk is a few hundred rows, so a 64-row tile leaves most of the
 // grid on one M block; the 32-row one doubles the M blocks for short chunks.

@@ -255,6 +255,20 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       REQUIRE(gpu::gemm_bf16_nt(A.device_span(), Wb.device_span(), C.device_span(), M, N, K));
       tl::gpu::flush();
       CHECK(same(C, A.dot(Wt), 1e-4f));
+      // A product past one 64-row band, and K not a multiple of 8 (Metal's
+      // STEEL form takes whole 8-element vectors of W's rows, the simple
+      // tile the rest): both raggedly against the tiles as above.
+      for (const int64_t k2 : {136, 76}) {
+        const int64_t M2 = 130, N2 = 200;
+        array W2 = random_array({N2, k2}, 943);
+        array W2b = dev(W2.to_bf16()), W2t = dev(W2.to_bf16().to_f32().transpose());
+        array A2 = dev(random_array({M2, k2}, 944).to_bf16().to_f32());
+        array C2 = array::empty({M2, N2});
+        REQUIRE(gpu::gemm_bf16_nt(A2.device_span(), W2b.device_span(), C2.device_span(), M2, N2,
+                                  k2));
+        tl::gpu::flush();
+        CHECK(same(C2, A2.dot(W2t), 1e-4f));
+      }
       // The f16-sum form: the same exact inputs (bf16 values sit inside f16),
       // so only the f16 sums' rounding is left. A backend without the form
       // sums in f32 and passes trivially.

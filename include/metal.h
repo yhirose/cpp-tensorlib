@@ -570,6 +570,18 @@ inline steel_grid steel_grid_(int64_t m, int64_t n) {
           (tiles_m + ((1ul << swizzle_log) - 1)) >> swizzle_log};
 }
 
+// The f32 gemm families' launch, STEEL's and the simple tiles': A, B and C at
+// buffers 0-2, the params at 3, 128 threads a threadgroup, grid z the batch.
+inline void gemm_launch_(context& c, gpu::span a, gpu::span b, gpu::span out,
+                         const gemm_params& p, unsigned long gx,
+                         unsigned long gy, unsigned long gz) {
+  set_buf_(c.enc, a, 0ul);
+  set_buf_(c.enc, b, 1ul);
+  set_buf_(c.enc, out, 2ul);
+  set_bytes_(c.enc, p, 3ul);
+  dispatch_grid_(c.enc, {gx, gy, gz}, {128, 1, 1});
+}
+
 }  // namespace detail_
 
 // `batch` products C(m,n) = (A @ B) * scale + offset in one launch: slice z
@@ -618,19 +630,15 @@ inline bool own_core::gemm_batched(gpu::span a, int64_t lda, bool ta,
     gy = (static_cast<unsigned long>(m) + bm - 1) / bm;
   }
   c.bind_(kk_);
-  detail_::set_buf_(c.enc, a, 0ul);
-  detail_::set_buf_(c.enc, b, 1ul);
-  detail_::set_buf_(c.enc, out, 2ul);
-  detail_::gemm_params p{static_cast<uint32_t>(m),   static_cast<uint32_t>(n),
+  const detail_::gemm_params p{static_cast<uint32_t>(m),   static_cast<uint32_t>(n),
                          static_cast<uint32_t>(k),   static_cast<uint32_t>(lda),
                          static_cast<uint32_t>(ldb), ta ? 1u : 0u,
                          tb ? 1u : 0u,               fast_a,
                          fast_b,                     scale,
                          offset,                     static_cast<uint32_t>(sa),
                          static_cast<uint32_t>(sb)};
-  detail_::set_bytes_(c.enc, p, 3ul);
-  detail_::dispatch_grid_(c.enc, {gx, gy, static_cast<unsigned long>(batch)},
-                          {128, 1, 1});
+  detail_::gemm_launch_(c, a, b, out, p, gx, gy,
+                        static_cast<unsigned long>(batch));
   return true;
 }
 

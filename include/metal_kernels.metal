@@ -196,8 +196,9 @@ struct gemm_params {
 };
 
 // Slice tgid.z of a batched launch: the operands' and C's starts moved to it.
+template <typename BT>
 inline void gemm_slice_(device const float* thread& A,
-                        device const float* thread& B, device float* thread& C,
+                        device const BT* thread& B, device float* thread& C,
                         constant gemm_params& p, uint z) {
   A += size_t(z) * p.sa;
   B += size_t(z) * p.sb;
@@ -471,8 +472,11 @@ struct SteelLoader {
 // operand stays in its original (transposed-view) storage. Thread mapping is
 // bi = idx % BROWS (one src row per thread): consecutive lanes scatter to
 // consecutive threadgroup banks, keeping the transposed stores at worst
-// 2-way bank-conflicted. All instantiations cover the tile in one pass.
-template <short BROWS, short BCOLS, short dst_ld, short reduction_dim, short tgp_size>
+// 2-way bank-conflicted. All instantiations cover the tile in one pass. The
+// source may be narrower than the f32 tile (T: a bf16 weight's ushort),
+// widened as it is stored.
+template <short BROWS, short BCOLS, short dst_ld, short reduction_dim, short tgp_size,
+          typename T = float>
 struct SteelLoaderT {
   STEEL_CONST short vec_size = (BCOLS * BROWS) / tgp_size;
   static_assert(BCOLS == vec_size * (tgp_size / BROWS),
@@ -483,11 +487,11 @@ struct SteelLoaderT {
   const short bi;
   const short bj;
   threadgroup float* dst;
-  const device float* src;
+  const device T* src;
 
-  struct alignas(16) ReadVec { float v[vec_size]; };
+  struct alignas(16) ReadVec { T v[vec_size]; };
 
-  METAL_FUNC SteelLoaderT(const device float* src_, int src_ld_,
+  METAL_FUNC SteelLoaderT(const device T* src_, int src_ld_,
                           threadgroup float* dst_, ushort sid, ushort lane)
       : src_ld(src_ld_),
         tile_stride(reduction_dim ? BCOLS : BROWS * src_ld_),
@@ -499,7 +503,7 @@ struct SteelLoaderT {
   METAL_FUNC void load_unsafe() const {
     ReadVec v = *((const device ReadVec*)(&src[0]));
     STEEL_PRAGMA_UNROLL
-    for (short j = 0; j < vec_size; j++) dst[j * dst_ld] = v.v[j];
+    for (short j = 0; j < vec_size; j++) dst[j * dst_ld] = widen_(v.v[j]);
   }
 
   // tile_dim is in SOURCE coordinates (x = cols, y = rows), matching
@@ -514,7 +518,7 @@ struct SteelLoaderT {
     STEEL_PRAGMA_UNROLL
     for (short j = 0; j < vec_size; j++) {
       bool valid = (j < tile_dim.x);
-      dst[j * dst_ld] = valid ? src[valid ? j : 0] : 0.0f;
+      dst[j * dst_ld] = valid ? widen_(src[valid ? j : 0]) : 0.0f;
     }
   }
 
@@ -536,7 +540,7 @@ struct SteelLoaderT {
     } else {
       STEEL_PRAGMA_UNROLL
       for (short j = 0; j < vec_size; j++)
-        dst[j * dst_ld] = j < valid_cols ? src[j] : 0.0f;
+        dst[j * dst_ld] = j < valid_cols ? widen_(src[j]) : 0.0f;
     }
   }
 
@@ -691,8 +695,8 @@ struct SteelMMA {
 // ignores swizzle; STEEL ignores the fast flags). TA/TB select the
 // transposing loader for an operand whose device storage is a transposed
 // view (backward-pass matmuls, attention's Q·Kᵀ) — the MMA stays NN.
-template <short BM, bool TA = false, bool TB = false>
-void steel_body_(device const float* A, device const float* B,
+template <short BM, bool TA = false, bool TB = false, typename BT = float>
+void steel_body_(device const float* A, device const BT* B,
                  device float* C, constant gemm_params& p,
                  threadgroup float* As, threadgroup float* Bs,
                  uint3 tgid, uint sid, uint lane) {
@@ -717,7 +721,7 @@ void steel_body_(device const float* A, device const float* B,
   typename select_type<TA, SteelLoaderT<BK, BM, lda_nn, false, tgp_size>,
                        SteelLoader<BM, BK, lda_nn, true, tgp_size>>::type
       loader_a(A, int(p.lda), As, sid, ushort(lane));
-  typename select_type<TB, SteelLoaderT<BN, BK, ldb_nn, true, tgp_size>,
+  typename select_type<TB, SteelLoaderT<BN, BK, ldb_nn, true, tgp_size, BT>,
                        SteelLoader<BK, BN, ldb_nn, false, tgp_size>>::type
       loader_b(B, int(p.ldb), Bs, sid, ushort(lane));
   SteelMMA<BM, BN, BK, WM, WN, lda_nn, ldb_nn> mma_op(sid, lane);
@@ -806,9 +810,10 @@ void steel_body_(device const float* A, device const float* B,
   }
 }
 
-#define TL_STEEL_KERNEL(name, BM, TA, TB)                                    \
+// BT: B's element type (float here; a bf16 weight's ushort in the nn layer).
+#define TL_STEEL_KERNEL(name, BM, TA, TB, BT)                                \
   kernel void name(device const float* A [[buffer(0)]],                      \
-                   device const float* B [[buffer(1)]],                      \
+                   device const BT* B [[buffer(1)]],                         \
                    device float* C [[buffer(2)]],                            \
                    constant gemm_params& p [[buffer(3)]],                    \
                    uint3 tgid [[threadgroup_position_in_grid]],              \
@@ -817,17 +822,17 @@ void steel_body_(device const float* A, device const float* B,
     threadgroup float As[BM * 20];                                           \
     threadgroup float Bs[16 * 68];                                           \
     gemm_slice_(A, B, C, p, tgid.z);                                         \
-    steel_body_<BM, TA, TB>(A, B, C, p, As, Bs, tgid, sid, lane);            \
+    steel_body_<BM, TA, TB, BT>(A, B, C, p, As, Bs, tgid, sid, lane);        \
   }
 
-TL_STEEL_KERNEL(sgemm_steel_, 64, false, false)
-TL_STEEL_KERNEL(sgemm_steel_32x64_, 32, false, false)
+TL_STEEL_KERNEL(sgemm_steel_, 64, false, false, float)
+TL_STEEL_KERNEL(sgemm_steel_32x64_, 32, false, false, float)
 // Transposed-operand variants: _ta_ reads A's transposed view in place
 // (dW = xᵀ @ g), _tb_ reads B's (dx = g @ Wᵀ, attention's Q·Kᵀ).
-TL_STEEL_KERNEL(sgemm_steel_ta_, 64, true, false)
-TL_STEEL_KERNEL(sgemm_steel_tb_, 64, false, true)
-TL_STEEL_KERNEL(sgemm_steel_32x64_ta_, 32, true, false)
-TL_STEEL_KERNEL(sgemm_steel_32x64_tb_, 32, false, true)
+TL_STEEL_KERNEL(sgemm_steel_ta_, 64, true, false, float)
+TL_STEEL_KERNEL(sgemm_steel_tb_, 64, false, true, float)
+TL_STEEL_KERNEL(sgemm_steel_32x64_ta_, 32, true, false, float)
+TL_STEEL_KERNEL(sgemm_steel_32x64_tb_, 32, false, true, float)
 
 // ---------------------------------------------------------------------------
 // Row reductions over the last axis: one threadgroup per row, 256 threads,
