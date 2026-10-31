@@ -73,34 +73,46 @@ inline const char* gtile_name_(gtile t) {
   return "";
 }
 
-// The attention kernels' variant, by D (an f32 KV cache; caps::kv_f16 is false
-// here): also no other backend's, so also kept out of kop. Offset far enough past
-// gtile_key_'s range that the two never collide either.
-enum class attn_op {
-  prefill_64, prefill_128,
-  bwd_dq_64, bwd_dq_128, bwd_dkv_64, bwd_dkv_128,
-  decode_64, decode_128, decode_split_64, decode_split_128,
-  combine_64, combine_128,
+// The attention kernels, by kind, head width and the KV cache's element type
+// (f32, or f16 with caps::kv_f16): also no other backend's, so also kept out of
+// kop. attn_kernel_ names the instantiated ones and is the one place that says
+// which exist: an op asks it, and refuses a combination it has no name for.
+// Keyed from -101, far enough past gtile_key_'s range that the two never
+// collide either.
+enum class attn_op { prefill, decode, decode_split, combine, bwd_dq, bwd_dkv, count_ };
+struct attn_kernel {
+  int key;
+  const char* name;  // nullptr: not instantiated
+  explicit operator bool() const { return name != nullptr; }
 };
-constexpr int attn_op_key_(attn_op t) { return -101 - static_cast<int>(t); }
-inline const char* attn_op_name_(attn_op t) {
-  switch (t) {
-    case attn_op::prefill_64: return "attn_prefill_64_";
-    case attn_op::prefill_128: return "attn_prefill_128_";
-    case attn_op::bwd_dq_64: return "attn_bwd_dq_64_";
-    case attn_op::bwd_dq_128: return "attn_bwd_dq_128_";
-    case attn_op::bwd_dkv_64: return "attn_bwd_dkv_64_";
-    case attn_op::bwd_dkv_128: return "attn_bwd_dkv_128_";
-    case attn_op::decode_64: return "attn_decode_64_";
-    case attn_op::decode_128: return "attn_decode_128_";
-    case attn_op::decode_split_64: return "attn_decode_split_64_";
-    case attn_op::decode_split_128: return "attn_decode_split_128_";
-    case attn_op::combine_64: return "attn_combine_64_";
-    case attn_op::combine_128: return "attn_combine_128_";
-  }
-  return "";
+// The table's shape, which also sets the keys' range: op, head width (64 / 128
+// / 256), cache (f32 / f16).
+constexpr int attn_ops_ = static_cast<int>(attn_op::count_), attn_widths_ = 3,
+              attn_caches_ = 2;
+constexpr int attn_key_last_ = -101 - (attn_ops_ * attn_widths_ * attn_caches_ - 1);
+inline attn_kernel attn_kernel_(attn_op op, int64_t D, bool f16) {
+  static const char* const names[attn_ops_][attn_widths_][attn_caches_] = {
+      {{"attn_prefill_64_", "attn_prefill_64_f16_"},
+       {"attn_prefill_128_", "attn_prefill_128_f16_"},
+       {nullptr, "attn_prefill_256_f16_"}},
+      {{"attn_decode_64_", "attn_decode_64_f16_"},
+       {"attn_decode_128_", "attn_decode_128_f16_"},
+       {"attn_decode_256_", "attn_decode_256_f16_"}},
+      {{"attn_decode_split_64_", "attn_decode_split_64_f16_"},
+       {"attn_decode_split_128_", "attn_decode_split_128_f16_"},
+       {"attn_decode_split_256_", "attn_decode_split_256_f16_"}},
+      {{"attn_combine_64_", nullptr},
+       {"attn_combine_128_", nullptr},
+       {"attn_combine_256_", nullptr}},
+      {{"attn_bwd_dq_64_", nullptr}, {"attn_bwd_dq_128_", nullptr}, {nullptr, nullptr}},
+      {{"attn_bwd_dkv_64_", nullptr}, {"attn_bwd_dkv_128_", nullptr}, {nullptr, nullptr}},
+  };
+  const int w = D == 64 ? 0 : D == 128 ? 1 : D == 256 ? 2 : -1;
+  if (w < 0) return {0, nullptr};
+  const int o = static_cast<int>(op), c = f16 ? 1 : 0;
+  return {-101 - ((o * attn_widths_ + w) * attn_caches_ + c), names[o][w][c]};
 }
-static_assert(gtile_key_(gtile::steel32x64_tb) > attn_op_key_(attn_op::prefill_64),
+static_assert(gtile_key_(gtile::steel32x64_tb) > -101,
               "gtile and attn_op pipeline keys must stay in disjoint ranges");
 
 struct mtl_size {
@@ -228,7 +240,9 @@ struct context {
       case kop::layer_norm_bwd_gb_: return "layer_norm_bwd_gb_";
       case kop::layer_norm_bwd_gb_fold_: return "layer_norm_bwd_gb_fold_";
       case kop::kv_append_: return "kv_append_";
+      case kop::kv_append_f16_: return "kv_append_f16_";
       case kop::kv_fill_: return "kv_fill_";
+      case kop::kv_fill_f16_: return "kv_fill_f16_";
       case kop::argmax_: return "argmax_";
       case kop::rmsnorm_: return "rmsnorm_";
       case kop::add_rmsnorm_: return "add_rmsnorm_";
@@ -254,7 +268,7 @@ struct context {
   // pending encoder, opened if there is none.
   void bind_(kop op) { bind_id_(static_cast<int>(op), kernel_name_(op)); }
   void bind_(gtile t) { bind_id_(gtile_key_(t), gtile_name_(t)); }
-  void bind_(attn_op t) { bind_id_(attn_op_key_(t), attn_op_name_(t)); }
+  void bind_(attn_kernel k) { bind_id_(k.key, k.name); }
 
   void bind_id_(int id, const char* name) {
     objc::id pso = pso_id_(id, name);
@@ -265,7 +279,7 @@ struct context {
   }
 
   // psos is one cache for every family: a kop's id is never negative, gtile's
-  // (gtile_key_) counts down from -1, attn_op's (attn_op_key_) from -101,
+  // (gtile_key_) counts down from -1, attn_kernel_'s from -101,
   // metal_nn.h's nn_kernel from -201 -- gaps wide enough that no range reaches
   // the next (static_asserts here and in metal_nn.h check them).
   objc::id pso_id_(int id, const char* name) {
@@ -985,7 +999,7 @@ struct caps {
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = true;   // gemv_bf16_row: weights as [N,K]
   static constexpr bool bf16_gemm = true;  // gemm_bf16_nt: a bf16-weight GEMM
-  static constexpr bool kv_f16 = false;    // the KV cache is f32
+  static constexpr bool kv_f16 = true;     // an f16 KV cache, every head width and path
 };
 
 // The capture group, cuda.h's contracts: absent here, so each answers false

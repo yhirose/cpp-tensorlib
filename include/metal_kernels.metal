@@ -24,10 +24,17 @@ struct ew_params {
 // stored as ushort; the arithmetic is always f32.
 static inline float widen_(float w) { return w; }
 static inline float widen_(ushort h) { return as_type<float>(uint(h) << 16); }
+// An f16 KV cache's element (caps::kv_f16): read exactly, written rounded to
+// nearest even.
+static inline float widen_(half h) { return float(h); }
 static inline void narrow_(device float* dst, float v) { *dst = v; }
+static inline void narrow_(device half* dst, float v) { *dst = half(v); }
 // Four consecutive elements as a float4 (i4 counts float4s).
 static inline float4 load4_(device const float* p, uint i4) {
   return ((device const float4*)p)[i4];
+}
+static inline float4 load4_(device const half* p, uint i4) {
+  return float4(((device const half4*)p)[i4]);
 }
 
 #define EW_BINARY(name, expr)                                  \
