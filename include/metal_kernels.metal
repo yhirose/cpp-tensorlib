@@ -559,6 +559,9 @@ struct SteelLoaderF {
   STEEL_CONST short vec_size = (BCOLS * BROWS) / tgp_size;
   static_assert(BCOLS == vec_size * (tgp_size / BROWS),
                 "SteelLoaderF: tile must be covered in one pass");
+  // A thread's run is a reader's f.vec: eight weights from a k that stays a
+  // multiple of 8 (bj is 0 or 8, and k steps by BCOLS).
+  static_assert(vec_size == 8 && BCOLS % 8 == 0, "SteelLoaderF: runs of eight");
 
   const F f;
   const short bi;
@@ -577,8 +580,10 @@ struct SteelLoaderF {
         dst(dst_ + bj * dst_ld + bi) {}
 
   METAL_FUNC void load_unsafe() const {
+    float v[vec_size];
+    f.vec(n, k, v);
     STEEL_PRAGMA_UNROLL
-    for (short j = 0; j < vec_size; j++) dst[j * dst_ld] = f(n, k + j);
+    for (short j = 0; j < vec_size; j++) dst[j * dst_ld] = v[j];
   }
   METAL_FUNC void load_safe(short2 tile_dim) const {
     tile_dim -= short2(bj, bi);

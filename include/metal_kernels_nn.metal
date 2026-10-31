@@ -907,11 +907,20 @@ kernel void gemv_q4_(device const float* a       [[buffer(0)]],
 // columns of a wider output.
 // ---------------------------------------------------------------------------
 
-// B[n,k] of a bf16 [N,K] weight.
+// A reader gives one weight, f(n, k), and eight, f.vec(n, k, v): the eight
+// from k, a multiple of 8, which never cross a format's scale group (16 or
+// 32 weights), so one scale serves them and their bytes come in a few wide
+// loads. STEEL's functor loader takes a tile's whole rows by vec and its
+// clipped edges by element.
+
+// B[n,k] of a bf16 [N,K] weight (the reader only where K is not whole vectors).
 struct read_bf16_ {
   device const ushort* B;
   uint K;
   float operator()(uint n, uint k) const { return widen_(B[(ulong)n * K + k]); }
+  void vec(uint n, uint k, thread float* v) const {
+    for (uint j = 0; j < 8; j++) v[j] = (*this)(n, k + j);
+  }
 };
 
 // ---- GGUF block-quantized weights ([N,K] rows of whole blocks, read where
@@ -952,6 +961,21 @@ struct read_q4k_ {
     const float d1 = half_at_(b) * sc, m1 = half_at_(b + 2) * mn;
     return d1 * float((g & 1u) ? q >> 4 : q & 0xFu) - m1;
   }
+  // Two 32-bit loads (the block and its quants 4-byte aligned, as gemv_q4k_'s).
+  void vec(uint n, uint k, thread float* v) const {
+    device const uchar* b = W + (ulong)n * row_bytes + (k >> 8) * BYTES;
+    const uint o = k & 255u, g = o >> 5;
+    float sc, mn;
+    q4k_scale_min_(q4k_scale_words_(b), g, sc, mn);
+    device const uint* q =
+        reinterpret_cast<device const uint*>(b + 16 + 32 * (g >> 1) + (o & 31u));
+    const uint sh = (g & 1u) ? 4u : 0u, w0 = q[0] >> sh, w1 = q[1] >> sh;
+    const float d1 = half_at_(b) * sc, m1 = half_at_(b + 2) * mn;
+    for (uint j = 0; j < 4; j++) {
+      v[j] = d1 * float((w0 >> (8 * j)) & 0xFu) - m1;
+      v[4 + j] = d1 * float((w1 >> (8 * j)) & 0xFu) - m1;
+    }
+  }
 };
 struct read_q6k_ {
   static constexpr constant uint ELEMS = 256, BYTES = 210;
@@ -969,6 +993,26 @@ struct read_q6k_ {
     const float sc = float(scales[8 * h + l / 16 + 2 * quarter]);
     return half_at_(b + 208) * sc * float(q);
   }
+  // 16-bit loads (the block 2-byte aligned).
+  void vec(uint n, uint k, thread float* v) const {
+    device const uchar* b = W + (ulong)n * row_bytes + (k >> 8) * BYTES;
+    const uint o = k & 255u, h = o >> 7, r = o & 127u, quarter = r >> 5;
+    const uint l = r & 31u;
+    device const ushort* ql = reinterpret_cast<device const ushort*>(
+        b + 64 * h + l + ((quarter & 1u) ? 32u : 0u));
+    device const ushort* qh = reinterpret_cast<device const ushort*>(b + 128 + 32 * h + l);
+    device const char* scales = reinterpret_cast<device const char*>(b + 192);
+    const float d = half_at_(b + 208) * float(scales[8 * h + l / 16 + 2 * quarter]);
+    const uint ls = quarter >= 2 ? 4u : 0u, hs = 2 * quarter;
+    for (uint i = 0; i < 4; i++) {
+      const uint lo = ql[i], hi = qh[i];
+      for (uint e = 0; e < 2; e++) {
+        const int q = int((((lo >> (8 * e)) >> ls) & 0xFu) |
+                          ((((hi >> (8 * e)) >> hs) & 3u) << 4)) - 32;
+        v[2 * i + e] = d * float(q);
+      }
+    }
+  }
 };
 struct read_q80_ {
   static constexpr constant uint ELEMS = 32, BYTES = 34;
@@ -978,6 +1022,17 @@ struct read_q80_ {
     device const uchar* b = W + (ulong)n * row_bytes + (k >> 5) * BYTES;
     device const char* qs = reinterpret_cast<device const char*>(b + 2);
     return float(qs[k & 31u]) * half_at_(b);
+  }
+  // Four 16-bit loads (the block 2-byte aligned).
+  void vec(uint n, uint k, thread float* v) const {
+    device const uchar* b = W + (ulong)n * row_bytes + (k >> 5) * BYTES;
+    device const ushort* qs = reinterpret_cast<device const ushort*>(b + 2 + (k & 31u));
+    const float d = half_at_(b);
+    for (uint i = 0; i < 4; i++) {
+      const ushort w = qs[i];
+      v[2 * i] = float(char(w & 0xFF)) * d;
+      v[2 * i + 1] = float(char(w >> 8)) * d;
+    }
   }
 };
 
