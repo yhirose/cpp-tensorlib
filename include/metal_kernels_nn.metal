@@ -1060,126 +1060,176 @@ TL_STEEL_KERNEL_SRC(gemm_q80_nt32_, 32, false, true, uchar, TL_READ_Q(read_q80_)
 #undef TL_READ_BF16
 
 // The decode GEMVs over the same rows: cuda's tl_gemv_q4k_row / _q6k_row /
-// _q80_row, one threadgroup of 4 simdgroups a row (gemv_bf16_row_'s shape and
-// params), each lane folding the weights it dequantizes straight into its dot
-// product.
+// _q80_row in what they compute, llama.cpp's Metal mul_mv in shape: a
+// simdgroup takes QROWS rows (threadgroups of any number of simdgroups, the
+// host's gemv_quant_rows_ in all), holds the activations a lane multiplies
+// once for all of them, and folds the weights it dequantizes straight into
+// the rows' dot products, reduced by simd_sum. One row a threadgroup left
+// these short rows (a 1024-wide Q4_K row is four blocks) to the launch and
+// the reduction, at under a third of the bf16 GEMV's bandwidth. Each format
+// is an accumulate over its blocks (F, with its reader's geometry as F::L);
+// the activation is on 16 bytes (the host checks) for its float4 loads.
+constant constexpr uint QROWS = 2;
 
-// Q4_K, a simdgroup a block: lane = 8 * pair + j reads 4 bytes of the pair's 32
-// (4 low nibbles of group 2*pair, 4 high of 2*pair+1) and the 4 + 4 activations
-// they multiply. y_n = sum d*sc*q*a - dmin*m*a.
-kernel void gemv_q4k_(device const float* a        [[buffer(0)]],
-                      device const uchar* W        [[buffer(1)]],
-                      device float* y              [[buffer(2)]],
-                      constant gemv_row_params& p  [[buffer(3)]],
-                      uint row  [[threadgroup_position_in_grid]],
-                      uint tid  [[thread_index_in_threadgroup]],
-                      uint sgid [[simdgroup_index_in_threadgroup]],
-                      uint nsg  [[simdgroups_per_threadgroup]],
-                      uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float red[8];
-  const uint nb = p.k / read_q4k_::ELEMS, pr = lane >> 3, j = lane & 7u;
-  device const uchar* wrow = W + (ulong)row * nb * read_q4k_::BYTES;
-  float acc = 0.0f;
-  for (uint ib = sgid; ib < nb; ib += nsg) {
-    device const uchar* b = wrow + (ulong)ib * read_q4k_::BYTES;
-    const uint w =
-        *reinterpret_cast<device const uint*>(b + 16 + 32 * pr + 4 * j);
-    device const float* ap = a + (ulong)ib * 256u + 64u * pr + 4u * j;
-    float sql = 0.0f, sqh = 0.0f, suml = 0.0f, sumh = 0.0f;
-    _Pragma("clang loop unroll(full)")
-    for (uint i = 0; i < 4; i++) {
-      const float lo = ap[i], hi = ap[32 + i];
-      sql += float((w >> (8 * i)) & 0xFu) * lo;
-      sqh += float((w >> (8 * i + 4)) & 0xFu) * hi;
-      suml += lo;
-      sumh += hi;
-    }
-    const uint3 sw = q4k_scale_words_(b);
-    float s0, m0, s1, m1;
-    q4k_scale_min_(sw, 2 * pr, s0, m0);
-    q4k_scale_min_(sw, 2 * pr + 1, s1, m1);
-    acc += half_at_(b) * (s0 * sql + s1 * sqh) -
-           half_at_(b + 2) * (m0 * suml + m1 * sumh);
+// A simdgroup's QROWS rows of W: row r's block ib. A ragged last simdgroup
+// re-reads row n - 1 for the rows past n, which it does not store.
+template <class L>
+struct gemv_q_rows_ {
+  device const uchar* W;
+  uint row0, last;
+  ulong rb;
+  device const uchar* block(uint r, uint ib) const {
+    return W + min(row0 + r, last) * rb + (ulong)ib * L::BYTES;
   }
-  gemv_row_store_(acc, red, y + row, tid, sgid, nsg, lane);
+};
+
+template <class F>
+kernel void gemv_q_(device const float* a       [[buffer(0)]],
+                    device const uchar* W       [[buffer(1)]],
+                    device float* y             [[buffer(2)]],
+                    constant gemv_row_params& p [[buffer(3)]],
+                    uint tg   [[threadgroup_position_in_grid]],
+                    uint sgid [[simdgroup_index_in_threadgroup]],
+                    uint nsg  [[simdgroups_per_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]]) {
+  using L = typename F::L;
+  const uint row0 = (tg * nsg + sgid) * QROWS;
+  if (row0 >= p.n) return;
+  const uint nb = p.k / L::ELEMS;
+  float acc[QROWS] = {};
+  F::accumulate(acc, a, gemv_q_rows_<L>{W, row0, p.n - 1, (ulong)nb * L::BYTES}, nb,
+                lane);
+  _Pragma("clang loop unroll(full)")
+  for (uint r = 0; r < QROWS; r++) {
+    const float t = simd_sum(acc[r]);
+    if (lane == 0 && row0 + r < p.n) y[row0 + r] = t;
+  }
 }
 
-// Q6_K, a simdgroup two blocks at a time: lane = 16 * which + 8 * half + j
-// reads the 4 consecutive positions 4j.. of its 128-weight half in each of the
-// four 32-weight quarters (4 + 4 bytes of ql, 4 of qh, 16 activations).
+// Q4_K, four blocks at a time: lane = 8 * blk + j reads 16 of block blk's
+// 128 quant bytes, the positions 16 * (j & 1).. of pair j / 2 (low nibbles
+// group 2 * pair, high 2 * pair + 1). y_n = sum d*sc*q*a - dmin*m*a.
+struct gemv_q4k_dot_ {
+  using L = read_q4k_;
+  static void accumulate(thread float* acc, device const float* a, gemv_q_rows_<L> w,
+                         uint nb, uint lane) {
+    const uint j = lane & 7u, pr = j >> 1;
+    for (uint ib = lane >> 3; ib < nb; ib += 4) {
+      device const float4* ap = reinterpret_cast<device const float4*>(
+          a + (ulong)ib * 256u + 64u * pr + 16u * (j & 1u));
+      float4 lo[4], hi[4], sl = 0.0f, sh = 0.0f;
+      _Pragma("clang loop unroll(full)")
+      for (uint i = 0; i < 4; i++) {
+        lo[i] = ap[i];
+        hi[i] = ap[8 + i];
+        sl += lo[i];
+        sh += hi[i];
+      }
+      const float suml = sl.x + sl.y + sl.z + sl.w, sumh = sh.x + sh.y + sh.z + sh.w;
+      _Pragma("clang loop unroll(full)")
+      for (uint r = 0; r < QROWS; r++) {
+        device const uchar* b = w.block(r, ib);
+        device const uint* q = reinterpret_cast<device const uint*>(b + 16 + 16 * j);
+        float sql = 0.0f, sqh = 0.0f;
+        _Pragma("clang loop unroll(full)")
+        for (uint i = 0; i < 4; i++) {
+          const uint v = q[i];
+          sql += dot(float4(v & 0xFu, (v >> 8) & 0xFu, (v >> 16) & 0xFu, (v >> 24) & 0xFu),
+                     lo[i]);
+          sqh += dot(float4((v >> 4) & 0xFu, (v >> 12) & 0xFu, (v >> 20) & 0xFu, v >> 28),
+                     hi[i]);
+        }
+        const uint3 sw = q4k_scale_words_(b);
+        float s0, m0, s1, m1;
+        q4k_scale_min_(sw, 2 * pr, s0, m0);
+        q4k_scale_min_(sw, 2 * pr + 1, s1, m1);
+        acc[r] += half_at_(b) * (s0 * sql + s1 * sqh) -
+                  half_at_(b + 2) * (m0 * suml + m1 * sumh);
+      }
+    }
+  }
+};
+
+// Q6_K, two blocks at a time: lane = 16 * which + 8 * half + j reads the 4
+// consecutive positions 4j.. of its 128-weight half in each of the four
+// 32-weight quarters (4 + 4 bytes of ql, 4 of qh, 16 activations).
 static inline uint ld32_h_(device const uchar* b) {
   device const ushort* s = reinterpret_cast<device const ushort*>(b);
   return uint(s[0]) | (uint(s[1]) << 16);
 }
-kernel void gemv_q6k_(device const float* a        [[buffer(0)]],
-                      device const uchar* W        [[buffer(1)]],
-                      device float* y              [[buffer(2)]],
-                      constant gemv_row_params& p  [[buffer(3)]],
-                      uint row  [[threadgroup_position_in_grid]],
-                      uint tid  [[thread_index_in_threadgroup]],
-                      uint sgid [[simdgroup_index_in_threadgroup]],
-                      uint nsg  [[simdgroups_per_threadgroup]],
-                      uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float red[8];
-  const uint nb = p.k / read_q6k_::ELEMS, r = lane & 15u, h = r >> 3;
-  const uint j = r & 7u;
-  device const uchar* wrow = W + (ulong)row * nb * read_q6k_::BYTES;
-  float acc = 0.0f;
-  for (uint ib = sgid * 2u + (lane >> 4); ib < nb; ib += nsg * 2u) {
-    device const uchar* b = wrow + (ulong)ib * read_q6k_::BYTES;
-    const uint qa = ld32_h_(b + 64 * h + 4 * j);
-    const uint qb = ld32_h_(b + 64 * h + 32 + 4 * j);
-    const uint qh = ld32_h_(b + 128 + 32 * h + 4 * j);
-    device const char* sc =
-        reinterpret_cast<device const char*>(b + 192) + 8 * h + (j >> 2);
-    device const float* ap = a + (ulong)ib * 256u + 128u * h + 4u * j;
-    float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
-    _Pragma("clang loop unroll(full)")
-    for (uint i = 0; i < 4; i++) {
-      const uint la = (qa >> (8 * i)) & 0xFFu, lb = (qb >> (8 * i)) & 0xFFu;
-      const uint hq = (qh >> (8 * i)) & 0xFFu;
-      s0 += float(int((la & 0xFu) | ((hq & 3u) << 4)) - 32) * ap[i];
-      s1 += float(int((lb & 0xFu) | (((hq >> 2) & 3u) << 4)) - 32) * ap[32 + i];
-      s2 += float(int((la >> 4) | (((hq >> 4) & 3u) << 4)) - 32) * ap[64 + i];
-      s3 += float(int((lb >> 4) | (((hq >> 6) & 3u) << 4)) - 32) * ap[96 + i];
+struct gemv_q6k_dot_ {
+  using L = read_q6k_;
+  static void accumulate(thread float* acc, device const float* a, gemv_q_rows_<L> w,
+                         uint nb, uint lane) {
+    const uint h = (lane >> 3) & 1u, j = lane & 7u;
+    for (uint ib = lane >> 4; ib < nb; ib += 2) {
+      device const float4* ap = reinterpret_cast<device const float4*>(
+          a + (ulong)ib * 256u + 128u * h + 4u * j);
+      const float4 a0 = ap[0], a1 = ap[8], a2 = ap[16], a3 = ap[24];
+      _Pragma("clang loop unroll(full)")
+      for (uint r = 0; r < QROWS; r++) {
+        device const uchar* b = w.block(r, ib);
+        const uint qa = ld32_h_(b + 64 * h + 4 * j);
+        const uint qb = ld32_h_(b + 64 * h + 32 + 4 * j);
+        const uint qh = ld32_h_(b + 128 + 32 * h + 4 * j);
+        float4 q0, q1, q2, q3;
+        _Pragma("clang loop unroll(full)")
+        for (uint i = 0; i < 4; i++) {
+          const uint la = (qa >> (8 * i)) & 0xFFu, lb = (qb >> (8 * i)) & 0xFFu;
+          const uint hq = (qh >> (8 * i)) & 0xFFu;
+          q0[i] = float(int((la & 0xFu) | ((hq & 3u) << 4)) - 32);
+          q1[i] = float(int((lb & 0xFu) | (((hq >> 2) & 3u) << 4)) - 32);
+          q2[i] = float(int((la >> 4) | (((hq >> 4) & 3u) << 4)) - 32);
+          q3[i] = float(int((lb >> 4) | (((hq >> 6) & 3u) << 4)) - 32);
+        }
+        device const char* sc =
+            reinterpret_cast<device const char*>(b + 192) + 8 * h + (j >> 2);
+        acc[r] += half_at_(b + 208) *
+                  (float(sc[0]) * dot(q0, a0) + float(sc[2]) * dot(q1, a1) +
+                   float(sc[4]) * dot(q2, a2) + float(sc[6]) * dot(q3, a3));
+      }
     }
-    acc += half_at_(b + 208) * (float(sc[0]) * s0 + float(sc[2]) * s1 +
-                                float(sc[4]) * s2 + float(sc[6]) * s3);
   }
-  gemv_row_store_(acc, red, y + row, tid, sgid, nsg, lane);
-}
+};
 
-// Q8_0, a simdgroup eight blocks at a time: lane = 4 * which + j reads the 8
-// bytes 8j.. of its block and the 8 activations they multiply. y_n = sum d*q*a.
-kernel void gemv_q80_(device const float* a        [[buffer(0)]],
-                      device const uchar* W        [[buffer(1)]],
-                      device float* y              [[buffer(2)]],
-                      constant gemv_row_params& p  [[buffer(3)]],
-                      uint row  [[threadgroup_position_in_grid]],
-                      uint tid  [[thread_index_in_threadgroup]],
-                      uint sgid [[simdgroup_index_in_threadgroup]],
-                      uint nsg  [[simdgroups_per_threadgroup]],
-                      uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float red[8];
-  const uint nb = p.k / read_q80_::ELEMS, j = lane & 3u;
-  device const uchar* wrow = W + (ulong)row * nb * read_q80_::BYTES;
-  float acc = 0.0f;
-  for (uint ib = sgid * 8u + (lane >> 2); ib < nb; ib += nsg * 8u) {
-    device const uchar* b = wrow + (ulong)ib * read_q80_::BYTES;
-    device const ushort* q16 =
-        reinterpret_cast<device const ushort*>(b + 2 + 8 * j);
-    device const float* ap = a + (ulong)ib * 32u + 8u * j;
-    float s = 0.0f;
-    _Pragma("clang loop unroll(full)")
-    for (uint i = 0; i < 4; i++) {
-      const uint w = q16[i];
-      s += float(char(w & 0xFFu)) * ap[2 * i] +
-           float(char(w >> 8)) * ap[2 * i + 1];
+// Q8_0, eight blocks at a time: lane = 4 * which + j reads the 8 bytes 8j..
+// of its block and the 8 activations they multiply. y_n = sum d*q*a.
+struct gemv_q80_dot_ {
+  using L = read_q80_;
+  static void accumulate(thread float* acc, device const float* a, gemv_q_rows_<L> w,
+                         uint nb, uint lane) {
+    const uint j = lane & 3u;
+    for (uint ib = lane >> 2; ib < nb; ib += 8) {
+      device const float4* ap =
+          reinterpret_cast<device const float4*>(a + (ulong)ib * 32u + 8u * j);
+      const float4 a0 = ap[0], a1 = ap[1];
+      _Pragma("clang loop unroll(full)")
+      for (uint r = 0; r < QROWS; r++) {
+        device const uchar* b = w.block(r, ib);
+        device const ushort* q16 = reinterpret_cast<device const ushort*>(b + 2 + 8 * j);
+        float4 q0, q1;
+        _Pragma("clang loop unroll(full)")
+        for (uint i = 0; i < 2; i++) {
+          const uint w0 = q16[i], w1 = q16[2 + i];
+          q0[2 * i] = float(char(w0 & 0xFFu));
+          q0[2 * i + 1] = float(char(w0 >> 8));
+          q1[2 * i] = float(char(w1 & 0xFFu));
+          q1[2 * i + 1] = float(char(w1 >> 8));
+        }
+        acc[r] += half_at_(b) * (dot(q0, a0) + dot(q1, a1));
+      }
     }
-    acc += half_at_(b) * s;
   }
-  gemv_row_store_(acc, red, y + row, tid, sgid, nsg, lane);
-}
+};
+
+#define TL_GEMV_Q(name, F)                                                   \
+  template [[host_name(name)]] kernel void gemv_q_<F>(                       \
+      device const float*, device const uchar*, device float*,               \
+      constant gemv_row_params&, uint, uint, uint, uint);
+TL_GEMV_Q("gemv_q4k_", gemv_q4k_dot_)
+TL_GEMV_Q("gemv_q6k_", gemv_q6k_dot_)
+TL_GEMV_Q("gemv_q80_", gemv_q80_dot_)
+#undef TL_GEMV_Q
 
 // ---------------------------------------------------------------------------
 // Fused decode attention: one query row against the whole cache. cuda's

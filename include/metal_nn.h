@@ -285,6 +285,11 @@ struct gemv_combine_params {
 // eight): K whole runs, W on 16 bytes.
 inline bool bf16_rows_vec_(int64_t K, gpu::span W) { return K % 8 == 0 && W.off % 16 == 0; }
 
+// The quantized GEMVs' threadgroup: gemv_quant_sg_ simdgroups, each the
+// kernels' QROWS rows (metal_kernels_nn.metal).
+inline constexpr unsigned long gemv_quant_qrows_ = 2, gemv_quant_sg_ = 2,
+                               gemv_quant_rows_ = gemv_quant_sg_ * gemv_quant_qrows_;
+
 // The quantized weights this backend reads natively: ggml type codes 12 Q4_K,
 // 14 Q6_K and 8 Q8_0, K a whole number of their blocks, and W aligned for the
 // kernels' loads (32-bit into a Q4_K block, 16-bit into the others).
@@ -441,11 +446,12 @@ inline bool own_nn::gemm_bf16_nt_f16acc(gpu::span A, gpu::span B, gpu::span C,
 }
 
 // y[n] = W[n,K] . a over a GGUF block-quantized weight read where it lies:
-// cuda.h's contract, one threadgroup of 128 a row.
+// cuda.h's contract (the activation on 16 bytes, for the kernels' float4
+// loads), in threadgroups of gemv_quant_rows_ rows.
 inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y,
                                int64_t n, int64_t k) {
   auto& c = context::get();
-  if (!c.device || n <= 0 || !detail_::quant_ok_(type, k, W)) return false;
+  if (!c.device || n <= 0 || a.off % 16 || !detail_::quant_ok_(type, k, W)) return false;
   detail_::bind_(c, type == 12   ? nn_kernel::gemv_q4k
                     : type == 14 ? nn_kernel::gemv_q6k
                                  : nn_kernel::gemv_q80);
@@ -454,7 +460,9 @@ inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y,
   detail_::set_buf_(c.enc, y, 2ul);
   gpu::gemv_row_params p{static_cast<uint32_t>(n), static_cast<uint32_t>(k)};
   detail_::set_bytes_(c.enc, p, 3ul);
-  detail_::dispatch_grid_(c.enc, {static_cast<unsigned long>(n), 1, 1}, {128, 1, 1});
+  const unsigned long groups =
+      (static_cast<unsigned long>(n) + detail_::gemv_quant_rows_ - 1) / detail_::gemv_quant_rows_;
+  detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {32 * detail_::gemv_quant_sg_, 1, 1});
   return true;
 }
 
