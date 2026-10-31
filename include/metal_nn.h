@@ -343,7 +343,10 @@ inline void attn_dispatch_(objc::id enc, const attn_params& p,
 // q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D] cache read over
 // [0,pos0+T), query p at absolute position pos0+p. GQA via the head ratio.
 // The head widths and caches attn_kernel_ names (cuda's: 64 and 128 over
-// either cache, 256 over an f16 one).
+// either cache, 256 over an f16 one). An f16 cache is staged four halves at a
+// time (load4_'s half4) without a word_aligned_ check: no composition takes an
+// f16 cache, so a refusal would leave the op unrun, and on the M1 Pro these
+// loads read a cache one half off right (test_nn checks it).
 inline bool own_nn::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
                               gpu::span out, int64_t n_q_heads,
                               int64_t n_kv_heads, int64_t T, int64_t kv_max,
