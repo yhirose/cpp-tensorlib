@@ -546,6 +546,15 @@ inline void set_buf_(objc::id enc, gpu::span s, unsigned long idx) {
   set_buf_(enc, s.buf, s.off, idx);
 }
 
+// Whether a kernel may read `s` more than two bytes at a time. On the M1 Pro
+// a load or store of 4 bytes or more is right from any 4-byte-aligned address
+// (a float4 off 16 bytes included), but from a 2-byte-aligned one it can
+// silently move the wrong bytes, and the compiler may merge two narrower loads
+// into such a one. Apple asks only that a buffer's offset be a multiple of the
+// bound argument's element, so an f32 buffer always passes; a 1- or 2-byte one
+// (bf16, quantized blocks) read wider than its element needs this check.
+inline bool word_aligned_(gpu::span s) { return s.off % 4 == 0; }
+
 template <class P>
 inline void set_bytes_(objc::id enc, const P& p, unsigned long idx) {
   objc::send(enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
@@ -623,8 +632,8 @@ inline bool own_core::gemm_batched(gpu::span a, int64_t lda, bool ta,
   } else {
     kk_ = m >= 64 ? gtile::sgemm64x32 : gtile::sgemm32;
     const unsigned long bm = m >= 64 ? 64 : 32, bn = 32;
-    // float4 loader eligibility: row-major operand only (Apple GPUs handle
-    // the unaligned vector loads; transposed operands use the strided path).
+    // float4 loader eligibility: row-major operand only (an f32 operand is
+    // always word_aligned_; transposed operands use the strided path).
     fast_a = !ta ? 1u : 0u;
     fast_b = !tb ? 1u : 0u;
     gx = (static_cast<unsigned long>(n) + bn - 1) / bn;
