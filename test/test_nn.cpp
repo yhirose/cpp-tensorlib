@@ -1138,6 +1138,31 @@ TEST_CASE("generic compositions agree with the fused kernels") {
                                    scale, false, T + 1);
         },
         [&] { return host_close(host_values(pc), want, 1e-4f); }, true);
+    // An f16 cache one half off (off the 4 bytes Metal's wider loads need):
+    // the same prefill, read right. It must run, since no composition takes
+    // an f16 cache.
+    if (gpu::caps::kv_f16) {
+      const int64_t floats = HKV * MAXC * D / 2 + 1;  // the f16 cache, and a float for the lead
+      array Kh = dev(array::zeros({floats})), Vh = dev(array::zeros({floats}));
+      array Khs = dev(array::zeros({floats})), Vhs = dev(array::zeros({floats}));
+      REQUIRE(gpu::kv_fill(Kh.device_span(), Vh.device_span(), K2.device_span(), V2.device_span(),
+                           T2, MAXC, HKV, D, true));
+      REQUIRE(gpu::kv_fill(Khs.device_span().at(2), Vhs.device_span().at(2), K2.device_span(),
+                           V2.device_span(), T2, MAXC, HKV, D, true));
+      array ph = array::empty({HQ, T2, D}), phs = array::empty({HQ, T2, D});
+      REQUIRE(gpu::attn_prefill(qp.device_span(), Kh.device_span(), Vh.device_span(),
+                                ph.device_span(), HQ, HKV, T2, MAXC, D, scale, true, 0));
+      tl::gpu::flush();
+      const std::vector<float> want16 = host_values(ph);
+      check_misaligned(
+          "f16 prefill attention, K and V off 4 bytes",
+          [&] {
+            return gpu::attn_prefill(qp.device_span(), Khs.device_span().at(2),
+                                     Vhs.device_span().at(2), phs.device_span(), HQ, HKV, T2, MAXC,
+                                     D, scale, true, 0);
+          },
+          [&] { return host_close(host_values(phs), want16, 1e-6f); }, true);
+    }
   }
 
   SUBCASE("the inference prefill (tensor cores, f16 operands) at each head width") {
