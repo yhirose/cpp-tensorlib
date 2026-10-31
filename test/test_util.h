@@ -102,7 +102,8 @@ array with_lead(const array& a, int64_t lead) {
   const std::vector<float> h = host_values(a);
   std::vector<float> v((size_t)lead, 0.0f);
   v.insert(v.end(), h.begin(), h.end());
-  return array::from(std::move(v), {(int64_t)v.size()});
+  const int64_t n = static_cast<int64_t>(v.size());  // before the move below
+  return array::from(std::move(v), {n});
 }
 
 // The `n` values a kernel wrote `lead` elements into `buf` (a with_lead
