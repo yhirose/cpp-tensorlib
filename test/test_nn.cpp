@@ -1031,13 +1031,18 @@ TEST_CASE("generic compositions agree with the fused kernels") {
       const int64_t H = 6, T = 5, rows = H * T, pos = 17;
       const float base = 1e6f, eps = 1e-6f;
       array x = random_array({rows, s.D}, 1090), w = dev(random_array({s.D}, 1091));
-      array xa = dev(x), xb = dev(x);
+      // Each side flushed on its own, the reference's norm into a buffer of
+      // its own: both turn in place, which a backend whose launches cannot
+      // write what they read (WebGPU) must route around, not drop with its
+      // batch and leave a side as it was.
+      array xa = dev(x), xd = dev(x), xn = array::empty({rows, s.D});
+      REQUIRE(gpu::rmsnorm(xd.device_span(), w.device_span(), xn.device_span(), s.D, eps, rows));
+      REQUIRE(gpu::rope(xn.device_span(), xn.device_span(), rows, T, s.D, pos, base, {}, s.rot));
+      tl::gpu::flush();
       REQUIRE(gpu::rmsnorm_rope(xa.device_span(), w.device_span(), rows, T, s.D, pos, base,
                                 s.rot, eps));
-      REQUIRE(gpu::rmsnorm(xb.device_span(), w.device_span(), xb.device_span(), s.D, eps, rows));
-      REQUIRE(gpu::rope(xb.device_span(), xb.device_span(), rows, T, s.D, pos, base, {}, s.rot));
       tl::gpu::flush();
-      CHECK(same(xa, xb, 1e-7f));
+      CHECK(same(xa, xn, 1e-7f));
     }
     // silu(z) * rmsnorm(o) * w over o [T*H, D], the gate a row's head of z.
     // The fused form against the composition a decoder runs without it
