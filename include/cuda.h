@@ -50,6 +50,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -179,6 +180,35 @@ inline const char* ptx_source_() {
   return reinterpret_cast<const char*>(src);
 }
 
+// The alignment each kernel needs of its pointer arguments, as TL_ALIGN declares
+// it beside the kernel (tensorlib_cuda.cu): one byte count per leading pointer
+// parameter. nvcc emits each declaration into the PTX as
+//   .global .align 1 .b8 <kernel>_ptr_align[n] = {16, 4, 8};
+// so the table is read from the module's own text, once, with no driver call.
+// A kernel without one takes its pointers on their element's width.
+using align_table = std::unordered_map<std::string, std::vector<unsigned char>>;
+inline align_table parse_align_decls_(const char* ptx) {
+  static constexpr char tag[] = "_ptr_align[";
+  align_table out;
+  for (const char* p = std::strstr(ptx, tag); p; p = std::strstr(p + 1, tag)) {
+    const char* name = p;
+    while (name > ptx && name[-1] != ' ' && name[-1] != '\t') --name;
+    const char* open = std::strpbrk(p, "{\n");
+    if (!open || *open != '{') continue;  // a use, not the definition
+    std::vector<unsigned char> bytes;
+    for (char* q = const_cast<char*>(open + 1); *q && *q != '}';) {
+      bytes.push_back(static_cast<unsigned char>(std::strtoul(q, &q, 10)));
+      while (*q == ',' || *q == ' ') ++q;
+    }
+    out.emplace(std::string(name, p), std::move(bytes));
+  }
+  return out;
+}
+inline const align_table& align_decls_() {
+  static const align_table table = parse_align_decls_(ptx_source_());
+  return table;
+}
+
 inline const char* kernel_name_(kop op) {
   switch (op) {
     case kop::add: return "tl_add";
@@ -281,10 +311,16 @@ struct context {
   bool no_splitk = false;
   std::unordered_map<int, CUfunction> fns;
 
-  // tl::profile: the name each loaded function was looked up by (a launch
-  // only has the handle), and the launches bracketed by events whose
-  // elapsed time has not been read back yet. Events are recycled.
-  std::unordered_map<CUfunction, std::string> kernel_names;
+  // Each loaded function's record, read back on every launch (which only has
+  // the handle): the name it was looked up by, for tl::profile, and the
+  // pointer alignment its kernel declares (align_decls_). Then the launches
+  // bracketed by events whose elapsed time has not been read back yet. Events
+  // are recycled.
+  struct kernel_info {
+    std::string name;
+    std::vector<unsigned char> align;
+  };
+  std::unordered_map<CUfunction, kernel_info> kernels;
   struct timed_launch {
     profile::row* row;
     CUevent begin, end;
@@ -445,12 +481,46 @@ struct context {
   CUfunction load_(const char* name) {
     CUfunction f = nullptr;
     d.ModuleGetFunction(&f, mod, name);
-    if (f) kernel_names.emplace(f, name);
+    if (f) {
+      const auto it = align_decls_().find(name);
+      kernels.emplace(f, kernel_info{name, it == align_decls_().end()
+                                               ? std::vector<unsigned char>{}
+                                               : it->second});
+    }
     return f;
   }
+
+  // Whether these arguments of `f` fit its kernel: each leading pointer on the
+  // alignment the kernel declares (TL_ALIGN), none declared past those
+  // pointers (kernels take their pointers first; dispatch_ relies on it too).
+  // launch_ and dispatch_ refuse a launch that does not fit, so a misaligned
+  // view is declined, never misread; a launcher choosing between kernels asks
+  // this of its candidate first.
+  bool fits_ptrs_(CUfunction f, const void* const* ptrs, size_t n) const {
+    auto it = kernels.find(f);
+    if (it == kernels.end()) return true;
+    const std::vector<unsigned char>& a = it->second.align;
+    if (a.size() > n) return false;
+    for (size_t i = 0; i < a.size(); i++)
+      if (reinterpret_cast<uintptr_t>(ptrs[i]) % a[i]) return false;
+    return true;
+  }
+  template <typename... Ts>
+  bool fits_(CUfunction f, Ts... args) const {
+    constexpr bool is_ptr[] = {std::is_pointer_v<Ts>...};
+    size_t n = 0;
+    while (n < sizeof...(Ts) && is_ptr[n]) n++;
+    const void* p[] = {ptr_or_null_(args)...};
+    return fits_ptrs_(f, p, n);
+  }
+  template <typename T>
+  static const void* ptr_or_null_(T v) {
+    if constexpr (std::is_pointer_v<T>) return static_cast<const void*>(v);
+    else return nullptr;
+  }
   std::string_view name_(CUfunction f) const {
-    auto it = kernel_names.find(f);
-    return it == kernel_names.end() ? std::string_view("?") : it->second;
+    auto it = kernels.find(f);
+    return it == kernels.end() ? std::string_view("?") : it->second.name;
   }
 
   CUfunction fn_(kop op) {
@@ -860,6 +930,7 @@ struct context {
                   "kernel arg must be a pointer or a 4-byte scalar: an 8-byte "
                   "one (int64_t/size_t/double/nullptr) shifts every arg after "
                   "it. Cast to unsigned/float at the call site.");
+    if (!fits_(f, args...)) return false;
     void* argv[] = {&args...};
     return launch_argv_(f, grid, block, smem, argv);
   }
@@ -904,9 +975,11 @@ struct context {
     void* ptrs[kMaxArgs];
     uint32_t scalars[kMaxArgs];
     void* argv[kMaxArgs];
+    for (size_t i = 0; i < n; i++) ptrs[i] = off_(args[i].s.buf, args[i].s.off);
+    // Declined before any residency change, so a refusal leaves no trace.
+    if (!fits_ptrs_(f, ptrs, n)) return false;
     for (size_t i = 0; i < n; i++) {
       before_kernel_(args[i].s.buf, args[i].a);
-      ptrs[i] = off_(args[i].s.buf, args[i].s.off);
       argv[i] = &ptrs[i];
     }
     std::memcpy(scalars, params, params_bytes);
@@ -998,13 +1071,13 @@ struct traits {
 // efficient, but a few-hundred-row activation against a projection (256×768:
 // 12 blocks) leaves most SMs idle, and the 64² tile makes that 48 at half the
 // FMA per shared float and about half the registers per thread. Take the big
-// tile only when its grid (batch counted) already fills.
+// tile only when its grid already fills.
 // 128²-tile blocks a batch of m×n outputs takes: what the fill rules measure.
 inline long blocks128_(int64_t m, int64_t n, int64_t batch) {
   return (long)((n + 127) / 128) * ((m + 127) / 128) * batch;
 }
-inline bool big_tile_(int64_t m, int64_t n, int64_t batch = 1) {
-  return blocks128_(m, n, batch) >= traits::fill_groups;
+inline bool big_tile_(int64_t m, int64_t n) {
+  return blocks128_(m, n, 1) >= traits::fill_groups;
 }
 
 // The wave plan. A launch places one block per SM up to kWaveSingles blocks
@@ -1590,19 +1663,18 @@ inline bool own_core::gemm_batched(gpu::span a, int64_t lda, bool ta, int64_t sa
   // operand contiguous in its own layout (lda == k, or == m for a transposed
   // view; ldb == n, or == k transposed), K%8==0 for the 8-slab, the dim a
   // float4 load runs along a multiple of 4 (N for NN's B, M for TN's A; K%8
-  // covers the K-contiguous operands), and 16B-aligned bases. The batch
-  // strides ride in the kernel's 32-bit arguments and must keep every slice
-  // 16B-aligned: multiples of 4 floats (C is stored per element, so only its
-  // m·n stride has to fit). M and N block edges are predicated in-kernel.
-  // Strided views, odd K and unaligned offsets fall to tl_sgemm.
-  bool aligned = (a.off % 16 == 0) && (b.off % 16 == 0) && (out.off % 16 == 0);
+  // covers the K-contiguous operands), and bases where the kernel declares
+  // them (TL_ALIGN). The batch strides ride in the kernel's 32-bit
+  // arguments and must keep every slice 16B-aligned: multiples of 4 floats (C
+  // is stored per element, so only its m·n stride has to fit). M and N block
+  // edges are predicated in-kernel. Strided views, odd K and unaligned
+  // offsets fall to tl_sgemm.
   bool a_ok = ta ? (lda == m && m % 4 == 0) : (lda == k);
   bool b_ok = tb ? (ldb == k) : (ldb == n && n % 4 == 0);
   bool batch_ok = sa % 4 == 0 && sb % 4 == 0 && sa <= (int64_t)UINT32_MAX &&
                   sb <= (int64_t)UINT32_MAX &&
                   (batch == 1 || m * n <= (int64_t)UINT32_MAX);
-  if (a_ok && b_ok && batch_ok && k % 8 == 0 && aligned && m > 0 && n > 0 &&
-      k > 0) {
+  if (a_ok && b_ok && batch_ok && k % 8 == 0 && m > 0 && n > 0 && k > 0) {
     // Tile choice (sgemm_tile_), then split-K fills what the grid leaves.
     const sgemm_tile& t = sgemm_tile_(m, n, k, batch);
     unsigned gx = (un + t.bm - 1) / t.bm, gy = (um + t.bm - 1) / t.bm;
@@ -1616,7 +1688,8 @@ inline bool own_core::gemm_batched(gpu::span a, int64_t lda, bool ta, int64_t sa
     // like z below.
     CUfunction fill = need_fill && m <= 65535 ? c.fill_rows_() : nullptr;
     // gridDim.z carries batch × S; the driver caps it at 65535.
-    if (f && (int64_t)S * batch <= 65535 && (!need_fill || fill)) {
+    if (f && c.fits_(f, pa, pb, po, pbias) && (int64_t)S * batch <= 65535 &&
+        (!need_fill || fill)) {
       if (fill) {
         if (!c.launch_(fill, {(un + 255) / 256, um}, {256}, 0, po, pbias, um, un))
           return false;
