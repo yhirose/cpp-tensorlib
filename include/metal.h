@@ -382,6 +382,11 @@ struct own_core {
   static bool gemm(gpu::span a, int64_t lda, bool ta, gpu::span b, int64_t ldb,
                    bool tb, gpu::span out, int64_t m, int64_t n, int64_t k,
                    float scale, float offset);
+  static bool gemm_batched(gpu::span a, int64_t lda, bool ta, int64_t sa,
+                           gpu::span b, int64_t ldb, bool tb, int64_t sb,
+                           gpu::span out, int64_t m, int64_t n, int64_t k,
+                           int64_t batch, float scale, float offset,
+                           gpu::span bias = {});
 };
 
 inline bool pending() { return context::get().pending; }
@@ -529,6 +534,7 @@ struct gemm_params {
   uint32_t M, N, K, lda, ldb, trans_a, trans_b;
   uint32_t a_fast, b_fast;  // float4 loader eligibility, verified host-side
   float scale, offset;
+  uint32_t sa, sb;  // batch slices' strides in floats; C's is M * N
 };
 
 inline void set_buf_(objc::id enc, void* buf, int64_t off, unsigned long idx) {
@@ -547,14 +553,23 @@ inline void set_bytes_(objc::id enc, const P& p, unsigned long idx) {
 
 }  // namespace detail_
 
-// C(m,n) = (A @ B) * scale + offset. lda/ldb are row strides; trans flags
-// let a transposed view be read in place. Buffers are raw MTLBuffers; byte
-// offsets fold the view offset in. Encodes without committing.
-inline bool own_core::gemm(gpu::span a, int64_t lda, bool ta, gpu::span b,
-                      int64_t ldb, bool tb, gpu::span out, int64_t m, int64_t n,
-                      int64_t k, float scale, float offset) {
+// `batch` products C(m,n) = (A @ B) * scale + offset in one launch: slice z
+// (grid z) reads A / B z * sa / z * sb floats past slice 0's and writes C
+// z * m * n past (a stride of 0 broadcasts one operand slice). lda/ldb are row
+// strides; trans flags let a transposed view be read in place. Buffers are
+// raw MTLBuffers; byte offsets fold the view offset in. Encodes without
+// committing. No row bias yet: one declines.
+inline bool own_core::gemm_batched(gpu::span a, int64_t lda, bool ta,
+                                   int64_t sa, gpu::span b, int64_t ldb,
+                                   bool tb, int64_t sb, gpu::span out,
+                                   int64_t m, int64_t n, int64_t k,
+                                   int64_t batch, float scale, float offset,
+                                   gpu::span bias) {
   auto& c = context::get();
-  if (!c.device) return false;
+  if (!c.device || bias.buf || batch < 1 || sa < 0 || sb < 0 ||
+      sa > UINT32_MAX || sb > UINT32_MAX) {
+    return false;
+  }
   // Dispatch ladder. STEEL (BN=64 bands) covers NN and single-transposed
   // shapes with enough width (the transposing loader reads the view in
   // place); BM band follows silarray (M < 97 → 32×64 tiles). TT or narrow
@@ -601,11 +616,20 @@ inline bool own_core::gemm(gpu::span a, int64_t lda, bool ta, gpu::span b,
                          static_cast<uint32_t>(ldb), ta ? 1u : 0u,
                          tb ? 1u : 0u,               fast_a,
                          fast_b,                     scale,
-                         offset};
-  objc::send(c.enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
-             static_cast<unsigned long>(sizeof(p)), 3ul);
-  detail_::dispatch_grid_(c.enc, {gx, gy, 1}, {128, 1, 1});
+                         offset,                     static_cast<uint32_t>(sa),
+                         static_cast<uint32_t>(sb)};
+  detail_::set_bytes_(c.enc, p, 3ul);
+  detail_::dispatch_grid_(c.enc, {gx, gy, static_cast<unsigned long>(batch)},
+                          {128, 1, 1});
   return true;
+}
+
+// C(m,n) = (A @ B) * scale + offset: the batch == 1 case of gemm_batched.
+inline bool own_core::gemm(gpu::span a, int64_t lda, bool ta, gpu::span b,
+                      int64_t ldb, bool tb, gpu::span out, int64_t m, int64_t n,
+                      int64_t k, float scale, float offset) {
+  return gemm_batched(a, lda, ta, 0, b, ldb, tb, 0, out, m, n, k, 1, scale,
+                      offset);
 }
 
 // Rank cap for pad_/fold_'s GPU dispatch — matches cuda.h's kPadFoldMaxRank
