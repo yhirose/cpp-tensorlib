@@ -192,7 +192,17 @@ struct gemm_params {
   uint M, N, K, lda, ldb, trans_a, trans_b;
   uint a_fast, b_fast;  // host-verified float4 eligibility
   float scale, offset;
+  uint sa, sb;  // slice strides in floats (C's is M * N), grid z the slice
 };
+
+// Slice tgid.z of a batched launch: the operands' and C's starts moved to it.
+inline void gemm_slice_(device const float* thread& A,
+                        device const float* thread& B, device float* thread& C,
+                        constant gemm_params& p, uint z) {
+  A += size_t(z) * p.sa;
+  B += size_t(z) * p.sb;
+  C += size_t(z) * p.M * p.N;
+}
 
 template <uint BM, uint BN, uint BK>
 void sgemm_body_(device const float* A, device const float* B,
@@ -322,6 +332,7 @@ void sgemm_body_(device const float* A, device const float* B,
                    uint lane [[thread_index_in_simdgroup]]) {                \
     threadgroup float As[BM * (BK + 4)];                                     \
     threadgroup float Bs[BK * (BN + 4)];                                     \
+    gemm_slice_(A, B, C, p, tgid.z);                                         \
     sgemm_body_<BM, BN, BK>(A, B, C, p, As, Bs, tgid, tid, sid, lane);       \
   }
 
@@ -805,6 +816,7 @@ void steel_body_(device const float* A, device const float* B,
                    uint lane [[thread_index_in_simdgroup]]) {                \
     threadgroup float As[BM * 20];                                           \
     threadgroup float Bs[16 * 68];                                           \
+    gemm_slice_(A, B, C, p, tgid.z);                                         \
     steel_body_<BM, TA, TB>(A, B, C, p, As, Bs, tgid, sid, lane);            \
   }
 
