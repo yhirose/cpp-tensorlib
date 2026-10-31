@@ -639,6 +639,7 @@ struct rope_params {
   uint32_t n, t, d, pos, half;
   float base;
 };
+struct argmax_params { uint32_t n; };
 
 inline uint32_t u32(int64_t v) { return static_cast<uint32_t>(v); }
 
@@ -926,11 +927,9 @@ inline bool own::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
   float* host = nullptr;
   void* res = alloc(4, &host);
   if (!res) return false;
-  struct {
-    uint32_t n;
-  } p{static_cast<uint32_t>(n)};
-  gpu::grid g;  // one workgroup
-  const bool ok = detail_::launch_own_("argmax", -1, {gpu::in(a), gpu::out({res, 0})}, p, g);
+  const bool ok = detail_::launch_own_("argmax", -1, {gpu::in(a), gpu::out({res, 0})},
+                                       detail_::argmax_params{detail_::u32(n)},
+                                       gpu::grid{});  // one workgroup
   if (ok) {
     sync_to_host(res, false);
     *out_idx = static_cast<int64_t>(host[0]);
