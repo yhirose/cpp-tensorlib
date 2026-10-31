@@ -239,6 +239,8 @@ struct context {
       case kop::layer_norm_bwd_dx_: return "layer_norm_bwd_dx_";
       case kop::layer_norm_bwd_gb_: return "layer_norm_bwd_gb_";
       case kop::layer_norm_bwd_gb_fold_: return "layer_norm_bwd_gb_fold_";
+      case kop::ssm_conv_: return "ssm_conv_";
+      case kop::gated_delta_: return "gated_delta_";
       case kop::kv_append_: return "kv_append_";
       case kop::kv_append_f16_: return "kv_append_f16_";
       case kop::kv_fill_: return "kv_fill_";

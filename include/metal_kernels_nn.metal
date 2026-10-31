@@ -94,10 +94,10 @@ struct layer_norm_bwd_params {
   float eps;
 };
 
-// tree_sum_ for two values at once, in the same order; `scratch` holds 2·256.
-static inline float2 tree_sum2_(threadgroup float* scratch, uint lid, float a,
-                                float b) {
-  constexpr uint T = 256;
+// tree_sum_ for two values at once over the threadgroup's T threads (a power
+// of two), in the same order as cuda's tl_tree_sum2_; `scratch` holds 2·T.
+static inline float2 tree_sum2_(threadgroup float* scratch, uint lid, uint T,
+                                float a, float b) {
   scratch[lid] = a;
   scratch[T + lid] = b;
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -153,7 +153,7 @@ kernel void layer_norm_bwd_dx_(device const float* x  [[buffer(0)]],
     sg += gh;
     sgx += gh * (src[c] - mu) * inv;
   }
-  const float2 sums = tree_sum2_(scratch, lid, sg, sgx);
+  const float2 sums = tree_sum2_(scratch, lid, T, sg, sgx);
   const float mean_g = sums.x * inv_n, mean_gx = sums.y * inv_n;
   for (uint c = lid; c < p.cols; c += T) {
     float xhat = (src[c] - mu) * inv;
@@ -1376,6 +1376,118 @@ TL_ATTN_COMBINE("attn_combine_64_", 64)
 TL_ATTN_COMBINE("attn_combine_128_", 128)
 TL_ATTN_COMBINE("attn_combine_256_", 256)
 #undef TL_ATTN_COMBINE
+
+// ---------------------------------------------------------------------------
+// Gated DeltaNet (Qwen3.5): its conv and its delta rule, cuda's tl_ssm_conv
+// and tl_gated_delta (gpu_ops_nn.h has the math of both).
+// ---------------------------------------------------------------------------
+
+struct ssm_conv_params {
+  uint C, K, T, ld;
+};
+
+// The causal depthwise conv over T tokens, then SiLU: token t reads row t of
+// x (rows ld apart) and writes row t of out [T, C]; state holds the K-1 inputs
+// before the first token [K-1, C] (oldest first), w the tap-major weights
+// [K, C]. A thread a channel walks the tokens with the window in registers
+// (K <= 8, which gpu::ssm_conv checks) and leaves the last K-1 inputs in its
+// column of the state.
+kernel void ssm_conv_(device const float* x      [[buffer(0)]],
+                      device float* state        [[buffer(1)]],
+                      device const float* w      [[buffer(2)]],
+                      device float* out          [[buffer(3)]],
+                      constant ssm_conv_params& p [[buffer(4)]],
+                      uint c [[thread_position_in_grid]]) {
+  if (c >= p.C) return;
+  float win[7], wk[8];
+  for (uint k = 0; k + 1 < p.K; k++) win[k] = state[(ulong)k * p.C + c];
+  for (uint k = 0; k < p.K; k++) wk[k] = w[(ulong)k * p.C + c];
+  for (uint t = 0; t < p.T; t++) {
+    const float xc = x[(ulong)t * p.ld + c];
+    float acc = xc * wk[p.K - 1];
+    for (uint k = 0; k + 1 < p.K; k++) acc += win[k] * wk[k];
+    out[(ulong)t * p.C + c] = acc / (1.0f + exp(-acc));
+    for (uint k = 0; k + 2 < p.K; k++) win[k] = win[k + 1];
+    win[p.K - 2] = xc;
+  }
+  for (uint k = 0; k + 1 < p.K; k++) state[(ulong)k * p.C + c] = win[k];
+}
+
+struct gated_delta_params {
+  uint H, dk, dv, T, ab_ld;
+  float eps;
+  uint Hk;
+};
+
+// The delta rule over T tokens: grid (ceil(dv/32), H), dk threads (a power of
+// two, 32 to 1024). A threadgroup owns 32 columns of its head's state S
+// [dk, dv] and 32-thread slice w the 32 rows from 32w of them, so each thread
+// holds a 32-row slice of one column in registers for the whole call. A token
+// stages its q and k (a thread an element), L2-normalizes them through one
+// tree, and reduces k.S and q.S over the slices in threadgroup memory: 6 dk
+// floats, sized here for the largest dk (sized for Qwen3.5's 128 instead, its
+// decode on an M1 Pro moved by under 1%).
+kernel void gated_delta_(device const float* qkv          [[buffer(0)]],
+                         device const float* ab           [[buffer(1)]],
+                         device const float* adt          [[buffer(2)]],
+                         device float* state              [[buffer(3)]],
+                         device float* out                [[buffer(4)]],
+                         constant gated_delta_params& p   [[buffer(5)]],
+                         uint2 tg   [[threadgroup_position_in_grid]],
+                         uint t     [[thread_index_in_threadgroup]]) {
+  constexpr uint R = 32;  // rows a 32-thread slice holds
+  threadgroup float sm[6 * 1024];
+  const uint dk = p.dk;
+  // Slices of 32 threads, as cuda's warps: no simd intrinsic is used, so the
+  // mapping does not depend on the simdgroup's width.
+  const uint lane = t & 31u, w = t >> 5, nsg = dk >> 5;
+  threadgroup float *qs = sm, *ks = sm + dk, *red = sm + 2 * dk;
+  threadgroup float *pk = sm + 4 * dk, *po = sm + 5 * dk;
+  const uint h = tg.y, j = tg.x * 32u + lane, i0 = w * R;
+  const bool live = j < p.dv;
+  const uint hk = h % p.Hk;  // the key head this value head reads
+  const ulong nq = (ulong)p.Hk * dk, C = 2 * nq + (ulong)p.H * p.dv;
+  const float A = adt[h], dt = adt[p.H + h];
+  device float* S = state + (ulong)h * dk * p.dv;
+  float Sr[R];
+  for (uint r = 0; r < R; r++) Sr[r] = live ? S[(ulong)(i0 + r) * p.dv + j] : 0.0f;
+  for (uint tok = 0; tok < p.T; tok++) {
+    device const float* row = qkv + tok * C;
+    const float a = row[(ulong)hk * dk + t], b = row[nq + (ulong)hk * dk + t];
+    // The last token's reads of qs and ks all came before its final barrier,
+    // and the tree writes only `red`.
+    const float2 sums = tree_sum2_(red, t, dk, a * a, b * b);
+    qs[t] = a * (1.0f / sqrt(sums.x + p.eps) / sqrt((float)dk));
+    ks[t] = b * (1.0f / sqrt(sums.y + p.eps));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const float* abt = ab + (ulong)tok * p.ab_ld;
+    const float x = abt[h] + dt;
+    const float decay = exp(A * (x > 20.0f ? x : log(1.0f + exp(x))));
+    const float beta = 1.0f / (1.0f + exp(-abt[p.H + h]));
+    float kv = 0.0f;
+    for (uint r = 0; r < R; r++) kv += Sr[r] * ks[i0 + r];
+    pk[w * 32u + lane] = kv;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    kv = 0.0f;
+    for (uint ww = 0; ww < nsg; ww++) kv += pk[ww * 32u + lane];
+    const float delta = live ? (row[2 * nq + (ulong)h * p.dv + j] - decay * kv) * beta : 0.0f;
+    float o = 0.0f;
+    for (uint r = 0; r < R; r++) {
+      Sr[r] = Sr[r] * decay + ks[i0 + r] * delta;
+      o += Sr[r] * qs[i0 + r];
+    }
+    po[w * 32u + lane] = o;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (w == 0 && live) {
+      o = 0.0f;
+      for (uint ww = 0; ww < nsg; ww++) o += po[ww * 32u + lane];
+      out[(ulong)tok * p.H * p.dv + (ulong)h * p.dv + j] = o;
+    }
+  }
+  if (live) {
+    for (uint r = 0; r < R; r++) S[(ulong)(i0 + r) * p.dv + j] = Sr[r];
+  }
+}
 
 // ---------------------------------------------------------------------------
 // The decode step's other kernels, cuda's tl_kv_append / tl_kv_fill /
