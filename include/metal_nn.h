@@ -277,10 +277,6 @@ struct gemv_combine_params {
   uint32_t n, parts;
 };
 
-struct gemm_nt_params {
-  uint32_t M, N, K, ldc;
-};
-
 // The quantized weights this backend reads natively: ggml type codes 12 Q4_K,
 // 14 Q6_K and 8 Q8_0, K a whole number of their blocks, and W aligned for the
 // kernels' loads (32-bit into a Q4_K block, 16-bit into the others).
@@ -289,21 +285,14 @@ inline bool quant_ok_(int type, int64_t k, gpu::span W) {
          k % (type == 8 ? 32 : 256) == 0 && W.off % (type == 12 ? 4 : 2) == 0;
 }
 
-// The NT GEMM body's launch (C[M,N] rows ldc apart; A, B, C at buffers 0-2),
-// after the caller has bound its 32- or 64-row tile by gemm_nt_short_(M).
-inline bool gemm_nt_short_(int64_t M) { return M <= 64; }
-inline void gemm_nt_launch_(context& c, gpu::span A, gpu::span B, gpu::span C,
-                            int64_t M, int64_t N, int64_t K, int64_t ldc) {
-  const unsigned long BM = gemm_nt_short_(M) ? 32 : 64;
-  set_buf_(c.enc, A, 0ul);
-  set_buf_(c.enc, B, 1ul);
-  set_buf_(c.enc, C, 2ul);
-  gemm_nt_params p{static_cast<uint32_t>(M), static_cast<uint32_t>(N),
-                   static_cast<uint32_t>(K), static_cast<uint32_t>(ldc)};
-  set_bytes_(c.enc, p, 3ul);
-  const unsigned long gx = (static_cast<unsigned long>(N) + 63) / 64;
-  const unsigned long gy = (static_cast<unsigned long>(M) + BM - 1) / BM;
-  dispatch_grid_(c.enc, {gx, gy, 1}, {128, 1, 1});
+// An NT GEMM's launch on STEEL's body (C[M,N] rows ldc apart, W [N,K] the
+// transposed B), tiled by g, after the caller has bound g's band's kernel.
+inline void gemm_nt_launch_(context& c, const steel_grid& g, gpu::span A, gpu::span W,
+                            gpu::span C, int64_t M, int64_t N, int64_t K, int64_t ldc) {
+  const auto u = [](int64_t v) { return static_cast<uint32_t>(v); };
+  const gemm_params p{u(M), u(N), u(K), u(K), u(K), 0u, 1u, g.swizzle_log, 0u,
+                      1.0f, 0.0f, 0u, 0u, u(ldc)};
+  gemm_launch_(c, A, W, C, p, g.gx, g.gy, 1);
 }
 
 struct attn_decode_params {
@@ -412,25 +401,20 @@ inline bool own_nn::gemv_bf16(gpu::span a, gpu::span B, gpu::span y, int64_t n,
 }
 
 // C[M,N] = A[M,K] · B[N,K]ᵀ, B bf16: the batched prefill's projection, where
-// one weight serves a whole chunk of prompt tokens. The 32-row tile for a
-// short chunk (more M blocks to fill the GPU), the 64-row one otherwise.
+// one weight serves a whole chunk of prompt tokens. STEEL's body (the f32
+// gemm's, metal.h), its vectorized loader where W's rows are whole 16-byte
+// vectors, the bf16 reader otherwise.
 inline bool own_nn::gemm_bf16_nt(gpu::span A, gpu::span B, gpu::span C, int64_t M,
                               int64_t N, int64_t K) {
   auto& c = context::get();
   if (!c.device || M <= 0 || N <= 0 || K <= 0) return false;
-  // STEEL's body (the f32 gemm's, metal.h) where its loaders read A's and W's
-  // rows as whole 16-byte vectors; the simple NT tile below for the rest.
-  if (K % 8 == 0 && A.off % 16 == 0 && B.off % 16 == 0) {
-    const detail_::steel_grid g = detail_::steel_grid_(M, N);
+  const detail_::steel_grid g = detail_::steel_grid_(M, N);
+  if (K % 8 == 0 && B.off % 16 == 0) {
     detail_::bind_(c, g.band32 ? nn_kernel::gemm_bf16_steel_32 : nn_kernel::gemm_bf16_steel);
-    const auto u = [](int64_t v) { return static_cast<uint32_t>(v); };
-    const detail_::gemm_params p{u(M), u(N), u(K), u(K), u(K), 0u, 1u, g.swizzle_log, 0u,
-                                 1.0f, 0.0f, 0u, 0u};
-    detail_::gemm_launch_(c, A, B, C, p, g.gx, g.gy, 1);
-    return true;
+  } else {
+    c.bind_(g.band32 ? kop::gemm_bf16_nt32_ : kop::gemm_bf16_nt_);
   }
-  c.bind_(detail_::gemm_nt_short_(M) ? kop::gemm_bf16_nt32_ : kop::gemm_bf16_nt_);
-  detail_::gemm_nt_launch_(c, A, B, C, M, N, K, N);
+  detail_::gemm_nt_launch_(c, g, A, B, C, M, N, K, N);
   return true;
 }
 
@@ -454,7 +438,7 @@ inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y,
 
 // C[m, 0..n) (rows ldc apart) = A[m,k] . W[n,k]ᵀ over a block-quantized
 // weight: cuda.h's contract in its exact form, the weight dequantized to f32 as
-// the bf16 GEMM's body stages it. Only that form: a16 is refused (the caller
+// STEEL's body stages it (its reader). Only that form: a16 is refused (the caller
 // never asks for it here, f16_activations being false on this backend), and
 // mmq, which CUDA applies only with a16, is ignored.
 inline bool own_nn::gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
@@ -465,11 +449,12 @@ inline bool own_nn::gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
   if (!c.device || a16 || m <= 0 || n <= 0 || ldc < n ||
       !detail_::quant_ok_(type, k, W))
     return false;
-  const bool s = detail_::gemm_nt_short_(m);
+  const detail_::steel_grid g = detail_::steel_grid_(m, n);
+  const bool s = g.band32;
   detail_::bind_(c, type == 12   ? (s ? nn_kernel::gemm_q4k_32 : nn_kernel::gemm_q4k)
                     : type == 14 ? (s ? nn_kernel::gemm_q6k_32 : nn_kernel::gemm_q6k)
                                  : (s ? nn_kernel::gemm_q80_32 : nn_kernel::gemm_q80));
-  detail_::gemm_nt_launch_(c, A, W, C, m, n, k, ldc);
+  detail_::gemm_nt_launch_(c, g, A, W, C, m, n, k, ldc);
   return true;
 }
 

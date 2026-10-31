@@ -256,8 +256,8 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       tl::gpu::flush();
       CHECK(same(C, A.dot(Wt), 1e-4f));
       // A product past one 64-row band, and K not a multiple of 8 (Metal's
-      // STEEL form takes whole 8-element vectors of W's rows, the simple
-      // tile the rest): both raggedly against the tiles as above.
+      // vectorized STEEL loader takes whole 8-element vectors of W's rows,
+      // its reader the rest): both raggedly against the tiles as above.
       for (const int64_t k2 : {136, 76}) {
         const int64_t M2 = 130, N2 = 200;
         array W2 = random_array({N2, k2}, 943);

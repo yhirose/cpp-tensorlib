@@ -535,6 +535,7 @@ struct gemm_params {
   uint32_t a_fast, b_fast;  // float4 loader eligibility, verified host-side
   float scale, offset;
   uint32_t sa, sb;  // batch slices' strides in floats; C's is M * N
+  uint32_t ldc;     // C's row stride for STEEL (N but for a GEMM into columns)
 };
 
 inline void set_buf_(objc::id enc, void* buf, int64_t off, unsigned long idx) {
@@ -636,7 +637,7 @@ inline bool own_core::gemm_batched(gpu::span a, int64_t lda, bool ta,
                          tb ? 1u : 0u,               fast_a,
                          fast_b,                     scale,
                          offset,                     static_cast<uint32_t>(sa),
-                         static_cast<uint32_t>(sb)};
+                         static_cast<uint32_t>(sb),  static_cast<uint32_t>(n)};
   detail_::gemm_launch_(c, a, b, out, p, gx, gy,
                         static_cast<unsigned long>(batch));
   return true;
