@@ -771,12 +771,13 @@ struct context {
   }
 
   // GPU argmax (greedy last-mile, tl_argmax): a persistent device buffer, so the
-  // per-token result is a 4-byte D2H, not the 608KB logits copy. The index at 0,
+  // per-token result is a 4-byte D2H, not the 608KB logits copy (argmax_to
+  // writes its f32 index elsewhere and uses only the pairs and the count). The index at 0,
   // the count of finished blocks at 4 (zero between calls: the last block puts it
   // back), then a (value, index) pair a block, argmax_blocks of each.
   static constexpr unsigned argmax_blocks = 128, argmax_pairs_at = 16;
   CUdeviceptr argmax_res = 0;
-  CUfunction argmax_fn = nullptr;
+  CUfunction argmax_fn = nullptr, argmax_f32_fn = nullptr;
   CUdeviceptr argmax_res_() {
     if (!argmax_res) {
       const size_t bytes = argmax_pairs_at + 8 * argmax_blocks;
@@ -1010,6 +1011,7 @@ inline bool dispatch(kop k, const gpu::arg* args, size_t n, const void* params,
 // the end of this file joins the three.
 struct own_core {
   static bool argmax(gpu::span a, int64_t n, int64_t* out_idx);
+  static bool argmax_to(gpu::span a, int64_t n, gpu::span idx);
   // n floats copied device to device on the launch stream (a copy engine's job,
   // not a kernel's).
   static bool copy_f32(gpu::span from, gpu::span to, int64_t n);
@@ -1169,13 +1171,15 @@ inline void flush() {
   c.resolve_timed_();  // the device is idle: free reads
 }
 
-// One int comes back through the device buffer the context keeps (argmax_res_);
-// a block of 256 threads for every 256 values, up to argmax_blocks.
-inline bool own_core::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
+// tl_argmax(_f32) over a's n values into `out`: a block of 256 threads for every
+// 256 values, up to argmax_blocks, their pairs in the device buffer the context
+// keeps (argmax_res_). One stream runs the launches in order, so every call
+// shares that buffer.
+inline bool argmax_launch_(gpu::span a, int64_t n, void* out, bool f32) {
   auto& c = context::get();
   if (!c.ready || n <= 0 || n > INT32_MAX) return false;
   CUdeviceptr res = c.argmax_res_();
-  CUfunction f = c.cached_(c.argmax_fn, "tl_argmax");
+  CUfunction f = f32 ? c.cached_(c.argmax_f32_fn, "tl_argmax_f32") : c.cached_(c.argmax_fn, "tl_argmax");
   if (!res || !f) return false;
   c.device_read_(a.buf);
   const unsigned un = static_cast<unsigned>(n), threads = 256;
@@ -1183,15 +1187,29 @@ inline bool own_core::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
   char* r = reinterpret_cast<char*>(res);
   float* pv = reinterpret_cast<float*>(r + context::argmax_pairs_at);
   int* pi = reinterpret_cast<int*>(r + context::argmax_pairs_at + 4 * context::argmax_blocks);
-  if (!c.launch_(f, {blocks}, {threads}, 0, context::off_(a.buf, a.off), reinterpret_cast<int*>(r), un, pv, pi,
-                 reinterpret_cast<unsigned*>(r + 4))) {
-    return false;
-  }
+  return c.launch_(f, {blocks}, {threads}, 0, context::off_(a.buf, a.off), out, un, pv, pi,
+                   reinterpret_cast<unsigned*>(r + 4));
+}
+
+// The int comes back through the context's buffer (its first 4 bytes).
+inline bool own_core::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  const CUdeviceptr res = c.argmax_res_();
+  if (!res || !argmax_launch_(a, n, reinterpret_cast<void*>(res), false)) return false;
   flush();  // the result index must be ready before the 4-byte D2H
   int h = 0;
   if (c.d.MemcpyDtoH(&h, res, sizeof(int)) != 0) return false;
   *out_idx = h;
   return true;
+}
+
+// The index as an f32 at idx[0], left on the device.
+inline bool own_core::argmax_to(gpu::span a, int64_t n, gpu::span idx) {
+  auto& c = context::get();
+  if (!c.ready) return false;
+  c.device_write_(idx.buf);
+  return argmax_launch_(a, n, context::off_(idx.buf, idx.off), true);
 }
 
 // What a model may ask of this backend beyond the kernel contract (gpu.h).
