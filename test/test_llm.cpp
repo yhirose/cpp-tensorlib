@@ -209,13 +209,32 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
   }
 
   SUBCASE("argmax reads back the smallest index among ties") {
-    std::vector<float> v(151936, -1.0f);
-    v[77777] = 5.0f;
-    v[77778] = 5.0f;  // a tie: the smaller index wins, as the host scan does
-    array a = dev(array::from(v, {(int64_t)v.size()}));
-    int64_t idx = -1;
-    REQUIRE(gpu::argmax(a.device_span(), (int64_t)v.size(), &idx));
-    CHECK(idx == 77777);
+    // A backend may split the vector across groups and reduce their winners:
+    // ties within one stretch and across two, a maximum at the ragged end, and
+    // a vector shorter than any stretch (all negative, so no pair a reduction
+    // starts from may win).
+    const struct {
+      const char* what;
+      int64_t n;
+      std::vector<int64_t> at;
+      float top;
+      int64_t want;
+    } cases[] = {
+        {"tie side by side", 151936, {77777, 77778}, 5.0f, 77777},
+        {"tie far apart", 151936, {150000, 100}, 5.0f, 100},
+        {"maximum at the ragged end", 100003, {100002}, 5.0f, 100002},
+        {"a short all-negative vector", 5, {3}, -0.5f, 3},
+    };
+    for (const auto& c : cases) {
+      INFO(c.what);
+      std::vector<float> v((size_t)c.n);
+      for (int64_t i = 0; i < c.n; i++) v[(size_t)i] = -1.0f - (float)(i % 7);
+      for (int64_t i : c.at) v[(size_t)i] = c.top;
+      array a = dev(array::from(v, {c.n}));
+      int64_t idx = -1;
+      REQUIRE(gpu::argmax(a.device_span(), c.n, &idx));
+      CHECK(idx == c.want);
+    }
   }
 
   SUBCASE("the [N,K] bf16 weight layout: row GEMV and the prefill GEMM") {
