@@ -43,6 +43,17 @@ inline bool kv_fill(span Kc, span Vc, span K, span V, int64_t T, int64_t kv_max,
   return true;
 }
 
+// The f32 at src, after a drain: copied into a buffer of this layer's own and
+// brought to the host, as generic::argmax reads its vector.
+inline bool read_now(span src, float* out) {
+  scratch c(1);
+  if (!c || !unary(kop::affine, src, c, 1, 1.0f, 0.0f)) return false;
+  cpu_barrier();
+  sync_to_host(c.buf, false);
+  *out = c.contents[0];
+  return true;
+}
+
 }  // namespace generic
 
 // One decode step's k, v (each [n_kv_heads, D]) into row `pos` of a
@@ -143,6 +154,30 @@ inline bool argmax_to(span a, int64_t n, span idx) {
   } else {
     return false;
   }
+}
+
+// The f32 src holds once the work queued so far has run: read_later takes it
+// behind that work and submits the work without waiting, and finish_read
+// waits for it, so the host can queue the next step in between (which may
+// write src, or let it go). A backend without the form drains and reads at
+// once.
+TL_GPU_DETECT_OWN(read_later)
+template <class Own = own>
+inline bool read_later(span src, pending_read& r) {
+  r = {};
+  if (!src) return false;
+  if constexpr (detail::owns_read_later<Own>::value) {
+    if (Own::read_later(src, r)) return true;
+  }
+  return generic::read_now(src, &r.value);
+}
+template <class Own = own>
+inline bool finish_read(pending_read& r, float* out) {
+  if constexpr (detail::owns_read_later<Own>::value) {
+    if (r.state) return Own::finish_read(r, out);
+  }
+  *out = r.value;
+  return true;
 }
 
 // Row idx[0] (an f32 index, as argmax_to leaves it) of a `rows`-row table into

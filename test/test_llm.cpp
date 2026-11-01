@@ -243,6 +243,58 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
     }
   }
 
+  SUBCASE("read_later sees the work queued before it, not after") {
+    // A decode step run ahead: the host queues the next step between
+    // read_later and finish_read, and the value read is what the work before
+    // read_later left, once that work has run (a long GEMM ahead of it, so a
+    // read that does not wait sees the old value). Plainly and under a
+    // profile, where a backend may commit each launch on its own.
+    for (bool profiled : {false, true}) {
+      CAPTURE(profiled);
+      tl::gpu::flush();
+      if (profiled) tl::profile::start();
+      using tl::gpu::kop;
+      const int64_t n = 384;
+      array A = dev(random_array({n, n}, 995)), C = dev(array::zeros({n, n}));
+      array zero = dev(array::zeros({1})), x = dev(array::from(std::vector<float>{3.0f}, {1})),
+            y = dev(array::zeros({1}));
+      auto gemm = [&] {
+        return gpu::gemm(A.device_span(), n, false, A.device_span(), n, false, C.device_span(), n,
+                         n, n, 1.0f, 0.0f);
+      };
+      REQUIRE(gemm());
+      REQUIRE(gpu::unary(kop::affine, zero.device_span(), x.device_span(), 1, 1.0f, 7.0f));
+      gpu::pending_read rx, ry;
+      REQUIRE(gpu::read_later(x.device_span(), rx));
+      REQUIRE(gemm());  // the next step, queued before x is read; it leaves x alone
+      REQUIRE(gpu::unary(kop::affine, zero.device_span(), y.device_span(), 1, 1.0f, 9.0f));
+      REQUIRE(gpu::read_later(y.device_span(), ry));
+      float vx = 0.0f, vy = 0.0f;
+      REQUIRE(gpu::finish_read(rx, &vx));
+      REQUIRE(gpu::finish_read(ry, &vy));
+      CHECK(vx == 7.0f);
+      CHECK(vy == 9.0f);
+
+      // src let go after read_later, its storage handed to the next step's
+      // write, and the queue drained before finish_read: still the value read.
+      gpu::pending_read rz;
+      {
+        array z = array::empty({1});
+        REQUIRE(gpu::unary(kop::affine, zero.device_span(), z.device_span(), 1, 1.0f, 5.0f));
+        REQUIRE(gpu::read_later(z.device_span(), rz));
+      }
+      array w = array::empty({1});
+      REQUIRE(gpu::unary(kop::affine, zero.device_span(), w.device_span(), 1, 1.0f, 11.0f));
+      gpu::pending_read dropped;  // a read never finished costs nothing
+      REQUIRE(gpu::read_later(w.device_span(), dropped));
+      tl::gpu::flush();
+      float vz = 0.0f;
+      REQUIRE(gpu::finish_read(rz, &vz));
+      CHECK(vz == 5.0f);
+      if (profiled) tl::profile::stop();
+    }
+  }
+
   SUBCASE("embed_row gathers the row an index on the device names") {
     // A decode step run ahead takes its input from the token argmax_to left: a
     // row of the embedding table in whichever form the model keeps it, [V, K]
