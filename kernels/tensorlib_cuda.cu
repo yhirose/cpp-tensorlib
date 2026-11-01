@@ -24,10 +24,11 @@
 // TL_ALIGN(kernel, a0, a1, ...): the byte alignment each leading pointer
 // parameter of `kernel` needs, written beside the kernel wherever its loads or
 // stores are wider than an element (a float4 read: 16; a float2 store: 8; a
-// Q4_K word: 4). The host reads it from the PTX (cuda.h, parse_align_decls_)
+// Q4_K word: 4). A kernel that picks its width by the address declares its
+// elements' sizes. The host reads it from the PTX (cuda.h, parse_align_decls_)
 // and declines a launch off it, so a misaligned view is refused, never
 // misread. Pointers past the last one listed, and every pointer of a kernel
-// without one, need only their element's width.
+// without one, need only their element's width, which the host does not check.
 #define TL_ALIGN(kernel, ...) \
   extern "C" __device__ const unsigned char kernel##_ptr_align[] = {__VA_ARGS__};
 

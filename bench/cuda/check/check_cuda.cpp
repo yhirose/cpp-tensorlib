@@ -514,12 +514,8 @@ int main() {
   // each names a kernel, covers no more than its leading pointer (.u64) parameters and
   // asks a power of two up to a uint4's 16 (a misspelt name or a miscounted list would
   // otherwise go unchecked, or read a scalar argument as a pointer); and every kernel
-  // that moves global memory by vectors (ld/st.global .v2/.v4, cp.async) has one, or
-  // guards its alignment itself and is listed here.
+  // that moves global memory by vectors (ld/st.global .v2/.v4, cp.async) has one.
   {
-    static const char* const self_guarded[] = {
-        "tl_gemm_bf16_nt", "tl_gemm_bf16_nt_s", "tl_gemm_bf16_nt_sk",  // vecA / vecB in-kernel
-    };
     struct entry {
       size_t ptrs = 0;
       bool vectors = false;
@@ -550,8 +546,7 @@ int main() {
       if (!ok) bad += " " + name;
     }
     for (const auto& [name, info] : entries)
-      if (info.vectors && !tl::cuda::align_decls_().count(name) &&
-          std::none_of(std::begin(self_guarded), std::end(self_guarded), [&](const char* g) { return name == g; }))
+      if (info.vectors && !tl::cuda::align_decls_().count(name))
         undeclared += " " + name;
     std::printf("  alignment declarations: %zu of %zu kernels, malformed:%s, vector access undeclared:%s\n",
                 tl::cuda::align_decls_().size(), entries.size(), bad.empty() ? " none" : bad.c_str(),
