@@ -237,12 +237,11 @@ inline bool own_llm::embed_row(int type, gpu::span W, gpu::span idx, gpu::span o
 
 // src's f32 copied into a pinned slot on the stream, behind every launch
 // queued so far, and an event after it; finish_read waits on the event. The
-// launches are already submitted, so nothing waits here. Refused under a
-// capture (the copy and the event would become graph nodes), where
-// gpu::read_later reads at once instead.
+// launches are already submitted, so nothing waits here. Not for use under a
+// capture, like every read-back (the decoder reads behind the graph's replay).
 inline bool own_llm::read_later(gpu::span src, gpu::pending_read& r) {
   auto& c = context::get();
-  if (!c.ready || c.capturing || !c.d.read_ok()) return false;
+  if (!c.ready || !c.d.read_ok()) return false;
   context::read_slot* slot = c.read_slot_();
   if (!slot) return false;
   c.device_read_(src.buf);  // a host-live src goes up first, on the same stream
