@@ -786,6 +786,9 @@ struct context {
     return argmax_res;
   }
 
+  // embed_row (cuda_llm.h): f32, bf16, Q4_K, Q6_K, Q8_0.
+  CUfunction embed_row_fn[5] = {};
+
   // The fused layer norm's pullback: three kernels.
   CUfunction layer_norm_bwd_dx_fn = nullptr;
   CUfunction layer_norm_bwd_dx_() {

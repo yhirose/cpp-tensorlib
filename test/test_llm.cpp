@@ -305,11 +305,19 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       const std::vector<float> f = host_values(T), fb = host_values(Tb);
       const array Wf = dev(T), Wft = dev(T.transpose()), Wb = dev(T.to_bf16()),
                   Wbt = dev(T.transpose().to_bf16());
-      auto row = [&](int type, const array& W, int64_t rs, int64_t cs, int64_t n) {
+      auto gather = [&](int type, const array& W, int64_t rs, int64_t cs, int64_t n, int64_t rows) {
         array idx = dev(array::from(std::vector<float>{(float)n}, {1})), out = dev(array::zeros({K}));
-        REQUIRE(gpu::embed_row(type, W.device_span(), idx.device_span(), out.device_span(), K, V,
-                               rs, cs));
+        REQUIRE(gpu::embed_row(type, W.device_span(), idx.device_span(), out.device_span(), K,
+                               rows, rs, cs));
         return host_values(out);
+      };
+      auto row = [&](int type, const array& W, int64_t rs, int64_t cs, int64_t n) {
+        return gather(type, W, rs, cs, n, V);
+      };
+      // A table of V - 1 rows: its index V - 1 is past it, and the row there
+      // holds data (past the buffer itself a backend may read zeros anyway).
+      auto past = [&](int type, const array& W, int64_t rs, int64_t cs) {
+        return gather(type, W, rs, cs, V - 1, V - 1) == std::vector<float>((size_t)K, 0.0f);
       };
       auto want = [&](const std::vector<float>& w, int64_t n) {
         std::vector<float> r((size_t)K, 0.0f);
@@ -336,6 +344,12 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
           INFO("type " << type);
           CHECK(close(row(type, dev(q.W), 0, 0, n), want(q.w, n)));
         }
+      }
+      CHECK(past(0, Wf, K, 1));
+      if (gpu::caps::row_gemv) CHECK(past(30, Wb, K, 1));
+      for (const auto& [type, q] : qs) {
+        INFO("type " << type);
+        CHECK(past(type, dev(q.W), 0, 0));
       }
     }
   }
