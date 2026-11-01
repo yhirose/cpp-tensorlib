@@ -156,7 +156,8 @@ static bool check_hybrid(const qm::gg::model& m, const Oracle& O) {
 
   // The chat's own decoder on the same weights: the prompt through begin() —
   // batched as GEMMs where the backend can, on the tensor cores with the
-  // activations rounded to bf16 — then step(). Its top-5 logits are held to
+  // activations rounded to bf16 — then step(), then next() (a step ahead where
+  // the backend runs one) for the rest of the greedy run. Its top-5 logits are held to
   // the imperative ones, after the prompt and after the first step: where the
   // backend captures, its warm-up forward must leave the DeltaNet state as it
   // found it, and a drift too small to move a short greedy run is a large one
@@ -186,10 +187,32 @@ static bool check_hybrid(const qm::gg::model& m, const Oracle& O) {
   for (int64_t i = 0; i < NB; i++) {
     std::printf(" %lld", (long long)tok);
     if (tok != want[i]) dec_ok = false;
-    tok = i == 0 ? second : dec.step(B, tok);
+    tok = i == 0 ? second : dec.next(B);
   }
-  dec.destroy();
   std::printf("\n  greedy %s\n", dec_ok ? "MATCH" : "DIVERGE");
+
+  // A second turn begun on the same decoder, its step queued ahead still in
+  // flight: the tokens a fresh decoder gives once that turn has run to the
+  // same place (destroy() lands the step ahead, so the cache holds it too).
+  const std::vector<int> turn2(O.prompt_ids, O.prompt_ids + std::min<int64_t>(NP, 6));
+  auto run_turn2 = [&](qm::captured_decoder& d) {
+    std::vector<int64_t> t{d.begin(B, turn2)};
+    for (int i = 0; i < 4; i++) t.push_back(d.next(B));
+    return t;
+  };
+  const std::vector<int64_t> same = run_turn2(dec);
+  dec.destroy();
+  qm::reset_cache(B);
+  qm::captured_decoder d1, d2;
+  d1.step(B, d1.begin(B, ids));
+  for (int64_t i = 1; i < NB; i++) d1.next(B);
+  d1.destroy();
+  const std::vector<int64_t> fresh = run_turn2(d2);
+  d2.destroy();
+  const bool turn2_ok = same == fresh;
+  std::printf("  second turn on the same decoder:");
+  for (int64_t t : same) std::printf(" %lld", (long long)t);
+  std::printf(" %s\n", turn2_ok ? "MATCH" : "DIVERGE (a fresh decoder gives another)");
 
   // A prompt past one chunk of the delta rule (32 tokens), so the batched
   // prefill takes the backend's chunked form where it has one: its last
@@ -209,7 +232,7 @@ static bool check_hybrid(const qm::gg::model& m, const Oracle& O) {
   }
   const bool f16_ok = !qm::can_prefill_batched(B, (int64_t)longp.size()) ||
                       check_f16_sums(B, longp, imp_long);
-  return ok && bf16_ok && logits_ok && dec_ok && long_ok && f16_ok;
+  return ok && bf16_ok && logits_ok && dec_ok && turn2_ok && long_ok && f16_ok;
 }
 
 int main(int argc, char** argv) {

@@ -1435,6 +1435,31 @@ inline void stage_embed(Model& M, int64_t id) {
   gpu::upload(M.scratch.embed.native, M.scratch.embed_stage.data(), c.NE);
 }
 
+// Where a step can gather its input on the device (gpu::embed_row), from the
+// token the step before left there: the embedding table, when the model keeps
+// it on the device as its tied lm_head (the [NE, VOCAB] outwT, or qout's one
+// run of blocks). type -1 where it does not, as for a model with its own
+// output.weight. The table is in the build's weight dtype, so a bf16 build of
+// an F16 file feeds the embedding rounded to bf16, as its lm_head reads it,
+// where stage_embed widens the file's own values (the same for the Qwen F16
+// files, converted from bf16).
+struct embed_table {
+  int type = -1;
+  gpu::span W;
+  int64_t row_stride = 0, col_stride = 0;
+};
+inline embed_table device_embed(const Model& M) {
+  const Config& c = M.c;
+  if (!c.tied_output) return {};
+  if (M.quant) {
+    if (M.qout.parts.size() != 1) return {};
+    const auto& p = M.qout.parts[0];
+    return {p.type, sp(M.qout.raw).at(p.byte_off), 0, 0};
+  }
+  if (M.outwT.size() == 0) return {};
+  return {M.outwT.dt() == tl::dtype::bf16 ? 30 : 0, sp(M.outwT), 1, c.VOCAB};
+}
+
 // CUDA-graph-captured greedy decoder (A-min). Captures the device-pos forward
 // once (after prefill, at the first decode position) and replays it per token —
 // collapsing the ~360 per-token kernel launches into one graph submit. Correct
@@ -1452,8 +1477,23 @@ inline void stage_embed(Model& M, int64_t id) {
 // own. All position state lives in cur_pos here; the host cache pos is
 // reconciled at the phase boundary, the only point where a caller could switch
 // to a host-pos API.
+//
+// next() runs a step ahead: it queues the step after the token it returns
+// before reading that token back, which stays on the device for that step's
+// input (MLX-LM's async_eval loop; SGLang's and TensorRT-LLM's overlap
+// schedulers). Where the backend or the model lacks a piece of that, next() is
+// step() on the last token.
 struct captured_decoder {
   storage d_pos;                      // device u32 position counter (capture)
+  // next(): the token each step reads, in one of two slots, and writes into
+  // the other; the read of the step in flight; and the token the next step
+  // feeds, which begin(), step() and next() all leave here.
+  storage d_tok;
+  gpu::pending_read in_flight;
+  bool flying = false;
+  int slot = 0;          // the slot the next queued step reads
+  int64_t last = -1;
+  int ahead = -1;        // whether next() runs ahead; -1 until its first call
   gpu::graph_exec exec = nullptr;     // opaque handle; non-null == captured
   int64_t cur_pos = 0, max_ctx = 0;   // capacity bound owned by the mechanism
   double capture_ms = 0;  // one-time init cost (warm + record + instantiate)
@@ -1471,9 +1511,11 @@ struct captured_decoder {
     capture_ms = StepProf::now_ms() - t0;
   }
   void init_(Model& M, int64_t first_id, int64_t pos) {
+    land_();
     if (M.layers.empty()) return;
     max_ctx = seq_cache(M).max_ctx;  // bound applies to the fallback too
     cur_pos = pos;
+    last = first_id;
     if (!gpu::graph_available()) return;
     d_pos = storage::make(1);
     if (!d_pos.native) return;
@@ -1521,7 +1563,7 @@ struct captured_decoder {
       if (next >= 0) {
         batched = true;
         init(M, next, seq_cache(M).pos);
-        return next;
+        return last = next;
       }
     }
     // Token-by-token: one capture serves prompt and decode alike.
@@ -1543,6 +1585,7 @@ struct captured_decoder {
   // S.embed while the previous replay still reads it. Without a graph this is
   // step_imperative minus the argmax, on the same scratch and host cache pos.
   bool feed(Model& M, int64_t id) {
+    if (flying) throw std::logic_error("qwen: feed()/step() after next() has queued a step ahead");
     if (cur_pos >= max_ctx) return false;
     stage_embed(M, id);  // gather id's row -> S.embed (host + blocking H2D)
     if (exec) gpu::graph_launch(exec);  // replay: append@d_pos, attn, logits, incr
@@ -1552,7 +1595,64 @@ struct captured_decoder {
   }
   // One decode step: feed + read the greedy token (-1 when the cache is full).
   int64_t step(Model& M, int64_t id) {
-    return feed(M, id) ? argmax_logits(M) : -1;
+    return last = feed(M, id) ? argmax_logits(M) : -1;
+  }
+
+  // The token after `last`, with the step after it already queued: the host
+  // reads one step behind the device. -1 once the cache is full. A step queued
+  // ahead has fed the token it read, so when the caller stops, the cache holds
+  // the last token returned too, as the next turn would have fed it. After the
+  // first next(), keep to next() (feed() and step() would race the step in
+  // flight); begin() starts a new turn. The scratch logits are then the step
+  // queued ahead's, not the returned token's.
+  int64_t next(Model& M) {
+    if (ahead < 0) {
+      ahead = !exec && gpu::has_argmax_to && gpu::has_read_later && M.c.VOCAB <= gpu::policy::max_f32_index &&
+              device_embed(M).type >= 0;
+      if (ahead) d_tok = storage::make(2);
+      ahead = ahead && d_tok.native;
+    }
+    if (!ahead) return step(M, last);
+    if (!flying) {
+      if (last < 0 || cur_pos >= max_ctx) return -1;
+      float v[2] = {0.0f, 0.0f};
+      v[slot] = static_cast<float>(last);
+      gpu::upload(d_tok.native, v, 2);
+      if (!queue_ahead_(M)) {
+        ahead = 0;  // the backend has no reader for this table: nothing was queued
+        return step(M, last);
+      }
+    }
+    gpu::pending_read read = std::move(in_flight);
+    flying = cur_pos < max_ctx && queue_ahead_(M);
+    float v = -1.0f;
+    if (!gpu::finish_read(read, &v)) throw std::runtime_error("qwen: a token's read-back failed");
+    return last = static_cast<int64_t>(v);
+  }
+  // The step queued ahead, waited for: its token was fed (the cache holds it)
+  // but is never returned.
+  void land_() {
+    if (!flying) return;
+    float drop;
+    gpu::finish_read(in_flight, &drop);
+    flying = false;
+  }
+  // One step queued: its input gathered from the token in `slot`, its token
+  // into the other slot and read later. False, with nothing queued, where the
+  // backend cannot gather from the table.
+  bool queue_ahead_(Model& M) {
+    const Config& c = M.c;
+    const embed_table t = device_embed(M);
+    const gpu::span in = sp(d_tok).at(4 * slot), out = sp(d_tok).at(4 * (1 - slot));
+    if (!gpu::embed_row(t.type, t.W, in, sp(M.scratch.embed), c.NE, c.VOCAB, t.row_stride,
+                        t.col_stride))
+      return false;
+    run_layers_(M, sp(M.scratch.embed), cur_pos);
+    if (!gpu::argmax_to(sp(M.scratch.logits), c.VOCAB, out) || !gpu::read_later(out, in_flight))
+      throw std::runtime_error("qwen: a step queued ahead lost its token");
+    cur_pos++;
+    slot ^= 1;
+    return true;
   }
   // Reconcile the host cache pos with the device counter. Captured replays
   // advance only d_pos, so the host pos would otherwise be stale for anyone
@@ -1563,6 +1663,10 @@ struct captured_decoder {
 
   bool ok() const { return exec != nullptr; }
   void destroy() {
+    land_();
+    gpu::flush();
+    d_tok = storage{};
+    ahead = -1;  // a decoder begun again decides afresh
     if (exec) gpu::graph_destroy(exec);
     exec = nullptr;
     d_pos = storage{};  // the pool takes the counter back
