@@ -4,8 +4,9 @@
 //   pp<P>  a P-token prompt into an empty cache (or one already holding d
 //          tokens): the batched prefill, through the last token's logits.
 //   tg<N>  N tokens decoded one at a time after d cached ones: the chat's own
-//          decoder (CUDA-graph replay where the backend captures, a step queued
-//          ahead where it runs one), each step through its greedy token. Capturing is set-up, like llama-bench's
+//          decoder (a step queued ahead where the model and backend allow it,
+//          each step a CUDA-graph replay where the backend captures), each step
+//          through its greedy token. Capturing is set-up, like llama-bench's
 //          warm-up run, and is not timed.
 //
 // Each test runs once untimed, then `reps` times; the row is the mean ± sample
