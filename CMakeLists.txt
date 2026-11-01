@@ -92,6 +92,8 @@ enable_testing()
 add_executable(tensorlib_test test/test_basic.cpp test/test_array.cpp test/test_nn.cpp
                               test/test_llm.cpp)
 target_link_libraries(tensorlib_test PRIVATE tensorlib)
+# INFO/CAPTURE print a C string as text, not its address (test/wasm/build.sh too).
+target_compile_definitions(tensorlib_test PRIVATE DOCTEST_CONFIG_TREAT_CHAR_STAR_AS_STRING)
 if(TENSORLIB_CUDA)
   # The test suite's gpu/auto modes now exercise the real CUDA backend (the
   # gpu:: facade routes to cuda off-Apple), falling back to CPU with no device.
