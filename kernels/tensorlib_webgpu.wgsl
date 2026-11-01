@@ -834,6 +834,22 @@ fn argmax(@builtin(local_invocation_index) lid : u32) {
   }
 }
 
+// Views: table, idx -> out. Row idx[0] (an f32 index) of a `rows`-row table,
+// read by strides in elements: out[j] = table[idx * rs + j * cs], zeros for an
+// index past the table (gpu_ops_llm.h's embed_row, f32).
+struct EmbedRowArgs { v : Views, k : u32, rows : u32, rs : u32, cs : u32 };
+@group(0) @binding(3) var<uniform> er : EmbedRowArgs;
+
+@compute @workgroup_size(256, 1, 1)
+fn embed_row(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let j = gid.x;
+  if (j >= er.k) { return; }
+  let n = u32(in1[er.v.v1] + 0.5);
+  var x = 0.0;
+  if (n < er.rows) { x = in0[er.v.v0 + n * er.rs + j * er.cs]; }
+  out2[er.v.v2 + j] = x;
+}
+
 // Views: idx, values -> out. Params: webgpu.h's index_add_params (n = the
 // output's element count, k = the source rows to scan).
 struct IndexAddArgs { v : Views, n : u32, row_size : u32, k : u32 };

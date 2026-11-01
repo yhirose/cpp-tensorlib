@@ -162,7 +162,7 @@ inline constexpr const char* kEntryPoints[] = {
     "index_select", "index_add",  "scatter_axis", "ew_bcast_nd",
     "where_nd",     "cmp",        "clamp_",       "sum_to",
     "concat_part",  "rope",        "ew_scalar",    "layer_norm",
-    "gather_axis",  "argmax"};
+    "gather_axis",  "argmax",     "embed_row"};
 
 // emscripten_webgpu_get_device() does not report "no device" — it hands
 // Module.preinitializedWebGPUDevice straight to importJsDevice, which reads
@@ -472,6 +472,8 @@ inline bool available() { return context::get().ready; }
 struct own {
   static bool argmax(gpu::span a, int64_t n, int64_t* out_idx);
   static bool argmax_to(gpu::span a, int64_t n, gpu::span idx);
+  static bool embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
+                        int64_t rows, int64_t row_stride, int64_t col_stride);
   static bool binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
                               gpu::span b, const int64_t* b_strides,
                               gpu::span out, const int64_t* out_shape, int rank,
@@ -935,6 +937,17 @@ inline bool own::argmax_to(gpu::span a, int64_t n, gpu::span idx) {
   return detail_::launch_own_("argmax", -1, {gpu::in(a), gpu::out(idx)},
                               detail_::argmax_params{detail_::u32(n)},
                               gpu::grid{});  // one workgroup
+}
+
+// Row idx[0] of an f32 table into out (gpu_ops_llm.h's contract): f32 only,
+// the one format this backend's buffers hold.
+inline bool own::embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
+                           int64_t rows, int64_t row_stride, int64_t col_stride) {
+  using detail_::u32;
+  if (type != 0) return false;
+  const uint32_t p[] = {u32(k), u32(rows), u32(row_stride), u32(col_stride)};
+  return detail_::launch_own_("embed_row", -1, {gpu::in(W), gpu::in(idx), gpu::out(out)}, p,
+                              gpu::policy::flat(k));
 }
 
 // argmax_to into a 4-byte buffer: one value comes back rather than the n
