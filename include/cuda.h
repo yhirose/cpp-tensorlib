@@ -185,7 +185,7 @@ inline const char* ptx_source_() {
 // parameter. nvcc emits each declaration into the PTX as
 //   .global .align 1 .b8 <kernel>_ptr_align[n] = {16, 4, 8};
 // so the table is read from the module's own text, once, with no driver call.
-// A kernel without one takes its pointers on their element's width.
+// A kernel without one takes its pointers on their element's width, unchecked.
 using align_table = std::unordered_map<std::string, std::vector<unsigned char>>;
 inline align_table parse_align_decls_(const char* ptx) {
   static constexpr char tag[] = "_ptr_align[";

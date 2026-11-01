@@ -1099,6 +1099,10 @@ __device__ __forceinline__ void gemm_bf16_nt_core(const float* __restrict__ A,
         }
     }
 }
+// Elements only: the core picks its vector loads by address (vecA, vecB).
+TL_ALIGN(tl_gemm_bf16_nt, sizeof(float), sizeof(__nv_bfloat16), sizeof(float))
+TL_ALIGN(tl_gemm_bf16_nt_s, sizeof(float), sizeof(__nv_bfloat16), sizeof(float))
+TL_ALIGN(tl_gemm_bf16_nt_sk, sizeof(float), sizeof(__nv_bfloat16), sizeof(float))
 extern "C" __global__ void tl_gemm_bf16_nt(const float* __restrict__ A,
     const __nv_bfloat16* __restrict__ B, float* __restrict__ C, unsigned M,
     unsigned N, unsigned K) {
