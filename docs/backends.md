@@ -210,7 +210,12 @@ Metal, short of the graph-capture forms, the forms over f16 activations
 (`gemm_quant_glu` among them) and the int8 ones (`quantize_act_q8`,
 `gemv_q4k_q8`); WebGPU is general tensor computation (the core layer, plus
 the nn kernels that pay off in a browser: softmax, layer norm, RoPE) and
-leaves the llm layer to the compositions; the host backend states every id
+leaves the llm layer to the compositions, short of the small pieces of the
+decode contract (`argmax_to`, `embed_row` on f32 tables, `read_later`).
+That line is a scope choice: in-browser LLMs are better served by engines
+built for them, so WebGPU takes no decode kernels (GEMV, attention,
+quantized forms), and its one-workgroup `argmax` stays as it is; the host
+backend states every id
 as a plain loop.
 
 ## Launch policy

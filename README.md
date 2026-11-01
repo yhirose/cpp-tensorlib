@@ -242,9 +242,14 @@ no platform `#ifdef`s (non-Apple builds get inline stubs).
 All three GPU backends cover the array surface — GEMM, elementwise
 unary/binary, rank-2 broadcast, row reductions (softmax / row sum / row max)
 — each with the same fused affine epilogue, and each validated against the
-reference implementation as an oracle. The LLM decode kernels (GEMV,
-attention, RoPE, int4 dequant-matmul) are CUDA-only; on Metal and WebGPU
-those ops decline at the seam and run on the CPU.
+reference implementation as an oracle. The LLM kernels (GEMV, attention,
+quantized matmul, DeltaNet) are on CUDA and Metal. WebGPU stops at the array
+surface by design: it serves tensors in the browser, and in-browser LLMs
+are better served by engines built for them. It does run the small pieces
+of the shared decode contract (`argmax_to`, `embed_row` on f32 tables,
+`read_later`), and its `argmax` is one workgroup, which is enough for array
+use but slow on a vocabulary-sized vector. Any op a backend lacks declines
+at the seam and runs on the CPU.
 
 **The WebGPU backend** is built with `emcc --use-port=emdawnwebgpu
 -DTENSORLIB_WEBGPU`, and differs from the native two in two ways worth
