@@ -143,6 +143,11 @@ struct driver {
   CUresult (*EventRecord)(CUevent, CUstream) = nullptr;
   CUresult (*EventSynchronize)(CUevent) = nullptr;
   CUresult (*EventElapsedTime)(float*, CUevent, CUevent) = nullptr;
+  // read_later's copy behind the queued work: a D2H into pinned memory, and
+  // an event after it to wait on. Optional like the sets above: read_ok()
+  // gates them, and without them a read drains and reads at once.
+  CUresult (*MemcpyDtoHAsync)(void*, CUdeviceptr, size_t, CUstream) = nullptr;
+  CUresult (*MemAllocHost)(void**, size_t) = nullptr;
   CUresult (*FuncSetAttribute)(CUfunction, int, int) = nullptr;
   // A kernel's resources and the module's kernels, for check_cuda's look over all of
   // them; optional (drivers from CUDA 12.4), nothing launches through them.
@@ -164,6 +169,9 @@ struct driver {
   }
   bool timing_ok() const {
     return EventCreate && EventRecord && EventSynchronize && EventElapsedTime;
+  }
+  bool read_ok() const {
+    return MemcpyDtoHAsync && MemAllocHost && EventCreate && EventRecord && EventSynchronize;
   }
 };
 
@@ -456,6 +464,8 @@ struct context {
     d.EventSynchronize = (CUresult(*)(CUevent))S("cuEventSynchronize");
     d.EventElapsedTime =
         (CUresult(*)(float*, CUevent, CUevent))S("cuEventElapsedTime");
+    d.MemcpyDtoHAsync = (CUresult(*)(void*, CUdeviceptr, size_t, CUstream))S("cuMemcpyDtoHAsync_v2");
+    d.MemAllocHost = (CUresult(*)(void**, size_t))S("cuMemAllocHost_v2");
     d.FuncSetAttribute = (CUresult(*)(CUfunction, int, int))S("cuFuncSetAttribute");
     d.FuncGetAttribute = (CUresult(*)(int*, int, CUfunction))S("cuFuncGetAttribute");
     d.FuncGetName = (CUresult(*)(const char**, CUfunction))S("cuFuncGetName");
@@ -784,6 +794,32 @@ struct context {
       if (d.MemAlloc(&argmax_res, bytes) != 0 || d.MemsetD8(argmax_res, 0, bytes) != 0) argmax_res = 0;
     }
     return argmax_res;
+  }
+
+  // read_later (cuda_llm.h): the f32 a read lands in, pinned so the copy runs
+  // behind the stream's work, and the event recorded after the copy. A slot
+  // goes back to the spares when its handle does (a read never finished too:
+  // the next copy into it is queued behind the old one); they are never freed,
+  // like the context.
+  struct read_slot {
+    CUevent done = nullptr;
+    float* host = nullptr;
+  };
+  std::vector<read_slot*> spare_reads;
+  read_slot* read_slot_() {
+    if (!spare_reads.empty()) {
+      read_slot* r = spare_reads.back();
+      spare_reads.pop_back();
+      return r;
+    }
+    auto* r = new read_slot;
+    void* p = nullptr;
+    if (d.EventCreate(&r->done, 2 /*CU_EVENT_DISABLE_TIMING*/) != 0 || d.MemAllocHost(&p, sizeof(float)) != 0) {
+      delete r;  // a failed slot leaks its event, if any: this happens only once
+      return nullptr;
+    }
+    r->host = static_cast<float*>(p);
+    return r;
   }
 
   // embed_row (cuda_llm.h): f32, bf16, Q4_K, Q6_K, Q8_0.

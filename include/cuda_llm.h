@@ -29,6 +29,8 @@ struct own_llm {
   // token on the device.
   static bool embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
                         int64_t rows, int64_t row_stride, int64_t col_stride);
+  static bool read_later(gpu::span src, gpu::pending_read& r);
+  static bool finish_read(gpu::pending_read& r, float* out);
 };
 
 // ---- CUDA-graph capture (M9 C1-2): record a fixed launch sequence once and
@@ -230,6 +232,40 @@ inline bool own_llm::embed_row(int type, gpu::span W, gpu::span idx, gpu::span o
   }
   const unsigned per = uk / 8;
   return c.launch_(f, {(per + threads - 1) / threads}, {threads}, 0, pw, pi, po, uk, urows);
+}
+
+// src's f32 copied into a pinned slot on the stream, behind every launch
+// queued so far, and an event after it; finish_read waits on the event. The
+// launches are already submitted, so nothing waits here. Refused under a
+// capture (the copy and the event would become graph nodes), where
+// gpu::read_later reads at once instead.
+inline bool own_llm::read_later(gpu::span src, gpu::pending_read& r) {
+  auto& c = context::get();
+  if (!c.ready || c.capturing || !c.d.read_ok()) return false;
+  context::read_slot* slot = c.read_slot_();
+  if (!slot) return false;
+  c.device_read_(src.buf);  // a host-live src goes up first, on the same stream
+  const auto at = reinterpret_cast<CUdeviceptr>(context::off_(src.buf, src.off));
+  if (c.d.MemcpyDtoHAsync(slot->host, at, sizeof(float), c.stream) != 0 ||
+      c.d.EventRecord(slot->done, c.stream) != 0) {
+    c.spare_reads.push_back(slot);
+    return false;
+  }
+  profile::detail::transfer("d2h", sizeof(float), 0.0);
+  r.state = std::shared_ptr<context::read_slot>(
+      slot, [](context::read_slot* s) { context::get().spare_reads.push_back(s); });
+  return true;
+}
+inline bool own_llm::finish_read(gpu::pending_read& r, float* out) {
+  auto& c = context::get();
+  auto* slot = static_cast<context::read_slot*>(r.state.get());
+  {
+    profile::detail::blocked waiting;
+    if (c.d.EventSynchronize(slot->done) != 0) return false;
+  }
+  *out = *slot->host;
+  r.state.reset();
+  return true;
 }
 
 // The KV cache itself is tl::kv_cache (kv_cache.h), written once over the
