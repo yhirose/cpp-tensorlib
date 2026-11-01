@@ -358,12 +358,10 @@ __device__ __forceinline__ void argmax_block_(float& v, int& i) {
     argmax_warp_(v, i);
   }
 }
-// O is how out[0] holds the index: an int (argmax, read back), or an f32
-// (argmax_to, left on the device for the next decode step's input). C++
-// linkage: the block around it is extern "C".
-extern "C++" template <class O>
-__device__ __forceinline__ void argmax_core(const float* __restrict__ in, O* out, unsigned n,
-                                            float* pv, int* pi, unsigned* done) {
+// out[0] holds the index as an f32 (exact to 2^24): argmax_to leaves it on the
+// device for the next decode step's input, argmax reads it back.
+__global__ void tl_argmax(const float* __restrict__ in, float* out, unsigned n,
+                                     float* pv, int* pi, unsigned* done) {
   __shared__ bool last;
   float v = -3.402823466e+38f;
   int i = 0;
@@ -391,17 +389,9 @@ __device__ __forceinline__ void argmax_core(const float* __restrict__ in, O* out
     argmax_take_(v, i, reinterpret_cast<volatile float*>(pv)[b], reinterpret_cast<volatile int*>(pi)[b]);
   argmax_block_(v, i);
   if (threadIdx.x == 0) {
-    out[0] = (O)i;
+    out[0] = (float)i;
     *done = 0;
   }
-}
-extern "C" __global__ void tl_argmax(const float* __restrict__ in, int* out, unsigned n,
-                                     float* pv, int* pi, unsigned* done) {
-  argmax_core(in, out, n, pv, pi, done);
-}
-extern "C" __global__ void tl_argmax_f32(const float* __restrict__ in, float* out, unsigned n,
-                                         float* pv, int* pi, unsigned* done) {
-  argmax_core(in, out, n, pv, pi, done);
 }
 
 // tl_pad/tl_fold's per-call shape/stride metadata is uploaded to a scratch
