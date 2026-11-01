@@ -208,7 +208,7 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
     CHECK(same(o, array::rope(x + b, 37, 1e6f), 1e-5f));
   }
 
-  SUBCASE("argmax reads back the smallest index among ties") {
+  SUBCASE("argmax reads back the smallest index among ties, or leaves it on the device") {
     // A backend may split the vector across groups and reduce their winners:
     // ties within one stretch and across two, a maximum at the ragged end, and
     // a vector shorter than any stretch (all negative, so no pair a reduction
@@ -234,6 +234,11 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       int64_t idx = -1;
       REQUIRE(gpu::argmax(a.device_span(), c.n, &idx));
       CHECK(idx == c.want);
+      if (gpu::has_argmax_to) {  // the same index, left on the device as an f32
+        array d = dev(array::zeros({1}));
+        REQUIRE(gpu::argmax_to(a.device_span(), c.n, d.device_span()));
+        CHECK(host_values(d)[0] == (float)c.want);
+      }
     }
   }
 

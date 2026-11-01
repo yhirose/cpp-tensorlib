@@ -519,6 +519,13 @@ struct own {
     gpu::launched("argmax");
     return true;
   }
+  // argmax's index as an f32 at idx[0] (the decode-ahead form, gpu_ops_llm.h).
+  static bool argmax_to(gpu::span a, int64_t n, gpu::span idx) {
+    int64_t i = 0;
+    if (!argmax(a, n, &i)) return false;
+    *view<float>(idx) = static_cast<float>(i);
+    return true;
+  }
   // C(m,n) = (A @ B) * scale + offset; a transposed operand is read in place.
   static bool gemm(gpu::span a, int64_t lda, bool ta, gpu::span b, int64_t ldb,
                    bool tb, gpu::span out, int64_t m, int64_t n, int64_t k,

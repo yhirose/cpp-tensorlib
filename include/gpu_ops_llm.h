@@ -127,5 +127,23 @@ inline bool incr_u32(span d_pos) {
   }
 }
 
+// ---- a decode step run ahead: the next step is queued before the host reads
+// this one's token, which stays on the device (an f32 index, exact up to 2^24)
+// for the next step's input. Each answers false where its backend has no form
+// of its own, and a decoder then reads the token back and takes the host path.
+
+// The argmax of a length-n vector (the smallest index on ties, as argmax) as an
+// f32 at idx[0], with no read-back and no drain.
+TL_GPU_DETECT_OWN(argmax_to)
+template <class Own = own>
+inline bool argmax_to(span a, int64_t n, span idx) {
+  if (!a || !idx || n <= 0 || n > policy::max_f32_index) return false;
+  if constexpr (detail::owns_argmax_to<Own>::value) {
+    return detail::ran(Own::argmax_to(a, n, idx));
+  } else {
+    return false;
+  }
+}
+
 }  // namespace gpu
 }  // namespace tl
