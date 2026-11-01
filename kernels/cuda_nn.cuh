@@ -1254,22 +1254,10 @@ __device__ __forceinline__ uint4 tc_pack8_(const float (&v)[8]) {
   return make_uint4(tc_pack2_<F16>(v[0], v[1]), tc_pack2_<F16>(v[2], v[3]),
                     tc_pack2_<F16>(v[4], v[5]), tc_pack2_<F16>(v[6], v[7]));
 }
-template <bool F16>
-__device__ __forceinline__ uint4 tc_dq8_q4k_(const unsigned char* row, unsigned gk) {
+template <bool F16, int WF>
+__device__ __forceinline__ uint4 tc_dq8_(const unsigned char* row, unsigned gk) {
   float v[8];
-  dq8_q4k_(row, gk, v);
-  return tc_pack8_<F16>(v);
-}
-template <bool F16>
-__device__ __forceinline__ uint4 tc_dq8_q6k_(const unsigned char* row, unsigned gk) {
-  float v[8];
-  dq8_q6k_(row, gk, v);
-  return tc_pack8_<F16>(v);
-}
-template <bool F16>
-__device__ __forceinline__ uint4 tc_dq8_q80_(const unsigned char* row, unsigned gk) {
-  float v[8];
-  dq8_q80_(row, gk, v);
+  dq8_<WF>(row, gk, v);
   return tc_pack8_<F16>(v);
 }
 
@@ -1289,9 +1277,7 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
   const __half* Ah = static_cast<const __half*>(Av);
   const __nv_bfloat16* B = static_cast<const __nv_bfloat16*>(Bv);
   const unsigned char* Bq = static_cast<const unsigned char*>(Bv);
-  const size_t qrow = WF == 1 ? (size_t)(K >> 8) * 144u
-                    : WF == 2 ? (size_t)(K >> 8) * 210u
-                              : (size_t)(K >> 5) * 34u;  // bytes a row
+  const size_t qrow = quant_row_bytes_<WF>(K);  // bytes a row (block formats)
   constexpr int LD = BK + 8;                    // +8: rows stay 16-byte aligned and
                                                 // ldmatrix reads hit distinct banks
   constexpr int NT = (BM / WM) * (BN / WN) * 32;
@@ -1336,15 +1322,11 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
       if constexpr (WF == 0) {
         rb[v] = gn < N && gk < K ? *reinterpret_cast<const uint4*>(B + (size_t)gn * K + gk)
                                  : make_uint4(0u, 0u, 0u, 0u);
-      } else if constexpr (WF == 1) {
-        rb[v] = gn < N && gk < K ? tc_dq8_q4k_<F16>(Bq + gn * qrow, gk) : make_uint4(0u, 0u, 0u, 0u);
-      } else if constexpr (WF == 2) {
-        rb[v] = gn < N && gk < K ? tc_dq8_q6k_<F16>(Bq + gn * qrow, gk) : make_uint4(0u, 0u, 0u, 0u);
       } else if constexpr (WF == 4) {
         rb[v] = gn < N && gk < K ? *reinterpret_cast<const uint4*>(Bq + (gn * (size_t)K + gk) * 2u)
                                  : make_uint4(0u, 0u, 0u, 0u);
       } else {
-        rb[v] = gn < N && gk < K ? tc_dq8_q80_<F16>(Bq + gn * qrow, gk) : make_uint4(0u, 0u, 0u, 0u);
+        rb[v] = gn < N && gk < K ? tc_dq8_<F16, WF>(Bq + gn * qrow, gk) : make_uint4(0u, 0u, 0u, 0u);
       }
     }
   };
@@ -1566,7 +1548,7 @@ __device__ __forceinline__ void dequant_f16_core(const unsigned char* __restrict
   if (t >= (size_t)rows * per_row) return;
   const unsigned row = (unsigned)(t / per_row), gk = (unsigned)(t % per_row) << 3;
   const unsigned char* r = W + row * quant_row_bytes_<WF>(K);
-  const uint4 v = WF == 1 ? tc_dq8_q4k_<true>(r, gk) : WF == 2 ? tc_dq8_q6k_<true>(r, gk) : tc_dq8_q80_<true>(r, gk);
+  const uint4 v = tc_dq8_<true, WF>(r, gk);
   *reinterpret_cast<uint4*>(out + (size_t)row * K + gk) = v;
 }
 TL_ALIGN(tl_dequant_f16_q4k, 8, 16)

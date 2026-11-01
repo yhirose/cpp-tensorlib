@@ -374,13 +374,19 @@ inline bool mmq_run_(context& c, int type, bool glu, void* pa, void* pw, void* o
          c.launch_(reduce, {(uM * (uN / 2) + 255) / 256}, {256}, 0, pp, out, uM, uN, ldc, z, stride);
 }
 
+// A block format the CUDA readers take as their format index (WF in
+// cuda_nn.cuh: Q4_K 1, Q6_K 2, Q8_0 3), or -1 for any other type or for a k that
+// is not a whole number of its blocks.
+inline int quant_wf_(int type, int64_t k) {
+  const int wf = type == 12 ? 1 : type == 14 ? 2 : type == 8 ? 3 : -1;
+  return wf > 0 && k > 0 && k % (wf == 3 ? 32 : 256) == 0 ? wf : -1;
+}
+
 inline bool own_nn::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
                              int64_t n, int64_t k, int64_t ldc, bool mmq) {
   auto& c = context::get();
-  if (!c.ready || m <= 0 || n <= 0 || k % (type == 8 ? 32 : 256) || n % 2 || ldc % 2 || ldc < n ||
-      (type != 12 && type != 14 && type != 8)) {
-    return false;
-  }
+  const int wf = quant_wf_(type, k);
+  if (!c.ready || m <= 0 || n <= 0 || wf < 0 || n % 2 || ldc % 2 || ldc < n) return false;
   float* pa = context::off_(A.buf, A.off);
   float* pw = context::off_(W.buf, W.off);
   float* pc = context::off_(C.buf, C.off);
@@ -405,8 +411,9 @@ inline bool own_nn::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu
   // each GEMM too few blocks for the long-K tile (pp512 1027 -> 1140 tok/s on the 27B).
   constexpr size_t slab_bytes = 192u << 20;
   const int64_t slab = std::max<int64_t>(128, (int64_t)(slab_bytes / ((size_t)k * 2)) / 128 * 128);
-  CUfunction& fn = c.dequant_fn[type == 12 ? 0 : type == 14 ? 1 : 2];
-  if (!fn) fn = c.load_(type == 12 ? "tl_dequant_f16_q4k" : type == 14 ? "tl_dequant_f16_q6k" : "tl_dequant_f16_q80");
+  static const char* const dequant_names[3] = {"tl_dequant_f16_q4k", "tl_dequant_f16_q6k",
+                                               "tl_dequant_f16_q80"};
+  const CUfunction fn = c.cached_(c.dequant_fn[wf - 1], dequant_names[wf - 1]);
   const CUdeviceptr scr = c.dequant_scratch_((size_t)std::min<int64_t>(n, slab) * k * 2);
   if (!fn || !scr) return false;
   for (int64_t r0 = 0; r0 < n; r0 += slab) {
@@ -469,8 +476,7 @@ inline bool own_nn::gemv_q4k_q8(gpu::span qa, gpu::span W, gpu::span y, int64_t 
 inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n,
                              int64_t k) {
   auto& c = context::get();
-  if (!c.ready || n <= 0 || k <= 0 || k % (type == 8 ? 32 : 256) || (type != 12 && type != 14 && type != 8))
-    return false;
+  if (!c.ready || n <= 0 || quant_wf_(type, k) < 0) return false;
   float* pa = context::off_(a.buf, a.off);
   float* pw = context::off_(W.buf, W.off);
   c.device_read_(a.buf);
