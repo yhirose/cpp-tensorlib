@@ -1426,13 +1426,21 @@ kernel void concat_part_(device const float* a [[buffer(0)]],
 
 // argmax of one length-n vector, the smallest index on ties (the host scan's
 // `v[i] > best`), so greedy decoding reads one int back instead of the logits.
+// Two launches of this kernel: groups reduce contiguous chunks of the logits to
+// a (value, index) pair each, then one group reduces those pairs, each value's
+// index taken from `idx` (`mapped`). Chunks run in index order, so the smaller
+// index still wins a tie. One group alone took ~215 us over a 152k vocabulary
+// on the M1 Pro, a decode step's 4%.
 struct argmax_params {
-  uint n;
+  uint n, chunk, mapped;
 };
 
 kernel void argmax_(device const float* in      [[buffer(0)]],
-                    device int* out             [[buffer(1)]],
-                    constant argmax_params& p   [[buffer(2)]],
+                    device const int* idx       [[buffer(1)]],
+                    device float* out_v         [[buffer(2)]],
+                    device int* out_i           [[buffer(3)]],
+                    constant argmax_params& p   [[buffer(4)]],
+                    uint g    [[threadgroup_position_in_grid]],
                     uint tid  [[thread_index_in_threadgroup]],
                     uint nt   [[threads_per_threadgroup]],
                     uint sgid [[simdgroup_index_in_threadgroup]],
@@ -1441,11 +1449,12 @@ kernel void argmax_(device const float* in      [[buffer(0)]],
   threadgroup int sidx[8];
   float best = -3.402823466e+38f;
   int besti = 0;
-  for (uint i = tid; i < p.n; i += nt) {
+  const uint end = min(p.n, (g + 1) * p.chunk);
+  for (uint i = g * p.chunk + tid; i < end; i += nt) {
     const float v = in[i];
     if (v > best) {
       best = v;
-      besti = int(i);
+      besti = p.mapped ? idx[i] : int(i);
     }
   }
   // Within a simdgroup, then across them: take the other if strictly greater,
@@ -1470,7 +1479,8 @@ kernel void argmax_(device const float* in      [[buffer(0)]],
         sidx[0] = sidx[w];
       }
     }
-    out[0] = sidx[0];
+    out_v[g] = sval[0];
+    out_i[g] = sidx[0];
   }
 }
 struct gather_axis_params {

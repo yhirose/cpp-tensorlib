@@ -151,7 +151,8 @@ struct context {
   void* scratch = nullptr;
   float* scratch_contents = nullptr;
   int64_t scratch_bytes = 0;
-  // argmax's one-int result, read back after a flush.
+  // argmax's buffer: each group's value, then each group's index, then the
+  // final (value, index) pair, whose index is read back after a flush.
   void* argmax_res = nullptr;
   float* argmax_res_contents = nullptr;
 
@@ -1028,21 +1029,36 @@ inline bool own_core::concat_part(gpu::span a, gpu::span out, const int64_t* a_s
   return true;
 }
 
-// One int comes back through a 4-byte buffer the context keeps.
+// Two launches of argmax_ (the kernel says how they split the work), then one
+// int read back from the buffer the context keeps.
 inline bool own_core::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
   auto& c = context::get();
-  if (!c.device) return false;
+  constexpr int64_t G = traits::fill_groups;
+  if (!c.device || n > INT32_MAX) return false;
   if (!c.argmax_res) {
-    c.argmax_res = alloc(4, &c.argmax_res_contents);
+    c.argmax_res = alloc(8 * (G + 1), &c.argmax_res_contents);
     if (!c.argmax_res) return false;
   }
-  const uint32_t p = static_cast<uint32_t>(n);
-  const gpu::arg args[] = {gpu::in(a), gpu::out({c.argmax_res, 0})};
-  if (!dispatch(kop::argmax_, args, 2, &p, sizeof(p), {1, 1, 1, 256, 1, 1, 0})) {
+  struct params {
+    uint32_t n, chunk, mapped;
+  };
+  const gpu::span r{c.argmax_res, 0};
+  const gpu::span pv = r, pi = r.at(4 * G), fv = r.at(8 * G), fi = r.at(8 * G + 4);
+  // Each group a contiguous run of at least a group's width, G at most.
+  constexpr gpu::policy::split_rule rule{G, 0, 256, 1};
+  const int64_t chunk = gpu::policy::split_chunk(n, gpu::policy::split_parts(1, n, rule), rule);
+  const auto groups = static_cast<uint32_t>((n + chunk - 1) / chunk);
+  const gpu::arg pass1[] = {gpu::in(a), gpu::in(a), gpu::out(pv), gpu::out(pi)};
+  const params p1{static_cast<uint32_t>(n), static_cast<uint32_t>(chunk), 0};
+  const gpu::arg pass2[] = {gpu::in(pv), gpu::in(pi), gpu::out(fv), gpu::out(fi)};
+  const params p2{groups, groups, 1};
+  if (!dispatch(kop::argmax_, pass1, 4, &p1, sizeof(p1), {groups, 1, 1, 256, 1, 1, 0}) ||
+      !dispatch(kop::argmax_, pass2, 4, &p2, sizeof(p2), {1, 1, 1, 256, 1, 1, 0})) {
     return false;
   }
   flush();
-  *out_idx = *reinterpret_cast<const int*>(c.argmax_res_contents);
+  *out_idx = *reinterpret_cast<const int*>(
+      reinterpret_cast<const char*>(c.argmax_res_contents) + fi.off);
   return true;
 }
 
