@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -126,6 +127,13 @@ struct arg {
 inline arg in(span s) { return {s, access::in}; }
 inline arg out(span s) { return {s, access::out}; }
 inline arg inout(span s) { return {s, access::inout}; }
+
+// One f32 on its way back from the device (gpu_ops_llm.h's read_later): the
+// backend's own handle to wait on, or, where it read at once, the value.
+struct pending_read {
+  std::shared_ptr<void> state;
+  float value = 0.0f;
+};
 
 // Where an allocation's live bytes are, for a backend whose device memory is
 // not the host's (a mirrored backend keeps one of these per allocation, next to

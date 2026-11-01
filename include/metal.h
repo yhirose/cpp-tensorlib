@@ -28,6 +28,7 @@
 #include <objc.h>
 #include <profile.h>
 
+#include <cassert>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -129,18 +130,20 @@ struct context {
   bool pending = false;
   // Free-list by byte size; contents pointers cached so a pool hit costs no
   // objc round trip (tiny-tensor workloads allocate per op). A buffer
-  // released while a batch is pending goes back at once — the next owner's
+  // released while work is pending goes back at once — the next owner's
   // kernels are encoded after the work still queued against it, so the
   // device keeps the order — but that work may yet read or write it, so it
-  // carries the batch and a buffer the host fills skips it (alloc's
-  // host_fill) until the flush moves `batch` on.
+  // carries the last command buffer that may touch it, and a buffer the host
+  // fills skips it (alloc's host_fill) until that one has retired.
   struct pooled {
     void* buf;
     float* contents;
-    uint64_t released_in;  // the pending batch it was released under, or 0
+    uint64_t busy_until;  // that command buffer's number, or 0
   };
   std::unordered_map<int64_t, std::vector<pooled>> free_bufs;
-  uint64_t batch = 1;  // the batch being encoded; the flush advances it
+  // Command buffers numbered from 1 as committed, and how many of them are
+  // done and let go (retire_): committed holds numbers retired + 1 on.
+  uint64_t submitted = 0, retired = 0;
   std::unordered_map<int, objc::id> psos;
   // The kernel the encoder currently has bound (set by bind_): what
   // tl::profile names the next dispatch.
@@ -322,12 +325,48 @@ struct context {
   }
 
   // End and commit the open command buffer without waiting, owed `r`'s
-  // device time; the batch stays pending until flush() waits for it.
+  // device time; the batch stays pending until flush() waits for it. Held
+  // (retained) until retired, so the batch's autorelease pool may go first.
   void commit_(profile::row* r) {
+    assert(cb && "commit_ with no open command buffer");
     objc::send(enc, "endEncoding");
     objc::send(cb, "commit");
+    objc::send(cb, "retain");
     committed.emplace_back(cb, r);
+    submitted++;
     cb = enc = nullptr;
+  }
+
+  // The first n committed buffers, finished: each owes its row its GPU time
+  // (a row lives until the next profile start(), which drains first), and is
+  // let go.
+  void retire_(size_t n) {
+    const bool profiling = profile::active();
+    for (size_t i = 0; i < n; i++) {
+      auto [done, row] = committed[i];
+      if (row || profiling) {
+        const double s = objc::send<double>(done, "GPUStartTime");
+        const double e = objc::send<double>(done, "GPUEndTime");
+        if (e > s) {
+          profile::detail::batch_device((e - s) * 1e6);
+          if (row) profile::detail::device_time(row, (e - s) * 1e6);
+        }
+      }
+      objc::send(done, "release");
+    }
+    committed.erase(committed.begin(), committed.begin() + static_cast<std::ptrdiff_t>(n));
+    retired += n;
+  }
+
+  // With no buffer open, the autorelease pool can go (what is still in
+  // flight is retained), and with nothing in flight nothing is pending.
+  void settle_() {
+    if (cb) return;
+    if (pool) {
+      objc_autoreleasePoolPop(pool);
+      pool = nullptr;
+    }
+    if (committed.empty()) pending = false;
   }
 };
 
@@ -355,6 +394,8 @@ struct traits {
 struct own_core {
   static bool argmax(gpu::span a, int64_t n, int64_t* out_idx);
   static bool argmax_to(gpu::span a, int64_t n, gpu::span idx);
+  static bool read_later(gpu::span src, gpu::pending_read& r);
+  static bool finish_read(gpu::pending_read& r, float* out);
   static bool binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
                               gpu::span b, const int64_t* b_strides,
                               gpu::span out, const int64_t* out_shape, int rank,
@@ -398,35 +439,21 @@ inline void flush() {
   auto& c = context::get();
   if (!c.pending) return;
   if (c.cb) c.commit_(nullptr);
-  {
+  if (!c.committed.empty()) {
     // One queue runs its command buffers in commit order: the last one done
     // is all of them done.
     profile::detail::blocked waiting;
     objc::send(c.committed.back().first, "waitUntilCompleted");
   }
-  // A row is owed its time even if the profile stopped before this flush:
-  // the rows live until the next start(), which drains first.
-  const bool profiling = profile::active();
-  for (auto [cb, row] : c.committed) {
-    if (!row && !profiling) continue;  // nothing would record it
-    const double s = objc::send<double>(cb, "GPUStartTime");
-    const double e = objc::send<double>(cb, "GPUEndTime");
-    if (e <= s) continue;
-    profile::detail::batch_device((e - s) * 1e6);
-    if (row) profile::detail::device_time(row, (e - s) * 1e6);
-  }
-  c.committed.clear();
-  c.batch++;
-  objc_autoreleasePoolPop(c.pool);
-  c.pool = nullptr;
-  c.pending = false;
+  c.retire_(c.committed.size());
+  c.settle_();
 }
 
 // Pooled shared-mode MTLBuffer. Returns null when no device (caller falls
 // back to heap). `bytes` is the pool key — pass the same value to release.
 // `host_fill`: the host writes the buffer before any kernel does (a tensor
-// made from host values), so it must not be one the pending batch may still
-// read or write — on unified memory the host's bytes would race that work.
+// made from host values), so it must not be one queued work may still read or
+// write — on unified memory the host's bytes would race that work.
 inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
   auto& c = context::get();
   if (!c.device) return nullptr;
@@ -434,7 +461,7 @@ inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
   if (it != c.free_bufs.end()) {
     auto& list = it->second;
     for (auto at = list.rbegin(); at != list.rend(); ++at) {
-      if (host_fill && at->released_in == c.batch) continue;
+      if (host_fill && at->busy_until > c.retired) continue;
       void* buf = at->buf;
       *contents = at->contents;
       list.erase(std::next(at).base());
@@ -451,7 +478,8 @@ inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
 
 inline void release(void* buf, int64_t bytes, float* contents) {
   auto& c = context::get();
-  c.free_bufs[bytes].push_back({buf, contents, c.pending ? c.batch : 0});
+  // The open buffer, if any, is the next to be numbered.
+  c.free_bufs[bytes].push_back({buf, contents, c.pending ? c.submitted + (c.cb ? 1 : 0) : 0});
 }
 
 // Stage `n` host floats into a device buffer. Unified memory has nothing to
@@ -1069,6 +1097,67 @@ inline bool own_core::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
   if (!r || n > gpu::policy::max_f32_index || !argmax_to(a, n, fi)) return false;
   flush();
   *out_idx = static_cast<int64_t>(context::get().argmax_res_contents[fi.off / 4]);
+  return true;
+}
+
+// read_later's handle: src copied into a 4-byte buffer of its own behind the
+// work so far, and the command buffer that copy ends (retained, and its number)
+// to wait on before the host reads the copy (unified memory).
+namespace detail_ {
+struct read_handle {
+  objc::id cb;
+  uint64_t seq;
+  void* buf;
+  float* at;
+  read_handle(objc::id b, uint64_t n, void* copy, float* p) : cb(b), seq(n), buf(copy), at(p) {
+    objc::send(cb, "retain");
+  }
+  read_handle(const read_handle&) = delete;
+  read_handle& operator=(const read_handle&) = delete;
+  ~read_handle() {
+    objc::send(cb, "release");
+    release(buf, 4, at);
+  }
+};
+}  // namespace detail_
+
+// The copy, then the open buffer committed; with nothing queued, read now.
+inline bool own_core::read_later(gpu::span src, gpu::pending_read& r) {
+  auto& c = context::get();
+  if (!c.device) return false;
+  if (!c.pending) {
+    r.value = *reinterpret_cast<const float*>(
+        static_cast<const char*>(objc::send<void*>(src.buf, "contents")) + src.off);
+    return true;
+  }
+  float* at = nullptr;
+  void* buf = alloc(4, &at);
+  const gpu::arg args[] = {gpu::in(src), gpu::out({buf, 0})};
+  const gpu::ew_params p{1, 1.0f, 0.0f};
+  if (!buf || !dispatch(kop::affine, args, 2, &p, sizeof(p), {1, 1, 1, 32, 1, 1, 0})) {
+    if (buf) release(buf, 4, at);
+    return false;
+  }
+  if (c.cb) c.commit_(nullptr);  // under a profile the copy committed its own
+  r.state = std::make_shared<detail_::read_handle>(c.committed.back().first, c.submitted, buf, at);
+  return true;
+}
+
+// Wait for that buffer, read, and retire it and those before it (unless a
+// flush already has).
+inline bool own_core::finish_read(gpu::pending_read& r, float* out) {
+  auto& c = context::get();
+  auto* h = static_cast<detail_::read_handle*>(r.state.get());
+  {
+    profile::detail::blocked waiting;
+    objc::send(h->cb, "waitUntilCompleted");
+  }
+  *out = *h->at;
+  if (h->seq > c.retired) {
+    c.retire_(h->seq - c.retired);
+    c.settle_();
+  }
+  r.state.reset();
   return true;
 }
 

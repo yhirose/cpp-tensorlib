@@ -51,11 +51,13 @@
 #include <webgpu/webgpu_cpp.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -449,6 +451,28 @@ struct context {
 
   void flush_();  // defined below, once flush() is in scope
 
+  // Submit the batch, with `then` encoded behind it if given, without
+  // waiting: a batch's state (pending, the uniform and meta ring slots) resets
+  // together here. Whether anything was submitted.
+  template <class F = std::nullptr_t>
+  bool submit_(F then = nullptr) {
+    pending = false;
+    slot = 0;
+    meta_slot = 0;
+    wgpu::CommandEncoder e = enc;
+    if (pass) pass.End();
+    pass = nullptr;
+    enc = nullptr;
+    if constexpr (!std::is_null_pointer_v<F>) {
+      if (!e) e = device.CreateCommandEncoder();
+      then(e);
+    }
+    if (!e) return false;
+    wgpu::CommandBuffer cmds = e.Finish();
+    queue.Submit(1, &cmds);
+    return true;
+  }
+
   wgpu::Buffer staging_(size_t bytes) {
     auto it = staging_pool.find(bytes);
     if (it != staging_pool.end() && !it->second.empty()) {
@@ -472,6 +496,8 @@ inline bool available() { return context::get().ready; }
 struct own {
   static bool argmax(gpu::span a, int64_t n, int64_t* out_idx);
   static bool argmax_to(gpu::span a, int64_t n, gpu::span idx);
+  static bool read_later(gpu::span src, gpu::pending_read& r);
+  static bool finish_read(gpu::pending_read& r, float* out);
   static bool embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
                         int64_t rows, int64_t row_stride, int64_t col_stride);
   static bool binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
@@ -511,15 +537,7 @@ inline bool pending() { return context::get().pending; }
 inline void flush() {
   auto& c = context::get();
   if (!c.pending) return;
-  c.pending = false;
-  c.slot = 0;
-  c.meta_slot = 0;
-  if (!c.enc) return;
-  c.pass.End();
-  c.pass = nullptr;
-  wgpu::CommandBuffer cmds = c.enc.Finish();
-  c.enc = nullptr;
-  c.queue.Submit(1, &cmds);
+  if (!c.submit_()) return;
   profile::detail::blocked waiting;
   c.wait(c.queue.OnSubmittedWorkDone(
       wgpu::CallbackMode::WaitAnyOnly,
@@ -948,6 +966,56 @@ inline bool own::embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, 
   const uint32_t p[] = {u32(k), u32(rows), u32(row_stride), u32(col_stride)};
   return detail_::launch_own_("embed_row", -1, {gpu::in(W), gpu::in(idx), gpu::out(out)}, p,
                               gpu::policy::flat(k));
+}
+
+// read_later's handle: a 4-byte MapRead staging buffer the copy lands in, and
+// its map, started at submit and waited on by finish_read.
+namespace detail_ {
+struct read_handle {
+  wgpu::Buffer stg;
+  wgpu::Future mapped;
+  bool ok = false;
+};
+}  // namespace detail_
+
+// The batch so far and a copy of src's 4 bytes behind it, in one submit, then
+// the staging buffer's map started without waiting.
+inline bool own::read_later(gpu::span src, gpu::pending_read& r) {
+  auto& c = context::get();
+  context::mirror* m = c.ready ? c.mirror_(src.buf) : nullptr;
+  if (!m || src.off % 4) return false;
+  c.before_kernel_(*m, gpu::access::in);
+  auto h = std::make_shared<detail_::read_handle>();
+  h->stg = c.staging_(4);
+  c.submit_([&](wgpu::CommandEncoder& e) {
+    e.CopyBufferToBuffer(m->dev, static_cast<uint64_t>(src.off), h->stg, 0, 4);
+  });
+  detail_::read_handle* hp = h.get();
+  h->mapped = h->stg.MapAsync(wgpu::MapMode::Read, 0, 4, wgpu::CallbackMode::WaitAnyOnly,
+                              [hp](wgpu::MapAsyncStatus st, wgpu::StringView) {
+                                hp->ok = st == wgpu::MapAsyncStatus::Success;
+                              });
+  r.state = std::move(h);
+  return true;
+}
+
+// Wait for the map (a suspend point, as flush's), read, and hand the staging
+// buffer back.
+inline bool own::finish_read(gpu::pending_read& r, float* out) {
+  auto& c = context::get();
+  auto* h = static_cast<detail_::read_handle*>(r.state.get());
+  bool ok;
+  {
+    profile::detail::blocked waiting;
+    ok = c.wait(h->mapped) && h->ok;
+  }
+  if (ok) {
+    std::memcpy(out, h->stg.GetConstMappedRange(0, 4), 4);
+    h->stg.Unmap();
+    c.staging_pool[4].push_back(h->stg);
+  }
+  r.state.reset();
+  return ok;
 }
 
 // argmax_to into a 4-byte buffer: one value comes back rather than the n
