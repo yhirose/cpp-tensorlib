@@ -19,6 +19,7 @@ enum class nn_kernel {
   gemm_q4k, gemm_q4k_32, gemm_q6k, gemm_q6k_32, gemm_q80, gemm_q80_32,
   rmsnorm_rope_64, rmsnorm_rope_128, rmsnorm_rope_256, gated_rmsnorm,
   gemm_bf16_steel, gemm_bf16_steel_32, gemm_bf16_f16acc, gemm_bf16_f16acc_32,
+  embed_row_f32, embed_row_bf16, embed_row_q4k, embed_row_q6k, embed_row_q80,
 };
 constexpr int nn_kernel_key_(nn_kernel t) { return -201 - static_cast<int>(t); }
 inline const char* nn_kernel_name_(nn_kernel t) {
@@ -40,6 +41,11 @@ inline const char* nn_kernel_name_(nn_kernel t) {
     case nn_kernel::gemm_bf16_steel_32: return "gemm_bf16_steel32_";
     case nn_kernel::gemm_bf16_f16acc: return "gemm_bf16_f16acc_";
     case nn_kernel::gemm_bf16_f16acc_32: return "gemm_bf16_f16acc32_";
+    case nn_kernel::embed_row_f32: return "embed_row_f32_";
+    case nn_kernel::embed_row_bf16: return "embed_row_bf16_";
+    case nn_kernel::embed_row_q4k: return "embed_row_q4k_";
+    case nn_kernel::embed_row_q6k: return "embed_row_q6k_";
+    case nn_kernel::embed_row_q80: return "embed_row_q80_";
   }
   return "";
 }
@@ -80,6 +86,8 @@ struct own_nn {
                            int64_t N, int64_t K);
   static bool gemm_bf16_nt_f16acc(gpu::span A, gpu::span B, gpu::span C,
                                   int64_t M, int64_t N, int64_t K);
+  static bool embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
+                        int64_t rows, int64_t row_stride, int64_t col_stride);
   static bool gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y,
                          int64_t n, int64_t k);
   static bool gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
@@ -467,6 +475,32 @@ inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y,
   const unsigned long groups =
       (static_cast<unsigned long>(n) + detail_::gemv_quant_rows_ - 1) / detail_::gemv_quant_rows_;
   detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {32 * detail_::gemv_quant_sg_, 1, 1});
+  return true;
+}
+
+// Row idx[0] of a table into f32 (gpu_ops_llm.h's contract): a thread an
+// element, through the GEMMs' readers. A block format's rows on gemv_quant's
+// terms (quant_ok_).
+inline bool own_nn::embed_row(int type, gpu::span W, gpu::span idx, gpu::span out,
+                              int64_t k, int64_t rows, int64_t row_stride,
+                              int64_t col_stride) {
+  auto& c = context::get();
+  const bool q = type == 12 || type == 14 || type == 8;
+  if (!c.device || (q ? !detail_::quant_ok_(type, k, W) : type != 0 && type != 30))
+    return false;
+  detail_::bind_(c, type == 0    ? nn_kernel::embed_row_f32
+                    : type == 30 ? nn_kernel::embed_row_bf16
+                    : type == 12 ? nn_kernel::embed_row_q4k
+                    : type == 14 ? nn_kernel::embed_row_q6k
+                                 : nn_kernel::embed_row_q80);
+  detail_::set_buf_(c.enc, W, 0ul);
+  detail_::set_buf_(c.enc, idx, 1ul);
+  detail_::set_buf_(c.enc, out, 2ul);
+  const auto u = [](int64_t v) { return static_cast<uint32_t>(v); };
+  const uint32_t p[] = {u(k), u(rows), u(row_stride), u(col_stride)};
+  detail_::set_bytes_(c.enc, p, 3ul);
+  detail_::dispatch_grid_(c.enc, {(static_cast<unsigned long>(k) + 255ul) / 256ul, 1, 1},
+                          {256, 1, 1});
   return true;
 }
 

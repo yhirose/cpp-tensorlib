@@ -1,6 +1,7 @@
 // The llm layer's tests (layers: include/gpu_abi.h): the KV cache and the decode
 // step's kernels, the graph replay, the GGUF reader.
 
+#include "test_quant.h"
 #include "test_util.h"
 
 #include <gguf.h>
@@ -238,6 +239,51 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
         array d = dev(array::zeros({1}));
         REQUIRE(gpu::argmax_to(a.device_span(), c.n, d.device_span()));
         CHECK(host_values(d)[0] == (float)c.want);
+      }
+    }
+  }
+
+  SUBCASE("embed_row gathers the row an index on the device names") {
+    // A decode step run ahead takes its input from the token argmax_to left: a
+    // row of the embedding table in whichever form the model keeps it, [V, K]
+    // or its transpose, f32, bf16 or GGUF blocks. Past the table, zeros.
+    if (gpu::has_embed_row) {
+      const int64_t V = 300, K = 256;
+      const array T = random_array({V, K}, 990), Tb = T.to_bf16().to_f32();
+      const std::vector<float> f = host_values(T), fb = host_values(Tb);
+      const array Wf = dev(T), Wft = dev(T.transpose()), Wb = dev(T.to_bf16()),
+                  Wbt = dev(T.transpose().to_bf16());
+      auto row = [&](int type, const array& W, int64_t rs, int64_t cs, int64_t n) {
+        array idx = dev(array::from(std::vector<float>{(float)n}, {1})), out = dev(array::zeros({K}));
+        REQUIRE(gpu::embed_row(type, W.device_span(), idx.device_span(), out.device_span(), K, V,
+                               rs, cs));
+        return host_values(out);
+      };
+      auto want = [&](const std::vector<float>& w, int64_t n) {
+        std::vector<float> r((size_t)K, 0.0f);
+        if (n < V) std::copy(w.begin() + n * K, w.begin() + (n + 1) * K, r.begin());
+        return r;
+      };
+      auto close = [](const std::vector<float>& got, const std::vector<float>& w) {
+        for (size_t i = 0; i < w.size(); i++)
+          if (std::fabs(got[i] - w[i]) > 1e-6f * (1.0f + std::fabs(w[i]))) return false;
+        return true;
+      };
+      std::vector<std::pair<int, quant_rows>> qs;
+      if (gpu::has_gemv_quant)
+        for (int type : {12, 14, 8}) qs.push_back({type, random_quant_rows(type, V, K, 990 + type)});
+      for (int64_t n : {int64_t(0), int64_t(137), V - 1, V}) {
+        INFO("row " << n);
+        CHECK(row(0, Wf, K, 1, n) == want(f, n));
+        CHECK(row(0, Wft, 1, V, n) == want(f, n));
+        if (gpu::caps::row_gemv) {  // a backend that decodes from bf16 weights
+          CHECK(row(30, Wb, K, 1, n) == want(fb, n));
+          CHECK(row(30, Wbt, 1, V, n) == want(fb, n));
+        }
+        for (const auto& [type, q] : qs) {
+          INFO("type " << type);
+          CHECK(close(row(type, dev(q.W), 0, 0, n), want(q.w, n)));
+        }
       }
     }
   }

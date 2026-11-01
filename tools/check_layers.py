@@ -39,7 +39,7 @@ FILES = {
                test/test_array.cpp""",
     "nn": """include/gpu_abi_nn.h include/gpu_ops_nn.h include/cuda_nn.h include/metal_nn.h
              include/array_nn.h include/ggml_quant.h include/metal_kernels_nn.metal
-             kernels/cuda_nn.cuh test/test_nn.cpp""",
+             kernels/cuda_nn.cuh test/test_nn.cpp test/test_quant.h""",
     "llm": """include/gpu_abi_llm.h include/gpu_ops_llm.h include/cuda_llm.h
               include/kv_cache.h include/gguf.h include/tokenizer.h
               include/tokenizer_data.h include/metal_kernels_llm.metal

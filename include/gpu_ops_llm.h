@@ -145,5 +145,27 @@ inline bool argmax_to(span a, int64_t n, span idx) {
   }
 }
 
+// Row idx[0] (an f32 index, as argmax_to leaves it) of a `rows`-row table into
+// out[0, k) as f32: the next step's input. W is of ggml `type`: f32 (0) or
+// bf16 (30) read by strides in elements (out[j] = W[idx * row_stride + j *
+// col_stride], so a [rows, k] table and its [k, rows] transpose both serve),
+// or a block format whose rows are whole blocks, read as gemv_quant reads them
+// (Q4_K 12, Q6_K 14, Q8_0 8; the strides unused). An index past the table
+// gives zeros. False for a format the backend has no reader for.
+TL_GPU_DETECT_OWN(embed_row)
+template <class Own = own>
+inline bool embed_row(int type, span W, span idx, span out, int64_t k, int64_t rows,
+                      int64_t row_stride, int64_t col_stride) {
+  if (!W || !idx || !out || k <= 0 || rows <= 0 || rows > policy::max_f32_index ||
+      row_stride < 0 || col_stride < 0 || k > UINT32_MAX || row_stride > UINT32_MAX ||
+      col_stride > UINT32_MAX)
+    return false;
+  if constexpr (detail::owns_embed_row<Own>::value) {
+    return detail::ran(Own::embed_row(type, W, idx, out, k, rows, row_stride, col_stride));
+  } else {
+    return false;
+  }
+}
+
 }  // namespace gpu
 }  // namespace tl

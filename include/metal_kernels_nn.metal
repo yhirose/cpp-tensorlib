@@ -1057,6 +1057,40 @@ TL_STEEL_KERNEL_SRC(gemm_q6k_nt_, 64, false, true, uchar, TL_READ_Q(read_q6k_))
 TL_STEEL_KERNEL_SRC(gemm_q6k_nt32_, 32, false, true, uchar, TL_READ_Q(read_q6k_))
 TL_STEEL_KERNEL_SRC(gemm_q80_nt_, 64, false, true, uchar, TL_READ_Q(read_q80_))
 TL_STEEL_KERNEL_SRC(gemm_q80_nt32_, 32, false, true, uchar, TL_READ_Q(read_q80_))
+
+// ---- one row of a table into f32, the row the f32 index idx[0] names (a
+// decode step's input, from the token the last step's argmax_to left; an
+// index past the table gives zeros). The strided readers take f32 or bf16 in
+// either layout, the block formats their rows as the GEMVs read them.
+struct read_f32_s_ {
+  device const float* B;
+  uint rs, cs;
+  float operator()(uint n, uint k) const { return B[(ulong)n * rs + (ulong)k * cs]; }
+};
+struct read_bf16_s_ {
+  device const ushort* B;
+  uint rs, cs;
+  float operator()(uint n, uint k) const { return widen_(B[(ulong)n * rs + (ulong)k * cs]); }
+};
+struct embed_row_params {
+  uint K, rows, rs, cs;
+};
+#define TL_EMBED_ROW(name, T, READER)                                        \
+  kernel void name(device const T* B [[buffer(0)]],                          \
+                   device const float* idx [[buffer(1)]],                    \
+                   device float* out [[buffer(2)]],                          \
+                   constant embed_row_params& p [[buffer(3)]],               \
+                   uint j [[thread_position_in_grid]]) {                     \
+    if (j >= p.K) return;                                                    \
+    const uint n = uint(idx[0] + 0.5f);                                      \
+    out[j] = n < p.rows ? READER(n, j) : 0.0f;                               \
+  }
+TL_EMBED_ROW(embed_row_f32_, float, (read_f32_s_{B, p.rs, p.cs}))
+TL_EMBED_ROW(embed_row_bf16_, ushort, (read_bf16_s_{B, p.rs, p.cs}))
+TL_EMBED_ROW(embed_row_q4k_, uchar, TL_READ_Q(read_q4k_))
+TL_EMBED_ROW(embed_row_q6k_, uchar, TL_READ_Q(read_q6k_))
+TL_EMBED_ROW(embed_row_q80_, uchar, TL_READ_Q(read_q80_))
+#undef TL_EMBED_ROW
 #undef TL_READ_Q
 #undef TL_READ_BF16
 

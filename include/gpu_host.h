@@ -519,6 +519,22 @@ struct own {
     gpu::launched("argmax");
     return true;
   }
+  // Row idx[0] of an f32 or bf16 table by strides (gpu_ops_llm.h's embed_row);
+  // no block formats here.
+  static bool embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
+                        int64_t rows, int64_t row_stride, int64_t col_stride) {
+    if (type != 0 && type != 30) return false;
+    const auto n = static_cast<int64_t>(*view<const float>(idx) + 0.5f);
+    float* o = view<float>(out);
+    for (int64_t j = 0; j < k; j++) {
+      const int64_t at = n * row_stride + j * col_stride;
+      o[j] = n >= rows ? 0.0f
+             : type == 0 ? view<const float>(W)[at]
+                         : bf16_to_f32(view<const uint16_t>(W)[at]);
+    }
+    gpu::launched("embed_row");
+    return true;
+  }
   // argmax's index as an f32 at idx[0] (the decode-ahead form, gpu_ops_llm.h).
   static bool argmax_to(gpu::span a, int64_t n, gpu::span idx) {
     int64_t i = 0;
