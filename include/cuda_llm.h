@@ -212,8 +212,9 @@ inline bool own_llm::attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
 inline bool own_llm::embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
                                int64_t rows, int64_t row_stride, int64_t col_stride) {
   auto& c = context::get();
-  const int e = type == 0 ? 0 : type == 30 ? 1 : type == 12 ? 2 : type == 14 ? 3 : type == 8 ? 4 : -1;
-  if (!c.ready || e < 0 || (e >= 2 && k % (e == 4 ? 32 : 256))) return false;
+  // 0 f32, 1 bf16, then the block formats on gemv_quant's terms (quant_wf_).
+  const int wf = quant_wf_(type, k), e = type == 0 ? 0 : type == 30 ? 1 : wf > 0 ? wf + 1 : -1;
+  if (!c.ready || e < 0) return false;
   static const char* const names[5] = {"tl_embed_row_f32", "tl_embed_row_bf16", "tl_embed_row_q4k",
                                        "tl_embed_row_q6k", "tl_embed_row_q80"};
   CUfunction f = c.cached_(c.embed_row_fn[e], names[e]);
