@@ -327,6 +327,10 @@ inline grid row_reduce(int64_t rows, int64_t k, uint32_t step = 8) {
 // head per group (CUDA's block limit and Metal's threadgroup limit agree).
 inline constexpr int64_t max_group_threads = 1024;
 
+// The largest index an f32 holds exactly: the bound on argmax_to's index, which
+// a decoder hands the next step on the device (gpu_ops_llm.h).
+inline constexpr int64_t max_f32_index = int64_t(1) << 24;
+
 // One group per (head, row), a thread per head-dim element: the attention
 // and KV-cache kernels' shape.
 inline grid per_head(int64_t heads, int64_t rows, int64_t D) {

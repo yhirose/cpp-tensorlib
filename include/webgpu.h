@@ -471,6 +471,7 @@ inline bool available() { return context::get().ready; }
 // declares what it has and nothing else. Defined below, among their helpers.
 struct own {
   static bool argmax(gpu::span a, int64_t n, int64_t* out_idx);
+  static bool argmax_to(gpu::span a, int64_t n, gpu::span idx);
   static bool binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
                               gpu::span b, const int64_t* b_strides,
                               gpu::span out, const int64_t* out_shape, int rank,
@@ -929,16 +930,21 @@ inline bool own::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
 }
 
 // The argmax of a length-n vector (the WGSL argmax: one workgroup, the
-// smallest index on ties): one value comes back rather than the n floats the
-// generic composition reads. The index travels as an f32, exact up to 2^24.
+// smallest index on ties), its index an f32 at idx[0].
+inline bool own::argmax_to(gpu::span a, int64_t n, gpu::span idx) {
+  return detail_::launch_own_("argmax", -1, {gpu::in(a), gpu::out(idx)},
+                              detail_::argmax_params{detail_::u32(n)},
+                              gpu::grid{});  // one workgroup
+}
+
+// argmax_to into a 4-byte buffer: one value comes back rather than the n
+// floats the generic composition reads.
 inline bool own::argmax(gpu::span a, int64_t n, int64_t* out_idx) {
-  if (n <= 0 || n > (int64_t(1) << 24)) return false;
+  if (n <= 0 || n > gpu::policy::max_f32_index) return false;
   float* host = nullptr;
   void* res = alloc(4, &host);
   if (!res) return false;
-  const bool ok = detail_::launch_own_("argmax", -1, {gpu::in(a), gpu::out({res, 0})},
-                                       detail_::argmax_params{detail_::u32(n)},
-                                       gpu::grid{});  // one workgroup
+  const bool ok = argmax_to(a, n, {res, 0});
   if (ok) {
     sync_to_host(res, false);
     *out_idx = static_cast<int64_t>(host[0]);
