@@ -76,9 +76,9 @@ int main(int argc, char** argv) {
               user.c_str(), ids.size());
 
   // begin() consumes the prompt — batched as GEMMs when the weights allow it,
-  // else token-by-token — and returns the first generated token; step() then
-  // self-bounds on the KV capacity and degrades to the imperative path on its
-  // own, so there is nothing to branch on here. See qm::captured_decoder. Greedy
+  // else token-by-token — and returns the first generated token; next() then
+  // runs a step ahead where it can, self-bounds on the KV capacity and degrades
+  // to step() on its own, so there is nothing to branch on here. See qm::captured_decoder. Greedy
   // throughout; capture is guarded argmax-equivalent to imperative in
   // bench_qwen_decode, and every prefill path against the array reference in
   // bench_qwen_prefill.
@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
   for (int64_t i = 0; i < MAX_NEW && next >= 0; i++) {
     if (next == tok.eos_id()) break;
     gen.push_back((int)next);
-    next = dec.step(M, next);
+    next = dec.next(M);
   }
   double dec_ms = ms_since(t_dec);
   double capture_ms = dec.capture_ms;

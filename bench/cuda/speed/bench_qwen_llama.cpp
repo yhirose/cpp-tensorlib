@@ -4,8 +4,8 @@
 //   pp<P>  a P-token prompt into an empty cache (or one already holding d
 //          tokens): the batched prefill, through the last token's logits.
 //   tg<N>  N tokens decoded one at a time after d cached ones: the chat's own
-//          decoder (CUDA-graph replay where the backend captures), each step
-//          through its greedy token. Capturing is set-up, like llama-bench's
+//          decoder (CUDA-graph replay where the backend captures, a step queued
+//          ahead where it runs one), each step through its greedy token. Capturing is set-up, like llama-bench's
 //          warm-up run, and is not timed.
 //
 // Each test runs once untimed, then `reps` times; the row is the mean ± sample
@@ -44,9 +44,9 @@ static double tg_ms(qm::Model& M, int64_t N, int64_t d) {
   if (!fill_depth(M, d)) return -1;
   qm::captured_decoder dec;
   dec.init(M, qm::PREFILL_IDS[0], qm::seq_cache(M).pos);
-  int64_t tok = qm::PREFILL_IDS[0];
+  int64_t tok = 0;
   const double t0 = qm::StepProf::now_ms();
-  for (int64_t i = 0; i < N && tok >= 0; i++) tok = dec.step(M, tok);
+  for (int64_t i = 0; i < N && tok >= 0; i++) tok = dec.next(M);
   const double ms = qm::StepProf::now_ms() - t0;
   dec.destroy();
   return tok >= 0 ? ms : -1;
