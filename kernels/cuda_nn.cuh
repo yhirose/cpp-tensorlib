@@ -2512,8 +2512,9 @@ extern "C" __global__ void tl_attn_combine(const float* __restrict__ pm,
 // (+9% at pos0=0, neutral once pos0 dominates).
 
 // Widen four consecutive cached elements. The rows are AD-contiguous and AD % 4
-// == 0, so the address is 16-byte aligned for f32 and 8-byte for f16 — one
-// vector load per four elements instead of four scalar ones (+9% on the staging).
+// == 0, so the address is 16-byte aligned for f32 and 8-byte for f16 when the
+// base is — one vector load per four elements instead of four scalar ones (+9%
+// on the staging).
 __device__ __forceinline__ void kv_ld4(const float* p, float* o) {
   const float4 v = *reinterpret_cast<const float4*>(p);
   o[0] = v.x; o[1] = v.y; o[2] = v.z; o[3] = v.w;
@@ -2523,6 +2524,16 @@ __device__ __forceinline__ void kv_ld4(const __half* p, float* o) {
   const float2 f0 = __half22float2(reinterpret_cast<const __half2&>(raw.x));
   const float2 f1 = __half22float2(reinterpret_cast<const __half2&>(raw.y));
   o[0] = f0.x; o[1] = f0.y; o[2] = f1.x; o[3] = f1.y;
+}
+// The same four by vector when `vec`, else one element at a time.
+template <typename KT>
+__device__ __forceinline__ void kv_ld4(const KT* p, float* o, bool vec) {
+  if (vec) {
+    kv_ld4(p, o);
+  } else {
+#pragma unroll
+    for (int e = 0; e < 4; e++) o[e] = kv_ld(p[e]);
+  }
 }
 
 template <int AD, int QPT, typename KT = float>
@@ -2552,6 +2563,9 @@ __device__ void attn_prefill_tiled_core(const float* __restrict__ q,
   const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
   const KT* Kh = K + (size_t)kv_h * kv_stride;
   const KT* Vh = V + (size_t)kv_h * kv_stride;
+  // kv_stride is a multiple of AD, so the heads keep the base's alignment.
+  const bool vecK = (size_t)K % (4 * sizeof(KT)) == 0;
+  const bool vecV = (size_t)V % (4 * sizeof(KT)) == 0;
   const unsigned tid = threadIdx.x;
   const unsigned qr0 = tid >> 3, dg = tid & 7u;
 
@@ -2575,8 +2589,8 @@ __device__ void attn_prefill_tiled_core(const float* __restrict__ q,
       const unsigned kk = kt + r;
       float kb[4] = {0, 0, 0, 0}, vb[4] = {0, 0, 0, 0};
       if (kk <= kmax) {
-        kv_ld4(Kh + (size_t)kk * AD + c4, kb);
-        kv_ld4(Vh + (size_t)kk * AD + c4, vb);
+        kv_ld4(Kh + (size_t)kk * AD + c4, kb, vecK);
+        kv_ld4(Vh + (size_t)kk * AD + c4, vb, vecV);
       }
 #pragma unroll
       for (int e = 0; e < 4; e++) {
@@ -2646,9 +2660,12 @@ __device__ void attn_prefill_tiled_core(const float* __restrict__ q,
 // tl_attn_prefill_tiled_{f32,f16}_{64,128}, and f16 at 256 (QPT 1, 8-key tiles): the
 // exact prefill of an f16 cache at that width (an f32 one takes gpu::attn_prefill's
 // GEMM form there, as it always has).
-// K and V by four elements at once (f32: float4, f16: uint2).
+// K and V by four elements at once (f32: float4, f16: uint2) when their base
+// allows, else one at a time (kv_ld4), so they need only their element's
+// alignment: an f16 cache has no composition to fall back to, so this kernel
+// must read it at whatever offset it is handed.
 #define TL_ATTN_TILED(AD, QPT, KT, TN)                                                             \
-  TL_ALIGN(tl_attn_prefill_tiled_##TN##_##AD, 4, 4 * sizeof(KT), 4 * sizeof(KT))                \
+  TL_ALIGN(tl_attn_prefill_tiled_##TN##_##AD, 4, sizeof(KT), sizeof(KT))                        \
   extern "C" __global__ void tl_attn_prefill_tiled_##TN##_##AD(                                    \
       const float* q, const KT* K, const KT* V, float* out, unsigned T, unsigned kv_stride,         \
       unsigned group, float scale, unsigned pos0) {                                                \
