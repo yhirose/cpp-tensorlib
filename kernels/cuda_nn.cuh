@@ -1193,8 +1193,10 @@ __device__ __forceinline__ void q4k_scale_min_(uint3 w, int j, int& sc, int& mn)
   sc = (int)(j < 4 ? a & 63u : (c & 0xFu) | ((a >> 2) & 0x30u));
   mn = (int)(j < 4 ? b & 63u : ((c >> 4) & 0xFu) | ((b >> 2) & 0x30u));
 }
-template <bool F16>
-__device__ __forceinline__ uint4 tc_dq8_q4k_(const unsigned char* row, unsigned gk) {
+// Eight consecutive weights of a row as f32, dequantized as ggml does: v[0..8)
+// for k = gk .. gk+7. The GEMMs round them to their operand type (tc_dq8_*_),
+// embed_row writes them as they are.
+__device__ __forceinline__ void dq8_q4k_(const unsigned char* row, unsigned gk, float (&v)[8]) {
   const unsigned char* b = row + (size_t)(gk >> 8) * 144u;
   const unsigned o = gk & 255u, g = o >> 5, p = g >> 1, l0 = o & 31u;
   const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(b));  // d, dmin
@@ -1203,17 +1205,13 @@ __device__ __forceinline__ uint4 tc_dq8_q4k_(const unsigned char* row, unsigned 
   const float d1 = dd.x * (float)sc, m1 = dd.y * (float)mn;
   const uint2 w = *reinterpret_cast<const uint2*>(b + 16 + 32 * p + l0);
   const unsigned sh = (g & 1u) ? 4u : 0u;
-  float v[8];
 #pragma unroll
   for (int i = 0; i < 4; i++) {
     v[i] = d1 * (float)((w.x >> (8 * i + sh)) & 0xFu) - m1;
     v[4 + i] = d1 * (float)((w.y >> (8 * i + sh)) & 0xFu) - m1;
   }
-  return make_uint4(tc_pack2_<F16>(v[0], v[1]), tc_pack2_<F16>(v[2], v[3]),
-                    tc_pack2_<F16>(v[4], v[5]), tc_pack2_<F16>(v[6], v[7]));
 }
-template <bool F16>
-__device__ __forceinline__ uint4 tc_dq8_q6k_(const unsigned char* row, unsigned gk) {
+__device__ __forceinline__ void dq8_q6k_(const unsigned char* row, unsigned gk, float (&v)[8]) {
   const unsigned char* b = row + (size_t)(gk >> 8) * 210u;
   const unsigned o = gk & 255u, h = o >> 7, qd = (o >> 5) & 3u, l0 = o & 31u;
   const float d = __half2float(*reinterpret_cast<const __half*>(b + 208));
@@ -1221,31 +1219,58 @@ __device__ __forceinline__ uint4 tc_dq8_q6k_(const unsigned char* row, unsigned 
   const unsigned char* qhp = b + 128 + 32 * h + l0;
   const signed char sc = reinterpret_cast<const signed char*>(b + 192)[8 * h + (l0 >> 4) + 2 * qd];
   const float ds = d * (float)sc;
-  float v[8];
 #pragma unroll
   for (int i = 0; i < 8; i++) {
     const unsigned ql = qlp[i], qh = qhp[i];
     const int lo = qd < 2 ? (int)(ql & 0xF) : (int)(ql >> 4);
     v[i] = ds * (float)(((lo | (int)(((qh >> (2 * qd)) & 3u) << 4))) - 32);
   }
-  return make_uint4(tc_pack2_<F16>(v[0], v[1]), tc_pack2_<F16>(v[2], v[3]),
-                    tc_pack2_<F16>(v[4], v[5]), tc_pack2_<F16>(v[6], v[7]));
 }
-
-template <bool F16>
-__device__ __forceinline__ uint4 tc_dq8_q80_(const unsigned char* row, unsigned gk) {
+__device__ __forceinline__ void dq8_q80_(const unsigned char* row, unsigned gk, float (&v)[8]) {
   const unsigned char* b = row + (size_t)(gk >> 5) * 34u;  // 2-byte aligned only
   const float d = __half2float(*reinterpret_cast<const __half*>(b));
   const unsigned short* q16 = reinterpret_cast<const unsigned short*>(b + 2 + (gk & 31u));
-  float v[8];
 #pragma unroll
   for (int i = 0; i < 4; i++) {
     const unsigned w = q16[i];
     v[2 * i] = (float)(signed char)(w & 0xFFu) * d;
     v[2 * i + 1] = (float)(signed char)(w >> 8) * d;
   }
+}
+// WF 1 Q4_K, 2 Q6_K, 3 Q8_0 (the GEMMs' weight formats below).
+template <int WF>
+__device__ __forceinline__ void dq8_(const unsigned char* row, unsigned gk, float (&v)[8]) {
+  if constexpr (WF == 1) dq8_q4k_(row, gk, v);
+  else if constexpr (WF == 2) dq8_q6k_(row, gk, v);
+  else dq8_q80_(row, gk, v);
+}
+// A row's bytes in format WF, K weights long (K % 256 == 0 for the K-quants).
+template <int WF>
+__device__ __forceinline__ size_t quant_row_bytes_(unsigned K) {
+  return WF == 1 ? (size_t)(K >> 8) * 144u : WF == 2 ? (size_t)(K >> 8) * 210u : (size_t)(K >> 5) * 34u;
+}
+template <bool F16>
+__device__ __forceinline__ uint4 tc_pack8_(const float (&v)[8]) {
   return make_uint4(tc_pack2_<F16>(v[0], v[1]), tc_pack2_<F16>(v[2], v[3]),
                     tc_pack2_<F16>(v[4], v[5]), tc_pack2_<F16>(v[6], v[7]));
+}
+template <bool F16>
+__device__ __forceinline__ uint4 tc_dq8_q4k_(const unsigned char* row, unsigned gk) {
+  float v[8];
+  dq8_q4k_(row, gk, v);
+  return tc_pack8_<F16>(v);
+}
+template <bool F16>
+__device__ __forceinline__ uint4 tc_dq8_q6k_(const unsigned char* row, unsigned gk) {
+  float v[8];
+  dq8_q6k_(row, gk, v);
+  return tc_pack8_<F16>(v);
+}
+template <bool F16>
+__device__ __forceinline__ uint4 tc_dq8_q80_(const unsigned char* row, unsigned gk) {
+  float v[8];
+  dq8_q80_(row, gk, v);
+  return tc_pack8_<F16>(v);
 }
 
 // WF: the weight format B holds: 0 bf16 [N][K], 1 Q4_K, 2 Q6_K blocks (rows of
@@ -1540,8 +1565,7 @@ __device__ __forceinline__ void dequant_f16_core(const unsigned char* __restrict
   const unsigned per_row = K >> 3;
   if (t >= (size_t)rows * per_row) return;
   const unsigned row = (unsigned)(t / per_row), gk = (unsigned)(t % per_row) << 3;
-  const size_t qrow = WF == 1 ? (size_t)(K >> 8) * 144u : WF == 2 ? (size_t)(K >> 8) * 210u : (size_t)(K >> 5) * 34u;
-  const unsigned char* r = W + row * qrow;
+  const unsigned char* r = W + row * quant_row_bytes_<WF>(K);
   const uint4 v = WF == 1 ? tc_dq8_q4k_<true>(r, gk) : WF == 2 ? tc_dq8_q6k_<true>(r, gk) : tc_dq8_q80_<true>(r, gk);
   *reinterpret_cast<uint4*>(out + (size_t)row * K + gk) = v;
 }

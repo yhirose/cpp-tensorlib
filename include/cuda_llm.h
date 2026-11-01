@@ -25,6 +25,10 @@ struct own_llm {
                                int64_t kv_max, int64_t D, float scale,
                                gpu::span partials, bool kv_f16 = false);
   static bool incr_u32(gpu::span d_pos);
+  // A decode step run ahead (gpu_ops_llm.h): its input row gathered from the
+  // token on the device.
+  static bool embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
+                        int64_t rows, int64_t row_stride, int64_t col_stride);
 };
 
 // ---- CUDA-graph capture (M9 C1-2): record a fixed launch sequence once and
@@ -198,6 +202,34 @@ inline bool own_llm::attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
     return false;
   }
   return p.combine(c, po, uh, uD, S);
+}
+
+// Row idx[0] of a table into f32 (gpu_ops_llm.h's contract): a thread an
+// element by strides for f32 / bf16, eight weights a thread for the block
+// formats, whose rows gemv_quant's K bounds (K % 256, Q8_0's K % 32) keep whole.
+inline bool own_llm::embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
+                               int64_t rows, int64_t row_stride, int64_t col_stride) {
+  auto& c = context::get();
+  const int e = type == 0 ? 0 : type == 30 ? 1 : type == 12 ? 2 : type == 14 ? 3 : type == 8 ? 4 : -1;
+  if (!c.ready || e < 0 || (e >= 2 && k % (e == 4 ? 32 : 256))) return false;
+  static const char* const names[5] = {"tl_embed_row_f32", "tl_embed_row_bf16", "tl_embed_row_q4k",
+                                       "tl_embed_row_q6k", "tl_embed_row_q80"};
+  CUfunction f = c.cached_(c.embed_row_fn[e], names[e]);
+  void* pw = context::off_(W.buf, W.off);
+  float* pi = context::off_(idx.buf, idx.off);
+  float* po = context::off_(out.buf, out.off);
+  const unsigned uk = (unsigned)k, urows = (unsigned)rows, threads = 256;
+  // Refused before any residency change if the table is misaligned for its reads.
+  if (!f || !c.fits_(f, pw, pi, po)) return false;
+  c.device_read_(W.buf);
+  c.device_read_(idx.buf);
+  c.device_write_(out.buf);
+  if (e < 2) {
+    const unsigned rs = (unsigned)row_stride, cs = (unsigned)col_stride;
+    return c.launch_(f, {(uk + threads - 1) / threads}, {threads}, 0, pw, pi, po, uk, urows, rs, cs);
+  }
+  const unsigned per = uk / 8;
+  return c.launch_(f, {(per + threads - 1) / threads}, {threads}, 0, pw, pi, po, uk, urows);
 }
 
 // The KV cache itself is tl::kv_cache (kv_cache.h), written once over the
