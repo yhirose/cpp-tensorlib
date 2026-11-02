@@ -159,6 +159,46 @@ TEST_CASE("a graph replay leaves what it wrote device-current") {
   tl::device_ = prev;
 }
 
+// A model's weights sit in a device-only buffer, so they are in memory once:
+// kernels read what upload_bytes wrote, and the host holds no pointer to it.
+TEST_CASE("a device-only buffer: kernels read what upload_bytes wrote, the host cannot") {
+  namespace gpu = tl::gpu;
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+  tl::use_gpu();
+  tl::storage w;
+  try {
+    w = tl::storage::make_device(4, 16, tl::dtype::f32);
+  } catch (const std::runtime_error&) {
+    MESSAGE("this backend keeps no device-only buffers");
+    tl::device_ = prev;
+    return;
+  }
+  CHECK(w.ptr == nullptr);
+  const float vals[4] = {1, 2, 3, 4}, ones[4] = {1, 1, 1, 1};
+  gpu::upload_bytes(w.native, 0, vals, sizeof vals);
+  tl::storage one = tl::storage::make(4), out = tl::storage::make(4);
+  gpu::upload(one.native, ones, 4);
+  REQUIRE(gpu::binary(gpu::kop::add, w.device_span(), one.device_span(), out.device_span(), 4, 1, 0));
+  gpu::cpu_barrier();
+  gpu::sync_to_host(out.native, false);
+  for (int i = 0; i < 4; i++) CHECK(out.ptr[i] == vals[i] + 1);
+#if defined(TENSORLIB_CUDA) && !defined(__APPLE__) && !defined(TENSORLIB_HOST_GPU)
+  // A mirrored backend has no host copy to bring the bytes into.
+  CHECK_THROWS_AS(gpu::sync_to_host(w.native, false), std::logic_error);
+#endif
+  // Released, its buffer must not come back to an alloc that promises a host
+  // pointer (the pools key by size alone).
+  const int64_t bytes = 256;
+  w = tl::storage::make_device(bytes / 4, bytes, tl::dtype::f32);
+  w = tl::storage{};
+  tl::storage s = tl::storage::make(bytes / 4);
+  REQUIRE(s.ptr != nullptr);
+  s.ptr[0] = 5.0f;
+  CHECK(s.ptr[0] == 5.0f);
+  tl::device_ = prev;
+}
+
 TEST_CASE("the KV cache and the decode step's kernels match their array forms") {
   // The model path runs on raw device buffers through gpu::, outside the lazy
   // graph; each kernel here is checked against the array composition that

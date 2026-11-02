@@ -50,6 +50,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -369,6 +370,13 @@ struct context {
   gpu::mirror_table<CUdeviceptr> mt;
 
   mirror* mirror_(void* native) { return mt.find(native); }
+  // The mirror of a buffer the host is about to read or write through its
+  // host copy. A device-only buffer (alloc_device) has none, and says so.
+  mirror* host_mirror_(void* native) {
+    mirror* m = mt.find(native);
+    if (m && !m->host) throw std::logic_error("tensorlib cuda: host access to a device-only buffer");
+    return m;
+  }
 
   // A kernel is about to touch this buffer as `a`: bring the host copy up if
   // residency says so. Async on the stream like the meta uploads (a blocking
@@ -1261,7 +1269,7 @@ using graph_exec = CUgraphExec;
 inline void upload(void* native, const float* src, int64_t n) {
   auto& c = context::get();
   if (!c.ready || !native) return;
-  context::mirror* m = c.mirror_(native);
+  context::mirror* m = c.host_mirror_(native);
   if (!m) return;
   size_t bytes = std::min((size_t)n * sizeof(float), m->bytes);
   if (src != m->host) std::memcpy(m->host, src, bytes);
@@ -1308,11 +1316,25 @@ inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
   return native;
 }
 
+// A device buffer with no host copy: filled by upload_bytes, read only by
+// kernels (a model's weights, which would otherwise sit in host memory twice).
+// A host access to it throws (sync_to_host). Never pooled: release frees it.
+inline void* alloc_device(int64_t bytes) {
+  auto& c = context::get();
+  if (!c.ready) return nullptr;
+  size_t nb = bytes > 0 ? (size_t)bytes : 4;
+  CUdeviceptr dev = 0;
+  if (c.d.MemAlloc(&dev, nb) != 0) return nullptr;
+  void* native = reinterpret_cast<void*>(dev);
+  c.mt.insert(native, dev, nullptr, nb, false);
+  return native;
+}
+
 inline void release(void* buf, int64_t, float*) {
   auto& c = context::get();
   if (!c.ready || !buf) return;
   if (!c.mt.release(buf)) {
-    c.d.MemFree(reinterpret_cast<CUdeviceptr>(buf));  // untracked (shouldn't happen); free outright
+    c.d.MemFree(reinterpret_cast<CUdeviceptr>(buf));  // device-only, or untracked
   }
 }
 
@@ -1325,7 +1347,7 @@ inline void release(void* buf, int64_t, float*) {
 inline void sync_to_host(void* native, bool for_write) {
   auto& c = context::get();
   if (!c.ready || !native) return;
-  context::mirror* m = c.mirror_(native);
+  context::mirror* m = c.host_mirror_(native);
   if (!m) return;
   if (m->live.before_host(for_write)) {
     if (c.pending) flush();

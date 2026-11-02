@@ -494,8 +494,19 @@ inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
   return buf;
 }
 
+// A buffer the host does not read: filled by upload_bytes, read only by
+// kernels (a model's weights). Unified memory makes it the same shared buffer
+// as alloc's, with no copy to save; what differs is that no host pointer is
+// handed out, so a host read of it fails here as it does on a mirrored backend.
+inline void* alloc_device(int64_t bytes) {
+  float* contents = nullptr;
+  return alloc(bytes, &contents, false);
+}
+
 inline void release(void* buf, int64_t bytes, float* contents) {
   auto& c = context::get();
+  // A device-only buffer came back without its contents; the pool hands them out.
+  if (!contents) contents = static_cast<float*>(objc::send(buf, "contents"));
   // The open buffer, if any, is the next to be numbered.
   c.free_bufs[bytes].push_back({buf, contents, c.pending ? c.submitted + (c.cb ? 1 : 0) : 0});
 }

@@ -233,18 +233,25 @@ struct mirror_table {
     return true;
   }
 
+  // A null `host` is a device-only buffer (alloc_device): it starts device-live,
+  // so no kernel ever uploads from a host copy it does not have.
   void insert(void* key, Handle dev, float* host, size_t bytes, bool host_fill) {
-    mirrors[key] = entry{host, std::move(dev), bytes, residency(host_fill)};
+    entry e{host, std::move(dev), bytes, residency(host_fill)};
+    if (!host) e.live.where = residency::device;
+    mirrors[key] = std::move(e);
   }
 
-  // Moves `native`'s entry into the free list, keyed by its size. False if
-  // `native` is not tracked (nothing to release).
+  // Moves `native`'s entry into the free list, keyed by its size. False when
+  // the caller frees the device buffer itself: `native` is not tracked, or it
+  // is device-only, which the pool never holds (it would hand a buffer with no
+  // host copy to an alloc that promises one).
   bool release(void* native) {
     auto it = mirrors.find(native);
     if (it == mirrors.end()) return false;
-    pool[it->second.bytes].push_back({it->second.dev, it->second.host});
+    const bool pooled = it->second.host != nullptr;
+    if (pooled) pool[it->second.bytes].push_back({it->second.dev, it->second.host});
     mirrors.erase(it);
-    return true;
+    return pooled;
   }
 };
 

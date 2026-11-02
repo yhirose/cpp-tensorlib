@@ -10,7 +10,8 @@
 //   backend   the selected backend header, reached through the using-directive
 //             below. What a backend provides, its device core:
 //               lifecycle  available / pending / flush / cpu_barrier
-//               memory     alloc / release / sync_to_host / upload
+//               memory     alloc / alloc_device / release / sync_to_host /
+//                          upload / upload_bytes
 //               launch     dispatch(kernel, views, params, grid): the one way
 //                          a shared op runs a kernel; false for a kernel id the
 //                          backend has none for. has_kernel(kernel): whether

@@ -27,6 +27,9 @@ inline void cpu_barrier() {}             // before any host read of a buffer
 inline void* alloc(int64_t, float** /*contents*/, bool /*host_fill*/ = false) {
   return nullptr;  // null: storage falls back to the heap
 }
+// A buffer only kernels read and upload_bytes fills, with no host copy (a
+// model's weights). Null where the backend keeps none.
+inline void* alloc_device(int64_t) { return nullptr; }
 inline void release(void*, int64_t, float*) {}
 inline void sync_to_host(void*, bool /*for_write*/) {}  // before a host access
 inline void upload(void*, const float*, int64_t) {}     // stage host floats in

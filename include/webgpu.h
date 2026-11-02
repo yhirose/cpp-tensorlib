@@ -618,6 +618,10 @@ inline void release(void* buf, int64_t, float*) {
   else c.mt.release(buf);
 }
 
+// No device-only buffers: their one filler, upload_bytes, is a no-op here
+// (WebGPU stops at the array surface).
+inline void* alloc_device(int64_t) { return nullptr; }
+
 // Reconcile a buffer for a CPU access: flush pending kernels, then D2H if the
 // device holds the live copy. for_write invalidates the device copy (the host
 // is about to mutate it). No-op for heap storages / unknown handles.

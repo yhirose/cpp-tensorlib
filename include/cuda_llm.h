@@ -103,7 +103,7 @@ inline void graph_destroy(CUgraphExec e) {
 inline void upload_u32(void* native, unsigned val) {
   auto& c = context::get();
   if (!c.ready || !native) return;
-  context::mirror* m = c.mirror_(native);
+  context::mirror* m = c.host_mirror_(native);
   if (!m || m->bytes < 4) return;
   std::memcpy(m->host, &val, 4);
   c.d.MemcpyHtoD(m->dev, m->host, 4);

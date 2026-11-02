@@ -55,19 +55,24 @@ struct storage {
   // installed hook under TL_RUNTIME_HOOKS.
   static storage make_bytes_(int64_t elems, int64_t bytes, dtype dt,
                              bool host_fill = false) {
-    storage s;
-    s.size = elems;
-    s.dt = dt;
     int64_t nb = nonzero_(bytes);
     float* contents = nullptr;
-    if (void* mb = gpu::alloc(nb, &contents, host_fill)) {
-      s.native = mb;
-      s.ptr = contents;
-      s.buf = std::shared_ptr<void>(
-          mb, [nb, contents](void* p) { gpu::release(p, nb, contents); });
-      return s;
-    }
+    if (void* mb = gpu::alloc(nb, &contents, host_fill))
+      return device_bytes_(elems, mb, nb, contents, dt);
     return heap_bytes_(elems, nb, dt);
+  }
+
+  // A device buffer with no host copy (gpu::alloc_device): `ptr` is null, so
+  // the host never reads it, on any backend; gpu::upload_bytes fills it and
+  // only kernels read it. What a model keeps its weights in, so they sit in
+  // memory once. Throws where the backend keeps no such buffers (WebGPU, no
+  // device) or is out of device memory. Like make_bytes_, it names the
+  // backend, so it links one in only where it is called.
+  static storage make_device(int64_t elems, int64_t bytes, dtype dt) {
+    const int64_t nb = nonzero_(bytes);
+    void* mb = gpu::alloc_device(nb);
+    if (!mb) throw std::runtime_error("tensorlib: no device-only buffer (backend lacks them, or out of memory)");
+    return device_bytes_(elems, mb, nb, nullptr, dt);
   }
 
   // Plain elems x width in bytes; the allocators clamp the empty case. A
@@ -84,6 +89,20 @@ struct storage {
   // A zero-length allocation still needs a distinct, dereferenceable address —
   // and a device buffer of length 0 is invalid — so both allocators floor at 4.
   static int64_t nonzero_(int64_t bytes) { return bytes > 0 ? bytes : 4; }
+
+  // A backend buffer as a storage. `contents` is its host pointer, null for a
+  // device-only one; release gets back the (bytes, contents) alloc gave.
+  static storage device_bytes_(int64_t elems, void* mb, int64_t nb, float* contents,
+                               dtype dt) {
+    storage s;
+    s.size = elems;
+    s.dt = dt;
+    s.native = mb;
+    s.ptr = contents;
+    s.buf = std::shared_ptr<void>(
+        mb, [nb, contents](void* p) { gpu::release(p, nb, contents); });
+    return s;
+  }
 
   static storage heap_bytes_(int64_t elems, int64_t bytes, dtype dt) {
     storage s;

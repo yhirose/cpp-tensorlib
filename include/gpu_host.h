@@ -67,6 +67,9 @@ inline void* alloc(int64_t bytes, float** contents, bool /*host_fill*/ = false) 
   if (contents) *contents = static_cast<float*>(p);
   return p;
 }
+// Device memory the host does not read (a model's weights): here the same
+// memory, with no host pointer handed out.
+inline void* alloc_device(int64_t bytes) { return alloc(bytes, nullptr); }
 inline void release(void* buf, int64_t, float*) {
 #ifdef _WIN32
   _aligned_free(buf);
