@@ -41,6 +41,10 @@ inline bool dispatch(gpu::kop, const gpu::arg*, size_t, const void* /*params*/,
                      size_t /*params_bytes*/, const gpu::grid&) {
   return false;
 }
+// Whether a kernel id has a kernel on the device, whatever launches it
+// (dispatch, or an own op with arguments of its own). Every core id does on a
+// device backend (test_array.cpp checks it).
+inline bool has_kernel(gpu::kop) { return false; }
 
 // ---- the ops this backend runs its own way, as static members with the
 // signature the op has in gpu_ops.h. None.

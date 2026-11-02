@@ -181,6 +181,19 @@ TEST_CASE("clone of a strided view gathers the same elements on the device") {
   CHECK(matches_gpu_oracle([&] { return row.broadcast_to({4, 6}).clone(); }));
 }
 
+TEST_CASE("a device backend has a kernel for every core op") {
+  // The core layer (gpu_abi.h) is what every device backend runs on its
+  // device; an op it lacked would run on the CPU and pass every other test.
+  // A backend with no device kernels (null, the host reference) is skipped.
+  namespace gpu = tl::gpu;
+  if (!tl::gpu_available() || !gpu::has_kernel(gpu::kop::add)) return;
+  for (size_t i = 0; i < gpu::kKopCoreCount; i++) {
+    const auto k = static_cast<gpu::kop>(i);
+    INFO(gpu::kop_name(k));
+    CHECK(gpu::has_kernel(k));
+  }
+}
+
 TEST_CASE("a buffer freed under a queued kernel keeps its bytes until the kernel reads them") {
   // Each source dies as soon as its clone (a device copy, queued, not yet run)
   // is made, and the next source, the same size, may take its buffer from the

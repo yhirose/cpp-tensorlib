@@ -275,6 +275,23 @@ inline const char* kernel_name_(kop op) {
     case kop::sample_: return "tl_sample";
     case kop::merge_heads_: return "tl_merge_heads";
     case kop::split_heads_: return "tl_split_heads";
+    // The core ops this backend launches with arguments of their own (shape
+    // and stride meta, a reduction's partials), from own_core: their kernels,
+    // not ones dispatch's views and params fit.
+    case kop::pad: return "tl_pad";
+    case kop::concat_part_: return "tl_pad";  // a part placed as pad places it
+    case kop::fold: return "tl_fold";
+    case kop::index_add: return "tl_index_add";
+    case kop::scatter_axis: return "tl_scatter_axis";
+    case kop::badd_nd: return "tl_badd_nd";
+    case kop::bsub_nd: return "tl_bsub_nd";
+    case kop::bmul_nd: return "tl_bmul_nd";
+    case kop::bdiv_nd: return "tl_bdiv_nd";
+    case kop::bpow_nd: return "tl_bpow_nd";
+    case kop::where_nd: return "tl_where_nd";
+    case kop::copy_nd: return "tl_copy_nd";
+    case kop::sum_to_: return "tl_sum_to";
+    case kop::argmax_: return "tl_argmax";
     default: return nullptr;  // no kernel here: dispatch declines
   }
 }
@@ -603,53 +620,13 @@ struct context {
   CUfunction gemv_bf16_() { return cached_(gemv_bf16_fn, "tl_gemv_bf16"); }
   CUfunction gemv_bf16v8_() { return cached_(gemv_bf16v8_fn, "tl_gemv_bf16v8"); }
 
-  // im2col's pad/fold, cached like split_heads/merge_heads.
-  CUfunction pad_fn = nullptr, fold_fn = nullptr;
-  CUfunction pad_() { return cached_(pad_fn, "tl_pad"); }
-  CUfunction fold_() { return cached_(fold_fn, "tl_fold"); }
-
   // The f32 gemm's general fallback (the tiled fast path above, sgemm_(), has
   // its own names).
   CUfunction sgemm_fallback_fn = nullptr;
   CUfunction sgemm_fallback_() { return cached_(sgemm_fallback_fn, "tl_sgemm"); }
 
-  // Embedding-table lookup (index_select/index_add) and pooling-style
-  // one-hot scatter (scatter_to_axis), cached the same way.
-  CUfunction index_add_fn = nullptr, scatter_axis_fn = nullptr;
-  CUfunction index_add_() { return cached_(index_add_fn, "tl_index_add"); }
-  CUfunction scatter_axis_() {
-    return cached_(scatter_axis_fn, "tl_scatter_axis");
-  }
-
-  // N-D broadcast binary (any rank) and N-D broadcast ternary select
-  // (Tensor.where's GPU dispatch) -- new capabilities, one kernel per op
-  // like the rank-2 kop/fn_() vocabulary above, but not part of that
-  // vocabulary itself (fn_() caches one name per kop; these need a second,
-  // different name for the same op), so each gets its own cached
-  // CUfunction, dispatched by a small switch on the existing kop value.
-  CUfunction badd_nd_fn = nullptr, bsub_nd_fn = nullptr, bmul_nd_fn = nullptr,
-             bdiv_nd_fn = nullptr, bpow_nd_fn = nullptr, where_nd_fn = nullptr;
-  CUfunction bcast_nd_(kop op) {
-    switch (op) {
-      case kop::badd: return cached_(badd_nd_fn, "tl_badd_nd");
-      case kop::bsub: return cached_(bsub_nd_fn, "tl_bsub_nd");
-      case kop::bmul: return cached_(bmul_nd_fn, "tl_bmul_nd");
-      case kop::bdiv: return cached_(bdiv_nd_fn, "tl_bdiv_nd");
-      case kop::bpow: return cached_(bpow_nd_fn, "tl_bpow_nd");
-      default: return nullptr;
-    }
-  }
-  CUfunction where_nd_() { return cached_(where_nd_fn, "tl_where_nd"); }
-  // clone()'s strided arm (same meta layout as the bcast_nd family, one
-  // operand), so its own slot next to where_nd's.
-  CUfunction copy_nd_fn = nullptr;
-  CUfunction copy_nd_() { return cached_(copy_nd_fn, "tl_copy_nd"); }
-
-  // array.h's sum_to (un-broadcast a gradient) -- gather-based, its own
-  // meta-buffer layout (not the bcast_nd family's), so its own slot.
-  CUfunction sum_to_fn = nullptr;
-  CUfunction sum_to_() { return cached_(sum_to_fn, "tl_sum_to"); }
-  // The same reduction with a block per output, for a deep reduced range.
+  // sum_to's form with a block per output, for a deep reduced range (the op's
+  // own kernel is kernel_name_'s).
   CUfunction sum_to_blocked_fn = nullptr;
   CUfunction sum_to_blocked_() {
     return cached_(sum_to_blocked_fn, "tl_sum_to_blocked");
@@ -788,7 +765,6 @@ struct context {
   // back), then a (value, index) pair a block, argmax_blocks of each.
   static constexpr unsigned argmax_blocks = 128, argmax_pairs_at = 16;
   CUdeviceptr argmax_res = 0;
-  CUfunction argmax_fn = nullptr;
   CUdeviceptr argmax_res_() {
     if (!argmax_res) {
       const size_t bytes = argmax_pairs_at + 8 * argmax_blocks;
@@ -1225,7 +1201,7 @@ inline bool own_core::argmax_to(gpu::span a, int64_t n, gpu::span idx) {
   auto& c = context::get();
   if (!c.ready) return false;
   CUdeviceptr res = c.argmax_res_();
-  CUfunction f = c.cached_(c.argmax_fn, "tl_argmax");
+  CUfunction f = c.fn_(kop::argmax_);
   if (!res || !f) return false;
   c.device_read_(a.buf);
   c.device_write_(idx.buf);
@@ -1351,6 +1327,12 @@ inline bool dispatch(kop k, const gpu::arg* args, size_t n, const void* params,
   return c.dispatch_(c.fn_(k), args, n, params, params_bytes, g);
 }
 
+// Whether a kernel id has its kernel in the module (gpu.h's contract).
+inline bool has_kernel(kop k) {
+  auto& c = context::get();
+  return c.ready && c.fn_(k) != nullptr;
+}
+
 // Rank cap of the N-D ops (pad, fold, sum_to, ...): the per-axis arrays the
 // launchers below build their meta from. The kernels hold none (no local
 // memory), so only these and the other backends' kernels assume it. im2col's
@@ -1432,7 +1414,7 @@ inline bool own_core::binary_bcast_nd(kop op, gpu::span a, const int64_t* a_stri
   if (rank <= 0 || rank > kPadFoldMaxRank) return false;
   auto& c = context::get();
   if (!c.ready) return false;
-  CUfunction f = c.bcast_nd_(op);
+  CUfunction f = c.fn_(gpu::bcast_nd_of(op));
   if (!f) return false;
   c.device_read_(a.buf);
   c.device_read_(b.buf);
@@ -1470,7 +1452,7 @@ inline bool own_core::where_nd(gpu::span cond, const int64_t* c_strides, gpu::sp
   float* pb = context::off_(b.buf, b.off);
   float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(n);
-  return c.launch1d_(c.where_nd_(), un, pc, pa, pb, po, pmeta, rank, un);
+  return c.launch1d_(c.fn_(kop::where_nd), un, pc, pa, pb, po, pmeta, rank, un);
 }
 
 // N-D strided copy: clone()'s device arm for a view the flat one-input
@@ -1488,7 +1470,7 @@ inline bool own_core::copy_nd(gpu::span a, const int64_t* a_strides, gpu::span o
   float* pa = context::off_(a.buf, a.off);
   float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(n);
-  return c.launch1d_(c.copy_nd_(), un, pa, po, pmeta, rank, un);
+  return c.launch1d_(c.fn_(kop::copy_nd), un, pa, po, pmeta, rank, un);
 }
 
 // Gather-based GPU dispatch for array.h's sum_to (un-broadcast a gradient).
@@ -1504,7 +1486,7 @@ inline bool own_core::sum_to(gpu::span a, const int64_t* a_shape,
   if (rank <= 0 || rank > kPadFoldMaxRank) return false;
   auto& c = context::get();
   if (!c.ready) return false;
-  CUfunction f = c.sum_to_();
+  CUfunction f = c.fn_(kop::sum_to_);
   if (!f) return false;
   c.device_read_(a.buf);
   c.device_write_(out.buf);
@@ -1551,7 +1533,7 @@ inline bool own_core::pad(gpu::span a, gpu::span out, const int64_t* a_shape,
   float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(n);
   unsigned ushift = static_cast<unsigned>(before * out_strides[axis]);
-  return c.launch1d_(c.pad_(), un, pa, po, pmeta, rank, ushift, un);
+  return c.launch1d_(c.fn_(kop::pad), un, pa, po, pmeta, rank, ushift, un);
 }
 
 // unfold's inverse: scatter-add `a` (contiguous; its last dim is the sliding
@@ -1575,7 +1557,7 @@ inline bool own_core::fold(gpu::span a, gpu::span out, const int64_t* a_shape,
   float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(n);
   unsigned ustep = static_cast<unsigned>(step);
-  return c.launch1d_(c.fold_(), un, pa, po, pmeta, rank, axis, ustep, un);
+  return c.launch1d_(c.fn_(kop::fold), un, pa, po, pmeta, rank, axis, ustep, un);
 }
 
 // Writes `a` (contiguous) into `out_shape` at `before` along `axis`,
@@ -1600,7 +1582,7 @@ inline bool own_core::concat_part(gpu::span a, gpu::span out, const int64_t* a_s
   float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(n);
   unsigned ushift = static_cast<unsigned>(before * out_strides[axis]);
-  return c.launch1d_(c.pad_(), un, pa, po, pmeta, rank, ushift, un);
+  return c.launch1d_(c.fn_(kop::concat_part_), un, pa, po, pmeta, rank, ushift, un);
 }
 
 // index_select's dual: scatter-add `values` into `out` by row index.
@@ -1620,7 +1602,7 @@ inline bool own_core::index_add(gpu::span idx, gpu::span values, gpu::span out,
   float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(k * row_size);
   unsigned urow = static_cast<unsigned>(row_size);
-  return c.launch1d_(c.index_add_(), un, pidx, pv, po, urow, un);
+  return c.launch1d_(c.fn_(kop::index_add), un, pidx, pv, po, urow, un);
 }
 
 // One-hot scatter into a new trailing axis of size `size`: out[..., k] =
@@ -1642,7 +1624,7 @@ inline bool own_core::scatter_to_axis(gpu::span idx, gpu::span values, gpu::span
   float* po = context::off_(out.buf, out.off);
   unsigned un = static_cast<unsigned>(n);
   unsigned usize = static_cast<unsigned>(size);
-  return c.launch1d_(c.scatter_axis_(), un, pidx, pv, po, usize, un);
+  return c.launch1d_(c.fn_(kop::scatter_axis), un, pidx, pv, po, usize, un);
 }
 
 inline bool own_core::copy_f32(gpu::span from, gpu::span to, int64_t n) {

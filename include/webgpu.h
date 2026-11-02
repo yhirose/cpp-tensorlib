@@ -80,7 +80,9 @@ inline const char* wgsl_source_() {
 // selects the operation by (-1: the entry point has no OP), or no entry for an
 // id this backend has no kernel for. The counterpart of metal.h's and cuda.h's
 // kernel_name_; the OP values are the case labels of the family's switch in
-// the .wgsl.
+// the .wgsl. The ids after row_max are the core ops `own` launches with views
+// and params of their own (shape and stride meta): their kernels, which
+// dispatch's arguments do not fit.
 struct kernel {
   const char* entry = nullptr;
   int op = -1;
@@ -131,6 +133,21 @@ inline kernel kernel_(kop k) {
     case kop::layer_norm_: return {"layer_norm", -1};
     case kop::index_select: return {"index_select", -1};
     case kop::gather_axis_: return {"gather_axis", -1};
+
+    case kop::pad: return {"pad", -1};
+    case kop::fold: return {"fold", -1};
+    case kop::index_add: return {"index_add", -1};
+    case kop::scatter_axis: return {"scatter_axis", -1};
+    case kop::badd_nd: return {"ew_bcast_nd", 0};
+    case kop::bsub_nd: return {"ew_bcast_nd", 1};
+    case kop::bmul_nd: return {"ew_bcast_nd", 2};
+    case kop::bdiv_nd: return {"ew_bcast_nd", 3};
+    case kop::bpow_nd: return {"ew_bcast_nd", 4};
+    case kop::where_nd: return {"where_nd", -1};
+    case kop::copy_nd: return {"copy_nd", -1};
+    case kop::sum_to_: return {"sum_to", -1};
+    case kop::concat_part_: return {"concat_part", -1};
+    case kop::argmax_: return {"argmax", -1};
     default: return {};
   }
 }
@@ -661,6 +678,14 @@ inline bool dispatch(kop k, const gpu::arg* args, size_t n, const void* params,
   return c.launch_(p, args, n, params, params_bytes, g.gx, g.gy);
 }
 
+// Whether a kernel id has its kernel in the module (gpu.h's contract): its
+// pipeline builds.
+inline bool has_kernel(kop k) {
+  auto& c = context::get();
+  const kernel kn = kernel_(k);
+  return c.ready && kn.entry && c.pipeline_(kn.entry, kn.op) != nullptr;
+}
+
 namespace detail_ {
 
 // This backend's own kernels' params: 4-byte fields, which
@@ -698,6 +723,13 @@ inline bool launch_own_(const char* entry, int op,
   if (!c.ready) return false;
   return c.launch_(c.pipeline_(entry, op), args.begin(), args.size(), &p,
                    sizeof(P), g.gx, g.gy);
+}
+// The same for a kernel id's own kernel (kernel_).
+template <class P>
+inline bool launch_own_(kop k, std::initializer_list<gpu::arg> args, const P& p,
+                        const gpu::grid& g) {
+  const kernel e = kernel_(k);
+  return e.entry && launch_own_(e.entry, e.op, args, p, g);
 }
 
 }  // namespace detail_
@@ -815,7 +847,7 @@ inline bool own::pad(gpu::span a, gpu::span out, const int64_t* a_shape,
   gpu::span meta = meta_({{out_shape, rank}, {a_shape, rank}});
   if (!meta) return false;
   return detail_::launch_own_(
-      "pad", -1, {gpu::in(a), gpu::in(meta), gpu::out(out)},
+      kop::pad, {gpu::in(a), gpu::in(meta), gpu::out(out)},
       detail_::pad_params{u32(out_n), u32(rank), u32(axis), u32(before)},
       gpu::policy::flat(out_n));
 }
@@ -836,7 +868,7 @@ inline bool own::fold(gpu::span a, gpu::span out, const int64_t* a_shape,
   gpu::span meta = meta_({{out_shape, out_rank}, {a_shape, rank}});
   if (!meta) return false;
   return detail_::launch_own_(
-      "fold", -1, {gpu::in(a), gpu::in(meta), gpu::out(out)},
+      kop::fold, {gpu::in(a), gpu::in(meta), gpu::out(out)},
       detail_::fold_params{u32(out_n), u32(rank), u32(axis), u32(step)},
       gpu::policy::flat(out_n));
 }
@@ -850,7 +882,7 @@ inline bool own::index_add(gpu::span idx, gpu::span values, gpu::span out,
   using detail_::u32;
   if (out_n <= 0) return false;
   return detail_::launch_own_(
-      "index_add", -1, {gpu::in(idx), gpu::in(values), gpu::out(out)},
+      kop::index_add, {gpu::in(idx), gpu::in(values), gpu::out(out)},
       detail_::index_add_params{u32(out_n), u32(row_size), u32(k)},
       gpu::policy::flat(out_n));
 }
@@ -864,7 +896,7 @@ inline bool own::scatter_to_axis(gpu::span idx, gpu::span values, gpu::span out,
   const int64_t out_n = n * size;
   if (out_n <= 0) return false;
   return detail_::launch_own_(
-      "scatter_axis", -1, {gpu::in(idx), gpu::in(values), gpu::out(out)},
+      kop::scatter_axis, {gpu::in(idx), gpu::in(values), gpu::out(out)},
       detail_::scatter_axis_params{u32(out_n), u32(size)},
       gpu::policy::flat(out_n));
 }
@@ -887,7 +919,7 @@ inline bool own::binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
       meta_({{out_shape, rank}, {a_strides, rank}, {b_strides, rank}});
   if (!meta) return false;
   return detail_::launch_own_(
-      "ew_bcast_nd", kernel_(op).op,
+      gpu::bcast_nd_of(op),
       {gpu::in(a), gpu::in(b), gpu::in(meta), gpu::out(out)},
       detail_::bcast_nd_params{u32(n), u32(rank), scale, offset},
       gpu::policy::flat(n));
@@ -905,7 +937,7 @@ inline bool own::where_nd(gpu::span cond, const int64_t* c_strides, gpu::span a,
                           {a_strides, rank}, {b_strides, rank}});
   if (!meta) return false;
   return detail_::launch_own_(
-      "where_nd", -1,
+      kop::where_nd,
       {gpu::in(cond), gpu::in(a), gpu::in(b), gpu::in(meta), gpu::out(out)},
       detail_::where_nd_params{u32(n), u32(rank)}, gpu::policy::flat(n));
 }
@@ -918,7 +950,7 @@ inline bool own::copy_nd(gpu::span a, const int64_t* a_strides, gpu::span out,
   if (rank <= 0 || rank > kPadFoldMaxRank || n <= 0) return false;
   gpu::span meta = meta_({{out_shape, rank}, {a_strides, rank}});
   if (!meta) return false;
-  return detail_::launch_own_("copy_nd", -1, {gpu::in(a), gpu::in(meta), gpu::out(out)},
+  return detail_::launch_own_(kop::copy_nd, {gpu::in(a), gpu::in(meta), gpu::out(out)},
                               detail_::copy_nd_params{u32(n), u32(rank)},
                               gpu::policy::flat(n));
 }
@@ -934,7 +966,7 @@ inline bool own::sum_to(gpu::span a, const int64_t* a_shape,
   gpu::span meta = meta_({{a_shape, rank}, {a_strides, rank}, {acc, rank}});
   if (!meta) return false;
   return detail_::launch_own_(
-      "sum_to", -1, {gpu::in(a), gpu::in(meta), gpu::out(out)},
+      kop::sum_to_, {gpu::in(a), gpu::in(meta), gpu::out(out)},
       detail_::sum_to_params{u32(out_n), u32(rank), u32(reduced_n)},
       gpu::policy::flat(out_n));
 }
@@ -956,7 +988,7 @@ inline bool own::concat_part(gpu::span a, gpu::span out, const int64_t* a_shape,
   gpu::span meta = meta_({{a_shape, rank}, {out_strides, rank}});
   if (!meta) return false;
   return detail_::launch_own_(
-      "concat_part", -1, {gpu::in(a), gpu::in(meta), gpu::out(out)},
+      kop::concat_part_, {gpu::in(a), gpu::in(meta), gpu::out(out)},
       detail_::concat_params{u32(n), u32(rank), u32(before * out_strides[axis])},
       gpu::policy::flat(n));
 }
@@ -981,7 +1013,7 @@ inline bool own::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
 // The argmax of a length-n vector (the WGSL argmax: one workgroup, the
 // smallest index on ties), its index an f32 at idx[0].
 inline bool own::argmax_to(gpu::span a, int64_t n, gpu::span idx) {
-  return detail_::launch_own_("argmax", -1, {gpu::in(a), gpu::out(idx)},
+  return detail_::launch_own_(kop::argmax_, {gpu::in(a), gpu::out(idx)},
                               detail_::argmax_params{detail_::u32(n)},
                               gpu::grid{});  // one workgroup
 }

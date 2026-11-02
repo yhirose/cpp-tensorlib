@@ -13,7 +13,8 @@
 //               memory     alloc / release / sync_to_host / upload
 //               launch     dispatch(kernel, views, params, grid): the one way
 //                          a shared op runs a kernel; false for a kernel id the
-//                          backend has none for
+//                          backend has none for. has_kernel(kernel): whether
+//                          the device has one, however it is launched
 //               own        the ops it runs its own way (a different algorithm,
 //                          several kernels, a host round trip), as static
 //                          members of `struct own` with the shared signature.

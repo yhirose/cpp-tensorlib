@@ -90,6 +90,19 @@ inline constexpr layer kop_layer(kop k) {
                                            : layer::llm;
 }
 
+// The N-D broadcast id of a rank-2 one (badd..bpow): the same operation at any
+// rank. Any other id is returned as it is.
+inline constexpr kop bcast_nd_of(kop op) {
+  switch (op) {
+    case kop::badd: return kop::badd_nd;
+    case kop::bsub: return kop::bsub_nd;
+    case kop::bmul: return kop::bmul_nd;
+    case kop::bdiv: return kop::bdiv_nd;
+    case kop::bpow: return kop::bpow_nd;
+    default: return op;
+  }
+}
+
 // Comparisons (gt/lt/ge/le/eq/ne), the extra unaries and the tensor-scalar
 // ops are their own small vocabularies rather than kop values: each arrived
 // on one backend ahead of the others, and an op keyed by its own enum can be

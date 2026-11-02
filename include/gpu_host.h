@@ -490,6 +490,10 @@ inline bool kernel_(kop k, const gpu::arg* v, const void* params,
   }
 }
 
+// No device kernels: this backend's are loops on the CPU (gpu_null.h has the
+// contract).
+inline bool has_kernel(kop) { return false; }
+
 // A kernel that ran is a row under tl::profile, as on any backend.
 inline bool dispatch(kop k, const gpu::arg* v, size_t /*n*/, const void* params,
                      size_t /*params_bytes*/, const gpu::grid& g) {

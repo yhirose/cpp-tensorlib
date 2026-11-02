@@ -567,6 +567,19 @@ inline void dispatch_grid_(objc::id enc, mtl_size grid, mtl_size tg) {
 
 }  // namespace detail_
 
+// Whether a kernel id has its kernel in the library (gpu.h's contract): its
+// pipeline builds.
+inline bool has_kernel(kop k) {
+  auto& c = context::get();
+  const char* name = context::kernel_name_(k);
+  if (!c.device || !*name) return false;
+  try {
+    return c.pso_id_(static_cast<int>(k), name) != nullptr;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
 // The device core's one way to run a kernel (gpu_abi.h has the contract):
 // view i goes to buffer index i at its byte offset, the params follow at index
 // n, and the grid is threadgroups x threads. Encodes without committing.
@@ -897,22 +910,6 @@ struct copy_nd_params {
   uint32_t rank;
   uint32_t n;
 };
-
-// binary_bcast_nd's incoming `op` is one of the rank-2 kop values (badd etc,
-// shared with binary_bcast() above -- array.h's gpu_binary_bcast_nd_ passes
-// the same `bk` either kernel would take); map it to its own PSO/kernel name
-// here rather than caching the N-D kernel under the rank-2 op's slot in
-// context::psos, which pso_id_ keys by this same enum value.
-inline kop to_nd_(kop op) {
-  switch (op) {
-    case kop::badd: return kop::badd_nd;
-    case kop::bsub: return kop::bsub_nd;
-    case kop::bmul: return kop::bmul_nd;
-    case kop::bdiv: return kop::bdiv_nd;
-    case kop::bpow: return kop::bpow_nd;
-    default: return op;
-  }
-}
 }  // namespace detail_
 
 // N-D broadcast binary: generalizes binary_bcast() above to any rank (a
@@ -927,7 +924,9 @@ inline bool own_core::binary_bcast_nd(kop op, gpu::span a, const int64_t* a_stri
                                  float offset) {
   auto& c = context::get();
   if (!c.device || rank <= 0 || rank > kPadFoldMaxRank) return false;
-  c.bind_(detail_::to_nd_(op));
+  // op is a rank-2 id (badd..bpow), as binary_bcast() takes: its N-D kernel
+  // is its own pipeline, not one cached under the rank-2 id.
+  c.bind_(gpu::bcast_nd_of(op));
   detail_::set_buf_(c.enc, a, 0ul);
   detail_::set_buf_(c.enc, b, 1ul);
   detail_::set_buf_(c.enc, out, 2ul);
