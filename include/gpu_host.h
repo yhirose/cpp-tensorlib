@@ -506,16 +506,7 @@ struct own {
   // The argmax of a length-n vector, the smallest index on ties: the device
   // kernels' scan (cuda's tl_argmax, metal's argmax_) as one loop.
   static bool argmax(gpu::span a, int64_t n, int64_t* out_idx) {
-    const float* A = view<const float>(a);
-    float best = -3.402823466e+38f;
-    int64_t besti = 0;
-    for (int64_t i = 0; i < n; i++) {
-      if (A[i] > best) {
-        best = A[i];
-        besti = i;
-      }
-    }
-    *out_idx = besti;
+    *out_idx = gpu::argmax_ref(view<const float>(a), n);
     gpu::launched("argmax");
     return true;
   }
@@ -540,6 +531,14 @@ struct own {
     int64_t i = 0;
     if (!argmax(a, n, &i)) return false;
     *view<float>(idx) = static_cast<float>(i);
+    return true;
+  }
+  // sample_ref's token as an f32 at idx[0], the draw counter advanced.
+  static bool sample_to(gpu::span a, int64_t n, const gpu::sampling& s, gpu::span counter,
+                        gpu::span idx) {
+    uint32_t* c = view<uint32_t>(counter);
+    *view<float>(idx) = static_cast<float>(gpu::sample_ref(view<const float>(a), n, s, (*c)++));
+    gpu::launched("sample");
     return true;
   }
   // C(m,n) = (A @ B) * scale + offset; a transposed operand is read in place.
