@@ -361,15 +361,16 @@ On an RTX 3090, Qwen2.5-0.5B (F16 GGUF, bf16 weight storage):
 
 Decode started at 3.5 tok/s and reached ~460 by removing host-side graph
 construction, then per-launch overhead, then GEMV inefficiency. Against
-llama.cpp on the same files and GPU, decode is at parity or ahead for
-Qwen2.5, Qwen3 and Qwen3.5, with or without 2048 tokens cached, and prefill
-is at parity at 512 tokens and up to 1.3x behind with 2048 cached (both sum the
-prefill's products in f16 by default):
+llama.cpp on the same files and GPU, decode is ahead for Qwen2.5, Qwen3 and
+Qwen3.5 (1.05-1.4x), with or without 2048 tokens cached, and prefill is ahead
+at 512 tokens (1.1-1.3x) and with 2048 cached on all but Qwen3, where it is
+level (both sum the prefill's products in f16 by default):
 [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md) has the numbers,
 what differs between the two runs, and how to reproduce them. Quantized files
 prefill their Q4_K and Q8_0 projections on the int8 tensor cores, the activation
 rounded to 8 bits as llama.cpp's MMQ does (`TL_NO_MMQ=1` takes an f16 path
-instead), and are level with or ahead of llama.cpp there, Qwen3.8-27B included.
+instead), and are ahead of llama.cpp there but for Qwen3.8-27B's prefill
+(0.94-0.97x); its decode is ahead too.
 
 Prefill is a different regime and was slower than decode for a long time,
 because the prompt was fed through the decode path one token at a time. Its

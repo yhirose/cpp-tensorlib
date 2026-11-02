@@ -7,40 +7,41 @@ already cached when the test started.
 
 ## Results
 
-RTX 3090, driver 610.88, WSL2; tensorlib `a0a0d43`, llama.cpp `19cce6919` (2026-10-27), built with
-`-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86`. tok/s; this library's column
-is the median of 5 runs, llama.cpp's the mean of 5 (what `llama-bench` prints).
-Each row is two runs of each engine, alternated, and the range is given: llama.cpp's
-decode moved by up to 5% between invocations here and its prefill by up to 10%
-(Qwen2.5's pp512 has an sd of 9-11% within a run), so the ratios there are soft.
+RTX 3090, driver 610.88, WSL2; tensorlib `2782b61` (Qwen3.5-0.8B BF16: `cdc5fdf`,
+whose DeltaNet conv is a little faster), llama.cpp `19cce6919`, built with
+`-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86`; measured 2026-11-02. tok/s; this
+library's column is the median of 5 runs, llama.cpp's the mean of 5 (what
+`llama-bench` prints). Each row is two runs of each engine, alternated, and the
+range is given: llama.cpp's decode moved by up to 5% between invocations here and
+its prefill by up to 10% (Qwen2.5's pp512 has an sd of 9-16% within a run), so
+the ratios there are soft.
 
 | model (GGUF) | test | tensorlib | llama.cpp | ratio |
 |---|---|---:|---:|---:|
-| Qwen2.5-0.5B-Instruct F16 | tg128 | 486 | 462-464 | 1.05 |
-|  | tg128 @ d2048 | 444 | 455-456 | 0.97-0.98 |
-|  | pp512 | 58,924-59,535 | 51,289-51,560 | 1.14-1.16 |
-|  | pp512 @ d2048 | 47,164-47,713 | 43,366-43,982 | 1.08-1.10 |
-| Qwen3-0.6B F16 | tg128 | 418 | 378-385 | 1.09-1.11 |
-|  | tg128 @ d2048 | 352 | 344 | 1.03 |
-|  | pp512 | 40,442-40,573 | 39,014-40,046 | 1.01-1.04 |
-|  | pp512 @ d2048 | 28,324-28,447 | 31,012-31,324 | 0.90-0.92 |
-| Qwen3.5-0.8B F16 | tg128 | 393 | 310 | 1.27 |
-|  | tg128 @ d2048 | 383 | 294-310 | 1.24-1.30 |
-|  | pp512 | 30,718-30,950 | 28,655-29,250 | 1.05-1.08 |
-|  | pp512 @ d2048 | 26,802-27,111 | 28,074-28,133 | 0.95-0.97 |
-| Qwen3.5-0.8B BF16 | tg128 | 388 | 296 | 1.31 |
-|  | tg128 @ d2048 | 379-383 | 304-308 | 1.24-1.26 |
-|  | pp512 | 29,025-29,903 | 25,181-25,248 | 1.15-1.19 |
-|  | pp512 @ d2048 | 27,219-27,467 | 24,341-24,412 | 1.12-1.13 |
+| Qwen2.5-0.5B-Instruct F16 | tg128 | 510-512 | 469-470 | 1.09 |
+|  | tg128 @ d2048 | 471-472 | 448 | 1.05 |
+|  | pp512 | 60,681-60,821 | 50,265-51,104 | 1.19-1.21 |
+|  | pp512 @ d2048 | 48,679-48,810 | 43,513-45,155 | 1.08-1.12 |
+| Qwen3-0.6B F16 | tg128 | 426-428 | 382-386 | 1.10-1.12 |
+|  | tg128 @ d2048 | 379-381 | 350-359 | 1.06-1.09 |
+|  | pp512 | 45,943-46,566 | 39,840-40,284 | 1.14-1.17 |
+|  | pp512 @ d2048 | 31,970-32,071 | 32,217-32,243 | 0.99-1.00 |
+| Qwen3.5-0.8B F16 | tg128 | 424-425 | 300-314 | 1.35-1.42 |
+|  | tg128 @ d2048 | 413-416 | 313-314 | 1.31-1.33 |
+|  | pp512 | 34,085-35,374 | 30,254-30,258 | 1.13-1.17 |
+|  | pp512 @ d2048 | 30,934-31,137 | 28,769-28,929 | 1.07-1.08 |
+| Qwen3.5-0.8B BF16 | tg128 | 407-408 | 295-298 | 1.37-1.38 |
+|  | tg128 @ d2048 | 397-399 | 283-293 | 1.36-1.41 |
+|  | pp512 | 31,663-31,933 | 24,742-25,008 | 1.27-1.29 |
+|  | pp512 @ d2048 | 30,331-30,629 | 23,603-23,782 | 1.28-1.30 |
 
-Decode is at parity or ahead on every model, with or without 2048 tokens
-cached. Until the decode attention overlapped its key loads and split its
-keys finer (2026-10-27), Qwen2.5 trailed by 18% at depth: a block's warps
-walked ~64 keys each in series, one load at a time.
+Decode is ahead on every model, with or without 2048 tokens cached. Until the
+decode attention overlapped its key loads and split its keys finer
+(2026-10-27), Qwen2.5 trailed by 18% at depth: a block's warps walked ~64 keys
+each in series, one load at a time.
 
-Prefill is ahead on Qwen2.5 and both Qwen3.5 files, level at 512 tokens on
-Qwen3, and 3-10% behind with 2048 tokens cached on Qwen3 and Qwen3.5 F16 (those
-rows were measured before the DeltaNet prep moved onto the tensor cores). Like llama.cpp, it sums the GEMMs in f16 by default (below). Its
+Prefill is ahead on every file at 512 tokens, and with 2048 tokens cached on
+all but Qwen3, where it is level. Like llama.cpp, it sums the GEMMs in f16 by default (below). Its
 GEMM and its attention run on the tensor cores. The GEMM is `mma.sync` over
 `ldmatrix` with two shared-memory stages (two blocks share an SM, which beat
 deeper pipelines); the weights are converted to f16 as a block stages them, and
@@ -63,19 +64,31 @@ decode GEMVs read them as they lie, dequantizing as ggml does (bit for bit,
 checked over every quantized value of Qwen3.8-27B's file), and the prefill
 multiplies Q4_K and Q8_0 on the int8 tensor cores (MMQ, below). The decode is
 bound by the bytes it reads, so this is what lets a 27B model's 17.7 GiB sit on a
-24 GB card. The tg rows are one invocation of each engine (3 rounds), not
-alternated; the pp rows are the alternated runs of the MMQ table below.
+24 GB card. Measured as the table above (same commits and day, two runs of
+each engine, alternated):
 
 | model (GGUF) | test | tensorlib | llama.cpp | ratio |
 |---|---|---:|---:|---:|
-| Qwen3-0.6B Q4_K_M | tg128 | 519 | 528 | 0.98 |
-| | pp512 | 41,400-41,500 | 32,000-32,500 | 1.27-1.30 |
-| Qwen3.5-0.8B Q4_K_M | tg128 | 500 | 439 | 1.14 |
-| | pp512 | 32,600-33,200 | 26,700-28,600 | 1.14-1.24 |
-| Qwen3.5-0.8B Q8_0 | tg128 | 469 | 389 | 1.20 |
-| | pp512 | 31,900-34,700 | 30,100-30,500 | 1.05-1.15 |
-| Qwen3.8-27B Q4_K_M | tg128 | 35.6 | 38.1 | 0.93 |
-| | pp512 | 1,534-1,605 | 1,334-1,684 | ~1.0 |
+| Qwen3-0.6B Q4_K_M | tg128 | 606-610 | 573-583 | 1.04-1.06 |
+| | tg128 @ d2048 | 521 | 498-506 | 1.03-1.05 |
+| | pp512 | 46,394-46,904 | 32,637-33,396 | 1.39-1.44 |
+| | pp512 @ d2048 | 31,696-32,082 | 26,509-27,119 | 1.17-1.21 |
+| Qwen3.5-0.8B Q4_K_M | tg128 | 648-650 | 477-482 | 1.34-1.36 |
+| | tg128 @ d2048 | 615-623 | 442-452 | 1.36-1.41 |
+| | pp512 | 34,196-34,263 | 27,482-28,321 | 1.21-1.25 |
+| | pp512 @ d2048 | 28,922-29,963 | 26,826-26,897 | 1.08-1.12 |
+| Qwen3.5-0.8B Q8_0 | tg128 | 582-586 | 415-417 | 1.40-1.41 |
+| | tg128 @ d2048 | 567-573 | 348-430 | 1.32-1.65 |
+| | pp512 | 35,894-36,027 | 30,188-30,427 | 1.18-1.19 |
+| | pp512 @ d2048 | 31,936-32,089 | 28,885-29,022 | 1.10-1.11 |
+| Qwen3.8-27B Q4_K_M | tg128 | 41.3-41.5 | 36.6-40.6 | 1.02-1.13 |
+| | tg128 @ d2048 | 40.3-40.4 | 36.3-36.5 | 1.10-1.11 |
+| | pp512 | 1,614-1,663 | 1,709-1,713 | 0.94-0.97 |
+| | pp512 @ d2048 | 1,585 | 1,661-1,682 | 0.94-0.95 |
+
+The 27B's prefill is the one row behind. llama.cpp's 27B decode and Qwen3.5
+Q8_0's decode at depth moved widely within a run here (an sd of 9 tok/s on the
+27B's ~37, and of 176 on Q8_0's), so those ratios are the softest.
 
 Qwen3.8-27B is a Qwen3.5 architecture: 64 layers, 48 of them Gated DeltaNet with
 16 q / k heads for 48 value heads (value head h reads key head h % 16, the order
@@ -126,8 +139,9 @@ without it (it adds 4%). Alternated, pp512:
 | Qwen3.8-27B Q4_K_M | 1,105-1,199 | 1,534-1,605 | 1,334-1,684 (median ~1,585) |
 
 On the 27B a 64-token chunk goes from 314 to 605 tok/s, where the dequantization
-is most of the work. llama.cpp's 27B pp512 moves by a quarter between runs here,
-so the ratio there is level, not better or worse.
+is most of the work. llama.cpp's 27B pp512 moved by a quarter between runs when
+this table was taken, so the ratio there was level; in the later runs above it
+held at ~1,710, 3-6% ahead.
 
 ## Accumulation precision
 
@@ -195,8 +209,9 @@ What is left there is mostly the GEMM: this library's runs at ~46% of the
   Half the bytes per step at depth: Qwen3-0.6B's cache is 470 MB at 2048 tokens
   in f32.
 - **Variance.** Within one invocation, llama.cpp's prefill rows vary by
-  5-10% here and this library's by 1-2%, decode by 1-2% on both. Between
-  invocations llama.cpp's decode moved by up to 5%, hence the ranges.
+  5-16% here and this library's by 1-2%, decode by 1-2% on both (llama.cpp's
+  on the 27B and on Qwen3.5 Q8_0 at depth by far more). Between invocations
+  llama.cpp's decode moved by up to 5%, hence the ranges.
 
 ## Reproducing
 
