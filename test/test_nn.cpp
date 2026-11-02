@@ -1252,28 +1252,32 @@ TEST_CASE("generic compositions agree with the fused kernels") {
 
   SUBCASE("the gated delta rule over a prefill: chunked against token by token") {
     // 77 tokens: past one chunk, with a partial last one. The chunked form
-    // regroups the same f32 sums, so the two agree to rounding, outputs and
-    // the state left behind.
-    const int64_t H = 16, dk = 128, dv = 128, C = 2 * H * dk + H * dv, T = 77;
-    const int64_t ld = 2 * H + 5;
-    array r = random_array({2 * H}, 1020);
-    r.eval();
-    std::vector<float> adt_h(r.raw(), r.raw() + 2 * H);
-    for (int64_t h = 0; h < H; h++) adt_h[h] = -std::fabs(adt_h[h]) - 0.1f;  // A < 0
-    array adt = dev(array::from(std::move(adt_h), {2 * H}));
-    array qkv = dev(random_array({T, C}, 1021)), ab = dev(random_array({T, ld}, 1022));
-    array S0 = dev(random_array({H, dk, dv}, 1023) * 0.1f), Sa = dev(S0), Sb = dev(S0);
-    array oa = array::empty({T, H * dv}), ob = array::empty({T, H * dv});
-    REQUIRE(gpu::gated_delta(qkv.device_span(), ab.device_span(), ld, adt.device_span(),
-                             Sa.device_span(), oa.device_span(), H, dk, dv, T, 1e-6f));
-    for (int64_t t = 0; t < T; t++) {
-      REQUIRE(gpu::gated_delta(qkv.device_span().at(t * C * 4), ab.device_span().at(t * ld * 4),
-                               0, adt.device_span(), Sb.device_span(),
-                               ob.device_span().at(t * H * dv * 4), H, dk, dv, 1, 1e-6f));
+    // regroups the same rule, so the two agree to rounding, outputs and the
+    // state left behind. Three head counts, so that the chunked kernel splits
+    // a head's value columns over 4, 2 and 1 blocks (32, 64 and 128 a block),
+    // the last two with fewer key heads than value heads.
+    for (const auto [H, Hk] : {std::pair<int64_t, int64_t>{16, 16}, {24, 8}, {48, 16}}) {
+      CAPTURE(H);
+      const int64_t dk = 128, dv = 128, C = 2 * Hk * dk + H * dv, T = 77, ld = 2 * H + 5;
+      array r = random_array({2 * H}, 1020);
+      r.eval();
+      std::vector<float> adt_h(r.raw(), r.raw() + 2 * H);
+      for (int64_t h = 0; h < H; h++) adt_h[h] = -std::fabs(adt_h[h]) - 0.1f;  // A < 0
+      array adt = dev(array::from(std::move(adt_h), {2 * H}));
+      array qkv = dev(random_array({T, C}, 1021)), ab = dev(random_array({T, ld}, 1022));
+      array S0 = dev(random_array({H, dk, dv}, 1023) * 0.1f), Sa = dev(S0), Sb = dev(S0);
+      array oa = array::empty({T, H * dv}), ob = array::empty({T, H * dv});
+      REQUIRE(gpu::gated_delta(qkv.device_span(), ab.device_span(), ld, adt.device_span(),
+                               Sa.device_span(), oa.device_span(), H, dk, dv, T, 1e-6f, Hk));
+      for (int64_t t = 0; t < T; t++) {
+        REQUIRE(gpu::gated_delta(qkv.device_span().at(t * C * 4), ab.device_span().at(t * ld * 4),
+                                 0, adt.device_span(), Sb.device_span(),
+                                 ob.device_span().at(t * H * dv * 4), H, dk, dv, 1, 1e-6f, Hk));
+      }
+      tl::gpu::flush();
+      CHECK(same(oa, ob, 1e-4f));
+      CHECK(same(Sa, Sb, 1e-4f));
     }
-    tl::gpu::flush();
-    CHECK(same(oa, ob, 1e-4f));
-    CHECK(same(Sa, Sb, 1e-4f));
   }
 
   SUBCASE("the gated delta rule with fewer key heads than value heads") {

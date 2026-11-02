@@ -364,310 +364,322 @@ extern "C" __global__ void tl_gated_delta(const float* __restrict__ qkv,
   }
 }
 
+}  // extern "C"
 // ---- The gated delta rule in chunks (a prefill's T tokens; the math of
-// gpu_ops.h gated_delta, regrouped). Within a chunk of C tokens with g_t the
+// gpu_ops_nn.h gated_delta, regrouped). Within a chunk of C tokens with g_t the
 // cumulative log-decay from its start, each token's correction
-// d_t = beta_t (v_t - k_t . S'_t) solves (I + A) D = beta V - beta e^g K h, h
-// the state entering the chunk and A_ts = beta_t e^(g_t - g_s) k_t . k_s for
-// s < t. With T = (I + A)^-1, W = T diag(beta e^g) K and U = T diag(beta) V:
-//   D = U - W h,  o_t = e^(g_t) q_t h + sum_{s<=t} (q_t . k_s) e^(g_t - g_s) d_s,
-//   h' = e^(g_C) h + sum_s e^(g_C - g_s) k_s d_s^T.
-// Everything but h is the chunk's own, so a first kernel builds it for every
-// (chunk, head) at once, and a second walks the chunks in order, a block a
-// (head, 32 columns of the state): a few small matrix products a chunk where
-// the per-token kernel had a dependent step a token. All f32; prep's products
-// (K K^T, Q K^T, T K, T V) run on the tensor cores as 3xTF32, f32's accuracy.
-#define TL_GDC 32  // tokens a chunk
-#define TL_GDC_SCAN_R 8  // state rows a lane holds in the scan (cuda.h repeats it)
-// An f32 split into two tf32s whose sum is the f32 (to ~2^-21), and the product
-// of two such pairs on the tensor cores: three m16n8k8 mmas (the small terms
-// first, the lo*lo one dropped), which keep f32's accuracy where one tf32 mma
-// would not. A and B fragments as the f16 m16n8k16's, in 8-deep steps.
-__device__ __forceinline__ void split_tf32_(float x, unsigned& hi, unsigned& lo) {
-  asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(hi) : "f"(x));
-  asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(lo) : "f"(x - __uint_as_float(hi)));
+// d_t = beta_t (v_t - k_t . S'_t) solves (I + A) D = beta (V - e^g K S), S the
+// state entering the chunk and A_ts = beta_t e^(g_t - g_s) k_t . k_s for s < t:
+//   o_t = e^(g_t) q_t S + sum_{s<=t} (q_t . k_s) e^(g_t - g_s) d_s,
+//   S' = e^(g_C) S + sum_s e^(g_C - g_s) k_s d_s^T.
+// One kernel, llama.cpp's gdn_single schedule on this layer's inputs: a block
+// owns V value columns of a head and walks the tokens in chunks of C = 16, its
+// state in mma accumulators the whole way. Each chunk normalizes its q and k
+// rows and makes its gates (as the per-token kernel does), then
+//   A = beta strict_tril(K K^T e^(g_t - g_s)), P = tril(Q K^T e^(g_t - g_s)),
+//   delta = beta (V - e^g K S), base = e^g Q S, D = (I + A)^-1 delta,
+//   out = base + P D, S' = e^(g_end) S + K^T (D e^(g_end - g)).
+// Every product is a warp's 16 x 8 output tile over its whole reduction (no
+// sum across warps), on the tensor cores as bf16 high / residual pairs in
+// three mmas, the residuals' product dropped: f32 operands to ~2^-16, f32
+// sums (about 7e-6 of an fp64 rule over 512 tokens). (I + A)^-1 is a row a
+// warp, back-substituted across lanes.
+namespace gdn_ {
+constexpr int DK = 128, C = 16, WARPS = 16, NT = WARPS * 32;
+
+// A matrix as bf16 high parts and the bf16 of their residuals, rows padded by
+// 8 so ldmatrix's 8 rows of 16 bytes span 32 banks (and stay 16-byte aligned).
+template <int R, int COLS>
+struct mat {
+  static constexpr int P = COLS + 8;
+  __nv_bfloat16 hi[R * P], lo[R * P];
+  __device__ __forceinline__ void store(int r, int c, float x) {
+    const int i = r * P + c;
+    const __nv_bfloat16 h = __float2bfloat16(x);
+    hi[i] = h;
+    lo[i] = __float2bfloat16(x - __bfloat162float(h));
+  }
+  __device__ __forceinline__ float get(int r, int c) const {
+    const int i = r * P + c;
+    return __bfloat162float(hi[i]) + __bfloat162float(lo[i]);
+  }
+};
+
+// The fragments of mma.m16n8k16 by ldmatrix: A's 16 x 16 at (r0, k0), and
+// B's 16 x 8 from its transpose Bt (n rows, k contiguous) at (n0, k0).
+template <int R, int COLS>
+__device__ __forceinline__ void ldm_a(unsigned* a, const mat<R, COLS>& m, bool low, int r0, int k0) {
+  const int lane = threadIdx.x & 31;
+  const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(
+      (low ? m.lo : m.hi) + (r0 + (lane & 15)) * m.P + k0 + 8 * (lane >> 4)));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+               : "r"(addr));
 }
-__device__ __forceinline__ void mma_tf32_(float* c, const unsigned* a, unsigned b0, unsigned b1) {
-  asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-    : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+template <int R, int COLS>
+__device__ __forceinline__ void ldm_b(unsigned* b, const mat<R, COLS>& m, bool low, int n0, int k0) {
+  const int lane = threadIdx.x & 31;
+  const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(
+      (low ? m.lo : m.hi) + (n0 + (lane & 7)) * m.P + k0 + 8 * ((lane >> 3) & 1)));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+               : "=r"(b[0]), "=r"(b[1])
+               : "r"(addr));
 }
-__device__ __forceinline__ void mma3_tf32_(float* c, const unsigned* ah, const unsigned* al, const unsigned* bh, const unsigned* bl) {
-  mma_tf32_(c, al, bh[0], bh[1]);
-  mma_tf32_(c, ah, bl[0], bl[1]);
-  mma_tf32_(c, ah, bh[0], bh[1]);
+__device__ __forceinline__ void mma_(float* c, const unsigned* a, unsigned b0, unsigned b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+      "{%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
-TL_ALIGN(tl_gated_delta_chunk_prep, 4, 4, 4, 4, 4, 8, 8)  // W, U by float2
-extern "C" __global__ void tl_gated_delta_chunk_prep(
-    const float* __restrict__ qkv, const float* __restrict__ ab,
-    const float* __restrict__ adt, float* __restrict__ Qn, float* __restrict__ Kn,
-    float* __restrict__ W, float* __restrict__ U, float* __restrict__ P,
-    float* __restrict__ G, unsigned H, unsigned dv, unsigned T, unsigned ab_ld,
-    float eps, unsigned Hk) {
-  constexpr int C = TL_GDC, DK = 128;
-  // 256 threads: the K K^T / Q K^T tiles below are one per warp of eight. The rows
-  // are padded by 4 so a fragment's 8 rows x 4 columns fall in 32 distinct banks.
-  __shared__ float Qs[C][DK + 4], Ks[C][DK + 4];  // Qs later holds V
-  __shared__ float Am[C][C + 1], Tm[C][C + 1];
-  __shared__ float gs[C], bs[C], bg[C];  // bg = beta e^g
-  const unsigned c = blockIdx.x, h = blockIdx.y, tid = threadIdx.x, NTH = blockDim.x;
-  const unsigned warp = tid >> 5, lane = tid & 31, NW = NTH >> 5;
-  const unsigned t0 = c * C, n = min((unsigned)C, T - t0);
-  const size_t nq = (size_t)Hk * DK, Cq = 2 * nq + (size_t)H * dv;
-  const size_t hk = h % Hk;         // the key head this value head reads
-  const size_t hb = (size_t)h * T;  // this head's first row in the scratch
-  // q and k, L2-normalized (q also over sqrt(DK)); rows past the chunk zero.
-  for (unsigned t = warp; t < C; t += NW) {
-    float a[DK / 32], b[DK / 32], sq = 0.0f, sk = 0.0f;
+// c[16 x 8] += A[r0.., 0..K) B, B given as Bt[n0.., 0..K): the residual terms
+// first.
+template <int K, int AR, int AC, int BR, int BC>
+__device__ __forceinline__ void product(float* c, const mat<AR, AC>& A, int r0,
+                                        const mat<BR, BC>& Bt, int n0) {
 #pragma unroll
-    for (int r = 0; r < DK / 32; r++) {
-      const unsigned d = lane + 32 * r;
-      a[r] = t < n ? qkv[(t0 + t) * Cq + hk * DK + d] : 0.0f;
-      b[r] = t < n ? qkv[(t0 + t) * Cq + nq + hk * DK + d] : 0.0f;
-      sq += a[r] * a[r];
-      sk += b[r] * b[r];
-    }
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-      sq += __shfl_xor_sync(0xffffffffu, sq, off);
-      sk += __shfl_xor_sync(0xffffffffu, sk, off);
-    }
-    const float qn = 1.0f / sqrtf(sq + eps) / sqrtf((float)DK), kn = 1.0f / sqrtf(sk + eps);
-#pragma unroll
-    for (int r = 0; r < DK / 32; r++) {
-      const unsigned d = lane + 32 * r;
-      Qs[t][d] = a[r] * qn;
-      Ks[t][d] = b[r] * kn;
-      if (t < n) {
-        Qn[(hb + t0 + t) * DK + d] = a[r] * qn;
-        Kn[(hb + t0 + t) * DK + d] = b[r] * kn;
-      }
-    }
-  }
-  // The gates, then g's running sum over the chunk.
-  if (tid < C) {
-    float la = 0.0f, be = 0.0f;
-    if (tid < n) {
-      const float* abt = ab + (size_t)(t0 + tid) * ab_ld;
-      const float x = abt[h] + adt[H + h];
-      la = adt[h] * (x > 20.0f ? x : log1pf(expf(x)));
-      be = 1.0f / (1.0f + expf(-abt[H + h]));
-    }
-    gs[tid] = la;
-    bs[tid] = be;
-  }
-  __syncthreads();
-  if (tid == 0) {
-    float acc = 0.0f;
-    for (int t = 0; t < C; t++) gs[t] = (acc += gs[t]);
-  }
-  __syncthreads();
-  if (tid < n) G[hb + t0 + tid] = gs[tid];
-  if (tid < C) bg[tid] = bs[tid] * expf(gs[tid]);
-  // A (strictly lower) and P (lower with the diagonal): K K^T and Q K^T on the
-  // tensor cores (3xTF32), a warp an m16n8 tile of both.
-  {
-    const unsigned g = lane >> 2, tq = lane & 3, i = warp >> 2, j = warp & 3;
-    const unsigned r0 = 16 * i + g, r1 = r0 + 8, nn = 8 * j + g;
-    float ckk[4] = {0, 0, 0, 0}, cqk[4] = {0, 0, 0, 0};
-    for (unsigned k0 = 0; k0 < DK; k0 += 8) {
-      unsigned bh[2], bl[2];
-      split_tf32_(Ks[nn][k0 + tq], bh[0], bl[0]);
-      split_tf32_(Ks[nn][k0 + tq + 4], bh[1], bl[1]);
-      unsigned ah[4], al[4];
-      split_tf32_(Ks[r0][k0 + tq], ah[0], al[0]);
-      split_tf32_(Ks[r1][k0 + tq], ah[1], al[1]);
-      split_tf32_(Ks[r0][k0 + tq + 4], ah[2], al[2]);
-      split_tf32_(Ks[r1][k0 + tq + 4], ah[3], al[3]);
-      mma3_tf32_(ckk, ah, al, bh, bl);
-      split_tf32_(Qs[r0][k0 + tq], ah[0], al[0]);
-      split_tf32_(Qs[r1][k0 + tq], ah[1], al[1]);
-      split_tf32_(Qs[r0][k0 + tq + 4], ah[2], al[2]);
-      split_tf32_(Qs[r1][k0 + tq + 4], ah[3], al[3]);
-      mma3_tf32_(cqk, ah, al, bh, bl);
-    }
-#pragma unroll
-    for (int e = 0; e < 4; e++) {
-      const unsigned t = (e < 2 ? r0 : r1), sc = 8 * j + 2 * tq + (e & 1);
-      const float dec = sc <= t && t < n ? expf(gs[t] - gs[sc]) : 0.0f;
-      const float kk = sc <= t && t < n ? ckk[e] : 0.0f, qk = sc <= t && t < n ? cqk[e] : 0.0f;
-      Am[t][sc] = sc < t ? bs[t] * dec * kk : 0.0f;
-      P[((size_t)h * gridDim.x + c) * C * C + t * C + sc] = qk * dec;
-    }
-  }
-  __syncthreads();
-  // T = (I + A)^-1 by forward substitution, a warp a pass: row t is e_t minus
-  // A[t][s] times row s for every s < t.
-  if (warp == 0) {
-    for (unsigned t = 0; t < C; t++) {
-      float v = lane == t ? 1.0f : 0.0f;
-      for (unsigned sc = 0; sc < t; sc++) v -= Am[t][sc] * Tm[sc][lane];
-      Tm[t][lane] = v;
-      __syncwarp();
-    }
-  }
-  // V into Qs, whose q is spent.
-  for (unsigned e = tid; e < C * dv; e += NTH) {
-    const unsigned t = e / dv, d = e % dv;
-    Qs[t][d] = t < n ? qkv[(t0 + t) * Cq + 2 * nq + (size_t)h * dv + d] : 0.0f;
-  }
-  __syncthreads();
-  // W = T diag(beta e^g) K and U = T diag(beta) V on the tensor cores.
-  {
-    const unsigned g = lane >> 2, tq = lane & 3;
-    const unsigned nt = dv / 8;  // n8 tiles a matrix (dk = 128 >= dv)
-    for (unsigned job = warp; job < 2 * 2 * nt; job += NW) {
-      const unsigned mat = job / (2 * nt), i = (job / nt) & 1, nj = job % nt;
-      const float* sc = mat ? bs : bg;
-      const unsigned r0 = 16 * i + g, r1 = r0 + 8;
-      float cc[4] = {0, 0, 0, 0};
-      for (unsigned k0 = 0; k0 < C; k0 += 8) {
-        unsigned ah[4], al[4], bh[2], bl[2];
-        split_tf32_(Tm[r0][k0 + tq] * sc[k0 + tq], ah[0], al[0]);
-        split_tf32_(Tm[r1][k0 + tq] * sc[k0 + tq], ah[1], al[1]);
-        split_tf32_(Tm[r0][k0 + tq + 4] * sc[k0 + tq + 4], ah[2], al[2]);
-        split_tf32_(Tm[r1][k0 + tq + 4] * sc[k0 + tq + 4], ah[3], al[3]);
-        const float(*X)[DK + 4] = mat ? Qs : Ks;
-        split_tf32_(X[k0 + tq][8 * nj + g], bh[0], bl[0]);
-        split_tf32_(X[k0 + tq + 4][8 * nj + g], bh[1], bl[1]);
-        mma3_tf32_(cc, ah, al, bh, bl);
-      }
-      float* dst = mat ? U : W;
-      const unsigned ld = mat ? dv : DK, col = 8 * nj + 2 * tq;
-      if (r0 < n) *reinterpret_cast<float2*>(dst + (hb + t0 + r0) * ld + col) = make_float2(cc[0], cc[1]);
-      if (r1 < n) *reinterpret_cast<float2*>(dst + (hb + t0 + r1) * ld + col) = make_float2(cc[2], cc[3]);
-    }
+  for (int k0 = 0; k0 < K; k0 += 16) {
+    unsigned ah[4], al[4], bh[2], bl[2];
+    ldm_a(ah, A, false, r0, k0);
+    ldm_a(al, A, true, r0, k0);
+    ldm_b(bh, Bt, false, n0, k0);
+    ldm_b(bl, Bt, true, n0, k0);
+    mma_(c, al, bh[0], bh[1]);
+    mma_(c, ah, bl[0], bl[1]);
+    mma_(c, ah, bh[0], bh[1]);
   }
 }
-// The chunks in order, a block a (head, 32 state columns): DK/R warps, warp w
-// holding rows R*w.. of its lane's column in registers as the decode kernel
-// does, and each chunk's W, q and k rows staged in turn through one buffer.
-// Each chunk is a chain of dependent steps with a barrier between, so the time
-// is the chain's latency, not the arithmetic: R = 8 puts 16 warps on the SM's
-// four schedulers where R = 32 left one each (the scan took 260 us against 170
-// at T = 512). The tile is dynamic shared memory, TL_GDC_SCAN_SMEM bytes; the
-// launcher (own::gated_delta_chunked) must raise the limit and match R.
-TL_ALIGN(tl_gated_delta_chunk_scan, 16, 16, 16)  // Qn, Kn, W by float4
-extern "C" __global__ void tl_gated_delta_chunk_scan(
-    const float* __restrict__ Qn, const float* __restrict__ Kn,
-    const float* __restrict__ W, const float* __restrict__ U,
-    const float* __restrict__ P, const float* __restrict__ G,
-    float* __restrict__ state, float* __restrict__ out, unsigned H, unsigned dv,
-    unsigned T) {
-  constexpr int C = TL_GDC, DK = 128, R = TL_GDC_SCAN_R, NW = DK / R, NT = NW * 32;
-  static_assert(C * C % NT == 0, "the P tile splits evenly over the block");
-  extern __shared__ __align__(16) float smx[];
-  float(*Buf)[DK] = reinterpret_cast<float(*)[DK]>(smx);
-  float(*red)[C][32] = reinterpret_cast<float(*)[C][32]>(smx + C * DK);
-  float(*Dl)[32] = reinterpret_cast<float(*)[32]>(smx + C * DK + NW * C * 32);
-  float(*Pc)[C + 1] = reinterpret_cast<float(*)[C + 1]>(smx + C * DK + NW * C * 32 + C * 32);
-  float* gc = smx + C * DK + NW * C * 32 + C * 32 + C * (C + 1);
-  float* ed = gc + C;
-  const unsigned h = blockIdx.y, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
-  const unsigned j = blockIdx.x * 32 + lane, i0 = w * R;
-  const size_t hb = (size_t)h * T;
-  const unsigned nch = (T + C - 1) / C;
+
+// The block's shared memory. The state's transpose is read only by the
+// projections; after them its room holds K's transpose and the chunk's
+// delta and solved rows.
+template <int V>
+struct smem {
+  mat<C, DK> q, k;  // [t][d]
+  union U {
+    mat<V, DK> st;  // state^T [v][d]
+    struct {
+      mat<DK, C> kt;  // K^T [d][t]
+      mat<V, C> dt;   // delta^T, then the update's scaled solved^T [v][t]
+      mat<V, C> sol;  // solved^T [v][t]
+    } x;
+  } u;
+  mat<C, C> inv, p;  // (I + A)^-1, P [t][s]
+  float base[C][V];  // e^g Q S [t][v], held over the state's transpose
+  float lower[C][C + 1];
+  float gs[C], bs[C];
+};
+// Its bytes, which cuda.h repeats (context::gdn_smem).
+constexpr unsigned smem_bytes(int V) {
+  constexpr unsigned m = 2 * 2;  // a hi and a lo bf16 an element
+  const unsigned st = V * (DK + 8) * m, x = (DK + V + V) * (C + 8) * m;
+  return 2 * C * (DK + 8) * m + (st > x ? st : x) + 2 * C * (C + 8) * m + C * V * 4 +
+         C * (C + 1) * 4 + 2 * C * 4;
+}
+static_assert(sizeof(smem<128>) == smem_bytes(128) && sizeof(smem<64>) == smem_bytes(64) &&
+                  sizeof(smem<32>) == smem_bytes(32),
+              "smem_bytes is the layout's size");
+
+// An accumulator element e's row and column in its 16 x 8 tile.
+__device__ __forceinline__ int frow(int e) { return ((threadIdx.x & 31) >> 2) + (e >= 2 ? 8 : 0); }
+__device__ __forceinline__ int fcol(int e) { return 2 * (threadIdx.x & 3) + (e & 1); }
+
+// Inputs as tl_gated_delta's (gpu_ops_nn.h has the math): qkv rows of q [Hk,
+// DK] | k [Hk, DK] | v [H, dv], ab rows ab_ld apart (alpha [H] | beta [H]),
+// adt = A [H] | dt_bias [H]; state [H, DK, dv], out [T, H * dv]. Grid H * dv / V.
+template <int V>
+__device__ __forceinline__ void fused_core(const float* __restrict__ qkv, const float* __restrict__ ab,
+                                           const float* __restrict__ adt, float* __restrict__ state,
+                                           float* __restrict__ out, unsigned H, unsigned dv,
+                                           unsigned T, unsigned ab_ld, float eps, unsigned Hk) {
+  extern __shared__ __align__(16) unsigned char raw[];
+  smem<V>& s = *reinterpret_cast<smem<V>*>(raw);
+  constexpr int VT = V / 8;                     // n8 tiles of a C x V product
+  constexpr int ST = (DK / 16) * VT, PER = ST / WARPS;  // state tiles, a warp's share
+  constexpr int PJ = (VT + WARPS - 1) / WARPS;  // projection tiles a warp
+  static_assert(ST % WARPS == 0, "the state's tiles divide over the warps");
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const unsigned slices = dv / V, h = blockIdx.x / slices, v0 = (blockIdx.x % slices) * V;
+  const size_t nq = (size_t)Hk * DK, Cq = 2 * nq + (size_t)H * dv, hk = h % Hk;
   float* S = state + (size_t)h * DK * dv;
-  float Sr[R];
+  const float Ah = adt[h], dth = adt[H + h];
+  float sr[PER][4];
 #pragma unroll
-  for (int r = 0; r < R; r++) Sr[r] = S[(size_t)(i0 + r) * dv + j];
-  // A chunk's rows of W, q and k reach Buf in turn, but are all read into
-  // registers at the chunk's start, 16 bytes a load, so the three latencies
-  // overlap.
-  constexpr int NV = C * DK / 4 / NT;  // float4s a thread a matrix
-  auto load = [&](const float* src, unsigned t0, unsigned n, float4* v) {
+  for (int j = 0; j < PER; j++) {
+    const int ti = warp + j * WARPS, r = (ti / VT) * 16, c = (ti % VT) * 8;
 #pragma unroll
-    for (int k = 0; k < NV; k++) {
-      const unsigned e = (tid + k * NT) * 4, t = e / DK, d = e % DK;
-      v[k] = t < n ? *reinterpret_cast<const float4*>(src + (hb + t0 + t) * DK + d)
-                   : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int e = 0; e < 4; e++) sr[j][e] = S[(size_t)(r + frow(e)) * dv + v0 + c + fcol(e)];
+  }
+  for (unsigned t0 = 0; t0 < T; t0 += C) {
+    const int n = min((unsigned)C, T - t0);
+    // q and k, L2-normalized (q also over sqrt(DK)): a warp a token.
+#pragma unroll
+    for (int u = 0; u < C / WARPS; u++) {
+      const int t = warp + WARPS * u, d = 4 * lane;
+      float4 a = make_float4(0, 0, 0, 0), b = a;
+      if (t < n) {
+        a = *reinterpret_cast<const float4*>(qkv + (t0 + t) * Cq + hk * DK + d);
+        b = *reinterpret_cast<const float4*>(qkv + (t0 + t) * Cq + nq + hk * DK + d);
+      }
+      float sq = a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w;
+      float sk = b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w;
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) {
+        sq += __shfl_xor_sync(0xffffffffu, sq, o);
+        sk += __shfl_xor_sync(0xffffffffu, sk, o);
+      }
+      const float qn = 1.0f / sqrtf(sq + eps) / sqrtf((float)DK), kn = 1.0f / sqrtf(sk + eps);
+      s.q.store(t, d, a.x * qn);
+      s.q.store(t, d + 1, a.y * qn);
+      s.q.store(t, d + 2, a.z * qn);
+      s.q.store(t, d + 3, a.w * qn);
+      s.k.store(t, d, b.x * kn);
+      s.k.store(t, d + 1, b.y * kn);
+      s.k.store(t, d + 2, b.z * kn);
+      s.k.store(t, d + 3, b.w * kn);
     }
-  };
-  auto put = [&](const float4* v) {
+    // The gates, and g's running sum over the chunk.
+    if (warp == 0) {
+      float la = 0.0f, be = 0.0f;
+      if (lane < n) {
+        const float* abt = ab + (size_t)(t0 + lane) * ab_ld;
+        const float x = abt[h] + dth;
+        la = Ah * (x > 20.0f ? x : log1pf(expf(x)));
+        be = 1.0f / (1.0f + expf(-abt[H + h]));
+      }
 #pragma unroll
-    for (int k = 0; k < NV; k++) {
-      const unsigned e = (tid + k * NT) * 4, t = e / DK, d = e % DK;
-      *reinterpret_cast<float4*>(&Buf[t][d]) = v[k];
+      for (int o = 1; o < 32; o <<= 1) {
+        const float p = __shfl_up_sync(0xffffffffu, la, o);
+        if (lane >= o) la += p;
+      }
+      if (lane < C) s.gs[lane] = la, s.bs[lane] = be;
     }
-  };
-  // red[w][t][lane]: warp w's part of sum_i Buf[t][i] h[i][j], over its rows,
-  // four tokens at a time so four sums are in flight (one warp a scheduler
-  // has nothing else to hide a dependent chain behind).
-  auto partial = [&]() {
-    for (unsigned t = 0; t < C; t += 4) {
-      float p[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // The state into shared memory, transposed.
 #pragma unroll
-      for (int r = 0; r < R; r++)
+    for (int j = 0; j < PER; j++) {
+      const int ti = warp + j * WARPS, r = (ti / VT) * 16, c = (ti % VT) * 8;
 #pragma unroll
-        for (int u = 0; u < 4; u++) p[u] += Buf[t + u][i0 + r] * Sr[r];
-#pragma unroll
-      for (int u = 0; u < 4; u++) red[w][t + u][lane] = p[u];
-    }
-  };
-  // The next chunk's inputs are read into registers while this one runs its
-  // update, so no chunk starts by waiting on global memory.
-  constexpr int NP = C * C / NT;  // P cells a thread
-  float4 vw[NV], vq[NV], vk[NV];
-  float vp[NP], vg = 0.0f;
-  auto fetch = [&](unsigned c) {
-    const unsigned t0 = c * C, n = min((unsigned)C, T - t0);
-    load(W, t0, n, vw);
-    load(Qn, t0, n, vq);
-    load(Kn, t0, n, vk);
-#pragma unroll
-    for (int k = 0; k < NP; k++) vp[k] = P[((size_t)h * nch + c) * C * C + tid + k * NT];
-    if (tid < C) vg = tid < n ? G[hb + t0 + tid] : 0.0f;
-  };
-  fetch(0);
-  for (unsigned c = 0; c < nch; c++) {
-    const unsigned t0 = c * C, n = min((unsigned)C, T - t0);
-    __syncthreads();  // the previous chunk is done with every buffer
-#pragma unroll
-    for (int k = 0; k < NP; k++) Pc[(tid + k * NT) / C][(tid + k * NT) % C] = vp[k];
-    if (tid < C) gc[tid] = vg;
-    put(vw);
-    __syncthreads();
-    if (tid < C) ed[tid] = tid < n ? expf(gc[n - 1] - gc[tid]) : 0.0f;
-    partial();
-    __syncthreads();
-    // D = U - W h; each warp finishes C/4 of the chunk's tokens.
-    for (unsigned t = w * (C / NW); t < (w + 1) * (C / NW); t++) {
-      float wh = 0.0f;
-#pragma unroll
-      for (int ww = 0; ww < DK / R; ww++) wh += red[ww][t][lane];
-      Dl[t][lane] = t < n ? U[(hb + t0 + t) * dv + j] - wh : 0.0f;
+      for (int e = 0; e < 4; e++) s.u.st.store(c + fcol(e), r + frow(e), sr[j][e]);
     }
     __syncthreads();
-    put(vq);
-    __syncthreads();
-    partial();
-    __syncthreads();
-    // o_t = e^(g_t) q_t h + sum_{s<=t} P[t][s] d_s.
-    for (unsigned t = w * (C / NW); t < (w + 1) * (C / NW) && t < n; t++) {
-      float qh = 0.0f;
+    // A and P: warps 0-3, an n8 half of K K^T or Q K^T each.
+    if (warp < 4) {
+      const bool gram = warp < 2;
+      const int n0 = (warp & 1) * 8;
+      float x[4] = {0, 0, 0, 0};
+      product<DK>(x, gram ? s.k : s.q, 0, s.k, n0);
 #pragma unroll
-      for (int ww = 0; ww < DK / R; ww++) qh += red[ww][t][lane];
-      float o = expf(gc[t]) * qh;
-      for (unsigned sc = 0; sc <= t; sc++) o += Pc[t][sc] * Dl[sc][lane];
-      out[(size_t)(t0 + t) * H * dv + (size_t)h * dv + j] = o;
+      for (int e = 0; e < 4; e++) {
+        const int rr = frow(e), cc = n0 + fcol(e);
+        // (rows past the chunk's tokens are zero: their q and k are)
+        const float v = cc <= rr ? x[e] * expf(s.gs[rr] - s.gs[cc]) : 0.0f;
+        if (gram) s.lower[rr][cc] = cc < rr ? v * s.bs[rr] : 0.0f;
+        else s.p.store(rr, cc, v);
+      }
     }
-    __syncthreads();  // every warp is done with q's rows
-    put(vk);
-    __syncthreads();
-    if (c + 1 < nch) fetch(c + 1);  // in flight through the update below
-    // h' = e^(g_C) h + sum_t e^(g_C - g_t) k_t d_t^T.
-    // The token loop outside: the 32 rows are 32 independent sums.
-    const float eC = expf(gc[n - 1]);
+    // delta, held in registers until the state's transpose is spent; base.
+    float delta[PJ][4];
 #pragma unroll
-    for (int r = 0; r < R; r++) Sr[r] *= eC;
-    for (unsigned t = 0; t < n; t++) {
-      const float cf = ed[t] * Dl[t][lane];
+    for (int j = 0; j < PJ; j++) {
+      const int ti = warp + j * WARPS;
+      if (ti >= VT) break;
+      const int n0 = ti * 8;
+      float qs[4] = {0, 0, 0, 0}, ks[4] = {0, 0, 0, 0};
+      product<DK>(qs, s.q, 0, s.u.st, n0);
+      product<DK>(ks, s.k, 0, s.u.st, n0);
 #pragma unroll
-      for (int r = 0; r < R; r++) Sr[r] += cf * Buf[t][i0 + r];
+      for (int e = 0; e < 4; e++) {
+        const int t = frow(e), v = n0 + fcol(e);
+        const float dec = expf(s.gs[t]);
+        const float vv = t < n ? qkv[(t0 + t) * Cq + 2 * nq + (size_t)h * dv + v0 + v] : 0.0f;
+        delta[j][e] = s.bs[t] * (vv - dec * ks[e]);
+        s.base[t][v] = dec * qs[e];
+      }
     }
+    __syncthreads();
+    // (I + A)^-1 a row a warp: row r is x with x (I + A) = e_r, so x_r = 1 and
+    // x_c = -sum_{p > c} x_p A[p][c], the pivots from r - 1 down, a lane a
+    // column. Then delta^T and K^T where the state's transpose was.
+    for (int r = warp; r < C; r += WARPS) {
+      float x = lane == r ? 1.0f : (lane < r ? -s.lower[r][lane] : 0.0f);
+      for (int p = r - 1; p > 0; p--) {
+        const float xp = __shfl_sync(0xffffffffu, x, p);
+        if (lane < p) x -= xp * s.lower[p][lane];
+      }
+      if (lane < C) s.inv.store(r, lane, x);
+    }
+#pragma unroll
+    for (int j = 0; j < PJ; j++) {
+      const int ti = warp + j * WARPS;
+      if (ti >= VT) break;
+#pragma unroll
+      for (int e = 0; e < 4; e++) s.u.x.dt.store(ti * 8 + fcol(e), frow(e), delta[j][e]);
+    }
+    for (int i = threadIdx.x; i < C * DK; i += NT) {
+      const int t = i / DK, d = i % DK, ki = t * s.k.P + d, ti = d * s.u.x.kt.P + t;
+      s.u.x.kt.hi[ti] = s.k.hi[ki];
+      s.u.x.kt.lo[ti] = s.k.lo[ki];
+    }
+    __syncthreads();
+    for (int ti = warp; ti < VT; ti += WARPS) {
+      float x[4] = {0, 0, 0, 0};
+      product<C>(x, s.inv, 0, s.u.x.dt, ti * 8);
+#pragma unroll
+      for (int e = 0; e < 4; e++) s.u.x.sol.store(ti * 8 + fcol(e), frow(e), x[e]);
+    }
+    __syncthreads();
+    // out, and the update's scaled solved over delta^T.
+    const float gend = s.gs[n - 1];
+#pragma unroll
+    for (int j = 0; j < PJ; j++) {
+      const int ti = warp + j * WARPS;
+      if (ti >= VT) break;
+      float x[4] = {0, 0, 0, 0};
+      product<C>(x, s.p, 0, s.u.x.sol, ti * 8);
+#pragma unroll
+      for (int e = 0; e < 4; e++) {
+        const int t = frow(e), v = ti * 8 + fcol(e);
+        if (t < n) out[(size_t)(t0 + t) * H * dv + (size_t)h * dv + v0 + v] = s.base[t][v] + x[e];
+      }
+    }
+    for (int i = threadIdx.x; i < C * V; i += NT) {
+      const int t = i / V, v = i % V;
+      s.u.x.dt.store(v, t, s.u.x.sol.get(v, t) * expf(gend - s.gs[t]));
+    }
+    __syncthreads();
+    const float decay = expf(gend);
+#pragma unroll
+    for (int j = 0; j < PER; j++) {
+      const int ti = warp + j * WARPS, r = (ti / VT) * 16, c = (ti % VT) * 8;
+#pragma unroll
+      for (int e = 0; e < 4; e++) sr[j][e] *= decay;
+      product<C>(sr[j], s.u.x.kt, r, s.u.x.dt, c);
+    }
+    __syncthreads();
   }
 #pragma unroll
-  for (int r = 0; r < R; r++) S[(size_t)(i0 + r) * dv + j] = Sr[r];
+  for (int j = 0; j < PER; j++) {
+    const int ti = warp + j * WARPS, r = (ti / VT) * 16, c = (ti % VT) * 8;
+#pragma unroll
+    for (int e = 0; e < 4; e++) S[(size_t)(r + frow(e)) * dv + v0 + c + fcol(e)] = sr[j][e];
+  }
 }
+}  // namespace gdn_
+// tl_gated_delta_fused_{128,64,32}: V value columns a block. qkv's rows are
+// read by float4.
+#define TL_GDN_FUSED(V)                                                                         \
+  TL_ALIGN(tl_gated_delta_fused_##V, 16)                                                         \
+  extern "C" __global__ void __launch_bounds__(gdn_::NT, 1) tl_gated_delta_fused_##V(                 \
+      const float* __restrict__ qkv, const float* __restrict__ ab, const float* __restrict__ adt, \
+      float* __restrict__ state, float* __restrict__ out, unsigned H, unsigned dv, unsigned T,   \
+      unsigned ab_ld, float eps, unsigned Hk) {                                                 \
+    gdn_::fused_core<V>(qkv, ab, adt, state, out, H, dv, T, ab_ld, eps, Hk);                    \
+  }
+TL_GDN_FUSED(128)
+TL_GDN_FUSED(64)
+TL_GDN_FUSED(32)
+#undef TL_GDN_FUSED
+extern "C" {
 
 // Token-major [T, ld] -> head-major [H, T, D], adding an optional per-head bias.
 // The batched projections produce all heads of a token contiguously, while the

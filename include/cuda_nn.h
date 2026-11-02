@@ -781,44 +781,38 @@ inline bool own_nn::ssm_conv_tokens(gpu::span x, int64_t ld, gpu::span state,
          c.launch_(c.conv_state_(), {gx}, {256}, 0, px, ps, uC, uK, uT, uld);
 }
 
-// The chunked delta rule (tl_gated_delta_chunk_prep, then _scan): dk 128, dv a
-// multiple of 32 up to 128, and T past one chunk. The scratch holds, per head,
-// T rows each of q, k and W (dk) and U (dv), g, and a C x C P per chunk.
+// The chunked delta rule (tl_gated_delta_fused_<V>): dk 128, dv 128, 64 or 32,
+// and a prompt past 32 tokens (shorter ones take the per-token kernel).
 inline bool own_nn::gated_delta_chunked(gpu::span qkv, gpu::span ab, int64_t ab_ld,
                                      gpu::span adt, gpu::span state, gpu::span o,
                                      int64_t H, int64_t dk, int64_t dv, int64_t T,
                                      float eps, int64_t Hk) {
-  constexpr int64_t C = 32;
   auto& c = context::get();
-  if (!c.ready || dk != 128 || dv % 32 || dv > 128 || T < C || Hk <= 0 || H % Hk) return false;
-  const int64_t nch = (T + C - 1) / C;
-  const size_t rows = (size_t)H * T;
-  const size_t floats = rows * (3 * dk + dv + 1) + (size_t)H * nch * C * C;
-  CUdeviceptr scr = c.delta_scratch_(floats * sizeof(float));
-  if (!scr) return false;
-  float* Qn = reinterpret_cast<float*>(scr);
-  float* Kn = Qn + rows * dk;
-  float* W = Kn + rows * dk;
-  float* U = W + rows * dk;
-  float* G = U + rows * dv;
-  float* P = G + rows;
-  c.device_read_(qkv.buf);
-  c.device_read_(ab.buf);
-  c.device_read_(adt.buf);
-  c.device_rmw_(state.buf);
-  c.device_write_(o.buf);
+  if (!c.ready || dk != 128 || (dv != 128 && dv != 64 && dv != 32) || T < 32 || Hk <= 0 ||
+      H % Hk)
+    return false;
+  // A head's value columns in as many slices (V >= 32 a block) as keep the
+  // grid within a block an SM: a block's chunks run in order, so more blocks
+  // than SMs would wait a whole pass for the rest.
+  int64_t slices = 1;
+  while (dv / (2 * slices) >= 32 && H * 2 * slices <= kWaveSingles) slices *= 2;
+  const int64_t V = dv / slices;
+  CUfunction f = c.gdn_fused_(V);
   float* pqkv = context::off_(qkv.buf, qkv.off);
   float* pab = context::off_(ab.buf, ab.off);
   float* padt = context::off_(adt.buf, adt.off);
   float* pst = context::off_(state.buf, state.off);
   float* po = context::off_(o.buf, o.off);
-  const unsigned uH = (unsigned)H, udv = (unsigned)dv, uT = (unsigned)T,
-                 uld = (unsigned)ab_ld;
-  // prep is laid out for 256 threads (tl_gated_delta_chunk_prep).
-  return c.launch_(c.gdc_prep_(), {(unsigned)nch, uH}, {256}, 0, pqkv, pab, padt, Qn,
-                   Kn, W, U, P, G, uH, udv, uT, uld, eps, (unsigned)Hk) &&
-         c.launch_(c.gdc_scan_(), {udv / 32, uH}, {context::gdc_scan_threads},
-                   context::gdc_scan_smem, Qn, Kn, W, U, P, G, pst, po, uH, udv, uT);
+  // Refused before any residency change if qkv's rows are misaligned for float4.
+  if (!f || !c.fits_(f, pqkv, pab, padt, pst, po)) return false;
+  c.device_read_(qkv.buf);
+  c.device_read_(ab.buf);
+  c.device_read_(adt.buf);
+  c.device_rmw_(state.buf);
+  c.device_write_(o.buf);
+  return c.launch_(f, {(unsigned)(H * slices)}, {context::gdn_threads}, context::gdn_smem((unsigned)V), pqkv, pab,
+                   padt, pst, po, (unsigned)H, (unsigned)dv, (unsigned)T, (unsigned)ab_ld, eps,
+                   (unsigned)Hk);
 }
 
 // The query half of causal prefill attention's pullback: q, K, V, dO, O and dq

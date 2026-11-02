@@ -651,21 +651,25 @@ struct context {
   CUfunction conv_tok_fn = nullptr, conv_state_fn = nullptr;  // a prefill's conv
   CUfunction conv_tok_() { return cached_(conv_tok_fn, "tl_ssm_conv_tokens"); }
   CUfunction conv_state_() { return cached_(conv_state_fn, "tl_ssm_conv_state"); }
-  CUfunction gdc_prep_fn = nullptr, gdc_scan_fn = nullptr;  // the chunked delta rule
-  CUfunction gdc_prep_() { return cached_(gdc_prep_fn, "tl_gated_delta_chunk_prep"); }
-  // The scan's tile is dynamic shared memory (past the static 48 KB), raised on
-  // first lookup. R and the footprint repeat TL_GDC_SCAN_R and the kernel's
-  // carve-up in tensorlib_cuda.cu: Buf [C][128], red [128/R][C][32], Dl [C][32],
-  // Pc [C][C+1], gc and ed [C], in floats.
-  static constexpr unsigned gdc_scan_r = 8;
-  static constexpr unsigned gdc_scan_threads = 128 / gdc_scan_r * 32;
-  static constexpr unsigned gdc_scan_smem =
-      (32 * 128 + 128 / gdc_scan_r * 32 * 32 + 32 * 32 + 32 * 33 + 2 * 32) * 4;
-  CUfunction gdc_scan_() {
-    const bool fresh = !gdc_scan_fn;
-    CUfunction f = cached_(gdc_scan_fn, "tl_gated_delta_chunk_scan");
+  // The fused chunked rule, tl_gated_delta_fused_<V> (V = 128, 64, 32 value
+  // columns a block). Its dynamic shared memory, gdn_::smem_bytes repeated,
+  // is raised on first lookup.
+  static constexpr unsigned gdn_smem(unsigned V) {
+    const unsigned st = V * 136 * 4, x = (128 + 2 * V) * 24 * 4;
+    return 2 * 16 * 136 * 4 + (st > x ? st : x) + 2 * 16 * 24 * 4 + 16 * V * 4 + 16 * 17 * 4 +
+           2 * 16 * 4;
+  }
+  static constexpr unsigned gdn_threads = 512;  // gdn_::NT
+  CUfunction gdn_fused_fn[3] = {};
+  CUfunction gdn_fused_(int64_t V) {
+    const int i = V == 128 ? 0 : V == 64 ? 1 : 2;
+    static const char* const names[3] = {"tl_gated_delta_fused_128", "tl_gated_delta_fused_64",
+                                         "tl_gated_delta_fused_32"};
+    const bool fresh = !gdn_fused_fn[i];
+    CUfunction f = cached_(gdn_fused_fn[i], names[i]);
     if (fresh && f && d.FuncSetAttribute)
-      d.FuncSetAttribute(f, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, static_cast<int>(gdc_scan_smem));
+      d.FuncSetAttribute(f, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */,
+                         static_cast<int>(gdn_smem(static_cast<unsigned>(V))));
     return f;
   }
   // The prefill's tensor-core GEMM: tile (L 128x128, M 64x128, S 64x64) x sums
@@ -863,13 +867,6 @@ struct context {
   size_t attn_scratch_bytes = 0;
   CUdeviceptr attn_scratch_(size_t bytes) {
     return grow_scratch_(attn_scratch, attn_scratch_bytes, bytes);
-  }
-  // The chunked delta rule's per-chunk products (q, k, W, U, P, g), reused
-  // across layers and calls like the partials above.
-  CUdeviceptr delta_scratch = 0;
-  size_t delta_scratch_bytes = 0;
-  CUdeviceptr delta_scratch_(size_t bytes) {
-    return grow_scratch_(delta_scratch, delta_scratch_bytes, bytes);
   }
 
   // The f16 copy of one slab of a block-quantized weight (the prefill dequantizes a

@@ -49,12 +49,14 @@ the activation is rounded to f16 once, by the norm, SwiGLU or head merge that
 writes it, rather than by every block that reads it. The attention keeps a
 warp's q in registers (shared memory at head width 256), reads k and v with
 `ldmatrix` from a double buffer, and rounds q, k and v to f16. Qwen3.5's
-DeltaNet layers run the gated delta rule in 32-token chunks (as small matrix
-products, f32). The chunk prep's products (K K^T, Q K^T, T K, T V) run on the
-tensor cores as 3xTF32, three tf32 mmas a product, which keeps f32's accuracy
-(1.3e-6 against fp64, the scalar loop's 2.7e-7); the scan reads the next chunk's
-inputs while it updates the state, and is bound by a chain of ~8 barriers per
-chunk.
+DeltaNet layers run the gated delta rule as llama.cpp's CUDA backend does: one
+kernel, a block a head (or a slice of its value columns, where heads alone
+leave SMs idle), walking 16-token chunks with the state in tensor-core
+accumulators, every product a warp's own output tile over its whole reduction,
+as bf16 high / residual pairs in three mmas (about 7e-6 of an fp64 rule over
+512 tokens). On the 27B it is 0.34 ms a layer at 512 tokens, the q / k norms
+and gates included; the two kernels it replaced (a chunk prep, then a scan that
+summed the state's rows across warps every chunk) took 0.63.
 
 ## Quantized files
 
