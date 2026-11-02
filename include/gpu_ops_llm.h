@@ -156,6 +156,22 @@ inline bool argmax_to(span a, int64_t n, span idx) {
   }
 }
 
+// A token drawn from a length-n vector of logits as gpu_abi_llm.h's sampling
+// defines it (sample_ref), as an f32 at idx[0], with no read-back: draw number
+// counter[0] (a u32 on the device, which the draw advances by one, so a
+// replayed graph draws afresh). Greedy is argmax_to, the counter untouched.
+TL_GPU_DETECT_OWN(sample_to)
+template <class Own = own>
+inline bool sample_to(span a, int64_t n, const sampling& s, span counter, span idx) {
+  if (!a || !idx || !counter || n <= 0 || n > policy::max_f32_index || !s.valid()) return false;
+  if (s.greedy()) return argmax_to<Own>(a, n, idx);
+  if constexpr (detail::owns_sample_to<Own>::value) {
+    return detail::ran(Own::sample_to(a, n, s, counter, idx));
+  } else {
+    return false;
+  }
+}
+
 // The f32 src holds once the work queued so far has run: read_later takes it
 // behind that work and submits the work without waiting, and finish_read
 // waits for it, so the host can queue the next step in between (which may

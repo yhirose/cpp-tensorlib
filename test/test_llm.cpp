@@ -7,6 +7,86 @@
 #include <gguf.h>
 #include <kv_cache.h>
 
+// The sampler's definition (gpu_abi_llm.h), which the device samplers are held
+// to: its random bits are Philox4x32-10's (Random123's known answers), and its
+// draws follow the probabilities temperature, top_k and top_p leave.
+TEST_CASE("sample_ref draws as temperature, top_k and top_p say") {
+  namespace gpu = tl::gpu;
+  const struct {
+    uint32_t c[4], k[2], want[4];
+  } kat[] = {
+      {{0, 0, 0, 0}, {0, 0}, {0x6627e8d5, 0xe169c58d, 0xbc57ac4c, 0x9b00dbd8}},
+      {{0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff},
+       {0xffffffff, 0xffffffff},
+       {0x408f276d, 0x41c83b0e, 0xa20bc7c6, 0x6d5451fd}},
+      {{0x243f6a88, 0x85a308d3, 0x13198a2e, 0x03707344},
+       {0xa4093822, 0x299f31d0},
+       {0xd16cfe09, 0x94fdcceb, 0x5001e420, 0x24126ea1}},
+  };
+  for (const auto& t : kat) {
+    uint32_t out[4];
+    gpu::philox(t.c[0], t.c[1], t.c[2], t.c[3], t.k[0], t.k[1], out);
+    CHECK(std::equal(out, out + 4, t.want));
+  }
+
+  // The open uniform the Gumbel noise takes stays inside (0, 1) at both ends.
+  CHECK(gpu::sample_uniform(0xFFFFFFFFu, true) < 1.0f);
+  CHECK(gpu::sample_uniform(0u, true) > 0.0f);
+
+  // Each setting's share of 4000 draws over three tokens of probability
+  // 0.5, 0.3, 0.2, against what it leaves them (within 0.03, about 4 sigma).
+  const float l[] = {std::log(0.2f), std::log(0.5f), std::log(0.3f)};
+  const struct {
+    const char* what;
+    gpu::sampling s;
+    double want[3];
+  } cases[] = {
+      {"top_k 3", {1.0f, 3, 1.0f, 1}, {0.2, 0.5, 0.3}},
+      {"top_p 0.75 keeps the two most likely", {1.0f, 3, 0.75f, 2}, {0.0, 0.625, 0.375}},
+      {"top_k 2", {1.0f, 2, 1.0f, 3}, {0.0, 0.625, 0.375}},
+      {"temperature 2 over the whole vocabulary", {2.0f, 0, 1.0f, 4},
+       {0.4472 / 1.7020, 0.7071 / 1.7020, 0.5477 / 1.7020}},
+  };
+  for (const auto& c : cases) {
+    INFO(c.what);
+    int hits[3] = {0, 0, 0};
+    for (uint32_t d = 0; d < 4000; d++) hits[gpu::sample_ref(l, 3, c.s, d)]++;
+    for (int i = 0; i < 3; i++) CHECK(std::abs(hits[i] / 4000.0 - c.want[i]) < 0.03);
+  }
+  // Greedy, top_k 1 and a top_p below the largest probability are argmax;
+  // NaN and -inf are never drawn.
+  CHECK(gpu::sample_ref(l, 3, {0.0f, 0, 1.0f, 5}, 0) == 1);
+  CHECK(gpu::sample_ref(l, 3, {1.0f, 1, 1.0f, 5}, 0) == 1);
+  CHECK(gpu::sample_ref(l, 3, {1.0f, 3, 0.1f, 5}, 0) == 1);
+  // Equal logits are ranked by index: the smaller holds the first half of
+  // the draw's uniform.
+  const float tie[] = {1.0f, 1.0f};
+  for (uint32_t d = 0; d < 20; d++) {
+    const float u = gpu::sample_uniform(gpu::philox(d, gpu::sample_pick_element, 0, 0, 5, 0));
+    CHECK(gpu::sample_ref(tie, 2, {1.0f, 2, 1.0f, 5}, d) == (u < 0.5f ? 0 : 1));
+  }
+  // A NaN or a -inf logit is never drawn, and leaves the others' shares as
+  // they are: two equal logits beside them are both drawn. Either end of the
+  // vector, as a scan meets them first or last.
+  const float odd[2][4] = {{NAN, 0.0f, -INFINITY, 0.0f}, {0.0f, -INFINITY, 0.0f, NAN}};
+  for (const float* v : odd) {
+    for (int top_k : {3, 0}) {
+      CAPTURE(v[0]);
+      CAPTURE(top_k);
+      int hits[4] = {0, 0, 0, 0};
+      for (uint32_t d = 0; d < 50; d++) hits[gpu::sample_ref(v, 4, {1.0f, top_k, 1.0f, 6}, d)]++;
+      for (int i = 0; i < 4; i++) CHECK((hits[i] > 0) == (v[i] == 0.0f));
+    }
+  }
+  // What a sampler refuses: top_k past the limit, top_p without top_k.
+  CHECK(gpu::sampling{0.7f, 20, 0.8f, 0}.valid());
+  CHECK_FALSE(gpu::sampling{0.7f, gpu::policy::max_top_k + 1, 1.0f, 0}.valid());
+  CHECK_FALSE(gpu::sampling{0.7f, 0, 0.9f, 0}.valid());
+  CHECK_FALSE(gpu::sampling{-1.0f, 20, 1.0f, 0}.valid());
+  CHECK_FALSE(gpu::sampling{0.7f, 20, 0.0f, 0}.valid());
+  CHECK_FALSE(gpu::sampling{1e-39f, 20, 1.0f, 0}.valid());  // 1 / t is inf
+}
+
 // A BF16 tensor (ggml type 30, as BF16 GGUFs ship their weights) is read with
 // its size and bytes as the file has them. The smallest GGUF v3 that holds
 // one: no metadata, one 1-D tensor of four values, the data section aligned
@@ -240,6 +320,44 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
         REQUIRE(gpu::argmax_to(a.device_span(), c.n, d.device_span()));
         CHECK(host_values(d)[0] == (float)c.want);
       }
+    }
+  }
+
+  SUBCASE("sample_to draws sample_ref's token on the device, and counts its draws") {
+    // A vocabulary-sized vector that groups split (its top two tied far
+    // apart), and one shorter than k that holds what is never drawn. Each
+    // setting draws six times on one counter; the token of each draw is the
+    // host definition's for that draw number.
+    if (!gpu::has_sample_to) return;
+    std::vector<float> big = host_values(random_array({151936}, 990));
+    for (float& x : big) x *= 6.0f;
+    big[1234] = big[150000] = 9.0f;
+    const std::vector<float> small = {-INFINITY, 2.0f, NAN, 1.0f, 1.5f};
+    const struct {
+      const char* what;
+      const std::vector<float>* v;
+      gpu::sampling s;
+    } cases[] = {
+        {"Qwen's setting", &big, {0.7f, 20, 0.8f, 7}},
+        {"the widest k, no top_p", &big, {1.5f, 64, 1.0f, 8}},
+        {"a narrow top_p", &big, {1.0f, 5, 0.5f, 9}},
+        {"the whole vocabulary (Gumbel-max)", &big, {0.7f, 0, 1.0f, 10}},
+        {"fewer tokens than k", &small, {2.0f, 20, 1.0f, 11}},
+    };
+    for (const auto& c : cases) {
+      INFO(c.what);
+      const auto n = static_cast<int64_t>(c.v->size());
+      array a = dev(array::from(*c.v, {n})), ctr = dev(array::zeros({1})),
+            d = dev(array::zeros({1}));
+      for (uint32_t draw = 0; draw < 6; draw++) {
+        CAPTURE(draw);
+        REQUIRE(gpu::sample_to(a.device_span(), n, c.s, ctr.device_span(), d.device_span()));
+        CHECK(host_values(d)[0] == (float)gpu::sample_ref(c.v->data(), n, c.s, draw));
+      }
+      uint32_t draws = 0;
+      const float bits = host_values(ctr)[0];
+      std::memcpy(&draws, &bits, 4);
+      CHECK(draws == 6);
     }
   }
 
