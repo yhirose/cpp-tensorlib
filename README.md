@@ -345,6 +345,11 @@ cmake --build build --target tensorlib_chat_qwen
 ./build/tensorlib_chat_qwen path/to/qwen2.5-0.5b-instruct.gguf "What is the capital of France?"
 ```
 
+Decoding is greedy unless sampling is asked for, as Qwen recommends it:
+append `temp=0.7 top_k=20 top_p=0.8 seed=1` (after the dtype, q4 spec and
+`nothink` arguments). The token is drawn on the GPU, so it costs a decode
+step little; the same seed draws the same text.
+
 On an RTX 3090, Qwen2.5-0.5B (F16 GGUF, bf16 weight storage):
 
 | Path | tok/s |
