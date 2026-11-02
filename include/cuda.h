@@ -1351,9 +1351,11 @@ inline bool dispatch(kop k, const gpu::arg* args, size_t n, const void* params,
   return c.dispatch_(c.fn_(k), args, n, params, params_bytes, g);
 }
 
-// Rank cap shared with the kernel side (tensorlib_cuda.cu's
-// TL_PAD_FOLD_MAX_RANK) — both the meta buffer layout and each kernel's
-// on-stack index array assume it.
+// Rank cap of the N-D ops (pad, fold, sum_to, ...): the per-axis arrays the
+// launchers below build their meta from. The kernels hold none (no local
+// memory), so only these and the other backends' kernels assume it. im2col's
+// chained unfold/pad calls on a conv input (N,C,H,W -> ...,winH,winW) stay
+// well under it.
 inline constexpr int kPadFoldMaxRank = 8;
 
 // Zero an output buffer that a kernel will only partially write (pad's

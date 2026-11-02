@@ -481,13 +481,9 @@ int main() {
   // ---- no kernel keeps an array in local memory, as the module was JIT-compiled here:
   // indexing a byte copy of the Q4_K scales put it there and cost the decode GEMV a fifth
   // of its speed, and the conv window indexed by its runtime width cost tl_ssm_conv a
-  // third (a loop to the largest width with the runtime one as a guard keeps the indices
-  // constant). The kernels below still have a frame, each for the reason given; any
-  // other one fails this.
+  // third. A loop to the largest width with the runtime one as a guard keeps an array's
+  // indices constant; per-axis walks fold each axis in as they go.
   {
-    static const char* const allowed[] = {
-        "tl_fold", "tl_sum_to", "tl_sum_to_blocked",  // per-axis shape and stride arrays
-    };
     auto& cx = context::get();
     unsigned count = 0;
     if (!cx.d.FuncGetAttribute || !cx.d.FuncGetName || !cx.d.ModuleGetFunctionCount ||
@@ -503,10 +499,9 @@ int main() {
         listed = listed && cx.d.FuncGetAttribute(&bytes, 3 /* LOCAL_SIZE_BYTES */, f) == 0 &&
                  cx.d.FuncGetName(&name, f) == 0;
         if (!listed || bytes == 0) continue;
-        if (std::none_of(std::begin(allowed), std::end(allowed), [&](const char* a) { return !std::strcmp(a, name); }))
-          framed += std::string(" ") + name + " (" + std::to_string(bytes) + " B)";
+        framed += std::string(" ") + name + " (" + std::to_string(bytes) + " B)";
       }
-      std::printf("  local memory: %u kernels, framed outside the list:%s\n", count, framed.empty() ? " none" : framed.c_str());
+      std::printf("  local memory: %u kernels, framed:%s\n", count, framed.empty() ? " none" : framed.c_str());
       check(listed && framed.empty(), "no local memory");
     }
   }

@@ -158,6 +158,20 @@ __global__ void tl_copy_nd(const float* a, float* out, const long long* meta,
 // being summed over. `reduced_n` is the host-computed product of a_shape
 // over exactly those zero-acc axes (1 if there are none, i.e. sum_to is
 // really just a shape-preserving copy).
+// Reduced element r's offset: r split over the summed axes (acc 0), the last
+// fastest, with no per-axis array (it would sit in local memory).
+__device__ __forceinline__ long long sum_to_offset_(const long long* a_shape,
+                                                    const long long* a_strides,
+                                                    const long long* acc, int rank, unsigned r) {
+  long long off = 0;
+  for (int d = rank - 1; d >= 0; --d) {
+    if (acc[d] != 0) continue;
+    const unsigned dim = static_cast<unsigned>(a_shape[d]);
+    off += static_cast<long long>(r % dim) * a_strides[d];
+    r /= dim;
+  }
+  return off;
+}
 __global__ void tl_sum_to(const float* a, float* out, const long long* meta,
                           int rank, unsigned out_n, unsigned reduced_n) {
   unsigned t = blockIdx.x * blockDim.x + threadIdx.x;
@@ -166,28 +180,11 @@ __global__ void tl_sum_to(const float* a, float* out, const long long* meta,
   const long long* a_strides = meta + rank;
   const long long* acc = meta + 2 * rank;
   long long base = 0;
-  int red_axis[8];
-  int red_count = 0;
-  for (int d = 0; d < rank; d++) {
-    if (acc[d] != 0) {
-      long long idx = (t / acc[d]) % a_shape[d];
-      base += idx * a_strides[d];
-    } else {
-      red_axis[red_count++] = d;
-    }
-  }
+  for (int d = 0; d < rank; d++)
+    if (acc[d] != 0) base += (t / acc[d]) % a_shape[d] * a_strides[d];
   float sum = 0.0f;
   for (unsigned r = 0; r < reduced_n; r++) {
-    unsigned rem = r;
-    long long off = base;
-    for (int k = red_count - 1; k >= 0; --k) {
-      int d = red_axis[k];
-      unsigned dim = static_cast<unsigned>(a_shape[d]);
-      unsigned coord = rem % dim;
-      rem /= dim;
-      off += static_cast<long long>(coord) * a_strides[d];
-    }
-    sum += a[off];
+    sum += a[base + sum_to_offset_(a_shape, a_strides, acc, rank, r)];
   }
   out[t] = sum;
 }
@@ -208,30 +205,13 @@ __global__ void tl_sum_to_blocked(const float* a, float* out,
   const long long* a_strides = meta + rank;
   const long long* acc = meta + 2 * rank;
   long long base = 0;
-  int red_axis[8];
-  int red_count = 0;
-  for (int d = 0; d < rank; d++) {
-    if (acc[d] != 0) {
-      long long idx = (t / acc[d]) % a_shape[d];
-      base += idx * a_strides[d];
-    } else {
-      red_axis[red_count++] = d;
-    }
-  }
+  for (int d = 0; d < rank; d++)
+    if (acc[d] != 0) base += (t / acc[d]) % a_shape[d] * a_strides[d];
   extern __shared__ float sdata[];
   unsigned tid = threadIdx.x, T = blockDim.x;
   float sum = 0.0f;
   for (unsigned r = tid; r < reduced_n; r += T) {
-    unsigned rem = r;
-    long long off = base;
-    for (int k = red_count - 1; k >= 0; --k) {
-      int d = red_axis[k];
-      unsigned dim = static_cast<unsigned>(a_shape[d]);
-      unsigned coord = rem % dim;
-      rem /= dim;
-      off += static_cast<long long>(coord) * a_strides[d];
-    }
-    sum += a[off];
+    sum += a[base + sum_to_offset_(a_shape, a_strides, acc, rank, r)];
   }
   sdata[tid] = sum;
   __syncthreads();
@@ -394,13 +374,6 @@ __global__ void tl_argmax(const float* __restrict__ in, float* out, unsigned n,
   }
 }
 
-// tl_pad/tl_fold's per-call shape/stride metadata is uploaded to a scratch
-// device buffer by cuda.h's pad()/fold(); this caps how many int64 slots that
-// buffer (and each kernel's on-stack index array) needs to hold. im2col's
-// chained unfold/pad calls on a conv input (N,C,H,W -> ...,winH,winW) stay
-// well under it.
-#define TL_PAD_FOLD_MAX_RANK 8
-
 // ---- pad: copy a (contiguous) into a zero-initialized larger buffer,
 // shifted by `before` elements along one axis. The caller pre-zeros `out` on
 // the device (MemsetD8) since this kernel only visits a's own n elements —
@@ -441,18 +414,15 @@ extern "C" __global__ void tl_fold(const float* __restrict__ a,
   if (i >= n) return;
   const long long* a_shape = meta;
   const long long* out_strides = meta + rank;
-  long long idx[TL_PAD_FOLD_MAX_RANK];
-  long long rem = i;
-  for (int d = rank - 1; d >= 0; --d) {
-    long long dim = a_shape[d];
-    idx[d] = rem % dim;
-    rem /= dim;
-  }
-  int last = rank - 1;
-  long long dst = 0;
-  for (int d = 0; d < last; ++d) {
-    long long di = (d == axis) ? idx[d] * (long long)step + idx[last] : idx[d];
-    dst += di * out_strides[d];
+  // i's coordinates, the last (the window position) first, each folded into
+  // dst as it comes: no per-axis array (it would sit in local memory).
+  const int last = rank - 1;
+  const long long w = i % a_shape[last];
+  long long rem = i / a_shape[last], dst = 0;
+  for (int d = last - 1; d >= 0; --d) {
+    const long long di = rem % a_shape[d];
+    rem /= a_shape[d];
+    dst += (d == axis ? di * (long long)step + w : di) * out_strides[d];
   }
   atomicAdd(&out[dst], a[i]);
 }
