@@ -272,6 +272,7 @@ inline const char* kernel_name_(kop op) {
     case kop::kv_append_f16_: return "tl_kv_append_f16";
     case kop::kv_fill_: return "tl_kv_fill";
     case kop::kv_fill_f16_: return "tl_kv_fill_f16";
+    case kop::sample_: return "tl_sample";
     case kop::merge_heads_: return "tl_merge_heads";
     case kop::split_heads_: return "tl_split_heads";
     default: return nullptr;  // no kernel here: dispatch declines
@@ -824,6 +825,13 @@ struct context {
 
   // embed_row (cuda_llm.h): f32, bf16, Q4_K, Q6_K, Q8_0.
   CUfunction embed_row_fn[5] = {};
+
+  // sample_to's keys between its launches (cuda_llm.h). Its caller asks one
+  // size every time, so the buffer never moves: a captured graph keeps the
+  // address.
+  CUdeviceptr sample_keys = 0;
+  size_t sample_keys_bytes = 0;
+  CUdeviceptr sample_keys_(size_t bytes) { return grow_scratch_(sample_keys, sample_keys_bytes, bytes); }
 
   // The fused layer norm's pullback: three kernels.
   CUfunction layer_norm_bwd_dx_fn = nullptr;

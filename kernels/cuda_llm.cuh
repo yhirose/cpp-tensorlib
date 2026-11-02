@@ -193,3 +193,131 @@ extern "C" __global__ void tl_embed_row_q80(const unsigned char* W, const float*
                                             unsigned K, unsigned rows) {
   embed_row_quant_core<3>(W, idx, out, K, rows);
 }
+
+// ---- gpu_abi_llm.h's sample_ref on the device: metal_kernels_llm.metal's
+// sample_ (its comment says how the launches split the work), a warp for a
+// simdgroup. The arithmetic is the host's, rounded as it rounds (no fused
+// multiply-add).
+
+// Philox4x32-10 of (c0, c1, 0, 0) under (k0, 0): the first word.
+__device__ __forceinline__ unsigned sample_philox_(unsigned c0, unsigned c1, unsigned k0) {
+  unsigned c2 = 0, c3 = 0, k1 = 0;
+#pragma unroll
+  for (int r = 0; r < 10; r++) {
+    const unsigned n0 = __umulhi(0xCD9E8D57u, c2) ^ c1 ^ k0, n2 = __umulhi(0xD2511F53u, c0) ^ c3 ^ k1;
+    c1 = 0xCD9E8D57u * c2;
+    c3 = 0xD2511F53u * c0;
+    c0 = n0;
+    c2 = n2;
+    k0 += 0x9E3779B9u;
+    k1 += 0xBB67AE85u;
+  }
+  return c0;
+}
+// gpu_abi_llm.h's sample_uniform: 24 bits in [0, 1), or 23 centred in (0, 1).
+__device__ __forceinline__ float sample_uniform_(unsigned bits, bool open) {
+  return open ? (float(bits >> 9) + 0.5f) * 0x1p-23f : float(bits >> 8) * 0x1p-24f;
+}
+constexpr unsigned sample_pick_element_ = 0xFFFFFFFFu;  // gpu_abi_llm.h's sample_pick_element
+constexpr int sample_thread_keys_ = 16;                         // a thread's keys
+
+// The first of a thread's keys after (last, lasti): argmax_take_'s rank.
+__device__ __forceinline__ void sample_lane_next_(const float (&x)[sample_thread_keys_],
+                                                  const int (&xi)[sample_thread_keys_], float last,
+                                                  int lasti, float& v, int& vi) {
+  v = -INFINITY;
+  vi = -1;
+#pragma unroll
+  for (int e = 0; e < sample_thread_keys_; e++) {
+    if (x[e] < last || (x[e] == last && xi[e] > lasti)) argmax_take_(v, vi, x[e], xi[e]);
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    tl_sample(const float* __restrict__ in, const float* __restrict__ idx, unsigned* counter,
+              float* out_v, float* out_i, unsigned n, unsigned chunk, unsigned k, unsigned mapped,
+              unsigned gumbel, unsigned draw, unsigned seed, float inv_t, float top_p) {
+  __shared__ float lv[8][64];  // each warp's k first (policy::max_top_k)
+  __shared__ int li[8][64];
+  __shared__ float tv[64];     // the drawing block's k first
+  __shared__ int ti[64];
+  const unsigned tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+  const unsigned ctr = counter[0];
+  const unsigned begin = blockIdx.x * chunk, end = min(n, begin + chunk);
+  float x[sample_thread_keys_];
+  int xi[sample_thread_keys_];
+#pragma unroll
+  for (int e = 0; e < sample_thread_keys_; e++) {
+    const unsigned i = begin + tid + e * 256u;
+    x[e] = -INFINITY;
+    xi[e] = -1;
+    if (i >= end) continue;
+    xi[e] = mapped ? (int)idx[i] : (int)i;
+    x[e] = in[i];
+    if (gumbel && !mapped)
+      x[e] = __fadd_rn(__fmul_rn(x[e], inv_t),
+                       -logf(-logf(sample_uniform_(sample_philox_(ctr, i, seed), true))));
+  }
+  float hv;
+  int hi;
+  sample_lane_next_(x, xi, INFINITY, -1, hv, hi);
+  for (unsigned r = 0; r < k; r++) {
+    float v = hv;
+    int vi = hi;
+    argmax_warp_(v, vi);
+    if (lane == 0) lv[wid][r] = v, li[wid][r] = vi;
+    if (hi == vi && vi >= 0) sample_lane_next_(x, xi, hv, hi, hv, hi);
+  }
+  __syncthreads();
+  if (wid != 0) return;
+  // The eight lists, a lane each.
+  unsigned at = 0;
+  hv = lane < 8 ? lv[lane][0] : -INFINITY;
+  hi = lane < 8 ? li[lane][0] : -1;
+  for (unsigned r = 0; r < k; r++) {
+    float v = hv;
+    int vi = hi;
+    argmax_warp_(v, vi);
+    if (lane == 0) {
+      if (draw) {
+        tv[r] = v;
+        ti[r] = vi;
+      } else {
+        out_v[blockIdx.x * k + r] = v;
+        out_i[blockIdx.x * k + r] = (float)vi;
+      }
+    }
+    if (hi == vi && vi >= 0) {
+      at++;
+      hv = at < k ? lv[lane][at] : -INFINITY;
+      hi = at < k ? li[lane][at] : -1;
+    }
+  }
+  if (!draw || tid != 0) return;
+  unsigned kk = 0;
+  while (kk < k && ti[kk] >= 0) kk++;
+  int tok = 0;
+  if (kk > 0 && gumbel) {
+    tok = ti[0];
+  } else if (kk > 0) {
+    // Each key's weight over the first's, in order.
+    const float top = tv[0];
+    float z = 0.0f;
+    for (unsigned j = 0; j < kk; j++) z += tv[j] = expf(__fmul_rn(tv[j] - top, inv_t));
+    unsigned kept = 1;
+    float acc = tv[0];
+    while (kept < kk && acc < __fmul_rn(top_p, z)) acc += tv[kept++];
+    const float target =
+        __fmul_rn(sample_uniform_(sample_philox_(ctr, sample_pick_element_, seed), false), acc);
+    float run = 0.0f;
+    tok = ti[kept - 1];
+    for (unsigned j = 0; j < kept; j++) {
+      if (target < (run += tv[j])) {
+        tok = ti[j];
+        break;
+      }
+    }
+  }
+  out_i[0] = (float)tok;
+  counter[0] = ctr + 1;
+}

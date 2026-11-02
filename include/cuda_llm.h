@@ -31,6 +31,9 @@ struct own_llm {
                         int64_t rows, int64_t row_stride, int64_t col_stride);
   static bool read_later(gpu::span src, gpu::pending_read& r);
   static bool finish_read(gpu::pending_read& r, float* out);
+  // A token drawn from the logits (gpu_ops_llm.h), left on the device.
+  static bool sample_to(gpu::span a, int64_t n, const gpu::sampling& s, gpu::span counter,
+                        gpu::span idx);
 };
 
 // ---- CUDA-graph capture (M9 C1-2): record a fixed launch sequence once and
@@ -266,6 +269,44 @@ inline bool own_llm::finish_read(gpu::pending_read& r, float* out) {
   *out = *slot->host;
   r.state.reset();
   return true;
+}
+
+// metal_llm.h's launches of the same kernel, but the first level's blocks
+// take per_block keys too, and the two halves the keys go back and forth
+// between are sized for the longest vector and the largest k, once: every
+// grid and address is then n's and k's alone, so a graph captures the draw.
+inline bool own_llm::sample_to(gpu::span a, int64_t n, const gpu::sampling& s,
+                               gpu::span counter, gpu::span idx) {
+  constexpr int64_t per_block = 256 * 16;
+  constexpr int64_t half = 8 * gpu::policy::max_top_k *
+                           ((gpu::policy::max_f32_index + per_block - 1) / per_block);
+  auto& c = context::get();
+  if (!c.ready) return false;
+  const gpu::span scratch = {reinterpret_cast<void*>(c.sample_keys_(2 * half)), 0};
+  if (!scratch) return false;
+  const bool gumbel = s.top_k == 0;
+  const int64_t k = gumbel ? 1 : s.top_k;
+  const float inv_t = 1.0f / s.temperature;
+  gpu::span keys = a, ids = a;
+  int64_t m = n;
+  for (uint32_t level = 0;; level++) {
+    const bool draw = m <= per_block;
+    const int64_t blocks = draw ? 1 : (m + per_block - 1) / per_block;
+    const gpu::span out = draw ? idx : scratch.at(level % 2 * half),
+                    out_ids = draw ? idx : out.at(4 * blocks * k);
+    const gpu::arg args[] = {gpu::in(keys), gpu::in(ids), gpu::inout(counter), gpu::out(out),
+                             gpu::out(out_ids)};
+    const gpu::sample_params p{static_cast<uint32_t>(m), static_cast<uint32_t>(per_block),
+                               static_cast<uint32_t>(k), level > 0, gumbel, draw, s.seed,
+                               inv_t, s.top_p};
+    if (!dispatch(kop::sample_, args, 5, &p, sizeof(p),
+                  {static_cast<uint32_t>(blocks), 1, 1, 256, 1, 1, 0}))
+      return false;
+    if (draw) return true;
+    keys = out;
+    ids = out_ids;
+    m = blocks * k;
+  }
 }
 
 // The KV cache itself is tl::kv_cache (kv_cache.h), written once over the
