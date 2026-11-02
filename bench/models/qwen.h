@@ -1460,7 +1460,7 @@ inline embed_table device_embed(const Model& M) {
   return {M.outwT.dt() == tl::dtype::bf16 ? 30 : 0, sp(M.outwT), 1, c.VOCAB};
 }
 
-// CUDA-graph-captured greedy decoder (A-min). Captures the device-pos forward
+// CUDA-graph-captured decoder (A-min). Captures the device-pos forward
 // once (after prefill, at the first decode position) and replays it per token —
 // collapsing the ~360 per-token kernel launches into one graph submit. Correct
 // across positions because rope/kv-append/attn read the position from the device
@@ -1481,7 +1481,7 @@ inline embed_table device_embed(const Model& M) {
 //
 // Where the model keeps its embedding table on the device and the backend
 // gathers from it (tok_in), a step takes its input from the token on the
-// device, d_tok, and leaves its own greedy token there: feed() and step() put
+// device, d_tok, and leaves the token it draws there: feed() and step() put
 // the token in, and next() runs a step ahead: it queues the step after the
 // token it returns before reading that token back (MLX-LM's async_eval loop;
 // SGLang's and TensorRT-LLM's overlap schedulers). Every step is then the same
@@ -1495,6 +1495,17 @@ struct captured_decoder {
   // next step feeds, which begin(), step() and next() all leave in `last`.
   storage d_tok;
   bool tok_in = false;
+  // How each token is drawn (greedy by default; set before begin()), and the
+  // tokens returned so far, one stream from the first begin() to destroy():
+  // draw n is the n-th token returned, on every path. The draw is on the
+  // device where the backend has one (into d_tok, whether or not steps take
+  // their input from it), from the counter d_draws, else on the host. Steps
+  // whose token is never returned (the prompt fed a token at a time, a step
+  // queued ahead and dropped) draw on the device too, so begin() puts `draws`
+  // back into d_draws before the draw it returns.
+  gpu::sampling sampler;
+  storage d_draws;
+  uint32_t draws = 0;
   gpu::pending_read in_flight;
   bool flying = false;
   int64_t last = -1;
@@ -1520,6 +1531,9 @@ struct captured_decoder {
     max_ctx = seq_cache(M).max_ctx;  // bound applies to the fallback too
     cur_pos = pos;
     last = first_id;
+    if (!sampler.valid()) throw std::invalid_argument("qwen: a sampler setting out of range");
+    if (!d_tok.native) d_tok = storage::make(1);
+    if (!d_draws.native) d_draws = storage::make(1);
     tok_in = token_input_(M, first_id);
     if (!gpu::graph_available()) return;
     d_pos = storage::make(1);
@@ -1541,15 +1555,14 @@ struct captured_decoder {
     exec = gpu::capture_end();
   }
   // Whether steps take their input from d_tok, which then holds `id`: the
-  // table on the device, the backend's argmax_to, and its reader for the
-  // table's format, tried once here (embed_row refuses a format it has none
+  // table on the device, the backend's argmax_to (and sample_to when
+  // sampling), and its reader for the table's format, tried once here (embed_row refuses a format it has none
   // for, and its row is put in again before any step reads it).
   bool token_input_(Model& M, int64_t id) {
     if (device_embed(M).type < 0 || !gpu::has_argmax_to || !gpu::has_embed_row ||
-        M.c.VOCAB > gpu::policy::max_f32_index)
+        (!sampler.greedy() && !gpu::has_sample_to) || M.c.VOCAB > gpu::policy::max_f32_index)
       return false;
-    if (!d_tok.native) d_tok = storage::make(1);
-    if (!d_tok.native) return false;
+    if (!d_tok.native || !d_draws.native) return false;
     upload_token_(id);
     return gather_(M);
   }
@@ -1572,24 +1585,55 @@ struct captured_decoder {
     else stage_embed(M, id);
   }
   // One step's launches, the graph's too: the input gathered from d_tok, the
-  // layers, and the greedy token over d_tok (from logits_out when given).
+  // layers, and the token drawn over d_tok (from logits_out when given).
   void run_step_(Model& M, int64_t pos, gpu::span dp = {}, gpu::span logits_out = {}) {
-    const Config& c = M.c;
     if (tok_in && !gather_(M)) throw std::runtime_error("qwen: a step lost its input row");
     run_layers_(M, sp(M.scratch.embed), pos, dp, logits_out);
-    if (tok_in && !gpu::argmax_to(logits_out ? logits_out : sp(M.scratch.logits), c.VOCAB, sp(d_tok)))
+    if (tok_in && !draw_to_(logits_out ? logits_out : sp(M.scratch.logits), M.c.VOCAB))
       throw std::runtime_error("qwen: a step lost its token");
   }
+  bool draw_to_(gpu::span logits, int64_t n) {
+    return gpu::sample_to(logits, n, sampler, sp(d_draws), sp(d_tok));
+  }
+  // The token drawn from the logits in scratch: over d_tok and read back, or,
+  // where the backend cannot draw, on the host.
+  int64_t draw_(Model& M) {
+    if (sampler.greedy() && !tok_in) return argmax_logits(M);
+    if (d_tok.native && d_draws.native && draw_to_(sp(M.scratch.logits), M.c.VOCAB))
+      return read_token_();
+    return gpu::sample_ref(host_read(M.scratch.logits), M.c.VOCAB, sampler, draws);
+  }
+  // `draws` into d_draws (a u32, uploaded by its bits).
+  void sync_draws_() {
+    float bits;
+    std::memcpy(&bits, &draws, 4);
+    if (d_draws.native) gpu::upload(d_draws.native, &bits, 1);
+  }
+  // A token returned to the caller: the next draw's number moves on.
+  int64_t took_(int64_t t) {
+    draws++;
+    return last = t;
+  }
+  int64_t read_token_() {
+    gpu::pending_read r;
+    if (!gpu::read_later(sp(d_tok), r)) throw std::runtime_error("qwen: a token's read-back failed");
+    return finish_token_(r);
+  }
+  static int64_t finish_token_(gpu::pending_read& r) {
+    float v = -1.0f;
+    if (!gpu::finish_read(r, &v)) throw std::runtime_error("qwen: a token's read-back failed");
+    return static_cast<int64_t>(v);
+  }
 
-  // Consume a whole prompt and return the first generated token (the greedy
-  // argmax of the LAST prompt token's logits), leaving scratch logits holding
-  // that token's row. Two branches, one post-condition:
+  // Consume a whole prompt and return the first generated token (drawn as
+  // `sampler` says from the LAST prompt token's logits), leaving scratch
+  // logits holding that token's row. Two branches, one post-condition:
   //
   //  - BATCHED (`batched`, whenever can_prefill_batched allows): the prompt runs
   //    as GEMMs, then the decode graph is captured at the position the prompt
   //    left the cache at. The prompt itself never enters the graph.
   //  - token-by-token: capture first, then feed() every prompt token but the
-  //    last through it (no argmax; their greedy output is discarded). ONE graph
+  //    last through it (no read-back; what they draw is discarded). ONE graph
   //    then serves both phases, since the device pos counter advances across the
   //    boundary. ids[0]'s forward runs twice here — once to warm/grow scratch
   //    before recording, once through the loop; one token out of T, and skipping
@@ -1608,12 +1652,19 @@ struct captured_decoder {
       if (next >= 0) {
         batched = true;
         init(M, next, seq_cache(M).pos);
-        return last = next;
+        // prefill took the greedy token; a sampler draws its own from the
+        // prompt's logits, still in scratch (init's warm run used the sink).
+        if (!sampler.greedy()) {
+          sync_draws_();
+          put_(M, next = draw_(M));
+        }
+        return took_(next);
       }
     }
     // Token-by-token: one capture serves prompt and decode alike.
     init(M, ids[0], seq_cache(M).pos);
     for (size_t i = 0; i + 1 < ids.size(); i++) feed(M, ids[i]);
+    if (!sampler.greedy()) sync_draws_();
     int64_t last = step(M, ids.back());  // only the last token's logits are read
     sync_host_pos(M);
     return last;
@@ -1637,16 +1688,11 @@ struct captured_decoder {
     cur_pos++;
     return true;
   }
-  // One decode step: feed + read the greedy token (-1 when the cache is full):
-  // the one the step left in d_tok, or the logits' argmax.
+  // One decode step: feed + read the token drawn (-1 when the cache is full):
+  // the one the step left in d_tok, or one drawn from the logits on the host.
   int64_t step(Model& M, int64_t id) {
     if (!feed(M, id)) return last = -1;
-    if (!tok_in) return last = argmax_logits(M);
-    gpu::pending_read r;
-    float v = -1.0f;
-    if (!gpu::read_later(sp(d_tok), r) || !gpu::finish_read(r, &v))
-      throw std::runtime_error("qwen: a token's read-back failed");
-    return last = static_cast<int64_t>(v);
+    return took_(tok_in ? read_token_() : draw_(M));
   }
 
   // The token after `last`, with the step after it already queued: the host
@@ -1666,9 +1712,7 @@ struct captured_decoder {
     gpu::pending_read read = std::move(in_flight);
     flying = cur_pos < max_ctx;
     if (flying) queue_ahead_(M);
-    float v = -1.0f;
-    if (!gpu::finish_read(read, &v)) throw std::runtime_error("qwen: a token's read-back failed");
-    return last = static_cast<int64_t>(v);
+    return took_(finish_token_(read));
   }
   // The step queued ahead, waited for: its token was fed (the cache holds it)
   // but is never returned.
@@ -1698,6 +1742,8 @@ struct captured_decoder {
     land_();
     gpu::flush();
     d_tok = storage{};
+    d_draws = storage{};
+    draws = 0;
     tok_in = false;
     if (exec) gpu::graph_destroy(exec);
     exec = nullptr;
