@@ -6,6 +6,8 @@
 #include "test_quant.h"
 #include "test_util.h"
 
+#include <tuple>
+
 TEST_CASE("softmax: own CPU rows across the pool match the ref oracle") {
   // rank 1, 2 and 3, a transposed (strided) view, and a shape big enough to
   // split across threads
@@ -1251,14 +1253,17 @@ TEST_CASE("generic compositions agree with the fused kernels") {
   }
 
   SUBCASE("the gated delta rule over a prefill: chunked against token by token") {
-    // 77 tokens: past one chunk, with a partial last one. The chunked form
-    // regroups the same rule, so the two agree to rounding, outputs and the
-    // state left behind. Three head counts, so that the chunked kernel splits
-    // a head's value columns over 4, 2 and 1 blocks (32, 64 and 128 a block),
-    // the last two with fewer key heads than value heads.
-    for (const auto [H, Hk] : {std::pair<int64_t, int64_t>{16, 16}, {24, 8}, {48, 16}}) {
+    // 77 tokens: past one chunk, with a partial last one; and 8, the fewest
+    // the chunked form takes, all in one partial chunk. It regroups the same
+    // rule, so the two agree to rounding, outputs and the state left behind.
+    // Three head counts, so that the chunked kernel splits a head's value
+    // columns over 4, 2 and 1 blocks (32, 64 and 128 a block), the last two
+    // with fewer key heads than value heads.
+    for (const auto [H, Hk, T] : {std::tuple<int64_t, int64_t, int64_t>{16, 16, 77}, {24, 8, 77},
+                                  {48, 16, 77}, {48, 16, 8}}) {
       CAPTURE(H);
-      const int64_t dk = 128, dv = 128, C = 2 * Hk * dk + H * dv, T = 77, ld = 2 * H + 5;
+      CAPTURE(T);
+      const int64_t dk = 128, dv = 128, C = 2 * Hk * dk + H * dv, ld = 2 * H + 5;
       array r = random_array({2 * H}, 1020);
       r.eval();
       std::vector<float> adt_h(r.raw(), r.raw() + 2 * H);

@@ -782,15 +782,17 @@ inline bool own_nn::ssm_conv_tokens(gpu::span x, int64_t ld, gpu::span state,
 }
 
 // The chunked delta rule (tl_gated_delta_fused_<V>): dk 128, dv 128, 64 or 32,
-// and at least 32 tokens; fewer take the per-token kernel. (32 was the old
-// two-kernel form's chunk; this one's crossover against the per-token kernel
-// has not been measured.)
+// and at least 8 tokens (half a chunk); fewer take the per-token kernel, whose
+// time grows with each token where this one's grows a chunk at a time. Measured
+// against it (RTX 3090), the fused kernel is level at 7 tokens on 48 heads (V
+// 128: 25.6 against 25.3 us, then ahead) and at 3 on 16 (V 32: 11.3 against
+// 11.3); at 16 tokens it is 1.9x and 3.5x ahead.
 inline bool own_nn::gated_delta_chunked(gpu::span qkv, gpu::span ab, int64_t ab_ld,
                                      gpu::span adt, gpu::span state, gpu::span o,
                                      int64_t H, int64_t dk, int64_t dv, int64_t T,
                                      float eps, int64_t Hk) {
   auto& c = context::get();
-  if (!c.ready || dk != 128 || (dv != 128 && dv != 64 && dv != 32) || T < 32 || Hk <= 0 ||
+  if (!c.ready || dk != 128 || (dv != 128 && dv != 64 && dv != 32) || T < 8 || Hk <= 0 ||
       H % Hk)
     return false;
   // A head's value columns in as many slices (V >= 32 a block) as keep the
