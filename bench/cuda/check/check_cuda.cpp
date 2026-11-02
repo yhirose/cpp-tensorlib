@@ -480,11 +480,12 @@ int main() {
 
   // ---- no kernel keeps an array in local memory, as the module was JIT-compiled here:
   // indexing a byte copy of the Q4_K scales put it there and cost the decode GEMV a fifth
-  // of its speed. The kernels below still have a frame, each for the reason given; any
+  // of its speed, and the conv window indexed by its runtime width cost tl_ssm_conv a
+  // third (a loop to the largest width with the runtime one as a guard keeps the indices
+  // constant). The kernels below still have a frame, each for the reason given; any
   // other one fails this.
   {
     static const char* const allowed[] = {
-        "tl_ssm_conv", "tl_ssm_conv_state",       // the conv window, indexed by the runtime width
         "tl_fold", "tl_sum_to", "tl_sum_to_blocked",  // per-axis shape and stride arrays
     };
     auto& cx = context::get();

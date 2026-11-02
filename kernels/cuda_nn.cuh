@@ -219,7 +219,9 @@ __device__ __forceinline__ float2 tl_tree_sum2_(float* s, unsigned t, unsigned T
 // the K-1 inputs before the first token [K-1, C] (oldest first), w the tap-
 // major weights [K, C]. A thread per channel walks the tokens with the window
 // in registers (K <= 8, which the launcher checks) and leaves the last K-1
-// inputs in its own column of the state. grid = ceil(C/256).
+// inputs in its own column of the state. grid = ceil(C/256). Every loop runs
+// to the largest K with the runtime K as a guard, so each array index is a
+// constant and the arrays stay in registers, not local memory.
 extern "C" __global__ void tl_ssm_conv(const float* __restrict__ x,
                                        float* __restrict__ state,
                                        const float* __restrict__ w,
@@ -227,18 +229,31 @@ extern "C" __global__ void tl_ssm_conv(const float* __restrict__ x,
                                        unsigned K, unsigned T, unsigned ld) {
   const unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
-  float win[7], wk[8];
-  for (unsigned k = 0; k + 1 < K; k++) win[k] = state[(size_t)k * C + c];
-  for (unsigned k = 0; k < K; k++) wk[k] = w[(size_t)k * C + c];
+  float win[7], wk[7], wlast = 0.0f;
+#pragma unroll
+  for (unsigned k = 0; k < 7; k++) {
+    win[k] = k + 1 < K ? state[(size_t)k * C + c] : 0.0f;
+    wk[k] = k + 1 < K ? w[(size_t)k * C + c] : 0.0f;
+  }
+#pragma unroll
+  for (unsigned k = 1; k < 8; k++)
+    if (k + 1 == K) wlast = w[(size_t)k * C + c];
   for (unsigned t = 0; t < T; t++) {
     const float xc = x[(size_t)t * ld + c];
-    float acc = xc * wk[K - 1];
-    for (unsigned k = 0; k + 1 < K; k++) acc += win[k] * wk[k];
+    float acc = xc * wlast;
+#pragma unroll
+    for (unsigned k = 0; k < 7; k++)
+      if (k + 1 < K) acc += win[k] * wk[k];
     out[(size_t)t * C + c] = acc / (1.0f + expf(-acc));
-    for (unsigned k = 0; k + 2 < K; k++) win[k] = win[k + 1];
-    win[K - 2] = xc;
+#pragma unroll
+    for (unsigned k = 0; k < 7; k++) {
+      if (k + 2 < K) win[k] = win[k + 1];
+      else if (k + 2 == K) win[k] = xc;
+    }
   }
-  for (unsigned k = 0; k + 1 < K; k++) state[(size_t)k * C + c] = win[k];
+#pragma unroll
+  for (unsigned k = 0; k < 7; k++)
+    if (k + 1 < K) state[(size_t)k * C + c] = win[k];
 }
 
 // The same conv over a prefill's tokens with a thread a (channel, token): each
@@ -267,12 +282,15 @@ extern "C" __global__ void tl_ssm_conv_state(const float* __restrict__ x,
                                              unsigned K, unsigned T, unsigned ld) {
   const unsigned c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= C) return;
-  float keep[7];  // K <= 8, which the launcher checks
-  for (unsigned k = 0; k + 1 < K; k++) {
+  float keep[7];  // K <= 8, which the launcher checks; guarded as tl_ssm_conv's
+#pragma unroll
+  for (unsigned k = 0; k < 7; k++) {
     const int u = (int)T - (int)(K - 1) + (int)k;
-    keep[k] = u >= 0 ? x[(size_t)u * ld + c] : state[(size_t)((int)K - 1 + u) * C + c];
+    if (k + 1 < K) keep[k] = u >= 0 ? x[(size_t)u * ld + c] : state[(size_t)((int)K - 1 + u) * C + c];
   }
-  for (unsigned k = 0; k + 1 < K; k++) state[(size_t)k * C + c] = keep[k];
+#pragma unroll
+  for (unsigned k = 0; k < 7; k++)
+    if (k + 1 < K) state[(size_t)k * C + c] = keep[k];
 }
 
 // The gated delta rule over T tokens (gpu_ops.h gated_delta has the math).
