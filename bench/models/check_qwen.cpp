@@ -87,6 +87,60 @@ static bool check_f16_sums(qm::Model& B, const std::vector<int>& ids,
   return close && net;
 }
 
+// A hot sampler (temperature 2 over the top 64, so each draw turns on its
+// random number even where the model is sure), over two turns on one
+// decoder: each token step() returns is the host definition's for the logits
+// it left, draw n the n-th token the decoder returned (the first, begin()'s,
+// is draw 0); and where steps run ahead, next() returns the same tokens
+// (the step() run feeds its last token before the second turn, as next()'s
+// step queued ahead leaves it in the cache).
+static bool check_sampled_from(qm::Model& B, const std::vector<int>& ids) {
+  const tl::gpu::sampling hot{2.0f, 64, 1.0f, 1};
+  const std::vector<int> turn2(ids.begin(), ids.begin() + std::min<size_t>(ids.size(), 3));
+  auto run = [&](bool ahead, bool* ok) {
+    qm::reset_cache(B);
+    qm::captured_decoder d;
+    d.sampler = hot;
+    std::vector<int64_t> t;
+    for (const auto* turn : {&ids, &turn2}) {
+      if (!ahead && !t.empty()) d.feed(B, t.back());
+      t.push_back(d.begin(B, *turn));
+      for (int i = 0; i < 8; i++) {
+        t.push_back(ahead ? d.next(B) : d.step(B, t.back()));
+        if (ok)
+          *ok &= t.back() == tl::gpu::sample_ref(qm::host_read(B.scratch.logits), B.c.VOCAB,
+                                                 hot, uint32_t(t.size() - 1));
+      }
+    }
+    const bool in = d.tok_in;
+    d.destroy();
+    return std::make_pair(t, in);
+  };
+  bool ok = true;
+  const auto [drawn, ahead] = run(false, &ok);
+  std::printf("    step() vs the host definition:");
+  for (int64_t t : drawn) std::printf(" %lld", (long long)t);
+  std::printf(" %s\n", ok ? "MATCH" : "DIVERGE");
+  if (!ahead) {
+    std::printf("    next(): no step runs ahead here, skipped\n");
+    return ok;
+  }
+  const bool same = run(true, nullptr).first == drawn;
+  std::printf("    next() vs step(): %s\n", same ? "MATCH" : "DIVERGE");
+  return ok && same;
+}
+// The prompt, and its first three tokens, which begin() feeds a token at a
+// time (each step it feeds draws too, and is not returned).
+static bool check_sampled(qm::Model& B, const std::vector<int>& prompt) {
+  bool ok = true;
+  for (size_t len : {prompt.size(), size_t(3)}) {
+    const std::vector<int> ids(prompt.begin(), prompt.begin() + std::min(len, prompt.size()));
+    std::printf("  sampled (temp 2, top_k 64), a %zu-token prompt:\n", ids.size());
+    ok &= check_sampled_from(B, ids);
+  }
+  return ok;
+}
+
 // A hybrid model (Qwen3.5) has no array path, so its checkpoints are read off
 // the imperative forward: the final norm the last layer's seam leaves in
 // scratch, the logits, and the greedy continuation, at F32 against the oracle.
@@ -214,6 +268,8 @@ static bool check_hybrid(const qm::gg::model& m, const Oracle& O) {
   for (int64_t t : same) std::printf(" %lld", (long long)t);
   std::printf(" %s\n", turn2_ok ? "MATCH" : "DIVERGE (a fresh decoder gives another)");
 
+  const bool sample_ok = check_sampled(B, ids);
+
   // A prompt past one chunk of the delta rule (32 tokens), so the batched
   // prefill takes the backend's chunked form where it has one: its last
   // token's top-5 logits against the imperative path's.
@@ -232,7 +288,7 @@ static bool check_hybrid(const qm::gg::model& m, const Oracle& O) {
   }
   const bool f16_ok = !qm::can_prefill_batched(B, (int64_t)longp.size()) ||
                       check_f16_sums(B, longp, imp_long);
-  return ok && bf16_ok && logits_ok && dec_ok && turn2_ok && long_ok && f16_ok;
+  return ok && bf16_ok && logits_ok && dec_ok && turn2_ok && sample_ok && long_ok && f16_ok;
 }
 
 int main(int argc, char** argv) {
@@ -391,6 +447,7 @@ int main(int argc, char** argv) {
       bf16_ok = got == want;
       std::printf("\n  greedy %s\n", bf16_ok ? "MATCH" : "DIVERGE");
       bf16_ok &= check_f16_sums(B, ids, array_prompt);
+      bf16_ok &= check_sampled(B, ids);
     }
   }
 

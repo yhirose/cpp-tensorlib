@@ -5,13 +5,17 @@
 // GPU kernels + own GGUF loader + own BPE tokenizer, zero third-party runtime deps.
 //
 // Usage: chat_qwen [model.gguf] ["your prompt"] [f32|bf16] [q4 spec] [nothink] [f32acc]
-// Greedy decoding (deterministic); stops at <|im_end|> or the token budget.
+//                  [temp=T] [top_k=K] [top_p=P] [seed=S]
+// Greedy decoding by default; temp=0.7 top_k=20 top_p=0.8 is Qwen's own
+// recommended sampling (the same seed draws the same text). Stops at
+// <|im_end|> or the token budget.
 
 #include "qwen.h"
 #include "tokenizer.h"
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -63,7 +67,24 @@ int main(int argc, char** argv) {
   // Qwen3.5's template opens the <think> block itself.
   const bool qwen3 = M.c.arch == "qwen3", qwen35 = M.c.arch == "qwen35";
   bool nothink = false;
-  for (int i = 5; i < argc; i++) nothink |= std::string(argv[i]) == "nothink";
+  tl::gpu::sampling sampler;
+  for (int i = 5; i < argc; i++) {
+    const std::string a = argv[i];
+    nothink |= a == "nothink";
+    const auto eq = a.find('=');
+    if (eq == std::string::npos) continue;
+    const std::string key = a.substr(0, eq);
+    const char* v = a.c_str() + eq + 1;
+    if (key == "temp") sampler.temperature = std::strtof(v, nullptr);
+    else if (key == "top_k") sampler.top_k = std::atoi(v);
+    else if (key == "top_p") sampler.top_p = std::strtof(v, nullptr);
+    else if (key == "seed") sampler.seed = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+  }
+  if (!sampler.valid()) {
+    std::printf("temp >= 0, top_k 0..%d, top_p in (0, 1], and top_p < 1 needs top_k > 0\n",
+                tl::gpu::policy::max_top_k);
+    return 1;
+  }
   std::string templated =
       std::string(qwen3 || qwen35 ? "" : "<|im_start|>system\nYou are Qwen, created by "
                                            "Alibaba Cloud. You are a helpful "
@@ -72,17 +93,24 @@ int main(int argc, char** argv) {
       ((qwen3 || qwen35) && nothink ? "<think>\n\n</think>\n\n"
                                     : qwen35 ? "<think>\n" : "");
   std::vector<int> ids = tok.encode(templated);
-  std::printf("prompt: %s\n%zu prompt tokens; generating (greedy)...\n\n",
-              user.c_str(), ids.size());
+  if (sampler.greedy()) {
+    std::printf("prompt: %s\n%zu prompt tokens; generating (greedy)...\n\n", user.c_str(),
+                ids.size());
+  } else {
+    std::printf("prompt: %s\n%zu prompt tokens; generating (temp %g, top_k %d, top_p %g, seed %u)...\n\n",
+                user.c_str(), ids.size(), sampler.temperature, sampler.top_k, sampler.top_p,
+                sampler.seed);
+  }
 
   // begin() consumes the prompt — batched as GEMMs when the weights allow it,
   // else token-by-token — and returns the first generated token; next() then
   // runs a step ahead where it can, self-bounds on the KV capacity and degrades
-  // to step() on its own, so there is nothing to branch on here. See qm::captured_decoder. Greedy
-  // throughout; capture is guarded argmax-equivalent to imperative in
-  // bench_qwen_decode, and every prefill path against the array reference in
-  // bench_qwen_prefill.
+  // to step() on its own, so there is nothing to branch on here. See qm::captured_decoder.
+  // Each token is drawn as `sampler` says, the first one too; capture is
+  // guarded argmax-equivalent to imperative in bench_qwen_decode, and every
+  // prefill path against the array reference in bench_qwen_prefill.
   qm::captured_decoder dec;
+  dec.sampler = sampler;
   auto t_prefill = clk::now();
   int64_t next = dec.begin(M, ids);
   double prefill_ms = ms_since(t_prefill) - dec.capture_ms;  // prompt work only
