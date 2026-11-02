@@ -116,6 +116,21 @@ inline attn_kernel attn_kernel_(attn_op op, int64_t D, bool f16) {
 static_assert(gtile_key_(gtile::steel32x64_tb) > -101,
               "gtile and attn_op pipeline keys must stay in disjoint ranges");
 
+// A core op's other kernels, which it picks between by shape: a kop names what
+// is computed, not how, so these stay out of it too. Keyed from -51, between
+// gtile's range and attn_op's.
+enum class core_variant { sum_to_blocked };
+constexpr int core_variant_key_(core_variant v) { return -51 - static_cast<int>(v); }
+inline const char* core_variant_name_(core_variant v) {
+  switch (v) {
+    case core_variant::sum_to_blocked: return "sum_to_blocked_";
+  }
+  return "";
+}
+static_assert(gtile_key_(gtile::steel32x64_tb) > core_variant_key_(core_variant::sum_to_blocked) &&
+                  core_variant_key_(core_variant::sum_to_blocked) > -101,
+              "core_variant's pipeline keys sit between gtile's and attn_op's");
+
 struct mtl_size {
   unsigned long w, h, d;
 };
@@ -229,7 +244,6 @@ struct context {
       case kop::cos_: return "cos_";
       case kop::clamp_: return "clamp_";
       case kop::sum_to_: return "sum_to_";
-      case kop::sum_to_blocked_: return "sum_to_blocked_";
       case kop::concat_part_: return "concat_part_";
       case kop::rope_: return "rope_";
       case kop::pow_s_: return "pow_s_";
@@ -276,6 +290,7 @@ struct context {
   void bind_(kop op) { bind_id_(static_cast<int>(op), kernel_name_(op)); }
   void bind_(gtile t) { bind_id_(gtile_key_(t), gtile_name_(t)); }
   void bind_(attn_kernel k) { bind_id_(k.key, k.name); }
+  void bind_(core_variant v) { bind_id_(core_variant_key_(v), core_variant_name_(v)); }
 
   void bind_id_(int id, const char* name) {
     objc::id pso = pso_id_(id, name);
@@ -1008,7 +1023,8 @@ inline bool own_core::sum_to(gpu::span a, const int64_t* a_shape,
   // A deep reduction (a bias gradient sums its column over every row) earns a
   // threadgroup per output, as on CUDA; a shallow one keeps a thread per output.
   const bool blocked = reduced_n >= 64;
-  c.bind_(blocked ? kop::sum_to_blocked_ : kop::sum_to_);
+  if (blocked) c.bind_(core_variant::sum_to_blocked);
+  else c.bind_(kop::sum_to_);
   detail_::set_buf_(c.enc, a, 0ul);
   detail_::set_buf_(c.enc, out, 1ul);
   detail_::sum_to_params p{};

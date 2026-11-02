@@ -49,7 +49,7 @@ namespace gpu {
   X(where_nd) X(copy_nd) /* N-D select / clone()'s strided gather */           \
   X(gt_) X(lt_) X(ge_) X(le_) X(eq_) X(ne_) /* cmp_op maps onto these */       \
   X(tanh_) X(sin_) X(cos_)                  /* unary_ext_op maps onto these */ \
-  X(clamp_) X(sum_to_) X(sum_to_blocked_) X(concat_part_)                      \
+  X(clamp_) X(sum_to_) X(concat_part_)                                         \
   X(pow_s_) X(gt_s_) X(lt_s_) X(ge_s_) X(le_s_) X(eq_s_) X(ne_s_) /* scalar */ \
   X(argmax_) X(gather_axis_)
 #define TL_KOPS_NN(X)                                                          \
