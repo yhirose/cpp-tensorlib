@@ -721,6 +721,30 @@ fn where_nd(@builtin(global_invocation_id) gid : vec3<u32>) {
   out4[wn.v.v4 + i] = select(bv, av, cv != 0.0);
 }
 
+// N-D strided copy: clone()'s device arm for a view the flat kernels cannot
+// read (a permute, a transpose), where_nd's decode with one operand -- mirrors
+// cuda.h's tl_copy_nd and metal.h's copy_nd_.
+// Views: a, meta [out_shape(rank), a_strides(rank)] -> out. Params: webgpu.h's
+// copy_nd_params.
+struct CopyNdArgs { v : Views, n : u32, rank : u32 };
+@group(0) @binding(3) var<uniform> cn : CopyNdArgs;
+
+@compute @workgroup_size(256, 1, 1)
+fn copy_nd(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= cn.n) { return; }
+  let rank = cn.rank;
+  let base = cn.v.v1;
+  var rem = i;
+  var a_off : u32 = 0u;
+  for (var d : i32 = i32(rank) - 1; d >= 0; d = d - 1) {
+    let dim = bitcast<u32>(in1[base + u32(d)]);
+    a_off = a_off + (rem % dim) * bitcast<u32>(in1[base + rank + u32(d)]);
+    rem = rem / dim;
+  }
+  out2[cn.v.v2 + i] = in0[cn.v.v0 + a_off];
+}
+
 // ---- RoPE (rotary position embedding), half-split (GPT-NeoX / HF-llama)
 // convention -- mirrors cuda.h's/metal.h's own rope. x is [rows, D]
 // contiguous (rows = H*T: a [H,T,D] tensor flattened, or [H,D] with T=1);

@@ -164,7 +164,7 @@ inline constexpr const char* kEntryPoints[] = {
     "index_select", "index_add",  "scatter_axis", "ew_bcast_nd",
     "where_nd",     "cmp",        "clamp_",       "sum_to",
     "concat_part",  "rope",        "ew_scalar",    "layer_norm",
-    "gather_axis",  "argmax",     "embed_row"};
+    "gather_axis",  "argmax",     "embed_row",    "copy_nd"};
 
 // emscripten_webgpu_get_device() does not report "no device" — it hands
 // Module.preinitializedWebGPUDevice straight to importJsDevice, which reads
@@ -514,6 +514,8 @@ struct own {
                               gpu::span b, const int64_t* b_strides,
                               gpu::span out, const int64_t* out_shape, int rank,
                               int64_t n, float scale, float offset);
+  static bool copy_nd(gpu::span a, const int64_t* a_strides, gpu::span out,
+                      const int64_t* out_shape, int rank, int64_t n);
   static bool where_nd(gpu::span cond, const int64_t* c_strides, gpu::span a,
                        const int64_t* a_strides, gpu::span b,
                        const int64_t* b_strides, gpu::span out,
@@ -676,6 +678,7 @@ struct bcast_nd_params {
   float scale, offset;
 };
 struct where_nd_params { uint32_t n, rank; };
+struct copy_nd_params { uint32_t n, rank; };
 struct index_add_params { uint32_t n, row_size, k; };
 struct scatter_axis_params { uint32_t n, size; };
 struct rope_params {
@@ -905,6 +908,19 @@ inline bool own::where_nd(gpu::span cond, const int64_t* c_strides, gpu::span a,
       "where_nd", -1,
       {gpu::in(cond), gpu::in(a), gpu::in(b), gpu::in(meta), gpu::out(out)},
       detail_::where_nd_params{u32(n), u32(rank)}, gpu::policy::flat(n));
+}
+
+// N-D strided copy: clone()'s device arm for a view the flat kernels cannot
+// read, where_nd's decode with one operand (cuda.h's and metal.h's copy_nd).
+inline bool own::copy_nd(gpu::span a, const int64_t* a_strides, gpu::span out,
+                         const int64_t* out_shape, int rank, int64_t n) {
+  using detail_::u32;
+  if (rank <= 0 || rank > kPadFoldMaxRank || n <= 0) return false;
+  gpu::span meta = meta_({{out_shape, rank}, {a_strides, rank}});
+  if (!meta) return false;
+  return detail_::launch_own_("copy_nd", -1, {gpu::in(a), gpu::in(meta), gpu::out(out)},
+                              detail_::copy_nd_params{u32(n), u32(rank)},
+                              gpu::policy::flat(n));
 }
 
 // sum_to (un-broadcast a gradient): gather, mirrors cuda.h's tl_sum_to and
