@@ -181,6 +181,25 @@ TEST_CASE("clone of a strided view gathers the same elements on the device") {
   CHECK(matches_gpu_oracle([&] { return row.broadcast_to({4, 6}).clone(); }));
 }
 
+TEST_CASE("a buffer freed under a queued kernel keeps its bytes until the kernel reads them") {
+  // Each source dies as soon as its clone (a device copy, queued, not yet run)
+  // is made, and the next source, the same size, may take its buffer from the
+  // pool and fill it from the host. Every copy must still read the bytes it
+  // was queued on: a backend whose uploads run ahead of its queued kernels
+  // (WebGPU's WriteBuffer) holds a freed buffer back until they are submitted.
+  if (!tl::gpu_available()) return;
+  auto prev = tl::device_;
+  tl::use_gpu();
+  std::vector<array> copies;
+  for (int i = 0; i < 8; i++)
+    copies.push_back(array::from(std::vector<float>(64, float(i)), {64}).clone());
+  for (int i = 0; i < 8; i++) {
+    CAPTURE(i);
+    CHECK(tl::allclose(copies[i], array::full({64}, float(i)), 0.0f, 0.0f));
+  }
+  tl::device_ = prev;
+}
+
 TEST_CASE("an elementwise op on a widened view matches the oracle") {
   auto src = random_array({1, 64}, 21);
   // 2.0f / x builds recip's node, so it needs a source away from zero

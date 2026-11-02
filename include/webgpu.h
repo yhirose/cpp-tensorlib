@@ -213,6 +213,12 @@ struct context {
   wgpu::ComputePassEncoder pass;
   uint32_t slot = 0;  // next free uniform ring slot
 
+  // Buffers released while a batch is open, which a command in it may still
+  // read: they go back to the pool once it is submitted (submit_). Reused
+  // before that, the next owner's upload (a WriteBuffer, which runs ahead of
+  // the unsubmitted encoder) would land under the pending read.
+  std::vector<void*> retiring;
+
   // The N-D kernels' per-call shape metadata ring — same idea as the uniform
   // ring above (queue.WriteBuffer runs ahead of whatever is still sitting in
   // the unsubmitted encoder, so two calls sharing one buffer before a flush
@@ -367,8 +373,10 @@ struct context {
   // WriteBuffer executes in queue order, i.e. ahead of anything still sitting
   // in the unsubmitted encoder. That is safe precisely because a buffer whose
   // live bytes are the host's has no encoded command touching it: a pending
-  // kernel write would have made the device copy live, and a pending kernel
-  // read would have come through here and uploaded already.
+  // kernel write would have made the device copy live, a pending kernel read
+  // would have come through here and uploaded already, and a buffer released
+  // under a pending command is not handed out again until it is submitted
+  // (release, retiring).
   void before_kernel_(mirror& m, gpu::access a) {
     if (m.live.before_kernel(a)) queue.WriteBuffer(m.dev, 0, m.host, m.bytes);
   }
@@ -470,6 +478,8 @@ struct context {
     if (!e) return false;
     wgpu::CommandBuffer cmds = e.Finish();
     queue.Submit(1, &cmds);
+    for (void* t : retiring) mt.release(t);
+    retiring.clear();
     return true;
   }
 
@@ -580,10 +590,13 @@ inline void* alloc(int64_t bytes, float** contents, bool host_fill = false) {
   return token;
 }
 
+// Back to the pool, or, while a batch is open, once it is submitted
+// (context::retiring).
 inline void release(void* buf, int64_t, float*) {
   auto& c = context::get();
   if (!c.ready || !buf) return;
-  c.mt.release(buf);
+  if (c.pending) c.retiring.push_back(buf);
+  else c.mt.release(buf);
 }
 
 // Reconcile a buffer for a CPU access: flush pending kernels, then D2H if the
