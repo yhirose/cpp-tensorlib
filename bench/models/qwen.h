@@ -276,80 +276,52 @@ inline void widen_(const gg::tensor_info* t, size_t first, size_t n, float* dst)
 }
 
 // Fused weight load: widen several GGML [out,in] tensors that share the same
-// `in` (K) and stack them into ONE array, so a single GEMV/GEMM produces all
-// their outputs contiguously (q|k|v or gate|up). Block b occupies output slots
+// `in` (K) and stack them into ONE array, so a single GEMV produces all their
+// outputs contiguously (q|k|v or gate|up). Block b occupies output slots
 // [base, base+out_b), and the fused output [Ntot] is q|k|v (or gate|up) laid end
-// to end whichever layout is used — the downstream slices never change. Fusing
-// is the M9 decode lever: fewer kernels amortize the ~14us per-launch floor.
-// Imperative path only; the array path keeps the separate loads as its oracle.
+// to end — the downstream slices never change. Fusing is the M9 decode lever:
+// fewer kernels amortize the ~14us per-launch floor.
 //
-// `row` picks the destination layout, which is the ONLY difference between the
-// two forms — one place to read, so they cannot drift:
-//   false: [in, Ntot] = [K,N] column-major, what the split-K GEMV and .dot()
-//          expect. Bit-identical per column to loading each part separately
-//          (same widen, same layout).
-//   true:  [Ntot, in] = [N,K] row-major = GGML's own layout, so this drops the
-//          transpose entirely — the warp-per-row GEMV (lever A) and the prefill
-//          GEMM both read it. Its reduction order differs from split-K, so it is
-//          greedy-equivalent to the array oracle, not bit-identical.
+// The array is [in, Ntot] = [K,N] column-major, what the split-K GEMV and .dot()
+// expect: the array path's weights (the oracle), and the imperative path's where
+// the weights are not row-major. Bit-identical per column to loading each part
+// separately (same widen, same layout). The row-major [N,K] weights are wmats
+// (load_wmat below).
 //
 // A part normally takes all of its tensor's rows. With blk set it takes a strided
 // subset instead — output row o reads source row (o / blk) * stride + first +
 // o % blk — which is how Qwen3.5's q projection, q and gate interleaved per
 // head, splits into a contiguous q block and a contiguous gate block at load.
+// `wdt` is the storage dtype: f32 (exact, 4 B/weight) or bf16 (2 B/weight; the
+// decode GEMV consumes bf16 natively).
 struct wpart {
   std::string name;
   int64_t out;
   int64_t blk = 0, stride = 0, first = 0;
   int64_t src(int64_t o) const { return blk ? (o / blk) * stride + first + o % blk : o; }
 };
-inline array load_w_cat_(const gg::model& m, const std::vector<wpart>& parts,
-                         int64_t in, tl::dtype wdt, bool row) {
+inline array load_w_T_cat(const gg::model& m, const std::vector<wpart>& parts,
+                          int64_t in, tl::dtype wdt) {
   int64_t Ntot = 0;
   for (const auto& p : parts) Ntot += p.out;
-  std::vector<float> v((size_t)in * Ntot), rowbuf(row ? 0 : (size_t)in);
+  std::vector<float> v((size_t)in * Ntot), rowbuf((size_t)in);
   int64_t base = 0;
   for (const auto& p : parts) {
     const auto* t = need(m, p.name);
-    const int64_t out = p.out;
-    // A source row is contiguous in the file: widened straight into place in
-    // the row layout, through one row of scratch for the transposed one.
-    for (int64_t o = 0; o < out; o++) {
-      const size_t so = (size_t)p.src(o) * in;
-      if (row) {
-        widen_(t, so, in, &v[(size_t)(base + o) * in]);
-      } else {
-        widen_(t, so, in, rowbuf.data());
-        for (int64_t i = 0; i < in; i++) v[(size_t)i * Ntot + (base + o)] = rowbuf[i];
-      }
+    // A source row is contiguous in the file: widened through one row of
+    // scratch, then transposed into place.
+    for (int64_t o = 0; o < p.out; o++) {
+      widen_(t, (size_t)p.src(o) * in, in, rowbuf.data());
+      for (int64_t i = 0; i < in; i++) v[(size_t)i * Ntot + (base + o)] = rowbuf[i];
     }
-    base += out;
+    base += p.out;
   }
-  array a = array::from(std::move(v),
-                        row ? tl::shape_t{Ntot, in} : tl::shape_t{in, Ntot});
+  array a = array::from(std::move(v), {in, Ntot});
   return wdt == tl::dtype::bf16 ? a.to_bf16() : a;
-}
-
-// The four named entry points: {single, concatenated} x {[K,N], [N,K]}. The
-// [K,N] pair takes the storage dtype — f32 (exact, 4 B/weight) or bf16 (2 B/weight;
-// the decode GEMV consumes bf16 natively). The [N,K]
-// pair does not: row-major weights exist only to feed the warp-per-row GEMV and
-// the prefill GEMM, and both are bf16-only.
-inline array load_w_T_cat(const gg::model& m, const std::vector<wpart>& parts,
-                          int64_t in, tl::dtype wdt) {
-  return load_w_cat_(m, parts, in, wdt, /*row=*/false);
-}
-inline array load_w_T_cat_row(const gg::model& m, const std::vector<wpart>& parts,
-                              int64_t in) {
-  return load_w_cat_(m, parts, in, tl::dtype::bf16, /*row=*/true);
 }
 inline array load_w_T(const gg::model& m, const std::string& n, int64_t in,
                       int64_t out, tl::dtype wdt) {
   return load_w_T_cat(m, {{n, out}}, in, wdt);
-}
-inline array load_w_T_row(const gg::model& m, const std::string& n, int64_t in,
-                          int64_t out) {
-  return load_w_T_cat_row(m, {{n, out}}, in);
 }
 
 // `n` f32 of device scratch. A tl::storage rather than a raw gpu::alloc: the
@@ -396,86 +368,123 @@ inline array load_f32(const gg::model& m, const std::string& n, int64_t len) {
   return load_f32_cat(m, {{n, len}});  // the single-part case
 }
 
-// A projection kept as the GGUF's own quantization blocks, device-resident as they lie
-// in the file (a Q4_K weight is 0.56 byte; bf16 would be 2). The fused projections
-// (q|k|v, gate|up, ...) are their parts' rows end to end, a part a run of rows of
-// one block format — Q4_K_M files mix Q4_K and Q6_K inside one layer, so a fused
-// projection is a GEMV per run, writing its slice of the same contiguous output.
-struct qmat {
+// A projection on the device in the row layout [N,K] that the decode GEMV and the
+// prefill GEMM read, in a device-only buffer (storage::make_device), so the
+// weight sits in memory once: no host copy beside it, and no f32 copy on the way
+// in. A run of its rows is in one format: bf16 (ggml type 30), or the file's own
+// quantization blocks (Model.quant; a Q4_K weight is 0.56 byte, bf16 2). The
+// fused projections (q|k|v, gate|up, ...) are their parts' rows end to end;
+// Q4_K_M files mix Q4_K and Q6_K inside one layer, so a fused projection is a
+// GEMV per run, writing its slice of the same contiguous output.
+struct wmat {
   struct part {
-    int type;           // the ggml_type code, a format gpu::quant_reads takes
+    int type;           // the ggml_type code: 30 bf16, or a block format gpu::quant_reads takes
     int64_t rows;       // output rows of this run
-    int64_t byte_off;   // where its blocks start in `raw`
+    int64_t byte_off;   // where its rows start in `raw`
     int64_t row_off;    // its first output row
   };
   storage raw;
   std::vector<part> parts;
   int64_t K = 0;
   explicit operator bool() const { return !parts.empty(); }
+  gpu::span at(const part& p) const { return sp(raw).at(p.byte_off); }
 };
+constexpr int bf16_type = static_cast<int>(gg::ggml_type::bf16);
 
-// y = Q . a, a GEMV a run. In a prepared form f (gpu::act_form, into `pa`, room for
+// y = W . a, a GEMV a run. In a prepared form f (gpu::act_form, into `pa`, room for
 // gpu::act_bytes_max) the Q4_K runs read the activation as that form makes it,
 // prepared once for the call: int8 (q8) or f16 on the tensor cores (h16) is what
 // makes them run at the weights' bandwidth rather than at the float kernel's
 // instruction rate. The other formats, f32, and a form the backend has not got read
 // it as float.
-inline void gemv_q(const qmat& Q, gpu::span a, gpu::span y,
+inline void gemv_m(const wmat& W, gpu::span a, gpu::span y,
                    gpu::act_form f = gpu::act_form::f32, gpu::span pa = {}) {
   bool prepared = false;
-  for (const auto& p : Q.parts) {
-    const gpu::span w = sp(Q.raw).at(p.byte_off), out = y.at(p.row_off * 4);
-    if (p.type == 12 && (prepared || gpu::prepare_act(f, a, pa, Q.K))) {
-      prepared = true;
-      if (gpu::gemv_q4k_act(f, pa, w, out, p.rows, Q.K)) continue;
+  for (const auto& p : W.parts) {
+    const gpu::span w = W.at(p), out = y.at(p.row_off * 4);
+    if (p.type == bf16_type) {
+      gpu::gemv_bf16_row(a, w, out, p.rows, W.K);
+      continue;
     }
-    gpu::gemv_quant(p.type, a, w, out, p.rows, Q.K);
+    if (p.type == 12 && (prepared || gpu::prepare_act(f, a, pa, W.K))) {
+      prepared = true;
+      if (gpu::gemv_q4k_act(f, pa, w, out, p.rows, W.K)) continue;
+    }
+    gpu::gemv_quant(p.type, a, w, out, p.rows, W.K);
   }
 }
 
-// Parts' rows (the subset a wpart names, if strided) uploaded straight from the
-// file's mapping, no host copy in between.
-inline qmat load_q_cat(const gg::model& m, const std::vector<wpart>& parts, int64_t in) {
-  qmat Q;
-  Q.K = in;
+// The parts' rows (the subset a wpart names, if strided) onto the device. With
+// `native` each keeps the file's quantization blocks, which go up straight from
+// the file's mapping; otherwise each is bf16, which a BF16 file's rows already
+// are and any other float or block format is widened and rounded to, a few rows
+// at a time through a small staging buffer, so no copy of the whole weight is
+// ever made on the host.
+inline wmat load_wmat(const gg::model& m, const std::vector<wpart>& parts, int64_t in,
+                      bool native) {
+  wmat W;
+  W.K = in;
+  std::vector<int64_t> row_bytes;
   int64_t off = 0, rows_total = 0;
   for (const auto& p : parts) {
     const auto* t = need(m, p.name);
-    if (!gpu::quant_reads((int)t->type, in)) {
+    const gg::ggml_type ty = native ? t->type : gg::ggml_type::bf16;
+    if (native && !gpu::quant_reads((int)ty, in)) {
       std::fprintf(stderr, "tensor %s: this backend does not read its blocks (ggml type %d, %lld "
-                   "weights a row) as they are\n", p.name.c_str(), (int)t->type, (long long)in);
+                   "weights a row) as they are\n", p.name.c_str(), (int)ty, (long long)in);
       std::exit(2);
     }
-    const int64_t row_bytes = (int64_t)gg::bytes_of(t->type, in), type = (int64_t)t->type;
-    if (Q.parts.empty() || Q.parts.back().type != type) {  // a new run, 256-byte aligned
+    const int type = static_cast<int>(ty);
+    const int64_t rb = (int64_t)gg::bytes_of(ty, in);
+    if (W.parts.empty() || W.parts.back().type != type) {  // a new run, 256-byte aligned
       off = (off + 255) / 256 * 256;
-      Q.parts.push_back({(int)type, 0, off, rows_total});
+      W.parts.push_back({type, 0, off, rows_total});
     }
-    Q.parts.back().rows += p.out;
-    off += p.out * row_bytes;
+    W.parts.back().rows += p.out;
+    off += p.out * rb;
     rows_total += p.out;
+    row_bytes.push_back(rb);
   }
-  Q.raw = scratch_f32((off + 3) / 4);
-  int64_t base = 0, pi = 0;
-  for (const auto& p : parts) {
+  const int64_t words = (off + 3) / 4;  // a Q6_K or Q8_0 row ends mid-word
+  W.raw = storage::make_device(words, words * 4, tl::dtype::f32);
+  // Rows widened to f32 and rounded to bf16 per batch: about 4 MB of f32.
+  const int64_t batch = std::max<int64_t>(1, (4 << 20) / (in * 4));
+  std::vector<float> wide;
+  std::vector<uint16_t> narrow;
+  int64_t base = 0;
+  size_t pi = 0;
+  for (size_t i = 0; i < parts.size(); i++) {
+    const wpart& p = parts[i];
     const auto* t = m.tensor(p.name);
-    const int64_t row_bytes = (int64_t)gg::bytes_of(t->type, in);
-    while (pi + 1 < (int64_t)Q.parts.size() && Q.parts[pi + 1].row_off <= base) pi++;
-    const auto& run_ = Q.parts[pi];
+    const int64_t rb = row_bytes[i];
+    while (pi + 1 < W.parts.size() && W.parts[pi + 1].row_off <= base) pi++;
+    const wmat::part& run = W.parts[pi];
+    const bool as_stored = run.type == static_cast<int>(t->type);
     // Source rows are contiguous runs (the whole tensor, or the blk rows of one
-    // head of an interleaved projection): one upload a run.
+    // head of an interleaved projection): one upload a run, or a batch.
     int64_t o = 0;
     while (o < p.out) {
       const int64_t s0 = p.src(o);
       int64_t n = 1;
       while (o + n < p.out && p.src(o + n) == s0 + n) n++;
-      gpu::upload_bytes(Q.raw.native, run_.byte_off + (base + o - run_.row_off) * row_bytes,
-                        static_cast<const char*>(t->data) + s0 * row_bytes, n * row_bytes);
+      const int64_t dst = run.byte_off + (base + o - run.row_off) * rb;
+      if (as_stored) {
+        gpu::upload_bytes(W.raw.native, dst, static_cast<const char*>(t->data) + s0 * rb, n * rb);
+      } else {
+        for (int64_t r = 0; r < n; r += batch) {
+          const int64_t k = std::min(batch, n - r), len = k * in;
+          wide.resize((size_t)len);
+          narrow.resize((size_t)len);
+          widen_(t, (size_t)(s0 + r) * in, (size_t)len, wide.data());
+          for (int64_t j = 0; j < len; j++) narrow[j] = tl::f32_to_bf16(wide[j]);
+          gpu::upload_bytes(W.raw.native, dst + r * rb, narrow.data(), k * rb);
+        }
+      }
       o += n;
     }
     base += p.out;
   }
-  return Q;
+  return W;
 }
 
 struct Layer {
@@ -483,36 +492,36 @@ struct Layer {
   // Qwen3's per-head q / k RMSNorm weights, [1, HD] (empty when !Config::qk_norm).
   // bq/bk/bv above are likewise empty when !Config::qkv_bias.
   array qn, kn;
-  // Fused decode weights (imperative path only): wqkv = [wq|wk|wv], wgu = [wg|wu]
-  // concatenated. One GEMV each instead of 3/2, amortizing the per-launch floor.
-  // The separate wq/.../wu stay resident as the array-path oracle.
+  // Fused decode weights (imperative path only): q|k|v = [wq|wk|wv] and
+  // gate|up = [wg|wu] concatenated. One GEMV each instead of 3/2, amortizing the
+  // per-launch floor. The separate wq/.../wu stay resident as the array-path
+  // oracle.
   //
-  // Layout depends on the storage dtype (set in build): in bf16 mode these hold
-  // ROW-major [N,K] and feed the warp-per-row gemv_bf16_row (lever A, ~1.4-1.9x
-  // on the small-N floor-bound shapes); wo_row/wd_row are the row-major copies of
-  // the two shared weights (wo/wd stay [K,N] for the array oracle). In f32 mode
-  // wqkv/wgu hold column-major [K,N] for the split-K path and wo_row/wd_row are
-  // empty. lm_head stays split-K [K,N] in both (neutral + saves the [N,K] copy).
-  // bqkv = [bq|bk|bv] — the fused QKV projection's own column order, so the
+  // Where the weights are row-major (Model.row: bf16, or the file's quantized
+  // blocks) the decode and prefill read the wmats: [N,K], device-only, the
+  // warp-per-row GEMV's layout (lever A, ~1.4-1.9x on the small-N floor-bound
+  // shapes); wo_row and wd_row are the attention output and down projections. Otherwise
+  // (f32 weights, or a backend without the row GEMV) the split-K GEMV reads
+  // column-major [K,N] arrays: wqkv and wgu, and wo/wd shared with the oracle.
+  // bqkv = [bq|bk|bv], the fused QKV projection's own column order, so the
   // batched prefill splits all NH+2*NKV heads (and adds their bias) in one pass.
-  array wqkv, wgu, bqkv, wo_row, wd_row;
+  wmat wqkv_row, wgu_row, wo_row, wd_row;
+  array wqkv, wgu, bqkv;
   // q4 (group-symmetric int4, group=32) copies of the large bandwidth-bound MLP
   // weights (imperative bf16 path, when Model.q4_mlp). ~0.625 B/wt vs bf16's 2 →
-  // wgu 1.74×, wd 1.38× in the isolated bench. These REPLACE wgu/wd_row (the row
-  // bf16 fields stay empty), saving memory. Attention proj (QKV.fused, wo) stays
-  // bf16-row — q4 loses there (still floor-bound; dequant > byte savings).
+  // gate|up 1.74×, down 1.38× in the isolated bench. These REPLACE wgu_row/wd_row (left
+  // empty), saving memory. Attention proj (q|k|v, o) stays bf16-row — q4 loses
+  // there (still floor-bound; dequant > byte savings).
   array wgu_q4, wd_q4;
-  // The same projections kept as the file's block-quantized blocks (Model.quant): then
-  // the array fields above are empty and the GEMVs read these.
-  qmat qqkv, qgu, qo, qd, qssm, qsout;
   tl::kv_cache cache;  // attention layers only
   // Gated DeltaNet layers (Qwen3.5) instead of the attention weights above:
-  // wssm the fused [qkv | alpha | beta | z] projection and wsout the output
-  // projection (both in the decode GEMV's layout, like wqkv / wo_row), wconv
+  // wssm_row the fused [qkv | alpha | beta | z] projection and wsout_row the output
+  // projection (wssm / wsout where the weights are column-major, like q|k|v), wconv
   // the conv taps [SCONV, C] tap-major, adt = A | dt_bias [2*SH], sn the gated
   // norm's weight [SDV]; and the recurrent state the layer carries from token
   // to token in place of a KV cache: the conv window [SCONV-1, C] and the
   // rule's state [SH, SDK, SDV].
+  wmat wssm_row, wsout_row;
   array wssm, wsout, wconv, adt, sn;
   storage conv_state, ssm_state;
   // Config::post_norms (Gemma 3): the norms of the attention's and the MLP's
@@ -651,7 +660,7 @@ struct Model {
   array onorm;                // final norm [1, NE]
   array outwT_q4;             // q4 lm_head (imperative, when q4_lmhead); outwT
                               // stays bf16 as the array-path oracle
-  qmat qout;                  // the lm_head as block-quantized blocks (Model.quant); outwT is empty
+  wmat qout;                  // the lm_head as block-quantized blocks (Model.quant); outwT is empty
   // The form the decode's Q4_K GEMVs read their activation in (TL_GEMV_ACT).
   gpu::act_form gemv_form = gpu::act_form::f32;
   bool mmq = false;           // prefill Q4_K / Q8_0 GEMMs on the int8 tensor cores (TL_NO_MMQ: f16)
@@ -793,23 +802,28 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
   // The f16-sum GEMMs read their activation as f16 when the backend has the
   // producers that write it there (a16); `a16s` is that copy of `a`.
   const bool a16 = M.f16_acc && !exact && gpu::f16_activations;
-  auto gemm = [&](gpu::span a, gpu::span a16s, const array& w, const qmat& q, gpu::span y,
-                  int64_t n, int64_t k) {
-    if (q) {  // block-quantized blocks: a GEMM a run of one format, each into its columns of y
-      for (const auto& p : q.parts) {
-        if (!gpu::gemm_quant(p.type, a16, a16 ? a16s : a, sp(q.raw).at(p.byte_off),
-                              y.at(p.row_off * 4), T, p.rows, k, n, M.mmq && a16))
+  // A GEMM a run of one format, each into its columns of y. The bf16 GEMMs
+  // write y densely, so a bf16 run is the whole projection, as every bf16 build
+  // loads it (load_wmat).
+  auto gemm = [&](gpu::span a, gpu::span a16s, const wmat& W, gpu::span y, int64_t n,
+                  int64_t k) {
+    for (const auto& p : W.parts) {
+      const gpu::span w = W.at(p);
+      if (p.type != bf16_type) {
+        if (!gpu::gemm_quant(p.type, a16, a16 ? a16s : a, w, y.at(p.row_off * 4), T, p.rows,
+                             k, n, M.mmq && a16))
           throw std::logic_error("qwen: the block-quantized prefill GEMM refused its operands");
+        continue;
       }
-      return;
+      if (p.rows != n) throw std::logic_error("qwen: a bf16 run narrower than its projection");
+      // No f32 copy of an f16 activation exists to fall back on, so a refusal
+      // (misaligned buffer, odd n, k % 8) is an error, not a slower path.
+      if (a16) {
+        if (!gpu::gemm_bf16_nt_f16acc_a16(a16s, w, y, T, n, k))
+          throw std::logic_error("qwen: the f16 prefill GEMM refused its operands");
+      } else if (M.f16_acc && !exact) gpu::gemm_bf16_nt_f16acc(a, w, y, T, n, k);
+      else gpu::gemm_bf16_nt(a, w, y, T, n, k);
     }
-    // No f32 copy of an f16 activation exists to fall back on, so a refusal
-    // (misaligned buffer, odd n, k % 8) is an error, not a slower path.
-    if (a16) {
-      if (!gpu::gemm_bf16_nt_f16acc_a16(a16s, sp(w), y, T, n, k))
-        throw std::logic_error("qwen: the f16 prefill GEMM refused its operands");
-    } else if (M.f16_acc && !exact) gpu::gemm_bf16_nt_f16acc(a, sp(w), y, T, n, k);
-    else gpu::gemm_bf16_nt(a, sp(w), y, T, n, k);
   };
   // The norm that feeds a GEMM, and the residual-adding one (the branch delta
   // normalized by wd first where the family has it, as the decode's): with a16
@@ -843,7 +857,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       // copied out beside o and the norm and a swiglu over [z | o] make it).
       const int64_t C = c.ssm_conv_ch(), V = c.ssm_v(), PJ = c.ssm_proj();
       const gpu::span z = sp(P.zo), o = at_f32(z, T * V);
-      gemm(sp(P.h), sp(P.h16), L.wssm, L.qssm, sp(P.qkv), PJ, c.NE);
+      gemm(sp(P.h), sp(P.h16), L.wssm_row, sp(P.qkv), PJ, c.NE);
       gpu::ssm_conv(sp(P.qkv), PJ, sp(L.conv_state), sp(L.wconv), sp(P.conv), C,
                     c.SCONV, T);
       gpu::gated_delta(sp(P.conv), at_f32(sp(P.qkv), C), PJ, sp(L.adt),
@@ -856,9 +870,9 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
         if (a16) gpu::glu_h16(gpu::glu_act::silu, z, sp(P.at16), T * V, 1);
         else gpu::swiglu(z, sp(P.at), T * V);
       }
-      gemm(sp(P.at), sp(P.at16), L.wsout, L.qsout, ro, c.NE, V);
+      gemm(sp(P.at), sp(P.at16), L.wsout_row, ro, c.NE, V);
     } else {
-      gemm(sp(P.h), sp(P.h16), L.wqkv, L.qqkv, sp(P.qkv), AP, c.NE);
+      gemm(sp(P.h), sp(P.h16), L.wqkv_row, sp(P.qkv), AP, c.NE);
       // split_heads turns the [T, q|k|v] output into head-major [H, T, D] and
       // adds the bias — rope's own fused-bias form only indexes correctly at
       // T == 1, so the bias rides along here instead. One pass over every head;
@@ -895,20 +909,20 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       } else {
         gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, c.HD);
       }
-      gemm(ao, sp(P.at16), L.wo_row, L.qo, ro, c.NE, Q);
+      gemm(ao, sp(P.at16), L.wo_row, ro, c.NE, Q);
     }
     norm_res(x, ro, sp(L.pa), sp(L.fn), ro, sp(P.h2), sp(P.h216), false);
     // With MMQ, gate|up of one format is one GEMM whose epilogue is the GLU.
-    const bool glu = M.mmq && a16 && L.qgu.parts.size() == 1 &&
-                     gpu::gemm_quant_glu(L.qgu.parts[0].type, c.act, sp(P.h216),
-                                         sp(L.qgu.raw).at(L.qgu.parts[0].byte_off), sp(P.mb16), T, c.FF,
-                                         c.NE);
+    const bool glu = M.mmq && a16 && L.wgu_row.parts.size() == 1 &&
+                     gpu::gemm_quant_glu(L.wgu_row.parts[0].type, c.act, sp(P.h216),
+                                         L.wgu_row.at(L.wgu_row.parts[0]),
+                                         sp(P.mb16), T, c.FF, c.NE);
     if (!glu) {
-      gemm(sp(P.h2), sp(P.h216), L.wgu, L.qgu, sp(P.gu), 2 * c.FF, c.NE);
+      gemm(sp(P.h2), sp(P.h216), L.wgu_row, sp(P.gu), 2 * c.FF, c.NE);
       if (a16) gpu::glu_h16(c.act, sp(P.gu), sp(P.mb16), c.FF, T);
       else gpu::glu(c.act, sp(P.gu), sp(P.mb), c.FF, T);
     }
-    gemm(sp(P.mb), sp(P.mb16), L.wd_row, L.qd, sp(P.md), c.NE, c.FF);
+    gemm(sp(P.mb), sp(P.mb16), L.wd_row, sp(P.md), c.NE, c.FF);
     const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
     norm_res(ro, sp(P.md), sp(L.pf), nextw, ro, sp(P.h), sp(P.h16), l + 1 == c.NL);  // the logits read the last
     x = ro;
@@ -971,7 +985,7 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
     }
     // Only the final row of the final chunk needs logits — one GEMV for the
     // whole prompt rather than one per chunk, read in place as a view of it.
-    if (M.quant) gemv_q(M.qout, at_f32(sp(M.pscratch.h), (last - 1) * c.NE), sp(M.scratch.logits));
+    if (M.quant) gemv_m(M.qout, at_f32(sp(M.pscratch.h), (last - 1) * c.NE), sp(M.scratch.logits));
     else gemv_w(M.outwT, at_f32(sp(M.pscratch.h), (last - 1) * c.NE), sp(M.scratch.logits),
                 c.VOCAB, c.NE);
   };
@@ -1089,7 +1103,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
       // q4 lm_head (imperative): quantize the f32 [K,VOCAB], keep only the q4.
       .outwT_q4 =
           q4lm ? load_w_T(m, c.output_name(), c.NE, c.VOCAB, f32).to_q4() : array{},
-      .qout = nat ? load_q_cat(m, {{c.output_name(), c.VOCAB}}, c.NE) : qmat{},
+      .qout = nat ? load_wmat(m, {{c.output_name(), c.VOCAB}}, c.NE, true) : wmat{},
       .gemv_form = nat ? gemv_form_env() : gpu::act_form::f32,
       .mmq = nat && gpu::has_gemm_quant && !std::getenv("TL_NO_MMQ"),
       .quant = nat,
@@ -1110,15 +1124,16 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
     auto W = [&](bool want, const char* n, int64_t in, int64_t out) {
       return want ? load_w_T(m, p + n, in, out, wdt) : array{};
     };
-    // A fused projection in the decode GEMV's layout: in bf16 mode ROW [N,K]
-    // for the warp-per-row gemv (lever A), in f32 column [K,N] for split-K.
-    auto fused = [&](const std::vector<wpart>& parts, int64_t in) {
-      if (nat) return array{};
-      return row ? load_w_T_cat_row(m, parts, in) : load_w_T_cat(m, parts, in, wdt);
+    // A (fused) projection in the decode GEMV's layout: row-major on the device
+    // where the weights are (row; the file's quantized blocks with nat, else
+    // bf16), else column-major [K,N] for split-K. The other one stays empty.
+    auto dev = [&](const std::vector<wpart>& parts, int64_t in) {
+      return row ? load_wmat(m, parts, in, nat) : wmat{};
     };
-    auto qfused = [&](const std::vector<wpart>& parts, int64_t in) {
-      return nat ? load_q_cat(m, parts, in) : qmat{};
+    auto col = [&](const std::vector<wpart>& parts, int64_t in) {
+      return row ? array{} : load_w_T_cat(m, parts, in, wdt);
     };
+    const std::vector<wpart> down = {{p + "ffn_down.weight", c.NE}};
     // Every layer: the norms and the MLP.
     Layer L{
         .wg = W(oracle_w, "ffn_gate.weight", c.NE, c.FF),
@@ -1126,20 +1141,13 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
         .wd = W(col_wo, "ffn_down.weight", c.FF, c.NE),
         .an = load_f32(m, p + "attn_norm.weight", c.NE),
         .fn = load_f32(m, p + c.ffn_norm, c.NE),
-        // wgu: bf16-row when row & !q4m; column [K,N] in f32; empty when q4m
-        // (replaced by wgu_q4). wd_row likewise.
-        .wgu = (row && q4m) ? array{} : fused(gu_parts, c.NE),
-        .wd_row = (row && !nat) ? (q4m ? array{}
-                                       : load_w_T_row(m, p + "ffn_down.weight", c.FF, c.NE))
-                                : array{},
+        // gate|up and down: empty when q4m (replaced by wgu_q4 / wd_q4).
+        .wgu_row = q4m ? wmat{} : dev(gu_parts, c.NE),
+        .wd_row = q4m ? wmat{} : dev(down, c.FF),
+        .wgu = col(gu_parts, c.NE),
         // q4 MLP (imperative, when q4m): quantize the f32 [K,N] fused/down.
         .wgu_q4 = q4m ? load_w_T_cat(m, gu_parts, c.NE, f32).to_q4() : array{},
-        .wd_q4 =
-            q4m ? load_w_T(m, p + "ffn_down.weight", c.FF, c.NE, f32).to_q4() : array{},
-        .qqkv = {},
-        .qgu = qfused(gu_parts, c.NE),
-        .qo = {},
-        .qd = qfused({{p + "ffn_down.weight", c.NE}}, c.FF)};
+        .wd_q4 = q4m ? load_w_T_cat(m, down, c.FF, f32).to_q4() : array{}};
     if (c.post_norms) {
       L.pa = load_f32(m, p + "post_attention_norm.weight", c.NE);
       L.pf = load_f32(m, p + "post_ffw_norm.weight", c.NE);
@@ -1152,12 +1160,11 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
                                             {p + "ssm_alpha.weight", c.SH},
                                             {p + "ssm_beta.weight", c.SH},
                                             {p + "attn_gate.weight", V}};
-      L.wssm = fused(ssm_parts, c.NE);
-      L.qssm = qfused(ssm_parts, c.NE);
-      L.wsout = nat ? array{}
-                    : row ? load_w_T_row(m, p + "ssm_out.weight", V, c.NE)
-                          : load_w_T(m, p + "ssm_out.weight", V, c.NE, wdt);
-      L.qsout = qfused({{p + "ssm_out.weight", c.NE}}, V);
+      const std::vector<wpart> out = {{p + "ssm_out.weight", c.NE}};
+      L.wssm_row = dev(ssm_parts, c.NE);
+      L.wsout_row = dev(out, V);
+      L.wssm = col(ssm_parts, c.NE);
+      L.wsout = col(out, V);
       // The conv taps are [C][SCONV] in the GGUF; the op reads them
       // tap-major, so a transpose here.
       std::vector<float> cw((size_t)c.SCONV * C), taps((size_t)c.SCONV * C);
@@ -1197,15 +1204,14 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
       L.wo = W(col_wo, "attn_output.weight", Q, c.NE);
       L.qn = qk_norm("attn_q_norm.weight");
       L.kn = qk_norm("attn_k_norm.weight");
-      L.wqkv = fused(qkv_parts, c.NE);
-      L.qqkv = qfused(qkv_parts, c.NE);
-      // bqkv = [bq|bk|bv], matching wqkv's column order (batched path).
+      L.wqkv_row = dev(qkv_parts, c.NE);
+      L.wqkv = col(qkv_parts, c.NE);
+      // bqkv = [bq|bk|bv], matching q|k|v's column order (batched path).
       if (row && c.qkv_bias)
         L.bqkv = load_f32_cat(m, {{p + "attn_q.bias", Q},
                                   {p + "attn_k.bias", c.NKV * c.HD},
                                   {p + "attn_v.bias", c.NKV * c.HD}});
-      if (row && !nat) L.wo_row = load_w_T_row(m, p + "attn_output.weight", Q, c.NE);
-      L.qo = qfused({{p + "attn_output.weight", c.NE}}, Q);
+      L.wo_row = dev({{p + "attn_output.weight", c.NE}}, Q);
       L.cache.init(c.NKV, c.MAXC, c.HD, M.kv_f16, c.is_local(l) ? c.SWA : 0);
     }
     M.layers.push_back(std::move(L));
@@ -1433,15 +1439,11 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
   // via rmsnorm_res (writes the residual sum AND its norm). The layer input's
   // norm is therefore produced by the *previous* layer's mlp seam — so precompute
   // layer 0's here, and carry each layer's next-input norm in hb.
-  // Decode GEMV: warp-per-row [N,K] (lever A, bf16 imperative) in row mode, else
-  // the split-K [K,N] path — so `W` must be the weight in THIS mode's layout
-  // (the fused wqkv/wgu already are; wo/wd have a separate row copy). The y
-  // layout is identical either way (contiguous [n]), so the fused-output slices
-  // below are unchanged.
-  const bool row = M.row;
-  auto gv = [&](const array& W, const qmat& Q, gpu::span a, gpu::span y, int64_t n, int64_t k) {
-    if (Q) gemv_q(Q, a, y, M.gemv_form, sp(S.act));
-    else if (row) gpu::gemv_bf16_row(a, sp(W), y, n, k);
+  // Decode GEMV: the row-major wmat where the build made one (Model.row), else
+  // the split-K GEMV over the column-major array. The y layout is identical
+  // either way (contiguous [n]), so the fused-output slices below are unchanged.
+  auto gv = [&](const wmat& R, const array& W, gpu::span a, gpu::span y, int64_t n, int64_t k) {
+    if (R) gemv_m(R, a, y, M.gemv_form, sp(S.act));
     else gemv_w(W, a, y, n, k);
   };
   gpu::span x = x0;
@@ -1456,7 +1458,7 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
       // the out projection.
       const int64_t C = c.ssm_conv_ch(), V = c.ssm_v();
       const gpu::span pj = sp(S.qkvb), o = at_f32(pj, c.ssm_proj());
-      gv(L.wssm, L.qssm, sp(S.hb), pj, c.ssm_proj(), c.NE);
+      gv(L.wssm_row, L.wssm, sp(S.hb), pj, c.ssm_proj(), c.NE);
       gpu::ssm_conv(pj, C, sp(L.conv_state), sp(L.wconv), sp(S.convb), C, c.SCONV);
       gpu::gated_delta(sp(S.convb), at_f32(pj, C), 0, sp(L.adt), sp(L.ssm_state), o,
                        c.SH, c.SDK, c.SDV, 1, c.L2EPS, c.SK);
@@ -1465,13 +1467,13 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
         gpu::rmsnorm(o, sp(L.sn), o, c.SDV, c.EPS, c.SH);
         gpu::swiglu(at_f32(pj, C + 2 * c.SH), sp(S.ab), V);
       }
-      gv(L.wsout, L.qsout, sp(S.ab), ro, c.NE, V);  // ro = mixer @ ssm_out
+      gv(L.wsout_row, L.wsout, sp(S.ab), ro, c.NE, V);  // ro = mixer @ ssm_out
     } else {
       // Fused QKV: one GEMV -> [q(NH*HD) | k(NKV*HD) | v(NKV*HD)] in S.qkvb (then
       // Qwen3.5's gate), and q, k and v are views of it: rope q & k in place,
       // bias-add v. Same per-column split-K as the separate wq/wk/wv GEMVs (bx=1,
       // chunk=32), so bit-identical per column.
-      gv(L.wqkv, L.qqkv, sp(S.hb), sp(S.qkvb), c.attn_proj(), c.NE);
+      gv(L.wqkv_row, L.wqkv, sp(S.hb), sp(S.qkvb), c.attn_proj(), c.NE);
       const gpu::span qp = sp(S.qkvb);
       const gpu::span kp = at_f32(qp, c.NH * c.HD);
       const gpu::span vp = at_f32(qp, (c.NH + c.NKV) * c.HD);
@@ -1501,16 +1503,16 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
         gpu::binary(gpu::kop::mul, ao, sp(S.gateb), sp(S.gateb), Q, 1, 0);
         ao = sp(S.gateb);
       }
-      gv(row ? L.wo_row : L.wo, L.qo, ao, ro, c.NE, c.NH * c.HD);  // ro = attn @ wo
+      gv(L.wo_row, L.wo, ao, ro, c.NE, c.NH * c.HD);  // ro = attn @ wo
     }
     // x1 = x + (attn@wo) (Gemma 3: normalized by pa first); h2 = rmsnorm(x1, fn) — fused.
     gpu::rmsnorm_res(x, ro, sp(L.fn), ro, sp(S.h2b), c.NE, c.EPS, 1, sp(L.pa));
     // Fused gate|up: one GEMV -> [gate(FF) | up(FF)] in S.gub; the GLU reads both.
     if (M.q4_mlp) gemv_q4_w(L.wgu_q4, sp(S.h2b), sp(S.gub));  // [NE, 2*FF]
-    else gv(L.wgu, L.qgu, sp(S.h2b), sp(S.gub), 2 * c.FF, c.NE);
+    else gv(L.wgu_row, L.wgu, sp(S.h2b), sp(S.gub), 2 * c.FF, c.NE);
     gpu::glu(c.act, sp(S.gub), sp(S.mb), c.FF);
     if (M.q4_mlp) gemv_q4_w(L.wd_q4, sp(S.mb), sp(S.mdb));  // [FF, NE]
-    else gv(row ? L.wd_row : L.wd, L.qd, sp(S.mb), sp(S.mdb), c.NE, c.FF);
+    else gv(L.wd_row, L.wd, sp(S.mb), sp(S.mdb), c.NE, c.FF);
     // x2 = x1 + mlp (Gemma 3: normalized by pf first); next input norm = rmsnorm(x2,
     // next an | final onorm) — fused.
     const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
@@ -1520,7 +1522,7 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
   // hb now holds the final RMSNorm output (folded into the last layer's seam).
   const gpu::span logits = logits_out ? logits_out : sp(S.logits);
   if (M.q4_lmhead) gemv_q4_w(M.outwT_q4, sp(S.hb), logits);  // [NE, VOCAB]
-  else if (M.quant) gemv_q(M.qout, sp(S.hb), logits);
+  else if (M.quant) gemv_m(M.qout, sp(S.hb), logits);
   else gemv_w(M.outwT, sp(S.hb), logits, c.VOCAB, c.NE);
   // Tail of the captured region: advance the shared device pos so the next
   // graph replay reads pos+1 (lm_head is pos-independent, so order vs it is free).
@@ -1578,7 +1580,7 @@ inline embed_table device_embed(const Model& M) {
   if (M.quant) {
     if (M.qout.parts.size() != 1) return {};
     const auto& p = M.qout.parts[0];
-    return {p.type, sp(M.qout.raw).at(p.byte_off), 0, 0};
+    return {p.type, M.qout.at(p), 0, 0};
   }
   if (M.outwT.size() == 0) return {};
   return {M.outwT.dt() == tl::dtype::bf16 ? 30 : 0, sp(M.outwT), 1, c.VOCAB};

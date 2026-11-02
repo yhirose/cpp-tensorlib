@@ -208,12 +208,12 @@ int main(int argc, char** argv) {
   // not bit-exact).
   std::printf("=== 2a. projection GEMV(M=1) vs batched GEMM (per prompt token) ===\n");
   const int64_t MB = qm::PREFILL_CHUNK;  // the chunk production runs
-  struct Shape { const char* name; int64_t K, N; const tl::array* w; };
+  struct Shape { const char* name; int64_t K, N; const qm::wmat* w; };  // one bf16 run
   qm::Layer& L0 = M.layers[0];
   const Shape shapes[] = {
-      {"QKV.fused", C.NE, (C.NH + 2 * C.NKV) * C.HD, &L0.wqkv},
+      {"QKV.fused", C.NE, (C.NH + 2 * C.NKV) * C.HD, &L0.wqkv_row},
       {"wo", C.NH * C.HD, C.NE, &L0.wo_row},
-      {"gateup.fused", C.NE, 2 * C.FF, &L0.wgu},
+      {"gateup.fused", C.NE, 2 * C.FF, &L0.wgu_row},
       {"wd", C.FF, C.NE, &L0.wd_row},
   };
   int64_t maxK = 0, maxN = 0;
@@ -244,8 +244,8 @@ int main(int argc, char** argv) {
   bool gemm_ok = true;
   for (const Shape& s : shapes) {
     // Warm both paths (module load, first-touch upload) outside the timing.
-    tl::gpu::gemv_bf16_row({a, 0}, {s.w->native(), 0}, {y1, 0}, s.N, s.K);
-    tl::gpu::gemm_bf16_nt({a, 0}, {s.w->native(), 0}, {y, 0}, MB, s.N, s.K);
+    tl::gpu::gemv_bf16_row({a, 0}, s.w->at(s.w->parts[0]), {y1, 0}, s.N, s.K);
+    tl::gpu::gemm_bf16_nt({a, 0}, s.w->at(s.w->parts[0]), {y, 0}, MB, s.N, s.K);
     cu::flush();
     // Correctness: GEMM row 0 must reproduce the GEMV of A's row 0.
     cu::sync_to_host(y1, false);
@@ -258,10 +258,10 @@ int main(int argc, char** argv) {
     gemm_ok &= ok;
 
     double gemv_us = 1000.0 * min_ms(3, 20, [&] {
-      tl::gpu::gemv_bf16_row({a, 0}, {s.w->native(), 0}, {y1, 0}, s.N, s.K);
+      tl::gpu::gemv_bf16_row({a, 0}, s.w->at(s.w->parts[0]), {y1, 0}, s.N, s.K);
     });
     double gemm_us = 1000.0 * min_ms(3, 5, [&] {
-      tl::gpu::gemm_bf16_nt({a, 0}, {s.w->native(), 0}, {y, 0}, MB, s.N, s.K);
+      tl::gpu::gemm_bf16_nt({a, 0}, s.w->at(s.w->parts[0]), {y, 0}, MB, s.N, s.K);
     }) / MB;  // per prompt token
     sum_gemv += gemv_us;
     sum_gemm += gemm_us;
