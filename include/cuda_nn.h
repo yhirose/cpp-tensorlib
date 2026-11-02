@@ -782,7 +782,9 @@ inline bool own_nn::ssm_conv_tokens(gpu::span x, int64_t ld, gpu::span state,
 }
 
 // The chunked delta rule (tl_gated_delta_fused_<V>): dk 128, dv 128, 64 or 32,
-// and a prompt past 32 tokens (shorter ones take the per-token kernel).
+// and at least 32 tokens; fewer take the per-token kernel. (32 was the old
+// two-kernel form's chunk; this one's crossover against the per-token kernel
+// has not been measured.)
 inline bool own_nn::gated_delta_chunked(gpu::span qkv, gpu::span ab, int64_t ab_ld,
                                      gpu::span adt, gpu::span state, gpu::span o,
                                      int64_t H, int64_t dk, int64_t dv, int64_t T,
@@ -794,8 +796,9 @@ inline bool own_nn::gated_delta_chunked(gpu::span qkv, gpu::span ab, int64_t ab_
   // A head's value columns in as many slices (V >= 32 a block) as keep the
   // grid within a block an SM: a block's chunks run in order, so more blocks
   // than SMs would wait a whole pass for the rest.
+  constexpr int64_t sms = traits::fill_groups / 2;
   int64_t slices = 1;
-  while (dv / (2 * slices) >= 32 && H * 2 * slices <= kWaveSingles) slices *= 2;
+  while (dv / (2 * slices) >= 32 && H * 2 * slices <= sms) slices *= 2;
   const int64_t V = dv / slices;
   CUfunction f = c.gdn_fused_(V);
   float* pqkv = context::off_(qkv.buf, qkv.off);
@@ -810,9 +813,9 @@ inline bool own_nn::gated_delta_chunked(gpu::span qkv, gpu::span ab, int64_t ab_
   c.device_read_(adt.buf);
   c.device_rmw_(state.buf);
   c.device_write_(o.buf);
-  return c.launch_(f, {(unsigned)(H * slices)}, {context::gdn_threads}, context::gdn_smem((unsigned)V), pqkv, pab,
-                   padt, pst, po, (unsigned)H, (unsigned)dv, (unsigned)T, (unsigned)ab_ld, eps,
-                   (unsigned)Hk);
+  return c.launch_(f, {(unsigned)(H * slices)}, {context::gdn_threads}, context::gdn_smem(V),
+                   pqkv, pab, padt, pst, po, (unsigned)H, (unsigned)dv, (unsigned)T,
+                   (unsigned)ab_ld, eps, (unsigned)Hk);
 }
 
 // The query half of causal prefill attention's pullback: q, K, V, dO, O and dq

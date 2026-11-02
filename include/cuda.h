@@ -652,25 +652,28 @@ struct context {
   CUfunction conv_tok_() { return cached_(conv_tok_fn, "tl_ssm_conv_tokens"); }
   CUfunction conv_state_() { return cached_(conv_state_fn, "tl_ssm_conv_state"); }
   // The fused chunked rule, tl_gated_delta_fused_<V> (V = 128, 64, 32 value
-  // columns a block). Its dynamic shared memory, gdn_::smem_bytes repeated,
-  // is raised on first lookup.
-  static constexpr unsigned gdn_smem(unsigned V) {
-    const unsigned st = V * 136 * 4, x = (128 + 2 * V) * 24 * 4;
-    return 2 * 16 * 136 * 4 + (st > x ? st : x) + 2 * 16 * 24 * 4 + 16 * V * 4 + 16 * 17 * 4 +
-           2 * 16 * 4;
+  // columns a block), gdn_threads (gdn_::NT) a block. Its dynamic shared
+  // memory, gdn_::smem_bytes repeated line for line, is raised on first lookup.
+  static constexpr unsigned gdn_threads = 512;
+  static constexpr unsigned gdn_smem(int64_t V) {
+    constexpr int64_t DK = 128, C = 16, E = 2 * 2, PAD = 8;
+    const int64_t st = V * (DK + PAD) * E, x = (DK + 2 * V) * (C + PAD) * E;
+    return static_cast<unsigned>(2 * C * (DK + PAD) * E + (st > x ? st : x) +
+                                 2 * C * (C + PAD) * E + C * V * 4 + C * (C + 1) * 4 + 2 * C * 4);
   }
-  static constexpr unsigned gdn_threads = 512;  // gdn_::NT
   CUfunction gdn_fused_fn[3] = {};
   CUfunction gdn_fused_(int64_t V) {
-    const int i = V == 128 ? 0 : V == 64 ? 1 : 2;
-    static const char* const names[3] = {"tl_gated_delta_fused_128", "tl_gated_delta_fused_64",
-                                         "tl_gated_delta_fused_32"};
-    const bool fresh = !gdn_fused_fn[i];
-    CUfunction f = cached_(gdn_fused_fn[i], names[i]);
-    if (fresh && f && d.FuncSetAttribute)
-      d.FuncSetAttribute(f, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */,
-                         static_cast<int>(gdn_smem(static_cast<unsigned>(V))));
-    return f;
+    const int i = V == 128 ? 0 : V == 64 ? 1 : V == 32 ? 2 : -1;
+    if (i < 0) return nullptr;
+    CUfunction& slot = gdn_fused_fn[i];
+    if (!slot) {
+      char name[40];
+      std::snprintf(name, sizeof name, "tl_gated_delta_fused_%d", (int)V);
+      slot = load_(name);
+      if (slot && d.FuncSetAttribute)
+        d.FuncSetAttribute(slot, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, static_cast<int>(gdn_smem(V)));
+    }
+    return slot;
   }
   // The prefill's tensor-core GEMM: tile (L 128x128, M 64x128, S 64x64) x sums
   // (f32 / f16), each a kernel of its own. The tiles stage through dynamic
