@@ -324,15 +324,25 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
   }
 
   SUBCASE("sample_to draws sample_ref's token on the device, and counts its draws") {
-    // A vocabulary-sized vector that groups split (its top two tied far
-    // apart), and one shorter than k that holds what is never drawn. Each
-    // setting draws six times on one counter; the token of each draw is the
-    // host definition's for that draw number.
+    // A vocabulary-sized vector that groups split, its top two tied far apart
+    // and the next two tied a group's width apart (one thread's stretch); a
+    // vector long enough that the groups' keys take a second launch before
+    // the one that draws; a short one drawn in one group, its top three tied
+    // that far apart; one
+    // shorter than k that holds what is never drawn, and one with nothing to
+    // draw. Each setting draws six times on one counter; the token of each
+    // draw is the host definition's for that draw number.
     if (!gpu::has_sample_to) return;
     std::vector<float> big = host_values(random_array({151936}, 990));
     for (float& x : big) x *= 6.0f;
     big[1234] = big[150000] = 9.0f;
-    const std::vector<float> small = {-INFINITY, 2.0f, NAN, 1.0f, 1.5f};
+    big[777] = big[777 + 256] = 8.5f;
+    std::vector<float> longer = host_values(random_array({300000}, 992));
+    for (float& x : longer) x *= 4.0f;
+    std::vector<float> one_group = host_values(random_array({600}, 991));
+    one_group[5] = one_group[5 + 256] = one_group[5 + 512] = 3.0f;
+    const std::vector<float> small = {-INFINITY, 2.0f, NAN, 1.0f, 1.5f},
+                             none = {-INFINITY, NAN, -INFINITY};
     const struct {
       const char* what;
       const std::vector<float>* v;
@@ -341,8 +351,11 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
         {"Qwen's setting", &big, {0.7f, 20, 0.8f, 7}},
         {"the widest k, no top_p", &big, {1.5f, 64, 1.0f, 8}},
         {"a narrow top_p", &big, {1.0f, 5, 0.5f, 9}},
-        {"the whole vocabulary (Gumbel-max)", &big, {0.7f, 0, 1.0f, 10}},
+        {"the whole vocabulary (Gumbel-max)", &big, {3.0f, 0, 1.0f, 10}},
+        {"three launches", &longer, {1.0f, 64, 0.9f, 14}},
+        {"ties in one group", &one_group, {1.0f, 3, 1.0f, 13}},
         {"fewer tokens than k", &small, {2.0f, 20, 1.0f, 11}},
+        {"nothing to draw", &none, {1.0f, 20, 1.0f, 12}},
     };
     for (const auto& c : cases) {
       INFO(c.what);

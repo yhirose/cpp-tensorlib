@@ -249,6 +249,7 @@ struct context {
       case kop::kv_append_f16_: return "kv_append_f16_";
       case kop::kv_fill_: return "kv_fill_";
       case kop::kv_fill_f16_: return "kv_fill_f16_";
+      case kop::sample_: return "sample_";
       case kop::argmax_: return "argmax_";
       case kop::rmsnorm_: return "rmsnorm_";
       case kop::add_rmsnorm_: return "add_rmsnorm_";
@@ -512,6 +513,14 @@ inline void* scratch_(int64_t bytes) {
     c.scratch_bytes = c.scratch ? bytes : 0;
   }
   return c.scratch;
+}
+
+// The chunk each group of a reduction in index order takes (argmax_, sample_):
+// a contiguous run of at least a group's width, fill_groups of them at most,
+// so ties go to the smaller index as the chunks are taken in order.
+inline int64_t index_chunk_(int64_t n) {
+  constexpr gpu::policy::split_rule rule{traits::fill_groups, 0, 256, 1};
+  return gpu::policy::split_chunk(n, gpu::policy::split_parts(1, n, rule), rule);
 }
 
 // The context's argmax buffer (see context::argmax_res), allocated on first
@@ -1078,9 +1087,7 @@ inline bool own_core::argmax_to(gpu::span a, int64_t n, gpu::span idx) {
     uint32_t n, chunk, mapped;
   };
   const gpu::span pv = r, pi = r.at(4 * G), fv = r.at(8 * G);
-  // Each group a contiguous run of at least a group's width, G at most.
-  constexpr gpu::policy::split_rule rule{G, 0, 256, 1};
-  const int64_t chunk = gpu::policy::split_chunk(n, gpu::policy::split_parts(1, n, rule), rule);
+  const int64_t chunk = detail_::index_chunk_(n);
   const auto groups = static_cast<uint32_t>((n + chunk - 1) / chunk);
   const gpu::arg pass1[] = {gpu::in(a), gpu::in(a), gpu::out(pv), gpu::out(pi)};
   const params p1{static_cast<uint32_t>(n), static_cast<uint32_t>(chunk), 0};
@@ -1202,15 +1209,16 @@ inline void sync_to_host(void*, bool) {}
 
 }  // namespace tl
 
-// The nn layer's own ops, built on the device core above.
+// The nn and llm layers' own ops, built on the device core above.
 #include "metal_nn.h"
+#include "metal_llm.h"
 
 namespace tl {
 namespace metal {
 
 // What gpu_ops.h forwards to: the own ops of every layer. TL_GPU_DETECT_OWN
-// finds a member of either base. (No llm-layer own ops here: no graph capture.)
-struct own : own_core, own_nn {};
+// finds a member of any base.
+struct own : own_core, own_nn, own_llm {};
 
 }  // namespace metal
 }  // namespace tl

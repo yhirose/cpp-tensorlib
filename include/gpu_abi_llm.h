@@ -79,6 +79,13 @@ inline float sample_gumbel(uint32_t seed, uint32_t counter, uint32_t i) {
   return -std::log(-std::log(sample_uniform(philox(counter, i, 0, 0, seed, 0), true)));
 }
 
+// sample_'s params (metal_kernels_llm.metal says how its launches split the
+// work).
+struct sample_params {
+  uint32_t n, chunk, k, mapped, gumbel, draw, seed;
+  float inv_t, top_p;
+};
+
 // The argmax of a length-n vector, the smallest index on ties: the device
 // kernels' scan as one loop. NaN is never taken; with nothing above -FLT_MAX, 0.
 inline int64_t argmax_ref(const float* a, int64_t n) {
