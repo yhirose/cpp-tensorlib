@@ -369,8 +369,8 @@ level (both sum the prefill's products in f16 by default):
 what differs between the two runs, and how to reproduce them. Quantized files
 prefill their Q4_K and Q8_0 projections on the int8 tensor cores, the activation
 rounded to 8 bits as llama.cpp's MMQ does (`TL_NO_MMQ=1` takes an f16 path
-instead), and are ahead of llama.cpp there but for Qwen3.8-27B's prefill
-(0.94-0.97x); its decode is ahead too.
+instead), and are ahead of or level with llama.cpp there, Qwen3.8-27B
+included (its prefill 0.98-1.02x, its decode ahead).
 
 Prefill is a different regime and was slower than decode for a long time,
 because the prompt was fed through the decode path one token at a time. Its
