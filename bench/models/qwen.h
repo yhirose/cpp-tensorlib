@@ -656,11 +656,17 @@ struct PrefillScratch {
 struct Model {
   Config c;
   const gg::tensor_info* embed;  // token_embd [vocab, NE] in the file (row-gather source)
-  array outwT;                // logits weight [NE, VOCAB] (transposed output.weight)
+  // The lm head. Where the weights are row-major (Model.row) the imperative
+  // path reads outw_row [VOCAB, NE], bf16 or the file's blocks, as it reads
+  // every projection; outwT [NE, VOCAB] (transposed output.weight) is the
+  // column-major one, loaded where the weights are column-major or the array
+  // path (the oracle) runs.
+  wmat outw_row;
+  array outwT;
   array onorm;                // final norm [1, NE]
-  array outwT_q4;             // q4 lm_head (imperative, when q4_lmhead); outwT
-                              // stays bf16 as the array-path oracle
-  wmat qout;                  // the lm_head as block-quantized blocks (Model.quant); outwT is empty
+  array outwT_q4;             // q4 lm_head (imperative decode, when q4_lmhead)
+  tl::dtype wdt = tl::dtype::f32;  // the float weights' dtype, as build() chose
+                                   // (bf16 under quant, whose projections are blocks)
   // The form the decode's Q4_K GEMVs read their activation in (TL_GEMV_ACT).
   gpu::act_form gemv_form = gpu::act_form::f32;
   bool mmq = false;           // prefill Q4_K / Q8_0 GEMMs on the int8 tensor cores (TL_NO_MMQ: f16)
@@ -699,6 +705,20 @@ inline bool gemv_w(const array& W, gpu::span a, gpu::span y, int64_t n,
                    int64_t k) {
   return W.dt() == tl::dtype::bf16 ? gpu::gemv_bf16(a, sp(W), y, n, k)
                                    : gpu::gemv_f32(a, sp(W), y, n, k);
+}
+
+// y(n) = a(1,k) . a projection: the row-major wmat where the build made one
+// (Model.row), else the split-K GEMV over the column-major array. `f` and `pa`
+// as gemv_m.
+inline void gemv_rw(const wmat& R, const array& W, gpu::span a, gpu::span y, int64_t n,
+                    int64_t k, gpu::act_form f = gpu::act_form::f32, gpu::span pa = {}) {
+  if (R) gemv_m(R, a, y, f, pa);
+  else gemv_w(W, a, y, n, k);
+}
+
+// logits = the lm head . a.
+inline void lm_head(const Model& M, gpu::span a, gpu::span logits) {
+  gemv_rw(M.outw_row, M.outwT, a, logits, M.c.VOCAB, M.c.NE);
 }
 
 // Greedy token from the logits the most recent forward left in scratch (the one
@@ -985,9 +1005,7 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
     }
     // Only the final row of the final chunk needs logits — one GEMV for the
     // whole prompt rather than one per chunk, read in place as a view of it.
-    if (M.quant) gemv_m(M.qout, at_f32(sp(M.pscratch.h), (last - 1) * c.NE), sp(M.scratch.logits));
-    else gemv_w(M.outwT, at_f32(sp(M.pscratch.h), (last - 1) * c.NE), sp(M.scratch.logits),
-                c.VOCAB, c.NE);
+    lm_head(M, at_f32(sp(M.pscratch.h), (last - 1) * c.NE), sp(M.scratch.logits));
   };
   if (exact) {
     run(true);
@@ -1069,9 +1087,9 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
   // A backend whose attention reads no window holds the context to it: within the
   // window a local layer attends as a global one does.
   if (c.SWA > 0 && !gpu::caps::attn_window) c.MAXC = std::min(c.MAXC, c.SWA);
-  // bf16 weights need the backend's bf16 [K,N] GEMV: the lm_head reads it in
-  // every mode, and so does every projection off the row path. It has no
-  // composition to fall back to, so a backend without it would leave the
+  // bf16 weights need the backend's bf16 [K,N] GEMV: every projection off the
+  // row path reads it, the lm head included, and so does the array path. It has
+  // no composition to fall back to, so a backend without it would leave the
   // logits unwritten; it decodes from f32 weights instead.
   if (wdt == tl::dtype::bf16 && !gpu::has_gemv_bf16) wdt = tl::dtype::f32;
   // Row-major [N,K] weights exist only to feed gemv_bf16_row and the prefill
@@ -1095,15 +1113,25 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
   const bool oracle_w = oracle && c.array_path() && !nat;
   const bool col_wo = oracle_w || (!row && !nat);
   const tl::dtype f32 = tl::dtype::f32;
+  // A (fused) projection in the decode GEMV's layout: row-major on the device
+  // where the weights are (row; the file's quantized blocks with nat, else
+  // bf16), else column-major [K,N] for split-K. The other one stays empty.
+  auto dev = [&](const std::vector<wpart>& parts, int64_t in) {
+    return row ? load_wmat(m, parts, in, nat) : wmat{};
+  };
+  auto col = [&](const std::vector<wpart>& parts, int64_t in) {
+    return row ? array{} : load_w_T_cat(m, parts, in, wdt);
+  };
   Model M{
       .c = c,
       .embed = need(m, "token_embd.weight"),
-      .outwT = nat ? array{} : load_w_T(m, c.output_name(), c.NE, c.VOCAB, wdt),  // stays [K,N]
+      .outw_row = dev({{c.output_name(), c.VOCAB}}, c.NE),
+      .outwT = (!row || oracle_w) ? load_w_T(m, c.output_name(), c.NE, c.VOCAB, wdt) : array{},
       .onorm = load_f32(m, "output_norm.weight", c.NE),
       // q4 lm_head (imperative): quantize the f32 [K,VOCAB], keep only the q4.
       .outwT_q4 =
           q4lm ? load_w_T(m, c.output_name(), c.NE, c.VOCAB, f32).to_q4() : array{},
-      .qout = nat ? load_wmat(m, {{c.output_name(), c.VOCAB}}, c.NE, true) : wmat{},
+      .wdt = wdt,
       .gemv_form = nat ? gemv_form_env() : gpu::act_form::f32,
       .mmq = nat && gpu::has_gemm_quant && !std::getenv("TL_NO_MMQ"),
       .quant = nat,
@@ -1123,15 +1151,6 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
     // imperative path reads too where it has no row copies.
     auto W = [&](bool want, const char* n, int64_t in, int64_t out) {
       return want ? load_w_T(m, p + n, in, out, wdt) : array{};
-    };
-    // A (fused) projection in the decode GEMV's layout: row-major on the device
-    // where the weights are (row; the file's quantized blocks with nat, else
-    // bf16), else column-major [K,N] for split-K. The other one stays empty.
-    auto dev = [&](const std::vector<wpart>& parts, int64_t in) {
-      return row ? load_wmat(m, parts, in, nat) : wmat{};
-    };
-    auto col = [&](const std::vector<wpart>& parts, int64_t in) {
-      return row ? array{} : load_w_T_cat(m, parts, in, wdt);
     };
     const std::vector<wpart> down = {{p + "ffn_down.weight", c.NE}};
     // Every layer: the norms and the MLP.
@@ -1439,12 +1458,10 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
   // via rmsnorm_res (writes the residual sum AND its norm). The layer input's
   // norm is therefore produced by the *previous* layer's mlp seam — so precompute
   // layer 0's here, and carry each layer's next-input norm in hb.
-  // Decode GEMV: the row-major wmat where the build made one (Model.row), else
-  // the split-K GEMV over the column-major array. The y layout is identical
-  // either way (contiguous [n]), so the fused-output slices below are unchanged.
+  // Decode GEMV (gemv_rw). The y layout is identical in either layout
+  // (contiguous [n]), so the fused-output slices below are unchanged.
   auto gv = [&](const wmat& R, const array& W, gpu::span a, gpu::span y, int64_t n, int64_t k) {
-    if (R) gemv_m(R, a, y, M.gemv_form, sp(S.act));
-    else gemv_w(W, a, y, n, k);
+    gemv_rw(R, W, a, y, n, k, M.gemv_form, sp(S.act));
   };
   gpu::span x = x0;
   gpu::rmsnorm(x, sp(M.layers[0].an), sp(S.hb), c.NE, c.EPS);
@@ -1522,8 +1539,7 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
   // hb now holds the final RMSNorm output (folded into the last layer's seam).
   const gpu::span logits = logits_out ? logits_out : sp(S.logits);
   if (M.q4_lmhead) gemv_q4_w(M.outwT_q4, sp(S.hb), logits);  // [NE, VOCAB]
-  else if (M.quant) gemv_m(M.qout, sp(S.hb), logits);
-  else gemv_w(M.outwT, sp(S.hb), logits, c.VOCAB, c.NE);
+  else lm_head(M, sp(S.hb), logits);
   // Tail of the captured region: advance the shared device pos so the next
   // graph replay reads pos+1 (lm_head is pos-independent, so order vs it is free).
   if (cap) gpu::incr_u32(d_pos);
@@ -1563,8 +1579,8 @@ inline void stage_embed(Model& M, int64_t id) {
 
 // Where a step can gather its input on the device (gpu::embed_row), from the
 // token the step before left there: the embedding table, when the model keeps
-// it on the device as its tied lm_head (the [NE, VOCAB] outwT, or qout's one
-// run of blocks). type -1 where it does not, as for a model with its own
+// it on the device as its tied lm_head (outw_row's one run, bf16 or blocks, or
+// the [NE, VOCAB] outwT). type -1 where it does not, as for a model with its own
 // output.weight. The table is in the build's weight dtype, so a bf16 build of
 // an F16 file feeds the embedding rounded to bf16, as its lm_head reads it,
 // where stage_embed widens the file's own values (the same for the Qwen F16
@@ -1577,10 +1593,10 @@ struct embed_table {
 inline embed_table device_embed(const Model& M) {
   const Config& c = M.c;
   if (!c.tied_output) return {};
-  if (M.quant) {
-    if (M.qout.parts.size() != 1) return {};
-    const auto& p = M.qout.parts[0];
-    return {p.type, M.qout.at(p), 0, 0};
+  if (M.outw_row) {
+    if (M.outw_row.parts.size() != 1) return {};
+    const auto& p = M.outw_row.parts[0];
+    return {p.type, M.outw_row.at(p), c.NE, 1};  // a block format ignores the strides
   }
   if (M.outwT.size() == 0) return {};
   return {M.outwT.dt() == tl::dtype::bf16 ? 30 : 0, sp(M.outwT), 1, c.VOCAB};

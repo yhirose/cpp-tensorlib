@@ -156,7 +156,7 @@ int main(int argc, char** argv) {
     int64_t ref_arg = qm::argmax(ref);
     std::printf("dpos-vs-hostpos logits at pos %lld: %d/%d differ, maxrel %.2e %s\n",
                 (long long)P, mism, (int)C.VOCAB, maxrel,
-                (maxrel < 1e-5 ? "(OK — lm_head split-K atomicAdd noise)"
+                (maxrel < 1e-5 ? "(OK, reduction-order noise)"
                                : "(!! dpos error)"));
 
     // (3) the captured replay must recompute FRESH logits at P (not replay stale

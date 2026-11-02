@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
   double build_ms = ms_since(t_build);
   // What build() chose: a backend without the bf16 GEMV decodes from f32.
   std::printf("weight storage: %s | q4: mlp=%d lm=%d\n",
-              M.outwT.dt() == tl::dtype::bf16 ? "bf16" : "f32", M.q4_mlp, M.q4_lmhead);
+              M.quant ? "quantized blocks" : tl::dtype_name(M.wdt), M.q4_mlp, M.q4_lmhead);
 
   // Chat template, as each family's own jinja renders it. Qwen2.5 carries a
   // default system prompt. Qwen3 and Qwen3.5 have none, and think by default:

@@ -251,8 +251,7 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   std::vector<float> imp_step;                         // and the first decode step's
   bool bf16_ok = true;
   std::printf("\nthe chat's weights (%s), greedy %lld:\n  cpp:",
-              B.quant ? "blocks" : B.outwT.dt() == tl::dtype::bf16 ? "bf16" : "f32",
-              (long long)NB);
+              B.quant ? "blocks" : tl::dtype_name(B.wdt), (long long)NB);
   for (int64_t i = 0; i < NB; i++) {
     std::printf(" %lld", (long long)tok);
     if (tok != want[i]) bf16_ok = false;

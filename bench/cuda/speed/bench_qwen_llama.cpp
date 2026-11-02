@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
                                                                  : "other";
   std::printf("%s | %s | %lld layers | weights %s (file %s) | depth %lld | prefill sums %s\n",
               argv[1], M.c.arch.c_str(), (long long)M.c.NL,
-              M.quant ? "quantized blocks" : M.outwT.dt() == tl::dtype::bf16 ? "bf16" : "f32", file,
+              M.quant ? "quantized blocks" : tl::dtype_name(M.wdt), file,
               (long long)d, M.f16_acc ? "f16" : "f32");
   std::printf("| test     |       t/s (mean ± sd) |   t/s (med) |\n");
   const std::string pp = "pp" + std::to_string(P), tg = "tg" + std::to_string(N);
