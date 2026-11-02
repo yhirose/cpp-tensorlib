@@ -42,7 +42,7 @@ FILES = {
              kernels/cuda_nn.cuh test/test_nn.cpp test/test_quant.h""",
     "llm": """include/gpu_abi_llm.h include/gpu_ops_llm.h include/cuda_llm.h
               include/kv_cache.h include/gguf.h include/tokenizer.h
-              include/tokenizer_data.h include/metal_kernels_llm.metal
+              include/tokenizer_data.h include/metal_llm.h include/metal_kernels_llm.metal
               kernels/cuda_llm.cuh test/test_llm.cpp""",
 }
 LAYER_OF = {f: lay for lay, fs in FILES.items() for f in fs.split()}
@@ -52,7 +52,7 @@ UP = {
     ("include/gpu.h", "include/gpu_ops_nn.h"), ("include/gpu.h", "include/gpu_ops_llm.h"),
     ("include/array.h", "include/array_nn.h"),
     ("include/cuda.h", "include/cuda_nn.h"), ("include/cuda.h", "include/cuda_llm.h"),
-    ("include/metal.h", "include/metal_nn.h"),
+    ("include/metal.h", "include/metal_nn.h"), ("include/metal.h", "include/metal_llm.h"),
     ("include/metal.h", "include/metal_kernels_nn.metal"),
     ("include/metal.h", "include/metal_kernels_llm.metal"),
     ("kernels/tensorlib_cuda.cu", "kernels/cuda_nn.cuh"),

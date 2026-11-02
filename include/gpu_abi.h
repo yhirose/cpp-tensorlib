@@ -63,7 +63,8 @@ namespace gpu {
   X(row_logsumexp_) X(xent_bwd_) X(adam_step_) /* cross-entropy, Adam */       \
   X(ssm_conv_) X(gated_delta_) /* Gated DeltaNet: its conv and its rule */
 #define TL_KOPS_LLM(X)                                                         \
-  X(kv_append_) X(kv_append_f16_) X(kv_fill_) X(kv_fill_f16_) /* KV writes */
+  X(kv_append_) X(kv_append_f16_) X(kv_fill_) X(kv_fill_f16_) /* KV writes */ \
+  X(sample_)  /* a token drawn from the logits */
 
 #define TL_KOP_ID_(n) n,
 enum class kop { TL_KOPS_CORE(TL_KOP_ID_) TL_KOPS_NN(TL_KOP_ID_) TL_KOPS_LLM(TL_KOP_ID_) };
