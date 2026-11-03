@@ -232,8 +232,10 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   const int64_t NB = 8;
   qm::Model B = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false,
                           /*f16_acc=*/false, /*quant=*/qm::quant_file(m));
-  const bool int8_q8act = B.q8act, int8_mmq = B.mmq;
-  B.q8act = B.mmq = false;
+  const tl::gpu::act_form chat_form = B.gemv_form;
+  const bool chat_mmq = B.mmq;
+  B.gemv_form = tl::gpu::act_form::f32;
+  B.mmq = false;
   int64_t tok = 0, p = 0;
   auto logits_of = [&](qm::Model& X) {
     const float* l = qm::host_read(X.scratch.logits);
@@ -368,10 +370,10 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   // 1). How far int8 moves a model is the model's (Gemma 3 4B 1.4e-2, Qwen3-0.6B
   // 5e-4: docs/llama-cpp-comparison.md); the bound holds an int8 path that broke
   // (Gemma's GLU epilogue run as SiLU: 3.7).
-  bool int8_ok = true;
-  if (int8_q8act || int8_mmq) {
-    B.q8act = int8_q8act;
-    B.mmq = int8_mmq;
+  bool defaults_ok = true;
+  if (chat_form != tl::gpu::act_form::f32 || chat_mmq) {
+    B.gemv_form = chat_form;
+    B.mmq = chat_mmq;
     B.f16_acc = true;
     qm::reset_cache(B);
     qm::captured_decoder d;
@@ -380,13 +382,14 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
     d.destroy();
     const double kl = qm::kl_div(ref_spread, got);
     const bool top = qm::argmax(got) == qm::argmax(ref_spread);
-    int8_ok = top && kl < 0.3;
-    std::printf("\nthe chat's defaults (int8 activations, f16 sums), a spread-out prompt: KL %.2e "
-                "from the f32 forward, top token %s %s\n",
-                kl, top ? "same" : "different", int8_ok ? "OK" : "FAIL");
+    defaults_ok = top && kl < 0.3;
+    std::printf("\nthe chat's defaults (decode GEMV activations %s, prefill MMQ %s, f16 sums), a "
+                "spread-out prompt: KL %.2e from the f32 forward, top token %s %s\n",
+                qm::act_form_name(chat_form), chat_mmq ? "on" : "off", kl,
+                top ? "same" : "different", defaults_ok ? "OK" : "FAIL");
   }
   return ok && bf16_ok && logits_ok && cache_ok && dec_ok && turn2_ok && sample_ok && long_ok && f16_ok &&
-         int8_ok;
+         defaults_ok;
 }
 
 int main(int argc, char** argv) {

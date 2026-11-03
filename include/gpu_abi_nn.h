@@ -10,6 +10,13 @@
 namespace tl {
 namespace gpu {
 
+// The form a block-quantized GEMV reads its activation in (gpu_ops_nn.h's prepare_act
+// and gemv_q4k_act): f32, the activation as it is; q8, int8 blocks of 32 with an f32
+// scale and sum each (llama.cpp's q8_1), read with dp4a. Every form but f32 is
+// prepared from the f32 activation once per GEMV call; prepared_act_forms lists them.
+enum class act_form { f32, q8 };
+inline constexpr act_form prepared_act_forms[] = {act_form::q8};
+
 struct layer_norm_params {
   uint32_t rows, cols;
   float eps, scale, offset;

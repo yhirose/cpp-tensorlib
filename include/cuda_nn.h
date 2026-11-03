@@ -20,11 +20,19 @@ struct own_nn {
   // 128 or 256 and rot a multiple of 64, else false.
   static bool rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T, int64_t D,
                            int64_t pos, float base, int64_t rot, float eps);
-  // The activation a[K] quantized to int8 blocks of 32 (K int8, then K/32 float2 of
-  // scale and sum) into qa, and Q4_K rows dotted with it (dp4a): the Q4_K GEMV
-  // with the activation's bytes cut four-fold. K % 256 == 0.
-  static bool quantize_act_q8(gpu::span a, gpu::span qa, int64_t k);
-  static bool gemv_q4k_q8(gpu::span qa, gpu::span W, gpu::span y, int64_t n, int64_t k);
+  // The activation a[K] prepared in form f into pa, and Q4_K rows dotted with it. q8:
+  // int8 blocks of 32 (K int8, then K/32 float2 of scale and sum), read with dp4a: the
+  // Q4_K GEMV with the activation's bytes cut four-fold. K % 256 == 0. act_layout_ is
+  // where a form keeps its parts, the one place the launchers and act_bytes read it.
+  struct act_layout {  // byte offsets from the start; bytes 0: no such form
+    int64_t meta = 0;   // q8: the float2 (scale, sum) of each 32
+    int64_t bytes = 0;
+  };
+  static act_layout act_layout_(gpu::act_form f, int64_t k);
+  static int64_t act_bytes(gpu::act_form f, int64_t k) { return act_layout_(f, k).bytes; }
+  static bool prepare_act(gpu::act_form f, gpu::span a, gpu::span pa, int64_t k);
+  static bool gemv_q4k_act(gpu::act_form f, gpu::span pa, gpu::span W, gpu::span y, int64_t n,
+                           int64_t k);
   // C[m, ldc-strided n columns] = A[m,K] . W[n,K]^T over GGUF block-quantized rows (type 12
   // Q4_K, 14 Q6_K, 8 Q8_0). a16: A is f16 and the sums f16, else A f32, the operands
   // rounded to bf16 and the sums f32 (the exact form: no f16 range to overflow). K % 256 == 0
@@ -450,32 +458,42 @@ inline bool own_nn::gemm_quant_glu(int type, gpu::glu_act act, gpu::span A16, gp
   return mmq_run_(c, type, epi, pa, pw, ph, (unsigned)m, (unsigned)ff, (unsigned)k, (unsigned)ff);
 }
 
-inline bool own_nn::quantize_act_q8(gpu::span a, gpu::span qa, int64_t k) {
-  auto& c = context::get();
-  if (!c.ready || k <= 0 || k % 256) return false;
-  float* pa = context::off_(a.buf, a.off);
-  float* pq = context::off_(qa.buf, qa.off);
-  c.device_read_(a.buf);
-  c.device_write_(qa.buf);
-  const unsigned nblk = (unsigned)(k / 32);
-  return c.launch_(c.cached_(c.quant_act_fn, "tl_quant_act_q8"), {(nblk + 7) / 8}, {256}, 0, pa,
-                   reinterpret_cast<signed char*>(pq),
-                   reinterpret_cast<void*>(reinterpret_cast<char*>(pq) + k), nblk);
+inline own_nn::act_layout own_nn::act_layout_(gpu::act_form f, int64_t k) {
+  if (k <= 0 || k % 256) return {};
+  switch (f) {
+    case gpu::act_form::q8: return {k, k + k / 32 * 8};
+    case gpu::act_form::f32: break;
+  }
+  return {};
 }
 
-inline bool own_nn::gemv_q4k_q8(gpu::span qa, gpu::span W, gpu::span y, int64_t n, int64_t k) {
+inline bool own_nn::prepare_act(gpu::act_form f, gpu::span a, gpu::span pa, int64_t k) {
   auto& c = context::get();
-  if (!c.ready || n <= 0 || k <= 0 || k % 256) return false;
-  float* pq = context::off_(qa.buf, qa.off);
+  const act_layout L = act_layout_(f, k);
+  if (!c.ready || !pa.buf || !L.bytes) return false;
+  float* pf = context::off_(a.buf, a.off);
+  char* pp = reinterpret_cast<char*>(context::off_(pa.buf, pa.off));
+  c.device_read_(a.buf);
+  c.device_write_(pa.buf);
+  const unsigned nblk = (unsigned)(k / 32);
+  return c.launch_(c.cached_(c.quant_act_fn, "tl_quant_act_q8"), {(nblk + 7) / 8}, {256}, 0, pf,
+                   reinterpret_cast<signed char*>(pp), reinterpret_cast<void*>(pp + L.meta), nblk);
+}
+
+inline bool own_nn::gemv_q4k_act(gpu::act_form f, gpu::span pa, gpu::span W, gpu::span y,
+                                 int64_t n, int64_t k) {
+  auto& c = context::get();
+  const act_layout L = act_layout_(f, k);
+  if (!c.ready || !pa.buf || !L.bytes || n <= 0) return false;
+  char* pp = reinterpret_cast<char*>(context::off_(pa.buf, pa.off));
   float* pw = context::off_(W.buf, W.off);
-  c.device_read_(qa.buf);
+  c.device_read_(pa.buf);
   c.device_read_(W.buf);
   c.device_write_(y.buf);
   constexpr unsigned rows_per_block = 4;
   return c.launch_(c.cached_(c.gemv_q4k_q8_fn, "tl_gemv_q4k_q8_row"),
                    {((unsigned)n + rows_per_block - 1) / rows_per_block}, {rows_per_block * 32}, 0,
-                   reinterpret_cast<signed char*>(pq),
-                   reinterpret_cast<void*>(reinterpret_cast<char*>(pq) + k),
+                   reinterpret_cast<signed char*>(pp), reinterpret_cast<void*>(pp + L.meta),
                    reinterpret_cast<unsigned char*>(pw), context::off_(y.buf, y.off), (unsigned)n,
                    (unsigned)k);
 }

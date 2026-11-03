@@ -1534,8 +1534,9 @@ TEST_CASE("generic compositions agree with the fused kernels") {
   }
 
   SUBCASE("Q4_K GEMV on int8 activations against the float one") {
-    // Only a backend with the int8-activation GEMV has a second result to compare.
-    if (gpu::has_gemv_quant && gpu::int8_activations) {
+    // Only a backend with the int8 form has a second result to compare.
+    const gpu::act_form q8 = gpu::act_form::q8;
+    if (gpu::has_gemv_quant && gpu::act_bytes(q8, 2048) > 0) {
       // The activation rounded to 8 bits per 32 values (llama.cpp's q8_1): the
       // result differs from the float kernel's by that rounding, ~0.5% of the
       // result's rms on random data, and not by more.
@@ -1552,11 +1553,11 @@ TEST_CASE("generic compositions agree with the fused kernels") {
       std::memcpy(packed.data(), bytes.data(), bytes.size());
       array W = dev(array::from(std::move(packed), {(int64_t)((bytes.size() + 3) / 4)}));
       array a = dev(random_array({K}, 1077));
-      array qa = array::empty({K / 4 + K / 32 * 2});  // K int8, then K/32 (scale, sum)
+      array qa = array::empty({gpu::act_bytes(q8, K) / 4});
       array yf = array::empty({N}), yq = array::empty({N});
       REQUIRE(gpu::gemv_quant(12, a.device_span(), W.device_span(), yf.device_span(), N, K));
-      REQUIRE(gpu::quantize_act_q8(a.device_span(), qa.device_span(), K));
-      REQUIRE(gpu::gemv_q4k_q8(qa.device_span(), W.device_span(), yq.device_span(), N, K));
+      REQUIRE(gpu::prepare_act(q8, a.device_span(), qa.device_span(), K));
+      REQUIRE(gpu::gemv_q4k_act(q8, qa.device_span(), W.device_span(), yq.device_span(), N, K));
       tl::gpu::flush();
       yf.eval();
       yq.eval();
@@ -1574,8 +1575,8 @@ TEST_CASE("generic compositions agree with the fused kernels") {
       check_misaligned(
           "int8 Q4_K GEMV, W off 16 bytes",
           [&] {
-            return gpu::gemv_q4k_q8(qa.device_span(), Wl.device_span().at(4), yl.device_span(), N,
-                                    K);
+            return gpu::gemv_q4k_act(q8, qa.device_span(), Wl.device_span().at(4),
+                                     yl.device_span(), N, K);
           },
           [&] { return host_close(host_values(yl), want, 1e-5f); });
     }

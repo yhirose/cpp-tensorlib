@@ -6,11 +6,11 @@
 // bf16 rounding the oracle applies to every dequantized weight, and the top
 // token agrees except where the oracle's top two are within that rounding.
 //
-// The native run is made twice: reading the activation as float (the exact one,
-// which should agree to the oracle's bf16 rounding) and as int8 (Model.q8act,
-// the Q4_K GEMVs' dp4a form: the activation rounded to 8 bits per 32 values, as
-// llama.cpp does), which is held to a looser bound and to the same top token
-// except at near ties.
+// The native run is made once per form the Q4_K GEMVs read their activation in
+// (Model::gemv_form, every one the backend has): f32 (the exact one, which should
+// agree to the oracle's bf16 rounding) and q8 (the dp4a form: the activation rounded
+// to 8 bits per 32 values, as llama.cpp does), which is held to a looser bound and to
+// the same top token except at near ties.
 //
 // Usage: check_quant model-Q4_K_M.gguf [steps=32]
 
@@ -56,13 +56,26 @@ int main(int argc, char** argv) {
   {
     qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, false, true, /*quant=*/true);
     if (!M.quant) { std::printf("native block-quantized path unavailable\n"); return 1; }
-    const bool has_q8 = M.q8act;
-    for (bool q8 : {false, true}) {
-      if (q8 && !has_q8) {  // the backend or the environment has no int8 form
-        std::printf("int8 activations unavailable (TL_NO_Q8ACT or no dp4a): skipped\n");
+    // Each form's bound on the logits: f32 the oracle's bf16 rounding, q8 its 8-bit one
+    // (a form without one is held to 0, so it fails until it is given its own).
+    auto bound_of = [](tl::gpu::act_form f) {
+      switch (f) {
+        case tl::gpu::act_form::f32: return 2e-2;
+        case tl::gpu::act_form::q8: return 3e-1;
+      }
+      return 0.0;
+    };
+    std::vector<tl::gpu::act_form> forms{tl::gpu::act_form::f32};
+    forms.insert(forms.end(), std::begin(tl::gpu::prepared_act_forms),
+                 std::end(tl::gpu::prepared_act_forms));
+    for (const tl::gpu::act_form form : forms) {
+      const double bound = bound_of(form);
+      if (form != tl::gpu::act_form::f32 && tl::gpu::act_bytes(form, M.c.NE) == 0) {
+        std::printf("%s activations: the backend has not got the form, skipped\n",
+                    qm::act_form_name(form));
         continue;
       }
-      M.q8act = q8;
+      M.gemv_form = form;
       std::vector<std::vector<float>> lb;
       run(M, steps, lb, &fed);
       double worst = 0;
@@ -81,11 +94,10 @@ int main(int argc, char** argv) {
         const double gap = la[s][ta] - la[s][tb];
         if (gap < 4e-2 * (1.0 + ref)) tie_flips++; else bad++;
       }
-      const double bound = q8 ? 3e-1 : 2e-2;
       const bool ok = bad == 0 && worst < bound;
       ok_all = ok_all && ok;
       std::printf("%d steps, %s activations | top-1 agrees %d, near-tie flips %d, real misses %d | logits worst |d|/(1+max) %.2e (< %.0e) %s\n",
-                  steps, q8 ? "int8" : "float", agree, tie_flips, bad, worst, bound, ok ? "OK" : "FAIL");
+                  steps, qm::act_form_name(form), agree, tie_flips, bad, worst, bound, ok ? "OK" : "FAIL");
     }
   }
   // The batched prefill over the same blocks: a prompt through GEMMs that

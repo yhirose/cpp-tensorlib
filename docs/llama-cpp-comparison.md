@@ -109,7 +109,7 @@ activation as int8, as llama.cpp's does: quantized once per call to 8 bits per
 held back by the activation loads (8 `float4` a lane for every 32 weights), where
 the weights alone stream at ~850; on int8 it runs at ~750 and the 27B's decode
 goes from 24.9 to 35.6 tok/s. The price is the 8-bit rounding of the activation
-(`TL_NO_Q8ACT=1` turns it off; `check_quant` bounds both against the dequantized
+(`TL_GEMV_ACT=f32` turns it off; `check_quant` bounds both against the dequantized
 oracle). The Q8_0 and Q6_K GEMVs already ran at 700-850 GB/s on float activations
 and are unchanged. Without MMQ (`TL_NO_MMQ=1`, and for Q6_K always) the prefill
 dequantizes each projection to f16 once per chunk
@@ -214,7 +214,7 @@ defaults: flash attention, f16 KV) are written by `tools/llama_logits.cpp`.
 | Gemma 3 4B Q4_K_M | 6.0e-2 | 4.4e-3 | 2.1e-1 |
 
 The error is the int8 activations', not the f16 sums': the decode's Q4_K
-GEMVs read their activation rounded to int8 (`Model::q8act`, dp4a) and the
+GEMVs read their activation rounded to int8 (`Model::gemv_form` q8, dp4a) and the
 prefill's MMQ GEMMs too, as llama.cpp's do (q8_1). Gemma 3 is far more
 sensitive to that rounding than Qwen: rounding every GEMV input to int8 per
 32 values in a numpy forward (no kernel of either engine involved) moves its
@@ -225,7 +225,7 @@ error grows with depth, from ~8e-3 after the first layer to ~4e-2 after the
 last. Token by token through the int8 decode, a 200-token Gemma prompt ends at
 KL 0.30 (top token 5 of 7); llama.cpp's path, at 0.21, is no better.
 
-`TL_NO_Q8ACT=1` (float activations in the decode GEMVs) and `TL_NO_MMQ=1` (the
+`TL_GEMV_ACT=f32` (float activations in the decode GEMVs) and `TL_NO_MMQ=1` (the
 prefill's block GEMMs through f16 instead of int8) take the int8 rounding
 out, at a cost on Gemma 3 4B: tg128 213 -> 161 tok/s, pp512 10,640 -> 7,020.
 On Qwen they cost less (tg -8%, pp -11% on Qwen3-0.6B) and buy little.

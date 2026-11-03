@@ -418,17 +418,19 @@ struct qmat {
   explicit operator bool() const { return !parts.empty(); }
 };
 
-// y = Q . a, a GEMV a run. With `qa` (scratch for the int8-quantized activation, K
-// bytes + K/8) the Q4_K runs read the activation as int8 (quantized once for the
-// call), which is what makes them run at the weights' bandwidth rather than the
-// float activation loads'; the other formats read it as float.
-inline void gemv_q(const qmat& Q, gpu::span a, gpu::span y, gpu::span qa = {}) {
-  bool quantized = false;
+// y = Q . a, a GEMV a run. In a prepared form f (gpu::act_form, into `pa`, room for
+// gpu::act_bytes_max) the Q4_K runs read the activation as that form makes it,
+// prepared once for the call: int8 (q8) is what makes them run at the weights'
+// bandwidth rather than at the float kernel's instruction rate. The other formats,
+// f32, and a form the backend has not got read it as float.
+inline void gemv_q(const qmat& Q, gpu::span a, gpu::span y,
+                   gpu::act_form f = gpu::act_form::f32, gpu::span pa = {}) {
+  bool prepared = false;
   for (const auto& p : Q.parts) {
     const gpu::span w = sp(Q.raw).at(p.byte_off), out = y.at(p.row_off * 4);
-    if (p.type == 12 && qa.buf && (quantized || gpu::quantize_act_q8(a, qa, Q.K))) {
-      quantized = true;
-      if (gpu::gemv_q4k_q8(qa, w, out, p.rows, Q.K)) continue;
+    if (p.type == 12 && (prepared || gpu::prepare_act(f, a, pa, Q.K))) {
+      prepared = true;
+      if (gpu::gemv_q4k_act(f, pa, w, out, p.rows, Q.K)) continue;
     }
     gpu::gemv_quant(p.type, a, w, out, p.rows, Q.K);
   }
@@ -545,7 +547,7 @@ struct Layer {
 // (qkvb, gub).
 struct Scratch {
   storage res[2];       // residual ping-pong [NE]
-  storage qact;         // the int8-quantized activation of a Q4_K GEMV (K bytes + K/8)
+  storage act;          // a Q4_K GEMV's activation prepared in Model::gemv_form
   storage hb;           // input-norm out [NE]
   storage h2b;          // post-attn norm out [NE]
   storage qb;           // [NH*HD] query fixture (bench_qwen_ctx's isolated-
@@ -565,9 +567,9 @@ struct Scratch {
   storage embed;        // staged embedding row [NE] (the step's input)
   std::vector<float> embed_stage;  // host gather target, uploaded into embed
   void init(const Config& c) {
-    {  // the widest input of a Q4_K GEMV: K int8, then K/32 (scale, sum) pairs
+    {  // the widest input of a Q4_K GEMV, prepared in any form (a check switches them)
       const int64_t k = std::max(c.NE, c.FF);
-      qact = scratch_f32((k + k / 32 * 8 + 3) / 4);
+      act = scratch_f32(std::max<int64_t>(1, (gpu::act_bytes_max(k) + 3) / 4));
     }
     embed = scratch_f32(c.NE);
     embed_stage.assign(c.NE, 0.0f);
@@ -668,7 +670,8 @@ struct Model {
   array outwT_q4;             // q4 lm_head (imperative, when q4_lmhead); outwT
                               // stays bf16 as the array-path oracle
   qmat qout;                  // the lm_head as block-quantized blocks (Model.quant); outwT is empty
-  bool q8act = false;         // Q4_K GEMVs read the activation as int8 (dp4a); else float
+  // The form the decode's Q4_K GEMVs read their activation in (TL_GEMV_ACT).
+  gpu::act_form gemv_form = gpu::act_form::f32;
   bool mmq = false;           // prefill Q4_K / Q8_0 GEMMs on the int8 tensor cores (TL_NO_MMQ: f16)
   bool quant = false;         // the projections are block-quantized blocks, read as such
   std::vector<Layer> layers;
@@ -1015,6 +1018,33 @@ inline bool quant_file(const gg::model& m) {
   return t && gg::is_quant(t->type);
 }
 
+// The forms' names, as TL_GEMV_ACT takes them and the tools print them.
+inline const char* act_form_name(gpu::act_form f) {
+  switch (f) {
+    case gpu::act_form::f32: return "f32";
+    case gpu::act_form::q8: return "q8";
+  }
+  return "?";
+}
+// The decode GEMVs' activation form: TL_GEMV_ACT names it (f32 or q8; q8 when unset),
+// and a form the backend has not got for k-wide inputs falls back to f32.
+inline gpu::act_form gemv_form_env(int64_t k) {
+  gpu::act_form f = gpu::act_form::q8;
+  if (const char* e = std::getenv("TL_GEMV_ACT")) {
+    bool known = std::strcmp(e, act_form_name(gpu::act_form::f32)) == 0;
+    f = gpu::act_form::f32;
+    for (gpu::act_form x : gpu::prepared_act_forms)
+      if (std::strcmp(e, act_form_name(x)) == 0) f = x, known = true;
+    if (!known) {
+      std::fprintf(stderr, "TL_GEMV_ACT=%s: not a form (%s", e, act_form_name(gpu::act_form::f32));
+      for (gpu::act_form x : gpu::prepared_act_forms) std::fprintf(stderr, ", %s", act_form_name(x));
+      std::fprintf(stderr, ")\n");
+      std::exit(2);
+    }
+  }
+  return gpu::act_bytes(f, k) > 0 ? f : gpu::act_form::f32;  // f32's act_bytes is 0
+}
+
 // wdt = the linear-weight storage dtype (f32 exact, or bf16 for the decode
 // path). Biases, norms and the embedding stay F32 (elementwise / row-gather).
 // q4_mlp / q4_lmhead quantize the large bandwidth-bound gemvs to group-int4 in
@@ -1060,7 +1090,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
       .outwT_q4 =
           q4lm ? load_w_T(m, c.output_name(), c.NE, c.VOCAB, f32).to_q4() : array{},
       .qout = nat ? load_q_cat(m, {{c.output_name(), c.VOCAB}}, c.NE) : qmat{},
-      .q8act = nat && gpu::int8_activations && !std::getenv("TL_NO_Q8ACT"),
+      .gemv_form = nat ? gemv_form_env(c.NE) : gpu::act_form::f32,
       .mmq = nat && gpu::has_gemm_quant && !std::getenv("TL_NO_MMQ"),
       .quant = nat,
       .row = row,
@@ -1409,9 +1439,8 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
   // layout is identical either way (contiguous [n]), so the fused-output slices
   // below are unchanged.
   const bool row = M.row;
-  const bool q8act = M.q8act;
   auto gv = [&](const array& W, const qmat& Q, gpu::span a, gpu::span y, int64_t n, int64_t k) {
-    if (Q) gemv_q(Q, a, y, q8act ? sp(S.qact) : gpu::span{});
+    if (Q) gemv_q(Q, a, y, M.gemv_form, sp(S.act));
     else if (row) gpu::gemv_bf16_row(a, sp(W), y, n, k);
     else gemv_w(W, a, y, n, k);
   };

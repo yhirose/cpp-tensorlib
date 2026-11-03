@@ -207,8 +207,8 @@ backend's kernel and requires the same numbers.
 
 What each backend covers: CUDA has kernels in all three layers; so does
 Metal, short of the graph-capture forms, the forms over f16 activations
-(`gemm_quant_glu` among them) and the int8 ones (`quantize_act_q8`,
-`gemv_q4k_q8`); WebGPU is general tensor computation (the core layer, plus
+(`gemm_quant_glu` among them) and the prepared activations of the Q4_K
+GEMV (`prepare_act`, `gemv_q4k_act`); WebGPU is general tensor computation (the core layer, plus
 the nn kernels that pay off in a browser: softmax, layer norm, RoPE) and
 leaves the llm layer to the compositions, short of the small pieces of the
 decode contract (`argmax_to`, `embed_row` on f32 tables, `read_later`).

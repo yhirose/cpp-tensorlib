@@ -9,6 +9,7 @@
 //
 // Included by gpu.h, after gpu_ops.h.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
@@ -702,27 +703,44 @@ inline bool gated_rmsnorm(span o, span z, int64_t ldz, span w, span out, bool h1
   }
 }
 
-// The activation quantized to int8 blocks (see own::quantize_act_q8 in cuda.h) and
-// the Q4_K GEMV that reads it; false where the backend has no such pair.
-TL_GPU_DETECT_OWN(quantize_act_q8)
-TL_GPU_DETECT_OWN(gemv_q4k_q8)
+// A Q4_K GEMV reading its activation in a prepared form (act_form, gpu_abi_nn.h):
+// act_bytes is the prepared activation's size for k values in form f, 0 where the
+// backend has not got the form (f32 is never prepared); prepare_act writes it from the
+// f32 activation, gemv_q4k_act reads it. Both false where act_bytes is 0: the caller
+// then runs gemv_quant on the f32 activation.
+TL_GPU_DETECT_OWN(act_bytes)
+TL_GPU_DETECT_OWN(prepare_act)
+TL_GPU_DETECT_OWN(gemv_q4k_act)
 template <class Own = own>
-inline bool quantize_act_q8(span a, span qa, int64_t k) {
-  if constexpr (detail::owns_quantize_act_q8<Own>::value) {
-    return detail::ran(Own::quantize_act_q8(a, qa, k));
+inline int64_t act_bytes(act_form f, int64_t k) {
+  if constexpr (detail::owns_act_bytes<Own>::value) {
+    return Own::act_bytes(f, k);
+  } else {
+    return 0;
+  }
+}
+// The most act_bytes takes for k values over the forms: room for whichever is chosen.
+inline int64_t act_bytes_max(int64_t k) {
+  int64_t b = 0;
+  for (act_form f : prepared_act_forms) b = std::max(b, act_bytes(f, k));
+  return b;
+}
+template <class Own = own>
+inline bool prepare_act(act_form f, span a, span pa, int64_t k) {
+  if constexpr (detail::owns_prepare_act<Own>::value) {
+    return detail::ran(Own::prepare_act(f, a, pa, k));
   } else {
     return false;
   }
 }
 template <class Own = own>
-inline bool gemv_q4k_q8(span qa, span W, span y, int64_t n, int64_t k) {
-  if constexpr (detail::owns_gemv_q4k_q8<Own>::value) {
-    return detail::ran(Own::gemv_q4k_q8(qa, W, y, n, k));
+inline bool gemv_q4k_act(act_form f, span pa, span W, span y, int64_t n, int64_t k) {
+  if constexpr (detail::owns_gemv_q4k_act<Own>::value) {
+    return detail::ran(Own::gemv_q4k_act(f, pa, W, y, n, k));
   } else {
     return false;
   }
 }
-inline constexpr bool int8_activations = has_gemv_q4k_q8 && has_quantize_act_q8;
 
 // y[n] = W[n,K] . a with W the rows of a GGUF block-quantized weight (type = ggml_type
 // code: 12 Q4_K, 14 Q6_K, 8 Q8_0), read as quantized. False where the backend has no
