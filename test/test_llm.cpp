@@ -316,6 +316,20 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
           }
           tl::gpu::flush();
           CHECK(same(out, array::from(want, {HQ, D}), 1e-4f));
+
+          // The same rows as one prefill into a fresh windowed cache (the exact form):
+          // its last query, at position T - 1, attends the window the decode above did.
+          tl::kv_cache c2;
+          REQUIRE(c2.init(HKV, MAXC, D, f16, W));
+          array qp = dev(random_array({HQ, T, D}, 923));
+          array Kd = dev(K), Vd = dev(V), op = array::empty({HQ, T, D});
+          REQUIRE(c2.prefill(qp.device_span(), Kd.device_span(), Vd.device_span(), op.device_span(),
+                             T, HQ, scale, /*exact=*/true));
+          array qt = dev(qp.slice(1, T - 1, 1).reshape({HQ, D}).clone());
+          array ot = array::empty({HQ, D});
+          REQUIRE(cache.attn(qt.device_span(), ot.device_span(), HQ, scale));
+          tl::gpu::flush();
+          CHECK(same(op.slice(1, T - 1, 1).reshape({HQ, D}), ot, 1e-4f));
         }
       }
     }

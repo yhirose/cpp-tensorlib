@@ -81,11 +81,11 @@ struct own_nn {
   static bool attn_prefill(gpu::span q, gpu::span K, gpu::span V, gpu::span out,
                            int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
                            int64_t kv_max, int64_t D, float scale,
-                           bool kv_f16 = false, int64_t pos0 = 0);
+                           bool kv_f16, int64_t pos0, int64_t window);
   static bool attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V, gpu::span out,
                                int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
                                int64_t kv_max, int64_t D, float scale,
-                               bool kv_f16 = false, int64_t pos0 = 0);
+                               bool kv_f16, int64_t pos0, int64_t window);
   // Gated DeltaNet's conv over a prefill's T tokens, a thread a (channel, token).
   static bool ssm_conv_tokens(gpu::span x, int64_t ld, gpu::span state, gpu::span w,
                               gpu::span o, int64_t C, int64_t K, int64_t T);
@@ -753,14 +753,15 @@ inline bool own_nn::attn_decode(gpu::span q, gpu::span K, gpu::span V,
 
 // M9 causal prefill attention: q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D]
 // cache read over [0,pos0+T). Query p is at absolute position pos0+p and attends
-// keys 0..pos0+p, so a long prompt can be run in chunks (and a later turn
-// appended to a live cache). GQA via group. D∈{64,128}.
+// keys 0..pos0+p (with a window, its last `window` of them), so a long prompt can
+// be run in chunks (and a later turn appended to a live cache). GQA via group.
+// D∈{64,128}.
 // One block per (head, query tile); grid = (n_q_heads, ceil(T/tile)).
 inline bool own_nn::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
                               gpu::span out, int64_t n_q_heads,
                               int64_t n_kv_heads, int64_t T, int64_t kv_max,
                               int64_t D, float scale, bool kv_f16,
-                              int64_t pos0) {
+                              int64_t pos0, int64_t window) {
   auto& c = context::get();
   // D 64 or 128; 256 for an f16 cache (an f32 one there takes gpu::attn_prefill's
   // GEMM form, which reads only f32).
@@ -788,7 +789,7 @@ inline bool own_nn::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
   return c.launch_(c.attn_(context::attn_k::tiled, D, kv_f16),
                    {static_cast<unsigned>(n_q_heads), (uT + tile - 1) / tile},
                    {attn_tile_threads}, 0, pq, pk, pv, po, uT, kv_stride, group,
-                   scale, up0);
+                   scale, up0, static_cast<unsigned>(window));
 }
 
 // The same causal prefill on the tensor cores (tl_attn_prefill_tc_*), its
@@ -799,7 +800,7 @@ inline bool own_nn::attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V,
                                   gpu::span out, int64_t n_q_heads,
                                   int64_t n_kv_heads, int64_t T, int64_t kv_max,
                                   int64_t D, float scale, bool kv_f16,
-                                  int64_t pos0) {
+                                  int64_t pos0, int64_t window) {
   auto& c = context::get();
   if (!c.ready || (D != 64 && D != 128 && D != 256)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
@@ -818,7 +819,7 @@ inline bool own_nn::attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V,
                    context::attn_tc_smem(D), pq,
                    pk, pv, po, uT, static_cast<unsigned>(kv_max * D),
                    static_cast<unsigned>(n_q_heads / n_kv_heads), scale,
-                   static_cast<unsigned>(pos0));
+                   static_cast<unsigned>(pos0), static_cast<unsigned>(window));
 }
 
 // A prefill's conv (tl_ssm_conv_tokens, then tl_ssm_conv_state for the window

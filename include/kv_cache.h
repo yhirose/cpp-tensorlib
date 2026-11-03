@@ -87,11 +87,11 @@ struct kv_cache {
     // A cache serves inference, so the attention may take the tensor cores.
     if (exact) {
       return gpu::attn_prefill(q, K.device_span(), V.device_span(), out, n_q_heads,
-                               n_kv_heads, T, max_ctx, D, scale, f16, p0);
+                               n_kv_heads, T, max_ctx, D, scale, f16, p0, window);
     }
     return gpu::attn_prefill_f16(q, K.device_span(), V.device_span(), out,
                                  n_q_heads, n_kv_heads, T, max_ctx, D, scale, f16,
-                                 p0);
+                                 p0, window);
   }
 
   // Graph-capture forms: the position is *d_pos.

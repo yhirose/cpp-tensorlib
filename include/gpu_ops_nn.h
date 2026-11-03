@@ -19,6 +19,11 @@
 namespace tl {
 namespace gpu {
 
+// A sliding window of w keys (Gemma 3's local layers): a query at position n - 1
+// attends the keys [n - w, n), itself the last, so its first is attn_window_lo(n, w);
+// w = 0 is no window. The CUDA kernels' attn_window_lo_ is the device twin.
+inline int64_t attn_window_lo(int64_t n, int64_t w) { return w > 0 && n > w ? n - w : 0; }
+
 // log(sum exp) per row, affine epilogue: row_op's shape, one pass over the row
 // (each thread carries a running max and sum, hence two floats of scratch).
 inline bool row_logsumexp(span a, span o, int64_t rows, int64_t cols,
@@ -243,11 +248,13 @@ inline bool attn_decode(span q, span K, span V, span o, int64_t n_q_heads,
 }
 
 // The causal prefill, a head at a time: scores [T, ctx] over the cache rows
-// [0, pos0 + T), a mask that closes the keys past each query's position,
-// softmax by row, times V.
+// [0, pos0 + T), a mask that closes the keys past each query's position (and,
+// with a window, those before its first: attn_window_lo), softmax by row,
+// times V.
 inline bool attn_prefill(span q, span K, span V, span o, int64_t n_q_heads,
                          int64_t n_kv_heads, int64_t T, int64_t kv_max,
-                         int64_t D, float scale, bool kv_f16, int64_t pos0) {
+                         int64_t D, float scale, bool kv_f16, int64_t pos0,
+                         int64_t window = 0) {
   if (kv_f16 || n_kv_heads <= 0 || n_q_heads % n_kv_heads || T <= 0 ||
       D <= 0 || pos0 < 0 || pos0 + T > kv_max) {
     return false;
@@ -257,7 +264,8 @@ inline bool attn_prefill(span q, span K, span V, span o, int64_t n_q_heads,
   if (!mask || !s || !p) return false;
   for (int64_t t = 0; t < T; t++) {
     for (int64_t j = 0; j < ctx; j++) {
-      mask.contents[t * ctx + j] = j <= pos0 + t ? 0.0f : -1e30f;
+      const bool live = j <= pos0 + t && j >= attn_window_lo(pos0 + t + 1, window);
+      mask.contents[t * ctx + j] = live ? 0.0f : -1e30f;
     }
   }
   const int64_t group = n_q_heads / n_kv_heads;
@@ -806,11 +814,6 @@ TL_GPU_F16_OP(merge_heads_h16, (span src, span dst16, int64_t T, int64_t H, int6
 TL_GPU_F16_OP(cvt_h16, (span src, span dst16, int64_t n), (src, dst16, n))
 #undef TL_GPU_F16_OP
 
-// A sliding window of w keys (Gemma 3's local layers): a query at position n - 1
-// attends the keys [n - w, n), itself the last, so its first is attn_window_lo(n, w);
-// w = 0 is no window. The CUDA kernels' attn_window_lo_ is the device twin.
-inline int64_t attn_window_lo(int64_t n, int64_t w) { return w > 0 && n > w ? n - w : 0; }
-
 // One decode step: q [n_q_heads, D] against a [n_kv_heads, kv_max, D] cache
 // read over [0, ctx), or over its last `window` rows. GQA by the head ratio; the
 // cache is f32, or f16 with kv_f16.
@@ -837,20 +840,23 @@ inline bool attn_decode(span q, span K, span V, span o, int64_t n_q_heads,
 }
 
 // Causal prefill: q, out [n_q_heads, T, D] against the cache rows
-// [0, pos0 + T); query t sits at absolute position pos0 + t.
+// [0, pos0 + T); query t sits at absolute position pos0 + t and attends the keys
+// up to it, or with a window only its last `window` (attn_window_lo). A window no
+// query reaches past (window >= pos0 + T) is none.
 TL_GPU_DETECT_OWN(attn_prefill)
 template <class Own = own>
 inline bool attn_prefill(span q, span K, span V, span o, int64_t n_q_heads,
                          int64_t n_kv_heads, int64_t T, int64_t kv_max,
                          int64_t D, float scale, bool kv_f16 = false,
-                         int64_t pos0 = 0) {
+                         int64_t pos0 = 0, int64_t window = 0) {
+  if (window >= pos0 + T) window = 0;
   if constexpr (detail::owns_attn_prefill<Own>::value) {
-    if (detail::ran(Own::attn_prefill(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D, scale, kv_f16, pos0))) {
+    if (detail::ran(Own::attn_prefill(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D, scale, kv_f16, pos0, window))) {
       return true;
     }
   }
   return generic::attn_prefill(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D,
-                               scale, kv_f16, pos0);
+                               scale, kv_f16, pos0, window);
 }
 
 // The causal prefill for inference: a backend may round its operands to f16
@@ -862,15 +868,16 @@ template <class Own = own>
 inline bool attn_prefill_f16(span q, span K, span V, span o, int64_t n_q_heads,
                              int64_t n_kv_heads, int64_t T, int64_t kv_max,
                              int64_t D, float scale, bool kv_f16 = false,
-                             int64_t pos0 = 0) {
+                             int64_t pos0 = 0, int64_t window = 0) {
+  if (window >= pos0 + T) window = 0;  // as attn_prefill
   if constexpr (detail::owns_attn_prefill_f16<Own>::value) {
     if (detail::ran(Own::attn_prefill_f16(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D,
-                                          scale, kv_f16, pos0))) {
+                                          scale, kv_f16, pos0, window))) {
       return true;
     }
   }
   return attn_prefill<Own>(q, K, V, o, n_q_heads, n_kv_heads, T, kv_max, D, scale,
-                           kv_f16, pos0);
+                           kv_f16, pos0, window);
 }
 
 // The causal prefill's pullback, query half then key/value half.

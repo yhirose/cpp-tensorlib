@@ -1195,6 +1195,86 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     }
   }
 
+  SUBCASE("the prefill under a sliding window, exact and on the tensor cores") {
+    // A chunk of T queries after P0 cached rows, each at position p attending the keys
+    // [p - W + 1, p]: a window inside one key tile (20) and one across tiles (50), so a
+    // block's later rows start past keys its first row reads (their leading tiles all
+    // masked). Against the windowed softmax written out, in f64 over the values the
+    // cache holds (an f16 cache's rounding): the exact form to 1e-4, the f16 one to 2e-3.
+    // A key in or out by one moves a 20-key window's rows by ~5%.
+    auto held16 = [](std::vector<float> v) {
+      for (float& x : v) x = tl::f16_to_f32(tl::f32_to_f16(x));
+      return v;
+    };
+    const int64_t HKV = 2, HQ = 8, MAXC = 160, P0 = 37, T = 77, ctx = P0 + T;
+    for (int64_t D : {64, 128, 256}) {
+      for (const bool f16 : {false, true}) {
+        if (f16 && !gpu::caps::kv_f16) continue;
+        for (const int64_t W : {20, 50}) {
+          CAPTURE(D);
+          CAPTURE(f16);
+          CAPTURE(W);
+          const float scale = 1.0f / std::sqrt((float)D);
+          std::vector<float> Kh = host_values(random_array({HKV, ctx, D}, 1020)),
+                             Vh = host_values(random_array({HKV, ctx, D}, 1021));
+          if (f16) {
+            Kh = held16(Kh);
+            Vh = held16(Vh);
+          }
+          const int64_t floats = f16 ? HKV * MAXC * D / 2 : HKV * MAXC * D;
+          array Kc = dev(array::zeros({floats})), Vc = dev(array::zeros({floats}));
+          array Ks = dev(array::from(std::vector<float>(Kh), {HKV, ctx, D})),
+                Vs = dev(array::from(std::vector<float>(Vh), {HKV, ctx, D}));
+          REQUIRE(gpu::kv_fill(Kc.device_span(), Vc.device_span(), Ks.device_span(),
+                               Vs.device_span(), ctx, MAXC, HKV, D, f16));
+          array qp = dev(random_array({HQ, T, D}, 1022));
+          const std::vector<float> qh = host_values(qp);
+          std::vector<float> want((size_t)HQ * T * D);
+          for (int64_t h = 0; h < HQ; h++) {
+            const int64_t kh = h / (HQ / HKV);
+            for (int64_t t = 0; t < T; t++) {
+              const int64_t p = P0 + t, lo = std::max<int64_t>(0, p - W + 1);
+              std::vector<double> sc((size_t)(p + 1));
+              double m = -1e300, sum = 0;
+              for (int64_t j = lo; j <= p; j++) {
+                double a = 0;
+                for (int64_t d = 0; d < D; d++)
+                  a += (double)qh[(size_t)((h * T + t) * D + d)] * Kh[(size_t)((kh * ctx + j) * D + d)];
+                sc[j] = a * scale;
+                m = std::max(m, sc[j]);
+              }
+              for (int64_t j = lo; j <= p; j++) sum += (sc[j] = std::exp(sc[j] - m));
+              for (int64_t d = 0; d < D; d++) {
+                double e = 0;
+                for (int64_t j = lo; j <= p; j++) e += sc[j] * Vh[(size_t)((kh * ctx + j) * D + d)];
+                want[(size_t)((h * T + t) * D + d)] = (float)(e / sum);
+              }
+            }
+          }
+          const array ref = array::from(want, {HQ, T, D});
+          array pe = array::empty({HQ, T, D}), pf = array::empty({HQ, T, D});
+          if (D != 256 || f16) {  // the exact form's kernels (an f32 cache at 256 composes)
+            REQUIRE(gpu::attn_prefill(qp.device_span(), Kc.device_span(), Vc.device_span(),
+                                      pe.device_span(), HQ, HKV, T, MAXC, D, scale, f16, P0, W));
+            tl::gpu::flush();
+            CHECK(same(pe, ref, 1e-4f));
+          }
+          REQUIRE(gpu::attn_prefill_f16(qp.device_span(), Kc.device_span(), Vc.device_span(),
+                                        pf.device_span(), HQ, HKV, T, MAXC, D, scale, f16, P0, W));
+          tl::gpu::flush();
+          CHECK(same(pf, ref, 2e-3f));
+          if (!f16) {  // the composition a backend without the kernels runs (f32 caches)
+            array pg = array::empty({HQ, T, D});
+            REQUIRE(gen::attn_prefill(qp.device_span(), Kc.device_span(), Vc.device_span(),
+                                      pg.device_span(), HQ, HKV, T, MAXC, D, scale, false, P0, W));
+            tl::gpu::flush();
+            CHECK(same(pg, ref, 1e-4f));
+          }
+        }
+      }
+    }
+  }
+
   SUBCASE("the cache at a head width no kernel has (Qwen3.5's 256)") {
     // The ops take the composition rather than declining: a decoder ignores
     // their bool, so a decline would leave the cache silently unwritten.

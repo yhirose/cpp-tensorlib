@@ -73,7 +73,7 @@ struct own_nn {
   static bool attn_prefill(gpu::span q, gpu::span K, gpu::span V, gpu::span out,
                            int64_t n_q_heads, int64_t n_kv_heads, int64_t T,
                            int64_t kv_max, int64_t D, float scale,
-                           bool kv_f16 = false, int64_t pos0 = 0);
+                           bool kv_f16, int64_t pos0, int64_t window);
   static bool attn_prefill_dq(gpu::span q, gpu::span K, gpu::span V,
                               gpu::span dO, gpu::span O, gpu::span dq,
                               gpu::span stats, int64_t H, int64_t T, int64_t D,
@@ -362,10 +362,10 @@ inline bool own_nn::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
                               gpu::span out, int64_t n_q_heads,
                               int64_t n_kv_heads, int64_t T, int64_t kv_max,
                               int64_t D, float scale, bool kv_f16,
-                              int64_t pos0) {
+                              int64_t pos0, int64_t window) {
   auto& c = context::get();
   const attn_kernel k = attn_kernel_(attn_op::prefill, D, kv_f16);
-  if (!c.device || !k) return false;
+  if (!c.device || !k || window > 0) return false;  // no window in the kernel
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || T <= 0) return false;
   c.bind_(k);
   detail_::set_buf_(c.enc, q, 0ul);

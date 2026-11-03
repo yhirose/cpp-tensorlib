@@ -2828,7 +2828,7 @@ __device__ void attn_prefill_tiled_core(const float* __restrict__ q,
                                         const KT* __restrict__ V,
                                         float* __restrict__ out, unsigned T,
                                         unsigned kv_stride, unsigned group,
-                                        float scale, unsigned pos0) {
+                                        float scale, unsigned pos0, unsigned win) {
   constexpr int NT = 128, LANES = 8, ROWS = NT / LANES;
   constexpr int BQ = ROWS * QPT;            // queries per block
   constexpr int TK = AD == 64 ? 32 : AD == 128 ? 16 : 8;  // keys per tile (shared budget)
@@ -2859,16 +2859,18 @@ __device__ void attn_prefill_tiled_core(const float* __restrict__ q,
     const unsigned r = i / AD, c = i % AD;
     Qs[r][c] = (qbase + r < T) ? q[((size_t)h * T + qbase + r) * AD + c] : 0.f;
   }
-  // Last key any row of this block can need.
+  // Last key any row of this block can need, and the tile of the first (its first
+  // row's, under a window: the later rows' windows start later).
   const unsigned last = qbase + BQ - 1 < T ? qbase + BQ - 1 : T - 1;
   const unsigned kmax = pos0 + last;
+  const unsigned kt0 = attn_window_lo_(pos0 + qbase + 1, win) / TK * TK;
 
   float acc[QPT][DG] = {};
   float m[QPT], l[QPT];
 #pragma unroll
   for (int u = 0; u < QPT; u++) { m[u] = -1e30f; l[u] = 0.0f; }
 
-  for (unsigned kt = 0; kt <= kmax; kt += TK) {
+  for (unsigned kt = kt0; kt <= kmax; kt += TK) {
     __syncthreads();  // previous tile's Ks/Vs are done being read
     for (unsigned i = tid; i < TK * AD / 4; i += NT) {
       const unsigned r = i / (AD / 4), c4 = (i % (AD / 4)) * 4;
@@ -2889,7 +2891,7 @@ __device__ void attn_prefill_tiled_core(const float* __restrict__ q,
 #pragma unroll
     for (int u = 0; u < QPT; u++) {
       const unsigned row = qr0 + u * ROWS;
-      const unsigned pabs = pos0 + qbase + row;
+      const unsigned pabs = pos0 + qbase + row, plo = attn_window_lo_(pabs + 1, win);
       float sc[SPT], mt = -1e30f;
 #pragma unroll
       for (int t2 = 0; t2 < SPT; t2++) {
@@ -2897,7 +2899,7 @@ __device__ void attn_prefill_tiled_core(const float* __restrict__ q,
         float dot = 0.0f;
 #pragma unroll
         for (int d = 0; d < AD; d++) dot += Qs[row][d] * Ks[dg * SPT + t2][d];
-        sc[t2] = (kk <= pabs) ? dot * scale : -1e30f;  // causal mask
+        sc[t2] = (kk <= pabs && kk >= plo) ? dot * scale : -1e30f;  // causal (and window) mask
         mt = fmaxf(mt, sc[t2]);
       }
 #pragma unroll
@@ -2908,7 +2910,9 @@ __device__ void attn_prefill_tiled_core(const float* __restrict__ q,
       float ls = 0.0f;
 #pragma unroll
       for (int t2 = 0; t2 < SPT; t2++) {
-        const float p = __expf(sc[t2] - m_new);
+        // A masked key weighs 0 outright: under a window a row's leading tiles can be
+        // all masked, where m_new is the mask's own -1e30 and exp would give it 1.
+        const float p = sc[t2] == -1e30f ? 0.0f : __expf(sc[t2] - m_new);
         Ps[row][dg * SPT + t2] = p;
         ls += p;
       }
@@ -2954,8 +2958,8 @@ __device__ void attn_prefill_tiled_core(const float* __restrict__ q,
   TL_ALIGN(tl_attn_prefill_tiled_##TN##_##AD, 4, sizeof(KT), sizeof(KT))                        \
   extern "C" __global__ void tl_attn_prefill_tiled_##TN##_##AD(                                    \
       const float* q, const KT* K, const KT* V, float* out, unsigned T, unsigned kv_stride,         \
-      unsigned group, float scale, unsigned pos0) {                                                \
-    attn_prefill_tiled_core<AD, QPT, KT>(q, K, V, out, T, kv_stride, group, scale, pos0);          \
+      unsigned group, float scale, unsigned pos0, unsigned win) {                                  \
+    attn_prefill_tiled_core<AD, QPT, KT>(q, K, V, out, T, kv_stride, group, scale, pos0, win);     \
   }
 TL_ATTN_TILED(64, 4, float, f32)
 TL_ATTN_TILED(128, 2, float, f32)
@@ -3039,7 +3043,7 @@ struct attn_kv_tile_ {
 template <int AD, int NW, int BK, typename KT>
 __device__ void attn_prefill_tc_core(const float* __restrict__ q, const KT* __restrict__ K,
     const KT* __restrict__ V, float* __restrict__ out, unsigned T, unsigned kv_stride,
-    unsigned group, float scale, unsigned pos0) {
+    unsigned group, float scale, unsigned pos0, unsigned win) {
   constexpr int BQ = 16 * NW, LD = AD + 8, NTH = 32 * NW;
   constexpr int NS = BK / 8, NO = AD / 8, NV = BK * AD / 4 / NTH;
   static_assert(NV >= 1 && NS % 2 == 0 && NO % 2 == 0, "tile");
@@ -3051,8 +3055,11 @@ __device__ void attn_prefill_tc_core(const float* __restrict__ q, const KT* __re
   const KT* Kh = K + (size_t)(h / group) * kv_stride;
   const KT* Vh = V + (size_t)(h / group) * kv_stride;
   const unsigned kv_end = pos0 + min(T, t0 + BQ);
+  // Under a window the block's first row starts its keys at the first tile here.
+  const unsigned k_first = attn_window_lo_(pos0 + t0 + 1, win) / BK * BK;
   const unsigned qr = warp * 16 + g;
   const unsigned pa = pos0 + t0 + qr, pb = pa + 8;
+  const unsigned pla = attn_window_lo_(pa + 1, win), plb = attn_window_lo_(pb + 1, win);
   // Q fragments, once, straight from global.
   unsigned qf[AD / 16][4];
 #pragma unroll
@@ -3075,10 +3082,10 @@ __device__ void attn_prefill_tc_core(const float* __restrict__ q, const KT* __re
 #pragma unroll
   for (int d = 0; d < NO; d++) o[d][0] = o[d][1] = o[d][2] = o[d][3] = 0.0f;
   float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
-  load(0);
+  load(k_first);
   stage(0);
   __syncthreads();
-  for (unsigned k0 = 0, it = 0; k0 < kv_end; k0 += BK, it++) {
+  for (unsigned k0 = k_first, it = 0; k0 < kv_end; k0 += BK, it++) {
     const int cur = it & 1;
     const bool more = k0 + BK < kv_end;
     if (more) load(k0 + BK);
@@ -3102,7 +3109,8 @@ __device__ void attn_prefill_tc_core(const float* __restrict__ q, const KT* __re
 #pragma unroll
       for (int e = 0; e < 4; e++) {
         const unsigned j = k0 + n * 8 + tq * 2 + (e & 1), pos = e < 2 ? pa : pb;
-        const float v = j <= pos && j < kv_end ? s[n][e] * scale : -INFINITY;
+        const unsigned plo = e < 2 ? pla : plb;
+        const float v = j <= pos && j >= plo && j < kv_end ? s[n][e] * scale : -INFINITY;
         s[n][e] = v;
         mx[e >> 1] = fmaxf(mx[e >> 1], v);
       }
@@ -3170,7 +3178,7 @@ __device__ void attn_prefill_tc_core(const float* __restrict__ q, const KT* __re
 template <int AD, int NW, int BK, typename KT>
 __device__ void attn_prefill_tc_core_smem(const float* __restrict__ q, const KT* __restrict__ K,
     const KT* __restrict__ V, float* __restrict__ out, unsigned T, unsigned kv_stride,
-    unsigned group, float scale, unsigned pos0) {
+    unsigned group, float scale, unsigned pos0, unsigned win) {
   constexpr int BQ = 16 * NW, LD = AD + 8, NTH = 32 * NW;
   constexpr int NS = BK / 8, NO = AD / 8, NV = BK * AD / 4 / NTH;
   static_assert(NV >= 1 && NS % 2 == 0 && NO % 2 == 0, "tile");
@@ -3184,8 +3192,11 @@ __device__ void attn_prefill_tc_core_smem(const float* __restrict__ q, const KT*
   const KT* Kh = K + (size_t)(h / group) * kv_stride;
   const KT* Vh = V + (size_t)(h / group) * kv_stride;
   const unsigned kv_end = pos0 + min(T, t0 + BQ);
+  // Under a window the block's first row starts its keys at the first tile here.
+  const unsigned k_first = attn_window_lo_(pos0 + t0 + 1, win) / BK * BK;
   const unsigned qr = warp * 16 + g;
   const unsigned pa = pos0 + t0 + qr, pb = pa + 8;
+  const unsigned pla = attn_window_lo_(pa + 1, win), plb = attn_window_lo_(pb + 1, win);
   for (unsigned e = tid * 4; e < BQ * AD; e += NTH * 4) {
     const unsigned r = e / AD, c = e % AD, row = t0 + r;
     const float4 v = row < T ? *reinterpret_cast<const float4*>(qh + (size_t)row * AD + c) : make_float4(0, 0, 0, 0);
@@ -3201,10 +3212,10 @@ __device__ void attn_prefill_tc_core_smem(const float* __restrict__ q, const KT*
 #pragma unroll
   for (int d = 0; d < NO; d++) o[d][0] = o[d][1] = o[d][2] = o[d][3] = 0.0f;
   float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
-  load(0);
+  load(k_first);
   stage(0);
   __syncthreads();
-  for (unsigned k0 = 0, it = 0; k0 < kv_end; k0 += BK, it++) {
+  for (unsigned k0 = k_first, it = 0; k0 < kv_end; k0 += BK, it++) {
     const int cur = it & 1;
     const bool more = k0 + BK < kv_end;
     if (more) load(k0 + BK);
@@ -3230,7 +3241,8 @@ __device__ void attn_prefill_tc_core_smem(const float* __restrict__ q, const KT*
 #pragma unroll
       for (int e = 0; e < 4; e++) {
         const unsigned j = k0 + n * 8 + tq * 2 + (e & 1), pos = e < 2 ? pa : pb;
-        const float v = j <= pos && j < kv_end ? s[n][e] * scale : -INFINITY;
+        const unsigned plo = e < 2 ? pla : plb;
+        const float v = j <= pos && j >= plo && j < kv_end ? s[n][e] * scale : -INFINITY;
         s[n][e] = v;
         mx[e >> 1] = fmaxf(mx[e >> 1], v);
       }
@@ -3295,8 +3307,8 @@ __device__ void attn_prefill_tc_core_smem(const float* __restrict__ q, const KT*
            4 * sizeof(KT), 8)                                                               \
   extern "C" __global__ void tl_attn_prefill_tc_##TN##_##AD(                                       \
       const float* q, const KT* K, const KT* V, float* out, unsigned T, unsigned kv_stride,        \
-      unsigned group, float scale, unsigned pos0) {                                                \
-    CORE<AD, 4, BK, KT>(q, K, V, out, T, kv_stride, group, scale, pos0);                           \
+      unsigned group, float scale, unsigned pos0, unsigned win) {                                  \
+    CORE<AD, 4, BK, KT>(q, K, V, out, T, kv_stride, group, scale, pos0, win);                      \
   }
 TL_ATTN_TC(64, attn_prefill_tc_core, 32, float, f32)
 TL_ATTN_TC(128, attn_prefill_tc_core, 32, float, f32)
