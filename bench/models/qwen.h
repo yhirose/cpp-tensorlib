@@ -820,17 +820,20 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
     } else if (M.f16_acc && !exact) gpu::gemm_bf16_nt_f16acc(a, sp(w), y, T, n, k);
     else gpu::gemm_bf16_nt(a, sp(w), y, T, n, k);
   };
-  // The norm that feeds a GEMM, and the residual-adding one: with a16 each
-  // leaves the f16 copy the GEMM reads, and the f32 one only where something
-  // else reads it (`keep`; the layer's own norm output is read by nothing).
+  // The norm that feeds a GEMM, and the residual-adding one (the branch delta
+  // normalized by wd first where the family has it, as the decode's): with a16
+  // each leaves the f16 copy the GEMM reads, and the f32 one only where
+  // something else reads it (`keep`; the layer's own norm output is read by
+  // nothing).
   auto norm = [&](gpu::span in, gpu::span w, gpu::span o, gpu::span o16, bool keep) {
     if (a16) gpu::rmsnorm_h16(in, w, keep ? o : gpu::span{}, o16, c.NE, c.EPS, T);
     else gpu::rmsnorm(in, w, o, c.NE, c.EPS, T);
   };
-  auto norm_res = [&](gpu::span xin, gpu::span delta, gpu::span w, gpu::span xo, gpu::span o,
-                      gpu::span o16, bool keep) {
-    if (a16) gpu::rmsnorm_res_h16(xin, delta, w, xo, keep ? o : gpu::span{}, o16, c.NE, c.EPS, T);
-    else gpu::rmsnorm_res(xin, delta, w, xo, o, c.NE, c.EPS, T);
+  auto norm_res = [&](gpu::span xin, gpu::span delta, gpu::span wd, gpu::span w, gpu::span xo,
+                      gpu::span o, gpu::span o16, bool keep) {
+    if (a16)
+      gpu::rmsnorm_res_h16(xin, delta, w, xo, keep ? o : gpu::span{}, o16, c.NE, c.EPS, T, wd);
+    else gpu::rmsnorm_res(xin, delta, w, xo, o, c.NE, c.EPS, T, wd);
   };
   // A strided [T, n] block of rows `ld` apart, copied contiguous.
   auto rows_out = [&](gpu::span src, int64_t ld, gpu::span dst, int64_t n) {
@@ -877,12 +880,13 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       // Qwen3: every q / k head row (HD wide, one per h*T + t) is RMS-normalized
       // in place, before rope. v is untouched.
       // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
+      const float base = c.rope_base(l), pscale = c.rope_scale(l);
       if (c.qk_norm) {
-        gpu::rmsnorm_rope(qh, sp(L.qn), c.NH * T, T, c.HD, pos0, c.ROPE_BASE, c.ROT, c.EPS);
-        gpu::rmsnorm_rope(kh, sp(L.kn), c.NKV * T, T, c.HD, pos0, c.ROPE_BASE, c.ROT, c.EPS);
+        gpu::rmsnorm_rope(qh, sp(L.qn), c.NH * T, T, c.HD, pos0, base, c.ROT, c.EPS, pscale);
+        gpu::rmsnorm_rope(kh, sp(L.kn), c.NKV * T, T, c.HD, pos0, base, c.ROT, c.EPS, pscale);
       } else {
-        gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
-        gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, c.ROPE_BASE, {}, c.ROT);
+        gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, base, {}, c.ROT, pscale);
+        gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, base, {}, c.ROT, pscale);
       }
       L.cache.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale(), exact);
       // Qwen3.5: times sigmoid of the gate, the tail of each projection row —
@@ -902,7 +906,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       }
       gemm(ao, sp(P.at16), L.wo_row, L.qo, ro, c.NE, Q);
     }
-    norm_res(ro, x, sp(L.fn), ro, sp(P.h2), sp(P.h216), false);
+    norm_res(x, ro, sp(L.pa), sp(L.fn), ro, sp(P.h2), sp(P.h216), false);
     // With MMQ, gate|up of one format is one GEMM whose epilogue is the GLU.
     const bool glu = M.mmq && a16 && L.qgu.parts.size() == 1 &&
                      gpu::gemm_quant_glu(L.qgu.parts[0].type, c.act, sp(P.h216),
@@ -915,7 +919,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
     }
     gemm(sp(P.mb), sp(P.mb16), L.wd_row, L.qd, sp(P.md), c.NE, c.FF);
     const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
-    norm_res(ro, sp(P.md), nextw, ro, sp(P.h), sp(P.h16), l + 1 == c.NL);  // the logits read the last
+    norm_res(ro, sp(P.md), sp(L.pf), nextw, ro, sp(P.h), sp(P.h16), l + 1 == c.NL);  // the logits read the last
     x = ro;
   }
   // Leaves P.h holding the final RMSNorm for every row of the chunk. Logits are
@@ -952,10 +956,7 @@ inline void stage_embed_rows_(Model& M, const std::vector<int>& ids, int64_t fro
 // and it must fit the cache. One place answers it, so build(), begin() and
 // prefill_batched() cannot disagree.
 inline bool can_prefill_batched(const Model& M, int64_t T) {
-  // Gemma 3's prefill (post norms, GELU, its RoPE) is not batched yet: its
-  // prompt runs token by token.
   return gpu::caps::bf16_gemm && M.row && !M.q4_mlp && (!M.quant || gpu::has_gemm_quant) &&
-         M.c.arch != "gemma3" &&
          !M.layers.empty() &&
          T >= PREFILL_MIN && seq_cache(M).pos + T <= M.c.MAXC;
 }

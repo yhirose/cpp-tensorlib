@@ -337,8 +337,7 @@ which stay quantized on the device: Qwen3.8-27B Q4_K_M, 17.7 GiB, runs on a 24 G
 RTX 3090) and chats, using nothing but this library's own
 kernels — own GGUF v3 reader (`include/gguf.h`), own GPT-2-byte-BPE and
 SentencePiece tokenizers (`include/tokenizer.h`), and own CUDA prefill/decode kernels.
-Gemma 3 is the 4B for now, its context capped at its 1024-token sliding window
-and its prompt run token by token. No
+Gemma 3 is the 4B for now, its context capped at its 1024-token sliding window. No
 GGML, no llama.cpp, no third-party inference runtime anywhere in the path.
 
 ```bash

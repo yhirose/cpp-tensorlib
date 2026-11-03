@@ -142,6 +142,28 @@ static bool check_sampled(qm::Model& B, const std::vector<int>& prompt) {
   return ok;
 }
 
+// Every attention layer's cached k and v over the first n positions, as f32,
+// one vector a layer (DeltaNet layers keep no cache).
+static std::vector<std::vector<float>> cache_rows(qm::Model& M, int64_t n) {
+  std::vector<std::vector<float>> out;
+  for (auto& L : M.layers) {
+    const tl::kv_cache& c = L.cache;
+    if (!c.K.native) continue;
+    std::vector<float>& r = out.emplace_back();
+    for (const tl::storage* s : {&c.K, &c.V}) {
+      const float* f = qm::host_read(*s);
+      const auto* h = reinterpret_cast<const uint16_t*>(f);
+      for (int64_t k = 0; k < c.n_kv_heads; k++)
+        for (int64_t t = 0; t < n; t++)
+          for (int64_t d = 0; d < c.D; d++) {
+            const int64_t i = (k * c.max_ctx + t) * c.D + d;
+            r.push_back(c.f16 ? qm::f16_to_f32(h[i]) : f[i]);
+          }
+    }
+  }
+  return out;
+}
+
 // A model the array path does not model (Qwen3.5's DeltaNet, Gemma 3's post
 // norms: Config::array_path()) has its checkpoints read off the imperative
 // forward: the final norm the last layer's seam leaves in scratch, the logits,
@@ -201,6 +223,7 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   };
   for (int64_t i = 0; i < NP; i++) tok = qm::step_imperative(B, O.prompt_ids[i], p++);
   const std::vector<float> imp_prompt = logits_of(B);  // the last prompt token's
+  const auto imp_cache = cache_rows(B, NP);           // and the k / v the prompt left
   std::vector<float> imp_step;                         // and the first decode step's
   bool bf16_ok = true;
   std::printf("\nbf16 weights (built as %s), greedy %lld:\n  cpp:",
@@ -227,6 +250,22 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   std::vector<int> ids(O.prompt_ids, O.prompt_ids + NP);
   tok = dec.begin(B, ids);
   const std::vector<float> got_prompt = logits_of(B);
+  // The k and v the batched prompt left, held to the token-by-token steps' layer
+  // by layer: a wrong position or RoPE in one layer shows here in full (Gemma's
+  // global layers turned unscaled: 5.9), where the logits see it only through the
+  // attention it feeds. The prefill's activations rounded to bf16 move the deepest
+  // layers' by up to ~8e-2 (Gemma 3 4B; Qwen3.5 0.8B 3e-2).
+  const auto got_cache = cache_rows(B, NP);
+  double cache_mr = 0;
+  int64_t cache_worst = -1;
+  for (size_t l = 0; l < got_cache.size(); l++) {
+    const double mr = maxrel(got_cache[l], imp_cache[l].data(), (int64_t)imp_cache[l].size());
+    if (mr > cache_mr) cache_mr = mr, cache_worst = (int64_t)l;
+  }
+  const bool cache_ok = cache_mr < 0.3;
+  std::printf("\ndecoder (%s prefill) k / v cache vs imperative: maxrel %.2e (attention layer %lld) %s",
+              dec.batched ? "batched" : "token-by-token", cache_mr, (long long)cache_worst,
+              cache_ok ? "OK" : "FAIL");
   const double pmr = maxrel(got_prompt, imp_prompt.data(), B.c.VOCAB);
   const int64_t first = tok;
   const int64_t second = dec.step(B, first);
@@ -293,7 +332,7 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   }
   const bool f16_ok = !qm::can_prefill_batched(B, (int64_t)longp.size()) ||
                       check_f16_sums(B, longp, imp_long);
-  return ok && bf16_ok && logits_ok && dec_ok && turn2_ok && sample_ok && long_ok && f16_ok;
+  return ok && bf16_ok && logits_ok && cache_ok && dec_ok && turn2_ok && sample_ok && long_ok && f16_ok;
 }
 
 int main(int argc, char** argv) {
