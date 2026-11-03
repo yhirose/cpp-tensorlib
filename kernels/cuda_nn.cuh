@@ -122,10 +122,14 @@ extern "C" __global__ void tl_geglu(const float* __restrict__ gu,
                                     float* __restrict__ out, unsigned ff) {
   glu_core_<gelu_tanh_act_>(gu, out, ff);
 }
-// tl_swiglu writing only f16: the activation only the down GEMM reads.
+// tl_swiglu / tl_geglu writing only f16: the activation only the down GEMM reads.
 extern "C" __global__ void tl_swiglu_h16(const float* __restrict__ gu,
                                          __half* __restrict__ out, unsigned ff) {
   glu_core_<silu_act_>(gu, out, ff);
+}
+extern "C" __global__ void tl_geglu_h16(const float* __restrict__ gu,
+                                        __half* __restrict__ out, unsigned ff) {
+  glu_core_<gelu_tanh_act_>(gu, out, ff);
 }
 extern "C" {
 // Qwen3.5's gated norm of the DeltaNet output: out[t, h D + d] = silu(z) * o * w[d] /
@@ -1691,8 +1695,9 @@ __device__ __forceinline__ void tc_mma_s8_(int* c, const unsigned* a, unsigned b
 // other blocks find it in L2, where the weight-major order read it once per activation
 // tile: Qwen3.8-27B's prefill GEMMs take 2.6% (Q4_K) to 4.2% (Q8_0) less time.
 //
-// GLU: W is a fused gate|up projection (rows [0, N) the gate, [N, 2N) the up) and the
-// output is silu(gate) * up in f16, [M][N] ldc apart, as tl_swiglu_h16 rounds it: a
+// EPI 1 + gpu::glu_act (1 SiLU, 2 GELU), the GLU: W is a fused gate|up projection (rows
+// [0, N) the gate, [N, 2N) the up) and the output is act(gate) * up in f16, [M][N] ldc
+// apart, as tl_swiglu_h16 / tl_geglu_h16 round it: a
 // block's 128 weight rows are the gate and up rows of the same 64 outputs, a warp's
 // 64 columns 32 of each, so a thread holds both halves of its outputs. Not split.
 #define TL_MMQ_BM 128
@@ -1700,7 +1705,7 @@ __device__ __forceinline__ void tc_mma_s8_(int* c, const unsigned* a, unsigned b
 #define TL_MMQ_THREADS 256
 #define TL_MMQ_LDK 272  // a staged row: 256 int8 + 16, so ldmatrix's 8 rows hit distinct banks
 #define TL_MMQ_SMEM ((TL_MMQ_BM + TL_MMQ_BN) * (TL_MMQ_LDK + 64))  // int8 rows and 8 float2 scales a row
-template <int WF, bool GLU = false>  // WF: 1 Q4_K, 3 Q8_0
+template <int WF, int EPI = 0>  // WF: 1 Q4_K, 3 Q8_0; EPI: 0 C in f32, else the GLU
 __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq,
                                               const float2* __restrict__ As_g,
                                               const unsigned char* __restrict__ W,
@@ -1727,7 +1732,7 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
   // The weight row a tile row stages: the next 128, or (GLU) gate rows of 32 outputs then
   // the same outputs' up rows, twice over 64 outputs.
   auto wrow_of = [&](unsigned r) {
-    if constexpr (GLU) {
+    if constexpr (EPI != 0) {
       const unsigned o = min(tn * (BN / 2) + (r / 64) * 32 + (r & 31), N - 1);
       return (r & 32) ? o + N : o;
     } else {
@@ -1858,9 +1863,12 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
     }
     __syncthreads();  // everyone is done with the stage before the next one overwrites it
   }
-  if constexpr (GLU) {  // columns j < FN / 2 the gate, j + FN / 2 the up of the same outputs
+  if constexpr (EPI != 0) {  // columns j < FN / 2 the gate, j + FN / 2 the up of the same outputs
     __half* H = static_cast<__half*>(Cv);
-    auto glu = [](float g, float u) { return (g / (1.0f + expf(-g))) * u; };
+    auto glu = [](float g, float u) {
+      if constexpr (EPI == 2) return gelu_tanh_act_{}(g) * u;
+      else return silu_act_{}(g) * u;
+    };
 #pragma unroll
     for (int i = 0; i < FM; i++)
 #pragma unroll
@@ -1891,18 +1899,20 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
 }
 // The int8 rows and their scales by 16 bytes, Q4_K by uint4 and Q8_0 by words; C by
 // float2 (GLU: __half2).
-#define TL_GEMM_MMQ(NAME, WF, GLU)                                                                   \
-  TL_ALIGN(NAME, 16, 16, (WF) == 1 ? 16 : 4, (GLU) ? 4 : 8)                                   \
+#define TL_GEMM_MMQ(NAME, WF, EPI)                                                                   \
+  TL_ALIGN(NAME, 16, 16, (WF) == 1 ? 16 : 4, (EPI) ? 4 : 8)                                   \
   extern "C" __global__ void __launch_bounds__(TL_MMQ_THREADS, 1)                              \
   NAME(const signed char* __restrict__ Aq, const float2* __restrict__ As_g,                    \
        const unsigned char* __restrict__ W, void* __restrict__ C, unsigned M, unsigned N,      \
        unsigned K, unsigned Mpad, unsigned ldc, unsigned kchunk, unsigned zstride) {            \
-    gemm_mmq_core<WF, GLU>(Aq, As_g, W, C, M, N, K, Mpad, ldc, kchunk, zstride);                \
+    gemm_mmq_core<WF, EPI>(Aq, As_g, W, C, M, N, K, Mpad, ldc, kchunk, zstride);                \
   }
-TL_GEMM_MMQ(tl_gemm_mmq_q4k, 1, false)
-TL_GEMM_MMQ(tl_gemm_mmq_q80, 3, false)
-TL_GEMM_MMQ(tl_gemm_mmq_glu_q4k, 1, true)
-TL_GEMM_MMQ(tl_gemm_mmq_glu_q80, 3, true)
+TL_GEMM_MMQ(tl_gemm_mmq_q4k, 1, 0)
+TL_GEMM_MMQ(tl_gemm_mmq_q80, 3, 0)
+TL_GEMM_MMQ(tl_gemm_mmq_glu_q4k, 1, 1)
+TL_GEMM_MMQ(tl_gemm_mmq_glu_q80, 3, 1)
+TL_GEMM_MMQ(tl_gemm_mmq_geglu_q4k, 1, 2)
+TL_GEMM_MMQ(tl_gemm_mmq_geglu_q80, 3, 2)
 #undef TL_GEMM_MMQ
 // C[M, N columns ldc apart] = the sum of z partial products, each M x N, stride apart.
 TL_ALIGN(tl_mmq_reduce, 8, 8)

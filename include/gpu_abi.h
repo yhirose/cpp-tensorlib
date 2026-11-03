@@ -113,6 +113,9 @@ enum class unary_ext_op { tanh_, sin_, cos_ };
 // pow(x, s) and the comparisons against a scalar, with s a kernel argument
 // instead of a rank-0 operand buffer (an allocation and an upload per call).
 enum class scalar_op { pow, gt, lt, ge, le, eq, ne };
+// The gate's activation in a GLU, out = act(gate) * up: SiLU (SwiGLU) or GELU in
+// its tanh form (GeGLU, Gemma's MLP). A kernel id each, swiglu_ and geglu_.
+enum class glu_act { silu, gelu_tanh };
 
 // A view into a device buffer: the currency every op takes. `buf` is whatever
 // the backend's alloc() returned — an MTLBuffer handle, a device address, a

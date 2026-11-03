@@ -950,7 +950,7 @@ TEST_CASE("generic compositions agree with the fused kernels") {
   namespace gpu = tl::gpu;
   namespace gen = tl::gpu::generic;
 
-  SUBCASE("rmsnorm, rmsnorm_res and swiglu") {
+  SUBCASE("rmsnorm, rmsnorm_res and the GLUs") {
     const int64_t rows = 3, n = 896, ff = 512;
     array x = dev(random_array({rows, n}, 950)), d = dev(random_array({rows, n}, 951));
     array w = dev(random_array({n}, 952));
@@ -980,15 +980,15 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     array gu = dev(random_array({rows, 2 * ff}, 953));
     array oa = array::empty({rows, ff}), ob = array::empty({rows, ff});
     REQUIRE(gpu::swiglu(gu.device_span(), oa.device_span(), ff, rows));
-    REQUIRE(gen::swiglu(gu.device_span(), ob.device_span(), ff, rows));
+    REQUIRE(gen::glu(gpu::glu_act::silu, gu.device_span(), ob.device_span(), ff, rows));
     tl::gpu::flush();
     CHECK(same(oa, ob, 1e-5f));
 
-    // geglu, kernel and composition, against GELU's tanh form in double.
+    // GELU's, kernel and composition, against its tanh form in double.
     array gw = dev(random_array({rows, 2 * ff}, 956) * 4.0f);
     array ga = array::empty({rows, ff}), gb = array::empty({rows, ff});
-    REQUIRE(gpu::geglu(gw.device_span(), ga.device_span(), ff, rows));
-    REQUIRE(gen::geglu(gw.device_span(), gb.device_span(), ff, rows));
+    REQUIRE(gpu::glu(gpu::glu_act::gelu_tanh, gw.device_span(), ga.device_span(), ff, rows));
+    REQUIRE(gen::glu(gpu::glu_act::gelu_tanh, gw.device_span(), gb.device_span(), ff, rows));
     tl::gpu::flush();
     const std::vector<float> in = host_values(gw);
     std::vector<float> want((size_t)rows * ff);

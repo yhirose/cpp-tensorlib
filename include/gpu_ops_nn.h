@@ -99,7 +99,7 @@ inline bool rmsnorm_res(span x, span delta, span w, span xout, span hout,
 // for its steps), and up read in place. No launch writes a buffer it reads
 // (WebGPU refuses that).
 template <class Factor>
-inline bool glu(span gu, span o, int64_t ff, int64_t rows, Factor factor) {
+inline bool glu_by_(span gu, span o, int64_t ff, int64_t rows, Factor factor) {
   const int64_t n = rows * ff;
   scratch zero(1, true), g(n), a(n), b(n);
   if (!zero || !g || !a || !b) return false;
@@ -108,16 +108,15 @@ inline bool glu(span gu, span o, int64_t ff, int64_t rows, Factor factor) {
          binary(kop::mul, g, a, b, n, 1.0f, 0.0f) &&
          binary_bcast(kop::bmul, b, ff, 1, gu.at(ff * 4), 2 * ff, 1, o, rows, ff, 1.0f, 0.0f);
 }
-// silu(g) = g sigmoid(g).
-inline bool swiglu(span gu, span o, int64_t ff, int64_t rows) {
-  return glu(gu, o, ff, rows, [](span g, span a, span, int64_t n) {
-    return unary(kop::sigmoid, g, a, n, 1.0f, 0.0f);
-  });
-}
-// GELU's tanh form: g (1 + tanh(sqrt(2/pi) g (1 + 0.044715 g^2))) / 2, each
-// step an affine epilogue of the one before.
-inline bool geglu(span gu, span o, int64_t ff, int64_t rows) {
-  return glu(gu, o, ff, rows, [](span g, span a, span b, int64_t n) {
+// act(gate) * up. silu(g) = g sigmoid(g); GELU's tanh form is g (1 + tanh(sqrt(2/pi)
+// g (1 + 0.044715 g^2))) / 2, each step an affine epilogue of the one before.
+inline bool glu(glu_act act, span gu, span o, int64_t ff, int64_t rows) {
+  if (act == glu_act::silu) {
+    return glu_by_(gu, o, ff, rows, [](span g, span a, span, int64_t n) {
+      return unary(kop::sigmoid, g, a, n, 1.0f, 0.0f);
+    });
+  }
+  return glu_by_(gu, o, ff, rows, [](span g, span a, span b, int64_t n) {
     return binary(kop::mul, g, g, a, n, 0.044715f, 1.0f) &&  // 1 + c g^2
            binary(kop::mul, g, a, b, n, 0.79788456080286535587989211986876f, 0.0f) &&
            unary_ext(unary_ext_op::tanh_, b, a, n, 0.5f, 0.5f);  // (1 + tanh) / 2
@@ -439,22 +438,16 @@ inline bool rmsnorm_res(span x, span delta, span w, span xout, span hout,
          generic::rmsnorm_res(x, delta, w, xout, hout, n, eps, rows);
 }
 
-// out[rows, ff] = silu(gate) * up out of the fused gate|up buffer [rows, 2ff].
-inline bool swiglu(span gu, span o, int64_t ff, int64_t rows = 1) {
+// out[rows, ff] = act(gate) * up out of the fused gate|up buffer [rows, 2ff].
+inline bool glu(glu_act act, span gu, span o, int64_t ff, int64_t rows = 1) {
   if (ff <= 0 || rows <= 0) return false;
-  return launch(kop::swiglu_, {in(gu), out(o)},
-                swiglu_params{static_cast<uint32_t>(ff)},
-                policy::flat_rows(ff, rows)) ||
-         generic::swiglu(gu, o, ff, rows);
+  return launch(act == glu_act::silu ? kop::swiglu_ : kop::geglu_, {in(gu), out(o)},
+                glu_params{static_cast<uint32_t>(ff)}, policy::flat_rows(ff, rows)) ||
+         generic::glu(act, gu, o, ff, rows);
 }
-// out[rows, ff] = gelu(gate) * up, GELU's tanh form (Gemma's MLP), the same
-// layout.
-inline bool geglu(span gu, span o, int64_t ff, int64_t rows = 1) {
-  if (ff <= 0 || rows <= 0) return false;
-  return launch(kop::geglu_, {in(gu), out(o)},
-                swiglu_params{static_cast<uint32_t>(ff)},
-                policy::flat_rows(ff, rows)) ||
-         generic::geglu(gu, o, ff, rows);
+// SwiGLU, silu(gate) * up: the MLP of Qwen's, and Qwen3.5's gates, SiLU by definition.
+inline bool swiglu(span gu, span o, int64_t ff, int64_t rows = 1) {
+  return glu(glu_act::silu, gu, o, ff, rows);
 }
 
 // Gated DeltaNet's causal depthwise conv over T tokens, with its SiLU. Token t
@@ -663,13 +656,14 @@ inline bool gemm_quant(int type, bool a16, span A, span W, span C, int64_t m, in
   }
 }
 
-// silu(gate) * up of a fused gate|up block-quantized projection in one MMQ GEMM (see
+// act(gate) * up of a fused gate|up block-quantized projection in one MMQ GEMM (see
 // own::gemm_quant_glu in cuda.h). False where the backend has none or it does not apply.
 TL_GPU_DETECT_OWN(gemm_quant_glu)
 template <class Own = own>
-inline bool gemm_quant_glu(int type, span A16, span W, span H16, int64_t m, int64_t ff, int64_t k) {
+inline bool gemm_quant_glu(int type, glu_act act, span A16, span W, span H16, int64_t m, int64_t ff,
+                           int64_t k) {
   if constexpr (detail::owns_gemm_quant_glu<Own>::value) {
-    return detail::ran(Own::gemm_quant_glu(type, A16, W, H16, m, ff, k));
+    return detail::ran(Own::gemm_quant_glu(type, act, A16, W, H16, m, ff, k));
   } else {
     return false;
   }
@@ -740,13 +734,14 @@ inline bool rmsnorm_rope(span x, span w, int64_t rows, int64_t T, int64_t D, int
 // The f16 prefill's activations, rounded where they are made so the GEMM does
 // not round them again in every block that reads them (CUDA only: a backend
 // without them answers false, and `f16_activations` says which). The norms
-// write the f16 copy beside the f32 output; swiglu and merge_heads write only
+// write the f16 copy beside the f32 output; the GLUs and merge_heads write only
 // f16, their f32 form being read by nothing else. Spans of an f16 buffer are
 // byte offsets like any other; the buffer is sized in floats, half as many.
 TL_GPU_DETECT_OWN(gemm_bf16_nt_f16acc_a16)
 TL_GPU_DETECT_OWN(rmsnorm_h16)
 TL_GPU_DETECT_OWN(rmsnorm_res_h16)
 TL_GPU_DETECT_OWN(swiglu_h16)
+TL_GPU_DETECT_OWN(geglu_h16)
 TL_GPU_DETECT_OWN(merge_heads_h16)
 TL_GPU_DETECT_OWN(cvt_h16)
 inline constexpr bool f16_activations = has_gemm_bf16_nt_f16acc_a16;
@@ -768,10 +763,17 @@ TL_GPU_F16_OP(rmsnorm_res_h16,
                int64_t rows),
               (x, delta, w, xout, hout, hout16, n, eps, rows))
 TL_GPU_F16_OP(swiglu_h16, (span gu, span o16, int64_t ff, int64_t rows), (gu, o16, ff, rows))
+TL_GPU_F16_OP(geglu_h16, (span gu, span o16, int64_t ff, int64_t rows), (gu, o16, ff, rows))
 TL_GPU_F16_OP(merge_heads_h16, (span src, span dst16, int64_t T, int64_t H, int64_t D),
               (src, dst16, T, H, D))
 TL_GPU_F16_OP(cvt_h16, (span src, span dst16, int64_t n), (src, dst16, n))
 #undef TL_GPU_F16_OP
+// glu() writing only f16, by the activation.
+template <class Own = own>
+inline bool glu_h16(glu_act act, span gu, span o16, int64_t ff, int64_t rows) {
+  return act == glu_act::silu ? swiglu_h16<Own>(gu, o16, ff, rows)
+                              : geglu_h16<Own>(gu, o16, ff, rows);
+}
 
 // One decode step: q [n_q_heads, D] against a [n_kv_heads, kv_max, D] cache
 // read over [0, ctx). GQA by the head ratio; the cache is f32, or f16 with kv_f16.

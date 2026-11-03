@@ -232,7 +232,7 @@ inline bool rmsnorm(const gpu::arg* v, const void* params, const gpu::grid& g,
 // out[r, f] = act(gate) * up over the fused gate|up rows: swiglu and geglu.
 template <class Act>
 inline bool glu(const gpu::arg* v, const void* params, const gpu::grid& g, Act act) {
-  const uint32_t ff = as<gpu::swiglu_params>(params).ff;
+  const uint32_t ff = as<gpu::glu_params>(params).ff;
   const float* gu = at<const float>(v[0]);
   float* o = at<float>(v[1]);
   for (uint32_t r = 0; r < g.gy; r++) {  // rows ride on the grid's y

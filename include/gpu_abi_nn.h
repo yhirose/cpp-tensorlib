@@ -25,7 +25,7 @@ struct rmsnorm_params {  // per row of n: x * rsqrt(mean(x^2) + eps) * w
   uint32_t n;
   float eps;
 };
-struct swiglu_params {
+struct glu_params {  // swiglu_ / geglu_: out[rows, ff] = act(gate) * up
   uint32_t ff;
 };
 struct gemv_row_params {  // y[n] = a[k] . W[n, k], one group an output row

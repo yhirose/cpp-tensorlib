@@ -303,11 +303,15 @@ int main() {
     release(o, 0, nullptr);
   }
 
-  // ---- the same GEMM over a fused gate|up weight with the swiglu in its epilogue ----
-  // (gemm_quant_glu): it must be bit for bit the plain MMQ GEMM followed by swiglu_h16's
-  // f16 rounding of silu(gate) * up. FF = 150 leaves a partial 64-output tile; K = 512
-  // keeps the grid unsplit (glu does not split K).
+  // ---- the same GEMM over a fused gate|up weight with the GLU in its epilogue ----
+  // (gemm_quant_glu), per activation: it must be bit for bit the plain MMQ GEMM followed
+  // by glu_h16, whose output must in turn be glu's f32 one rounded to f16 (glu itself is
+  // held to the formula in the tests), so each of the three choices of the activation is
+  // pinned to the next. FF = 150 leaves a partial 64-output tile; K = 512 keeps the grid
+  // unsplit (the GLU does not split K).
+  for (const auto act : {tl::gpu::glu_act::silu, tl::gpu::glu_act::gelu_tanh})
   for (const int type : {12, 8}) {
+    const char* const aname = act == tl::gpu::glu_act::silu ? "silu" : "gelu";
     const int64_t M = 200, FF = 150, N = 2 * FF, K = 512;
     const size_t blk = type == 12 ? 144 : 34, rowb = (size_t)K / (type == 12 ? 256 : 32) * blk;
     std::vector<uint8_t> W((size_t)N * rowb);
@@ -326,31 +330,42 @@ int main() {
     float* cc = nullptr;
     float* ch = nullptr;
     float* cr = nullptr;
+    float* cf = nullptr;
     void* w = alloc(W.size(), &cw);
     void* a = alloc(M * K * 2, &ca);
     void* o = alloc(M * N * 4, &cc);
     void* h = alloc(M * FF * 2, &ch);
     void* r = alloc(M * FF * 2, &cr);
+    void* f = alloc(M * FF * 4, &cf);
     std::memcpy(cw, W.data(), W.size());
     uint16_t* ah = reinterpret_cast<uint16_t*>(ca);
     for (int64_t i = 0; i < M * K; i++) ah[i] = tl::f32_to_f16(d(g) * 2.0f);
     const bool launched = tl::gpu::gemm_quant(type, true, {a, 0}, {w, 0}, {o, 0}, M, N, K, N, true) &&
-                          tl::gpu::swiglu_h16({o, 0}, {r, 0}, FF, M) &&
-                          tl::gpu::gemm_quant_glu(type, {a, 0}, {w, 0}, {h, 0}, M, FF, K);
+                          tl::gpu::glu_h16(act, {o, 0}, {r, 0}, FF, M) &&
+                          tl::gpu::glu(act, {o, 0}, {f, 0}, FF, M) &&
+                          tl::gpu::gemm_quant_glu(type, act, {a, 0}, {w, 0}, {h, 0}, M, FF, K);
     sync_to_host(r, false);
     sync_to_host(h, false);
+    sync_to_host(f, false);
     const uint16_t* hh = reinterpret_cast<const uint16_t*>(ch);
     const uint16_t* rr = reinterpret_cast<const uint16_t*>(cr);
-    int64_t mismatches = 0;
-    for (int64_t i = 0; i < M * FF; i++) mismatches += hh[i] != rr[i];
-    std::printf("  mmq %s glu: %lld of %lld outputs differ from gemm + swiglu\n", type == 12 ? "Q4_K" : "Q8_0",
-                (long long)mismatches, (long long)(M * FF));
-    check(launched && mismatches == 0, type == 12 ? "mmq Q4_K glu" : "mmq Q8_0 glu");
+    int64_t mismatches = 0, rounding = 0;
+    for (int64_t i = 0; i < M * FF; i++) {
+      mismatches += hh[i] != rr[i];
+      rounding += rr[i] != tl::f32_to_f16(cf[i]);
+    }
+    std::printf("  mmq %s %s glu: %lld of %lld outputs differ from gemm + glu_h16, "
+                "%lld glu_h16 from glu rounded\n",
+                type == 12 ? "Q4_K" : "Q8_0", aname, (long long)mismatches, (long long)(M * FF),
+                (long long)rounding);
+    check(launched && mismatches == 0 && rounding == 0,
+          (std::string("mmq ") + (type == 12 ? "Q4_K " : "Q8_0 ") + aname + " glu").c_str());
     release(w, 0, nullptr);
     release(a, 0, nullptr);
     release(o, 0, nullptr);
     release(h, 0, nullptr);
     release(r, 0, nullptr);
+    release(f, 0, nullptr);
   }
 
   // ---- Qwen3.5's gated norm in one pass (gated_rmsnorm) against the norm and a swiglu ----

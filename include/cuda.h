@@ -648,6 +648,7 @@ struct context {
   CUfunction rmsnorm_rope_fn[3] = {};  // D 64, 128, 256
   CUfunction gated_rmsnorm_fn[2] = {};
   CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, swiglu_h16_fn = nullptr,
+             geglu_h16_fn = nullptr,
              merge_heads_h16_fn = nullptr, cvt_h16_fn = nullptr;  // the f16 activation's producers
   CUfunction conv_tok_fn = nullptr, conv_state_fn = nullptr;  // a prefill's conv
   CUfunction conv_tok_() { return cached_(conv_tok_fn, "tl_ssm_conv_tokens"); }
@@ -889,7 +890,7 @@ struct context {
   CUdeviceptr mmq_scratch_(size_t bytes) {
     return grow_scratch_(mmq_scratch, mmq_scratch_bytes, bytes);
   }
-  CUfunction mmq_quant_fn = nullptr, mmq_fn[2][2] = {}, mmq_reduce_fn = nullptr;
+  CUfunction mmq_quant_fn = nullptr, mmq_fn[3][2] = {}, mmq_reduce_fn = nullptr;
   // The partial products of a split-K MMQ GEMM (tl_mmq_reduce sums them into C).
   CUdeviceptr mmq_part_scratch = 0;
   size_t mmq_part_scratch_bytes = 0;
@@ -900,12 +901,15 @@ struct context {
   // shared memory (TL_MMQ_SMEM in tensorlib_cuda.cu, change them together), raised on first
   // lookup.
   static constexpr unsigned mmq_tile = 128, mmq_threads = 256, mmq_smem = (128 + 128) * (272 + 64);
-  CUfunction mmq_(int type, bool glu) {
-    static const char* const names[2][2] = {{"tl_gemm_mmq_q4k", "tl_gemm_mmq_q80"},
-                                            {"tl_gemm_mmq_glu_q4k", "tl_gemm_mmq_glu_q80"}};
-    CUfunction& slot = mmq_fn[glu][type == 12 ? 0 : 1];
+  // epi: 0 C in f32, 1 + gpu::glu_act the GLU epilogue of that activation (the kernels'
+  // EPI template argument).
+  CUfunction mmq_(int type, int epi) {
+    static const char* const names[3][2] = {{"tl_gemm_mmq_q4k", "tl_gemm_mmq_q80"},
+                                            {"tl_gemm_mmq_glu_q4k", "tl_gemm_mmq_glu_q80"},
+                                            {"tl_gemm_mmq_geglu_q4k", "tl_gemm_mmq_geglu_q80"}};
+    CUfunction& slot = mmq_fn[epi][type == 12 ? 0 : 1];
     if (!slot) {
-      slot = load_(names[glu][type == 12 ? 0 : 1]);
+      slot = load_(names[epi][type == 12 ? 0 : 1]);
       if (slot && d.FuncSetAttribute)
         d.FuncSetAttribute(slot, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, static_cast<int>(mmq_smem));
     }

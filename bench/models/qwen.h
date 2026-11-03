@@ -70,13 +70,14 @@ struct Config {
   float L2EPS = 1e-6f;  // DeltaNet's q / k L2 norms (the reference's constant)
   // Gemma 3: the embedding times sqrt(NE); an RMSNorm after the attention and
   // after the MLP too (their outputs normalized before the residual adds); the
-  // MLP's gate through GELU (tanh form) rather than SiLU; and sliding-window
+  // MLP's gate through GELU (tanh form) rather than SiLU (act); and sliding-window
   // attention on the layers `local` marks (a local layer sees the last SWA
   // positions), whose RoPE turns at ROPE_BASE_LOCAL, unscaled, while a global
   // layer's turns at ROPE_BASE with the position times ROPE_SCALE (a linear
   // scaling, which any family's GGUF may state).
   float EMB_SCALE = 1.0f;
-  bool post_norms = false, gelu = false;
+  bool post_norms = false;
+  gpu::glu_act act = gpu::glu_act::silu;  // the MLP's gate activation
   int64_t SWA = 0;
   std::vector<bool> local;  // per layer; empty: every layer global
   float ROPE_BASE_LOCAL = 10000.0f, ROPE_SCALE = 1.0f;
@@ -91,7 +92,8 @@ struct Config {
   // The array path (forward(), the per-op oracle) models the plain decoder:
   // no DeltaNet layers, no Gemma post norms or GELU, every layer global.
   bool array_path() const {
-    return !hybrid() && !post_norms && !gelu && local.empty() && ROPE_SCALE == 1.0f;
+    return !hybrid() && !post_norms && act == gpu::glu_act::silu && local.empty() &&
+           ROPE_SCALE == 1.0f;
   }
   bool is_delta(int64_t l) const { return hybrid() && (l + 1) % INTERVAL != 0; }
   // Output widths of the fused projections (and so of the scratch they land in).
@@ -170,7 +172,7 @@ inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
     // As llama.cpp's gemma3 (src/models/gemma3.cpp): its norms' weights carry
     // Gemma's +1 already (the GGUF conversion adds it).
     c.EMB_SCALE = std::sqrt((float)c.NE);
-    c.gelu = true;
+    c.act = gpu::glu_act::gelu_tanh;
     if (m.has(arch + ".final_logit_softcapping") &&
         m.kv(arch + ".final_logit_softcapping").as_f32() != 0.0f)
       throw std::runtime_error("qwen: a gemma3 with a final logit softcap");
@@ -553,7 +555,7 @@ struct Scratch {
   storage ab;           // attn (or DeltaNet gated-norm) out
   storage convb;        // DeltaNet conv out [ssm_conv_ch]
   storage gateb;        // Qwen3.5 attention: sigmoid(gate) [NH*HD]
-  storage mb;           // swiglu out [FF]
+  storage mb;           // GLU out [FF]
   storage gub;          // fused gate|up out [2*FF] = [9728]
   storage mdb;          // mlp-down out [NE]
   storage logits;       // [VOCAB]
@@ -613,7 +615,7 @@ struct PrefillScratch {
   // gated norm. zero is the one float a strided copy adds.
   storage conv, zo, zero;
   storage gu;  // fused gate|up [cap, 2*FF]
-  storage mb;  // swiglu out [cap, FF]
+  storage mb;  // GLU out [cap, FF]
   storage md;  // mlp-down out [cap, NE]
   // The f16 copies the f16-sum GEMMs read (a half-size buffer each, in floats):
   // the two norms' outputs, and the activations only a GEMM reads.
@@ -775,7 +777,7 @@ inline void set_cache_pos(Model& M, int64_t p) {
 // Qwen shapes in bench_qwen_prefill), and attention becomes one tiled causal
 // pass instead of T growing-ctx decode calls (~45x). This is the same forward as
 // run_layers_, one row per token: fused QKV -> split to head-major -> rope ->
-// causal attn over the cache -> merge back -> o proj -> fused gate|up -> swiglu
+// causal attn over the cache -> merge back -> o proj -> fused gate|up -> GLU
 // -> down, with the residual adds folded into the following RMSNorms exactly as
 // the decode seam does.
 //
@@ -900,15 +902,15 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       gemm(ao, sp(P.at16), L.wo_row, L.qo, ro, c.NE, Q);
     }
     norm_res(ro, x, sp(L.fn), ro, sp(P.h2), sp(P.h216), false);
-    // With MMQ, gate|up of one format is one GEMM whose epilogue is the swiglu.
+    // With MMQ, gate|up of one format is one GEMM whose epilogue is the GLU.
     const bool glu = M.mmq && a16 && L.qgu.parts.size() == 1 &&
-                     gpu::gemm_quant_glu(L.qgu.parts[0].type, sp(P.h216),
+                     gpu::gemm_quant_glu(L.qgu.parts[0].type, c.act, sp(P.h216),
                                          sp(L.qgu.raw).at(L.qgu.parts[0].byte_off), sp(P.mb16), T, c.FF,
                                          c.NE);
     if (!glu) {
       gemm(sp(P.h2), sp(P.h216), L.wgu, L.qgu, sp(P.gu), 2 * c.FF, c.NE);
-      if (a16) gpu::swiglu_h16(sp(P.gu), sp(P.mb16), c.FF, T);
-      else gpu::swiglu(sp(P.gu), sp(P.mb), c.FF, T);
+      if (a16) gpu::glu_h16(c.act, sp(P.gu), sp(P.mb16), c.FF, T);
+      else gpu::glu(c.act, sp(P.gu), sp(P.mb), c.FF, T);
     }
     gemm(sp(P.mb), sp(P.mb16), L.wd_row, L.qd, sp(P.md), c.NE, c.FF);
     const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
@@ -1461,8 +1463,7 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
     // Fused gate|up: one GEMV -> [gate(FF) | up(FF)] in S.gub; the GLU reads both.
     if (M.q4_mlp) gemv_q4_w(L.wgu_q4, sp(S.h2b), sp(S.gub));  // [NE, 2*FF]
     else gv(L.wgu, L.qgu, sp(S.h2b), sp(S.gub), 2 * c.FF, c.NE);
-    if (c.gelu) gpu::geglu(sp(S.gub), sp(S.mb), c.FF);
-    else gpu::swiglu(sp(S.gub), sp(S.mb), c.FF);
+    gpu::glu(c.act, sp(S.gub), sp(S.mb), c.FF);
     if (M.q4_mlp) gemv_q4_w(L.wd_q4, sp(S.mb), sp(S.mdb));  // [FF, NE]
     else gv(row ? L.wd_row : L.wd, L.qd, sp(S.mb), sp(S.mdb), c.NE, c.FF);
     if (c.post_norms) gpu::rmsnorm(sp(S.mdb), sp(L.pf), sp(S.mdb), c.NE, c.EPS);
