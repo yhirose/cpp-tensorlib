@@ -87,15 +87,17 @@ int main(int argc, char** argv) {
                 tl::gpu::policy::max_top_k);
     return 1;
   }
-  std::string templated =
-      gemma3 ? "<bos><start_of_turn>user\n" + user + "<end_of_turn>\n<start_of_turn>model\n"
-             : std::string(qwen3 || qwen35 ? ""
-                                           : "<|im_start|>system\nYou are Qwen, created by "
-                                             "Alibaba Cloud. You are a helpful "
-                                             "assistant.<|im_end|>\n") +
-                   "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n" +
-                   ((qwen3 || qwen35) && nothink ? "<think>\n\n</think>\n\n"
-                                                 : qwen35 ? "<think>\n" : "");
+  std::string templated;
+  if (gemma3) {
+    templated = "<bos><start_of_turn>user\n" + user + "<end_of_turn>\n<start_of_turn>model\n";
+  } else {
+    if (!qwen3 && !qwen35)
+      templated = "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful "
+                  "assistant.<|im_end|>\n";
+    templated += "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n";
+    if ((qwen3 || qwen35) && nothink) templated += "<think>\n\n</think>\n\n";
+    else if (qwen35) templated += "<think>\n";
+  }
   std::vector<int> ids = tok.encode(templated);
   if (sampler.greedy()) {
     std::printf("prompt: %s\n%zu prompt tokens; generating (greedy)...\n\n", user.c_str(),

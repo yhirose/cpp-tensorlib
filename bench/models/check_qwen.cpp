@@ -305,18 +305,23 @@ int main(int argc, char** argv) {
   std::printf("loading %s\n", path.c_str());
   qm::gg::model m(path);
   const qm::Config C = qm::config_from_gguf(m);
-  // Checkpoints exist for Qwen2.5-0.5B (24 layers, 896 wide), Qwen3-0.6B (28,
-  // 1024), Qwen3.5-0.8B (24, 1024) and Gemma 3 4B (34, 2560).
-  const bool q3 = C.arch == "qwen3", q35 = C.arch == "qwen35", g3 = C.arch == "gemma3";
-  const int64_t want_nl = g3 ? 34 : q3 ? 28 : 24, want_ne = g3 ? 2560 : q3 || q35 ? 1024 : 896;
-  if (C.NL != want_nl || C.NE != want_ne) {
+  // The models with checkpoints: arch, layers, width.
+  const struct {
+    const char* arch;
+    int64_t nl, ne;
+    Oracle o;
+  } oracles[] = {{"qwen2", 24, 896, TL_ORACLE(qwenoracle)},      // Qwen2.5-0.5B
+                 {"qwen3", 28, 1024, TL_ORACLE(qwen3oracle)},    // Qwen3-0.6B
+                 {"qwen35", 24, 1024, TL_ORACLE(qwen35oracle)},  // Qwen3.5-0.8B
+                 {"gemma3", 34, 2560, TL_ORACLE(gemma3oracle)}}; // Gemma 3 4B
+  const Oracle* found = nullptr;
+  for (const auto& r : oracles)
+    if (C.arch == r.arch && C.NL == r.nl && C.NE == r.ne) found = &r.o;
+  if (!found) {
     std::printf("config mismatch — no oracle for this model\n");
     return 2;
   }
-  const Oracle O = g3    ? TL_ORACLE(gemma3oracle)
-                   : q35 ? TL_ORACLE(qwen35oracle)
-                   : q3  ? TL_ORACLE(qwen3oracle)
-                         : TL_ORACLE(qwenoracle);
+  const Oracle O = *found;
   tl::use_gpu();
   if (!C.array_path()) {
     const bool ok = check_imperative(m, O);
