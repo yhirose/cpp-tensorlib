@@ -983,6 +983,23 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     REQUIRE(gen::swiglu(gu.device_span(), ob.device_span(), ff, rows));
     tl::gpu::flush();
     CHECK(same(oa, ob, 1e-5f));
+
+    // geglu, kernel and composition, against GELU's tanh form in double.
+    array gw = dev(random_array({rows, 2 * ff}, 956) * 4.0f);
+    array ga = array::empty({rows, ff}), gb = array::empty({rows, ff});
+    REQUIRE(gpu::geglu(gw.device_span(), ga.device_span(), ff, rows));
+    REQUIRE(gen::geglu(gw.device_span(), gb.device_span(), ff, rows));
+    tl::gpu::flush();
+    const std::vector<float> in = host_values(gw);
+    std::vector<float> want((size_t)rows * ff);
+    for (int64_t r = 0; r < rows; r++)
+      for (int64_t f = 0; f < ff; f++) {
+        const double x = in[r * 2 * ff + f], up = in[r * 2 * ff + ff + f];
+        const double t = std::tanh(std::sqrt(2.0 / M_PI) * (x + 0.044715 * x * x * x));
+        want[r * ff + f] = (float)(0.5 * x * (1.0 + t) * up);
+      }
+    CHECK(same(ga, array::from(want, {rows, ff}), 1e-5f));
+    CHECK(same(gb, array::from(want, {rows, ff}), 1e-5f));
   }
 
   SUBCASE("the f32 decode GEMV") {

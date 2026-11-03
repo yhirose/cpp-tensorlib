@@ -264,6 +264,7 @@ inline const char* kernel_name_(kop op) {
     case kop::rmsnorm_: return "tl_rmsnorm";
     case kop::add_rmsnorm_: return "tl_add_rmsnorm";
     case kop::swiglu_: return "tl_swiglu";
+    case kop::geglu_: return "tl_geglu";
     case kop::ssm_conv_: return "tl_ssm_conv";
     case kop::gated_delta_: return "tl_gated_delta";
     case kop::gemv_bf16_row_: return "tl_gemv_bf16_row";

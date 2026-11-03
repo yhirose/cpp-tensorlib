@@ -229,6 +229,19 @@ inline bool rmsnorm(const gpu::arg* v, const void* params, const gpu::grid& g,
   }
   return true;
 }
+inline bool geglu(const gpu::arg* v, const void* params, const gpu::grid& g) {
+  const uint32_t ff = as<gpu::swiglu_params>(params).ff;
+  const float* gu = at<const float>(v[0]);
+  float* o = at<float>(v[1]);
+  for (uint32_t r = 0; r < g.gy; r++) {  // rows ride on the grid's y
+    for (uint32_t f = 0; f < ff; f++) {
+      const float x = gu[size_t(r) * 2 * ff + f], up = gu[size_t(r) * 2 * ff + ff + f];
+      const float t = std::tanh(0.79788456080286535587989211986876f * x * (1.0f + 0.044715f * x * x));
+      o[size_t(r) * ff + f] = 0.5f * x * (1.0f + t) * up;
+    }
+  }
+  return true;
+}
 inline bool swiglu(const gpu::arg* v, const void* params, const gpu::grid& g) {
   const uint32_t ff = as<gpu::swiglu_params>(params).ff;
   const float* gu = at<const float>(v[0]);
@@ -479,6 +492,7 @@ inline bool kernel_(kop k, const gpu::arg* v, const void* params,
     case kop::rmsnorm_: return d::rmsnorm(v, params, g, false);
     case kop::add_rmsnorm_: return d::rmsnorm(v, params, g, true);
     case kop::swiglu_: return d::swiglu(v, params, g);
+    case kop::geglu_: return d::geglu(v, params, g);
     case kop::gemv_bf16_row_: return d::gemv_bf16_row(v, params);
     case kop::gemv_q4_: return d::gemv_q4(v, params);
     case kop::kv_append_: return d::kv_append(v, params, g);

@@ -103,6 +103,20 @@ extern "C" __global__ void tl_swiglu(const float* __restrict__ gu,
   float g = gu[src];
   out[(size_t)blockIdx.y * ff + f] = (g / (1.0f + expf(-g))) * gu[src + ff];
 }
+// GELU, tanh form (ggml's and PyTorch's approximate='tanh'), as their CUDA
+// kernels write it: Gemma's activation.
+__device__ __forceinline__ float gelu_tanh_(float x) {
+  return 0.5f * x * (1.0f + tanhf(0.79788456080286535587989211986876f * x * (1.0f + 0.044715f * x * x)));
+}
+// out[rows, ff] = gelu(gate) * up from the fused gate|up buffer: tl_swiglu's
+// layout and grid.
+extern "C" __global__ void tl_geglu(const float* __restrict__ gu,
+                                    float* __restrict__ out, unsigned ff) {
+  unsigned f = blockIdx.x * blockDim.x + threadIdx.x;
+  if (f >= ff) return;
+  const size_t src = (size_t)blockIdx.y * 2u * ff + f;
+  out[(size_t)blockIdx.y * ff + f] = gelu_tanh_(gu[src]) * gu[src + ff];
+}
 // tl_swiglu writing only f16: the activation only the down GEMM reads.
 extern "C" __global__ void tl_swiglu_h16(const float* __restrict__ gu,
                                          __half* __restrict__ out, unsigned ff) {

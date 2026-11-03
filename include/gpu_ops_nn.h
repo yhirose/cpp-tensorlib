@@ -107,6 +107,22 @@ inline bool swiglu(span gu, span o, int64_t ff, int64_t rows) {
                       ff, 1.0f, 0.0f);
 }
 
+// gelu(gate) * up, GELU's tanh form: 0.5 g (1 + tanh(sqrt(2/pi) g (1 + 0.044715
+// g^2))), each step an affine epilogue of the one before (no launch writes a
+// buffer it reads: WebGPU refuses that).
+inline bool geglu(span gu, span o, int64_t ff, int64_t rows) {
+  const int64_t n = rows * ff;
+  scratch zero(1, true), g(n), a(n), b(n);
+  if (!zero || !g || !a || !b) return false;
+  zero.contents[0] = 0.0f;
+  return copy_2d(gu, 2 * ff, 1, zero, g, rows, ff) &&
+         binary(kop::mul, g, g, a, n, 0.044715f, 1.0f) &&                 // 1 + c g^2
+         binary(kop::mul, g, a, b, n, 0.79788456080286535587989211986876f, 0.0f) &&
+         unary_ext(unary_ext_op::tanh_, b, a, n, 0.5f, 0.5f) &&           // (1 + tanh) / 2
+         binary(kop::mul, g, a, b, n, 1.0f, 0.0f) &&
+         binary_bcast(kop::bmul, b, ff, 1, gu.at(ff * 4), 2 * ff, 1, o, rows, ff, 1.0f, 0.0f);
+}
+
 // A GEMV is a GEMM with one row.
 inline bool gemv_f32(span a, span B, span y, int64_t n, int64_t k) {
   return gemm(a, k, false, B, n, false, y, 1, n, k, 1.0f, 0.0f);
@@ -429,6 +445,15 @@ inline bool swiglu(span gu, span o, int64_t ff, int64_t rows = 1) {
                 swiglu_params{static_cast<uint32_t>(ff)},
                 policy::flat_rows(ff, rows)) ||
          generic::swiglu(gu, o, ff, rows);
+}
+// out[rows, ff] = gelu(gate) * up, GELU's tanh form (Gemma's MLP), the same
+// layout.
+inline bool geglu(span gu, span o, int64_t ff, int64_t rows = 1) {
+  if (ff <= 0 || rows <= 0) return false;
+  return launch(kop::geglu_, {in(gu), out(o)},
+                swiglu_params{static_cast<uint32_t>(ff)},
+                policy::flat_rows(ff, rows)) ||
+         generic::geglu(gu, o, ff, rows);
 }
 
 // Gated DeltaNet's causal depthwise conv over T tokens, with its SiLU. Token t
