@@ -255,8 +255,8 @@ int main() {
     vec lr = cpu_step(w, rs, id, pos);
     double mr = 0;
     for (int64_t j = 0; j < VOCAB; j++)
-      mr = std::max(mr, std::fabs((double)lg[j] - lr[j]) / (1.0 + std::fabs(lr[j])));
-    worst = std::max(worst, mr);
+      mr = tl::max_err(mr, std::fabs((double)lg[j] - lr[j]) / (1.0 + std::fabs(lr[j])));
+    worst = tl::max_err(worst, mr);
     int64_t gnext = argmax(lg), cnext = argmax(lr);
     if (i + 1 >= prompt.size()) {  // this logits row predicts a generated token
       gpu_gen.push_back(gnext);

@@ -47,7 +47,7 @@ static bool test_uk(ukernel_fn uk, int mrt, int nrt, const char* name) {
         // ldc = nr: the kernel writes only the valid mr×nr corner.
         uk(kc, ap.data(), bp.data(), c.data(), nr, mr, nr);
         for (int i = 0; i < mr * nr; i++)
-          if (std::fabs(c[i] - ref[i]) > 1e-3f * (1 + std::fabs(ref[i]))) {
+          if (!(std::fabs(c[i] - ref[i]) <= 1e-3f * (1 + std::fabs(ref[i])))) {
             std::printf("%s MISMATCH kc=%d mr=%d nr=%d\n", name, kc, mr, nr);
             return false;
           }

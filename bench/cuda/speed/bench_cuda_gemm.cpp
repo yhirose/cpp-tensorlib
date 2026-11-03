@@ -135,7 +135,7 @@ int main(int argc, char** argv) {
     double maxrel = 0;
     for (int64_t i = 0; i < m * n; i++) {
       double err = std::fabs(ownv[i] - refv[i]) / (1.0 + std::fabs(refv[i]));
-      maxrel = std::max(maxrel, err);
+      maxrel = tl::max_err(maxrel, err);
     }
 
     // ---- timing: R launches per event pair, interleaved own/cuBLAS ----

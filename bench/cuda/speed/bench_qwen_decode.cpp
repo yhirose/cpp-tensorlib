@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
       int64_t tb = qm::argmax(std::vector<float>(imp, imp + C.VOCAB));
       if (ta != tb) mism++;
       double denom = 1.0 + std::fabs((double)bf16_logits[ta]);
-      maxrel = std::max(maxrel, std::fabs((double)imp[ta] - bf16_logits[ta]) / denom);
+      maxrel = tl::max_err(maxrel, std::fabs((double)imp[ta] - bf16_logits[ta]) / denom);
       nx = ta; p++;
     }
     if (q4on)
@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
     for (int64_t i = 0; i < C.VOCAB; i++) {
       if (ref[i] != got[i]) mism++;
       double denom = 1.0 + std::fabs((double)ref[i]);
-      maxrel = std::max(maxrel, std::fabs((double)got[i] - ref[i]) / denom);
+      maxrel = tl::max_err(maxrel, std::fabs((double)got[i] - ref[i]) / denom);
     }
     int64_t ref_arg = qm::argmax(ref);
     std::printf("dpos-vs-hostpos logits at pos %lld: %d/%d differ, maxrel %.2e %s\n",

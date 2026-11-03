@@ -134,8 +134,8 @@ int main(int argc, char** argv) {
       const float* got = M.scratch.logits.ptr;
       double maxrel = 0;
       for (int64_t i = 0; i < C.VOCAB; i++)
-        maxrel = std::max(maxrel, (double)std::fabs(got[i] - ref[(size_t)i]) /
-                                      (1.0 + std::fabs(ref[(size_t)i])));
+        maxrel = tl::max_err(maxrel, (double)std::fabs(got[i] - ref[(size_t)i]) /
+                                         (1.0 + std::fabs(ref[(size_t)i])));
       const double top5 = qm::top5_maxrel(got, ref.data(), C.VOCAB);
       bool tok_ok = got_tok == ref_tok, rel_ok = top5 < MAXREL_BOUND;
       std::printf("  %-9s first token %lld vs array %lld %s | top-5 logits maxrel "
@@ -252,8 +252,8 @@ int main(int argc, char** argv) {
     cu::sync_to_host(y, false);
     double maxrel = 0;
     for (int64_t i = 0; i < s.N; i++)
-      maxrel = std::max(maxrel, (double)std::fabs(hy[i] - hy1[i]) /
-                                    (1.0 + std::fabs(hy1[i])));
+      maxrel = tl::max_err(maxrel, (double)std::fabs(hy[i] - hy1[i]) /
+                                       (1.0 + std::fabs(hy1[i])));
     bool ok = maxrel < 1e-5;
     gemm_ok &= ok;
 

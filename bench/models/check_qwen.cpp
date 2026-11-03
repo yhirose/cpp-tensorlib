@@ -39,7 +39,7 @@ struct Oracle {
 static double maxrel(const std::vector<float>& a, const float* b, int64_t n) {
   double mr = 0;
   for (int64_t i = 0; i < n; i++)
-    mr = std::max(mr, std::fabs((double)a[i] - b[i]) / (1.0 + std::fabs((double)b[i])));
+    mr = tl::max_err(mr, std::fabs((double)a[i] - b[i]) / (1.0 + std::fabs((double)b[i])));
   return mr;
 }
 
@@ -194,7 +194,8 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
     double logit_mr = 0;
     for (int t = 0; t < 5; t++) {
       const double ref = O.top5_vals[t];
-      logit_mr = std::max(logit_mr, std::fabs(logits[O.top5_ids[t]] - ref) / (1.0 + std::fabs(ref)));
+      logit_mr =
+          tl::max_err(logit_mr, std::fabs(logits[O.top5_ids[t]] - ref) / (1.0 + std::fabs(ref)));
     }
     const int64_t top1 = qm::argmax(logits);
     std::printf("\ncheckpoints vs numpy-on-same-F16-weights (imperative path):\n");
@@ -455,8 +456,8 @@ int main(int argc, char** argv) {
   double logit_mr = 0;
   for (int t = 0; t < 5; t++) {
     int64_t id = O.top5_ids[t];
-    logit_mr = std::max(logit_mr, std::fabs((double)last_logits[id] - O.top5_vals[t]) /
-                                      (1.0 + std::fabs((double)O.top5_vals[t])));
+    logit_mr = tl::max_err(logit_mr, std::fabs((double)last_logits[id] - O.top5_vals[t]) /
+                                         (1.0 + std::fabs((double)O.top5_vals[t])));
   }
 
   std::printf("\ncheckpoints vs numpy-on-same-F16-weights (expect ~1e-4):\n");

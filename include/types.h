@@ -102,6 +102,14 @@ inline float f16_to_f32(uint16_t h) {
   return (h & 0x8000u) ? -v : v;
 }
 
+// The larger of two errors, a NaN in either kept: the running worst of an error
+// check. std::max drops a NaN (std::max(x, NaN) is x), and a test written as
+// !(err <= worst) takes it but lets the next error replace it, so a check through
+// either passes a NaN.
+inline double max_err(double worst, double err) {
+  return std::isnan(worst) || err <= worst ? worst : err;
+}
+
 enum class device_type { cpu, gpu, auto_ };
 
 inline device_type device_ = device_type::cpu;

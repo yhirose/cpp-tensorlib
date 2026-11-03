@@ -44,6 +44,20 @@ TEST_CASE("allclose and array_equal: a NaN is close to nothing, an infinity only
   CHECK(allclose(v({1, 2}), v({1, 2.00001f})));
 }
 
+TEST_CASE("max_err keeps a NaN, wherever in the run it comes") {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  CHECK(tl::max_err(1, 2) == 2);
+  CHECK(tl::max_err(2, 1) == 2);
+  CHECK(std::isnan(tl::max_err(1, nan)));
+  CHECK(std::isnan(tl::max_err(nan, 1)));
+  using run = std::vector<double>;
+  for (const run& r : {run{nan, 1, 2}, run{1, nan, 2}, run{1, 2, nan}}) {
+    double worst = 0;
+    for (double e : r) worst = tl::max_err(worst, e);
+    CHECK(std::isnan(worst));
+  }
+}
+
 TEST_CASE("a size past int64 is refused, not wrapped into a small buffer") {
   // 2^62 f32 elements are 2^64 bytes: wrapped, that was a 0-byte buffer every
   // element was then written into.

@@ -36,7 +36,7 @@ vec rnd(size_t n, uint32_t seed) {
 double maxrel(const vec& got, const vec& ref) {
   double m = 0;
   for (size_t i = 0; i < got.size(); i++)
-    m = std::max(m, std::fabs((double)got[i] - ref[i]) / (1.0 + std::fabs(ref[i])));
+    m = tl::max_err(m, std::fabs((double)got[i] - ref[i]) / (1.0 + std::fabs(ref[i])));
   return m;
 }
 

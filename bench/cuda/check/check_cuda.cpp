@@ -77,7 +77,7 @@ int main() {
     sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < n; i++)
-      if (std::fabs(co[i] - ref[i]) > 1e-4f) match = false;
+      if (!(std::fabs(co[i] - ref[i]) <= 1e-4f)) match = false;
     check(match, "binary add+affine");
     release(a, 0, nullptr);
     release(b, 0, nullptr);
@@ -100,7 +100,7 @@ int main() {
     sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < n; i++)
-      if (std::fabs(co[i] - ref[i]) > 1e-4f) match = false;
+      if (!(std::fabs(co[i] - ref[i]) <= 1e-4f)) match = false;
     check(match, "unary sigmoid");
     release(a, 0, nullptr);
     release(o, 0, nullptr);
@@ -128,7 +128,7 @@ int main() {
     sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < m * n; i++)
-      if (std::fabs(co[i] - ref[i]) > 1e-3f * (1 + std::fabs(ref[i])))
+      if (!(std::fabs(co[i] - ref[i]) <= 1e-3f * (1 + std::fabs(ref[i]))))
         match = false;
     check(match, "gemm NN + scale");
     release(a, 0, nullptr);
@@ -159,7 +159,7 @@ int main() {
     sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < m * n; i++)
-      if (std::fabs(co[i] - ref[i]) > 1e-3f * (1 + std::fabs(ref[i])))
+      if (!(std::fabs(co[i] - ref[i]) <= 1e-3f * (1 + std::fabs(ref[i]))))
         match = false;
     check(match, "gemm NT (transposed B)");
     release(a, 0, nullptr);
@@ -187,7 +187,7 @@ int main() {
     sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t r = 0; r < rows; r++)
-      if (std::fabs(co[r] - ref[r]) > 1e-2f) match = false;
+      if (!(std::fabs(co[r] - ref[r]) <= 1e-2f)) match = false;
     check(match, "row_sum + affine");
     release(in, 0, nullptr);
     release(o, 0, nullptr);
@@ -215,7 +215,7 @@ int main() {
     sync_to_host(o, false);  // D2H the device-written output before host read
     bool match = launched;
     for (int64_t i = 0; i < rows * cols; i++)
-      if (std::fabs(co[i] - ref[i]) > 1e-4f) match = false;
+      if (!(std::fabs(co[i] - ref[i]) <= 1e-4f)) match = false;
     check(match, "softmax");
     release(in, 0, nullptr);
     release(o, 0, nullptr);

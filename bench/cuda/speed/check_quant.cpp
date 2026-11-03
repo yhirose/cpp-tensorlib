@@ -86,10 +86,10 @@ int main(int argc, char** argv) {
       for (int s = 0; s < steps; s++) {
         double mx = 0, ref = 0;
         for (size_t i = 0; i < la[s].size(); i++) {
-          mx = std::max(mx, (double)std::fabs(la[s][i] - lb[s][i]));
+          mx = tl::max_err(mx, (double)std::fabs(la[s][i] - lb[s][i]));
           ref = std::max(ref, (double)std::fabs(la[s][i]));
         }
-        worst = std::max(worst, mx / (1.0 + ref));
+        worst = tl::max_err(worst, mx / (1.0 + ref));
         const int64_t ta = qm::argmax(la[s]), tb = qm::argmax(lb[s]);
         if (ta == tb) { agree++; continue; }
         // A different top token is fine only if the oracle itself had them within
@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
     }
     double pmx = 0, pref = 0;
     for (size_t i = 0; i < pa_.size(); i++) {
-      pmx = std::max(pmx, (double)std::fabs(pa_[i] - pb_[i]));
+      pmx = tl::max_err(pmx, (double)std::fabs(pa_[i] - pb_[i]));
       pref = std::max(pref, (double)std::fabs(pa_[i]));
     }
     const double err = pmx / (1.0 + pref), kl = qm::kl_div(pa_, pb_);

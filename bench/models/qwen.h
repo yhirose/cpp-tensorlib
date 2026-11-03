@@ -1372,7 +1372,7 @@ inline double top5_maxrel(const float* got, const float* ref, int64_t n) {
   double mr = 0;
   for (int i = 0; i < 5; i++) {
     const double r = ref[idx[i]];
-    mr = std::max(mr, std::fabs(got[idx[i]] - r) / (1.0 + std::fabs(r)));
+    mr = tl::max_err(mr, std::fabs(got[idx[i]] - r) / (1.0 + std::fabs(r)));
   }
   return mr;
 }

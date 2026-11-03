@@ -51,6 +51,11 @@ jobs:
       - name: Layers
         if: runner.os == 'Linux'
         run: python3 tools/check_layers.py
+      # Error checks a NaN would pass (a |difference| tested with '>', or kept
+      # with std::max): tools/check_nan_blind.py.
+      - name: NaN-blind error checks
+        if: runner.os == 'Linux'
+        run: python3 tools/check_nan_blind.py
 
   # Build verification for the CUDA toolchain. Hosted runners have no NVIDIA
   # driver, so the kernels are only compiled and linked. Running the tests here

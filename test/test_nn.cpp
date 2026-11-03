@@ -39,7 +39,7 @@ TEST_CASE("cpu::exp_shifted: within a few ulp of libm over softmax's domain") {
   for (size_t i = 0; i < xs.size(); i++) {
     double want = std::exp(double(xs[i]));
     if (want < 1.1754944e-38) continue;  // denormal results: flushed near there
-    worst = std::max(worst, std::abs(double(ys[i]) - want) / want);
+    worst = tl::max_err(worst, std::abs(double(ys[i]) - want) / want);
   }
   MESSAGE("exp_shifted worst relative error: " << worst);
   CHECK(worst < 1.1920929e-7);  // measured 7.7e-8 (~1.3 ulp) on AVX2
@@ -769,7 +769,7 @@ TEST_CASE("q4 weight storage: decode dot + widen fallback vs dequant oracle") {
   double maxerr = 0;
   for (int64_t k = 0; k < K; k++)
     for (int64_t j = 0; j < N; j++)
-      maxerr = std::max(maxerr, (double)std::fabs(deq.at({k, j}) - w.at({k, j})));
+      maxerr = tl::max_err(maxerr, (double)std::fabs(deq.at({k, j}) - w.at({k, j})));
   CHECK(maxerr < 0.2);  // symmetric int4, scale = maxabs/7
 
   // direct element access on q4 throws (weight-container semantics) — and
@@ -1459,7 +1459,7 @@ TEST_CASE("generic compositions agree with the fused kernels") {
         y.eval();
         double worst = 0;
         for (int64_t n = 0; n < N; n++)
-          worst = std::max(worst, std::fabs(y.raw()[n] - ref[n]) / (1.0 + std::fabs(ref[n])));
+          worst = tl::max_err(worst, std::fabs(y.raw()[n] - ref[n]) / (1.0 + std::fabs(ref[n])));
         CHECK(worst < 1e-5);
       }
     }
@@ -1501,7 +1501,7 @@ TEST_CASE("generic compositions agree with the fused kernels") {
               for (int64_t j = 0; j < N; j++) {
                 const size_t r = (size_t)(i * N + j);
                 const float g = got[(size_t)(i * ldc + col0 + j)];
-                worst = std::max(worst, std::fabs(g - ref[r]) / mag[r]);
+                worst = tl::max_err(worst, std::fabs(g - ref[r]) / mag[r]);
               }
             return worst;
           };
@@ -1675,8 +1675,7 @@ TEST_CASE("generic compositions agree with the fused kernels") {
             ref += t;
             mag += std::fabs(t);
           }
-          const double e = std::fabs(yv[(size_t)(pad + n)] - ref) / mag;
-          if (!(e <= worst)) worst = e;  // a NaN stays (std::max would drop it)
+          worst = tl::max_err(worst, std::fabs(yv[(size_t)(pad + n)] - ref) / mag);
         }
         for (int64_t i = 0; i < N + 2 * pad; i++)
           if (i < pad || i >= pad + N) kept = kept && yv[(size_t)i] == 7.0f;

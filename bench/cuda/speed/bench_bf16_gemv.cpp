@@ -96,7 +96,7 @@ int main() {
     double maxrel = 0;
     for (int64_t i = 0; i < N; i++) {
       double e = std::fabs(hyf[i] - hyb[i]) / (1.0 + std::fabs(hyf[i]));
-      maxrel = std::max(maxrel, e);
+      maxrel = tl::max_err(maxrel, e);
     }
 
     auto time_ms = [&](auto&& fn) {

@@ -484,7 +484,7 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       };
       auto close = [](const std::vector<float>& got, const std::vector<float>& w) {
         for (size_t i = 0; i < w.size(); i++)
-          if (std::fabs(got[i] - w[i]) > 1e-6f * (1.0f + std::fabs(w[i]))) return false;
+          if (!(std::fabs(got[i] - w[i]) <= 1e-6f * (1.0f + std::fabs(w[i])))) return false;
         return true;
       };
       std::vector<std::pair<int, quant_rows>> qs;

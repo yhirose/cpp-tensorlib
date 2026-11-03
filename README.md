@@ -102,6 +102,8 @@ yourself from `raw()`.
 For tests: `allclose(a, b, rtol = 1e-5f, atol = 1e-6f)` and `array_equal(a, b)`
 (the same thing with zero tolerance). Both return false on a shape mismatch, and,
 as numpy's do, where either holds a NaN; an infinity matches only itself.
+`max_err(worst, err)` is the larger of two errors with a NaN in either kept, for
+a running worst that a NaN cannot slip through (`std::max` drops one).
 
 ### Operations
 

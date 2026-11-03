@@ -100,7 +100,7 @@ int main() {
       double ref = 0;
       for (int64_t k = 0; k < K; k++) ref += (double)ha[k] * deq[(size_t)n * K + k];
       float got = hy[n];
-      maxrel = std::max(maxrel, std::fabs(got - ref) / (1.0 + std::fabs(ref)));
+      maxrel = tl::max_err(maxrel, std::fabs(got - ref) / (1.0 + std::fabs(ref)));
     }
 
     auto time_ms = [&](auto&& fn) {
