@@ -316,9 +316,11 @@ add_test(NAME llm_block COMMAND tensorlib_check_llm_block)
 # The Qwen2.5 / Qwen3 / Qwen3.5 driver (bench/models/qwen.h): backend-neutral, so both of
 # these build wherever tensorlib does and run on whatever gpu:: resolves to.
 # Neither is a ctest — they need a ~1.2-1.5 GB GGUF, kept out of the repo (models/).
-#   check_qwen: the decoder end to end vs a numpy reference on the same weights.
-#   chat_qwen:  own GGUF loader + own BPE tokenizer -> prompt in, text out.
-foreach(qwen_target check_qwen chat_qwen)
+#   check_qwen:  the decoder end to end vs a numpy reference on the same weights.
+#   chat_qwen:   own GGUF loader + own BPE tokenizer -> prompt in, text out.
+#   dump_logits: every forward path's logits on fixed prompts, to compare a change's
+#                before and after byte for byte.
+foreach(qwen_target check_qwen chat_qwen dump_logits)
   add_executable(tensorlib_${qwen_target} bench/models/${qwen_target}.cpp)
   target_include_directories(tensorlib_${qwen_target} BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench/models)
@@ -338,6 +340,7 @@ if(TENSORLIB_CUDA)
   tensorlib_enable_cuda(tensorlib_check_llm_block)
   tensorlib_enable_cuda(tensorlib_check_qwen)
   tensorlib_enable_cuda(tensorlib_chat_qwen)
+  tensorlib_enable_cuda(tensorlib_dump_logits)
 endif()
 
 # Own CPU GEMM bench (M5 tuning). Links OpenBLAS for the off-Apple gate when
