@@ -552,9 +552,10 @@ struct Scratch {
   storage embed;        // staged embedding row [NE] (the step's input)
   std::vector<float> embed_stage;  // host gather target, uploaded into embed
   void init(const Config& c) {
-    {  // the widest input of a Q4_K GEMV, prepared in any form (a check switches them)
-      const int64_t k = std::max(c.NE, c.FF);
-      act = scratch_f32(std::max<int64_t>(1, (gpu::act_bytes_max(k) + 3) / 4));
+    {  // the widest input of a GEMV (the residual, the MLP's, the heads', DeltaNet's
+       // values), up to whole Q4_K superblocks, prepared in any form (a check switches them)
+      const int64_t widest = std::max({c.NE, c.FF, c.NH * c.HD, c.hybrid() ? c.ssm_v() : 0});
+      act = scratch_f32(std::max<int64_t>(1, (gpu::act_bytes_max((widest + 255) / 256 * 256) + 3) / 4));
     }
     embed = scratch_f32(c.NE);
     embed_stage.assign(c.NE, 0.0f);
@@ -1022,9 +1023,13 @@ inline const char* act_form_name(gpu::act_form f) {
 // The decode GEMVs' activation form: TL_GEMV_ACT names it (f32, q8 or h16; h16 when
 // unset: as fast as q8 on large models, a few percent behind on small ones, and far
 // closer to f32: Gemma 3 4B's decode KL from the f32 forward 5e-7 against q8's 3e-3,
-// docs/llama-cpp-comparison.md), and a form the backend has not got for k-wide inputs
-// falls back to f32.
-inline gpu::act_form gemv_form_env(int64_t k) {
+// docs/llama-cpp-comparison.md), and a form the backend has not got falls back to f32.
+// Whether it has it is asked at one Q4_K superblock; a GEMV whose K the form does not
+// take (not whole superblocks) reads its activation as f32, call by call (gemv_q).
+inline bool gemv_form_available(gpu::act_form f) {
+  return f == gpu::act_form::f32 || gpu::act_bytes(f, 256) > 0;
+}
+inline gpu::act_form gemv_form_env() {
   gpu::act_form f = gpu::act_form::h16;
   if (const char* e = std::getenv("TL_GEMV_ACT")) {
     bool known = std::strcmp(e, act_form_name(gpu::act_form::f32)) == 0;
@@ -1038,7 +1043,7 @@ inline gpu::act_form gemv_form_env(int64_t k) {
       std::exit(2);
     }
   }
-  return gpu::act_bytes(f, k) > 0 ? f : gpu::act_form::f32;  // f32's act_bytes is 0
+  return gemv_form_available(f) ? f : gpu::act_form::f32;
 }
 
 // wdt = the linear-weight storage dtype (f32 exact, or bf16 for the decode
@@ -1089,7 +1094,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
       .outwT_q4 =
           q4lm ? load_w_T(m, c.output_name(), c.NE, c.VOCAB, f32).to_q4() : array{},
       .qout = nat ? load_q_cat(m, {{c.output_name(), c.VOCAB}}, c.NE) : qmat{},
-      .gemv_form = nat ? gemv_form_env(c.NE) : gpu::act_form::f32,
+      .gemv_form = nat ? gemv_form_env() : gpu::act_form::f32,
       .mmq = nat && gpu::has_gemm_quant && !std::getenv("TL_NO_MMQ"),
       .quant = nat,
       .row = row,

@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
                  std::end(tl::gpu::prepared_act_forms));
     for (const tl::gpu::act_form form : forms) {
       const double bound = bound_of(form);
-      if (form != tl::gpu::act_form::f32 && tl::gpu::act_bytes(form, M.c.NE) == 0) {
+      if (!qm::gemv_form_available(form)) {
         std::printf("%s activations: the backend has not got the form, skipped\n",
                     qm::act_form_name(form));
         continue;
