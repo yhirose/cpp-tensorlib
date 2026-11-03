@@ -750,9 +750,22 @@ inline bool gemv_q4k_act(act_form f, span pa, span W, span y, int64_t n, int64_t
   }
 }
 
+// Whether the backend reads a GGUF block format (type = ggml_type code) natively, in
+// rows of k weights: its gemv_quant / gemm_quant / embed_row take them. Formats
+// differ by backend, so a model asks before it keeps a tensor's blocks as they are.
+TL_GPU_DETECT_OWN(quant_reads)
+template <class Own = own>
+inline bool quant_reads(int type, int64_t k) {
+  if constexpr (detail::owns_quant_reads<Own>::value) {
+    return Own::quant_reads(type, k);
+  } else {
+    return false;
+  }
+}
+
 // y[n] = W[n,K] . a with W the rows of a GGUF block-quantized weight (type = ggml_type
-// code: 12 Q4_K, 14 Q6_K, 8 Q8_0), read as quantized. False where the backend has no
-// such kernel; the caller dequantizes instead.
+// code, a format quant_reads takes), read as quantized. False where the backend has
+// no such kernel; the caller dequantizes instead.
 TL_GPU_DETECT_OWN(gemv_quant)
 template <class Own = own>
 inline bool gemv_quant(int type, span a, span W, span y, int64_t n, int64_t k) {

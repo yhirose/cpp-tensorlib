@@ -89,6 +89,7 @@ struct own_nn {
   // A scale other than 1 is not in its kernels: false (the caller stages the row).
   static bool embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
                         int64_t rows, int64_t row_stride, int64_t col_stride, float scale);
+  static bool quant_reads(int type, int64_t k);  // Q4_K, Q6_K and Q8_0
   static bool gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y,
                          int64_t n, int64_t k);
   static bool gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
@@ -306,8 +307,10 @@ inline constexpr unsigned long gemv_quant_qrows_ = 2, gemv_quant_sg_ = 2,
 // kernels' loads (32-bit into a Q4_K block, so word_aligned_; 16-bit into the
 // others).
 inline bool quant_ok_(int type, int64_t k, gpu::span W) {
-  return (type == 12 || type == 14 || type == 8) && k > 0 &&
-         k % (type == 8 ? 32 : 256) == 0 && (type == 12 ? word_aligned_(W) : W.off % 2 == 0);
+  return own_nn::quant_reads(type, k) && (type == 12 ? word_aligned_(W) : W.off % 2 == 0);
+}
+inline bool own_nn::quant_reads(int type, int64_t k) {
+  return (type == 12 || type == 14 || type == 8) && k > 0 && k % (type == 8 ? 32 : 256) == 0;
 }
 
 // An NT GEMM's launch on STEEL's body (C[M,N] rows ldc apart, W [N,K] the

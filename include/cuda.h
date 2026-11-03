@@ -645,9 +645,13 @@ struct context {
   CUfunction gemm_bf16_nt_sk_() {
     return cached_(gemm_bf16_nt_sk_fn, "tl_gemm_bf16_nt_sk");
   }
-  CUfunction gemv_q4k_fn = nullptr, gemv_q6k_fn = nullptr,
-             gemv_q80_fn = nullptr, quant_act_fn = nullptr, gemv_q4k_q8_fn = nullptr,
-             act_h16_fn = nullptr, gemv_q4k_h16_fn = nullptr;
+  // The block formats' kernels, by their row of cuda_nn.h's quant_fmts_ (at most
+  // quant_fmts_max rows): the GEMV, the f16 dequantization and the row lookup.
+  static constexpr int quant_fmts_max = 8;
+  CUfunction gemv_quant_fn[quant_fmts_max] = {}, dequant_fn[quant_fmts_max] = {},
+             embed_quant_fn[quant_fmts_max] = {};
+  CUfunction quant_act_fn = nullptr, gemv_q4k_q8_fn = nullptr, act_h16_fn = nullptr,
+             gemv_q4k_h16_fn = nullptr;
   CUfunction rmsnorm_rope_fn[3] = {};  // D 64, 128, 256
   CUfunction gated_rmsnorm_fn[2] = {};
   CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, glu_h16_fn[2] = {},
@@ -811,8 +815,8 @@ struct context {
     return r;
   }
 
-  // embed_row (cuda_llm.h): f32, bf16, Q4_K, Q6_K, Q8_0.
-  CUfunction embed_row_fn[5] = {};
+  // embed_row (cuda_llm.h) of an f32 or bf16 table (the block formats': embed_quant_fn).
+  CUfunction embed_row_fn[2] = {};
 
   // sample_to's keys between its launches (cuda_llm.h). Its caller asks one
   // size every time, so the buffer never moves: a captured graph keeps the
@@ -884,7 +888,6 @@ struct context {
   CUdeviceptr dequant_scratch_(size_t bytes) {
     return grow_scratch_(dequant_scratch, dequant_scratch_bytes, bytes);
   }
-  CUfunction dequant_fn[3] = {};
 
   // The int8 copy of the prefill's activation for the MMQ GEMM (tl_quant_act_mmq):
   // the scales first, then the int8 rows.
@@ -904,15 +907,16 @@ struct context {
   // shared memory (TL_MMQ_SMEM in tensorlib_cuda.cu, change them together), raised on first
   // lookup.
   static constexpr unsigned mmq_tile = 128, mmq_threads = 256, mmq_smem = (128 + 128) * (272 + 64);
-  // epi: 0 C in f32, 1 the SiLU GLU epilogue, 2 the GELU one (the kernels' EPI
-  // template argument; own_nn::gemm_quant_glu picks it by the activation).
-  CUfunction mmq_(int type, int epi) {
+  // i: the format's MMQ kernels (cuda_nn.h's quant_fmt::mmq: 0 Q4_K, 1 Q8_0); epi: 0 C
+  // in f32, 1 the SiLU GLU epilogue, 2 the GELU one (the kernels' EPI template
+  // argument; own_nn::gemm_quant_glu picks it by the activation).
+  CUfunction mmq_(int i, int epi) {
     static const char* const names[3][2] = {{"tl_gemm_mmq_q4k", "tl_gemm_mmq_q80"},
                                             {"tl_gemm_mmq_swiglu_q4k", "tl_gemm_mmq_swiglu_q80"},
                                             {"tl_gemm_mmq_geglu_q4k", "tl_gemm_mmq_geglu_q80"}};
-    CUfunction& slot = mmq_fn[epi][type == 12 ? 0 : 1];
+    CUfunction& slot = mmq_fn[epi][i];
     if (!slot) {
-      slot = load_(names[epi][type == 12 ? 0 : 1]);
+      slot = load_(names[epi][i]);
       if (slot && d.FuncSetAttribute)
         d.FuncSetAttribute(slot, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, static_cast<int>(mmq_smem));
     }

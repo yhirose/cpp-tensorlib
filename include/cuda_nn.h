@@ -7,6 +7,7 @@
 //
 // Included by cuda.h, after the device core.
 
+#include "ggml_quant.h"
 #include "gpu_abi_nn.h"
 
 namespace tl {
@@ -49,9 +50,12 @@ struct own_nn {
   // glu_h16 would make it. False where it does not apply (the caller does those two).
   static bool gemm_quant_glu(int type, gpu::glu_act act, gpu::span A16, gpu::span W,
                              gpu::span H16, int64_t m, int64_t ff, int64_t k);
-  // y[n] = W[n,K] . a over GGUF block-quantized rows (type: the ggml_type code, 12 Q4_K
-  // 14 Q6_K or 8 Q8_0), the blocks read where they lie. K a whole number of blocks.
+  // y[n] = W[n,K] . a over GGUF block-quantized rows (type: the ggml_type code, a format
+  // of quant_fmts_), the blocks read where they lie. K a whole number of blocks.
   static bool gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n, int64_t k);
+  // Whether the kernels read `type`'s blocks in rows of k (a format of quant_fmts_, k a
+  // whole number of its blocks).
+  static bool quant_reads(int type, int64_t k);
   // The f16 prefill GEMM reading an activation that is already f16, and the
   // producers that round it where it is made (see their definitions).
   static bool gemm_bf16_nt_f16acc_a16(gpu::span a, gpu::span B, gpu::span C,
@@ -344,11 +348,47 @@ inline bool own_nn::gemm_bf16_nt_f16acc_a16(gpu::span a, gpu::span B, gpu::span 
   return f16acc_run_(context::tc_form::f16h, a, B, out, m, n, k);
 }
 
+// The GGUF block formats the kernels read, a row each: the ggml type; the format's
+// index in the GEMM's staging and the device code (context::tc_weight, cuda_nn.cuh's
+// WF); its GEMV, f16 dequantization and row-lookup kernels; and its MMQ kernels'
+// index (context::mmq_), -1 where it has none. A block's geometry is ggml's
+// (gguf::ggml_block). Every reader of a format takes it from here.
+struct quant_fmt {
+  int type;
+  context::tc_weight wf;
+  const char *gemv, *dequant, *embed;
+  int mmq;
+};
+inline constexpr quant_fmt quant_fmts_[] = {
+    {12, context::tc_weight::q4k, "tl_gemv_q4k_row", "tl_dequant_f16_q4k", "tl_embed_row_q4k", 0},
+    {14, context::tc_weight::q6k, "tl_gemv_q6k_row", "tl_dequant_f16_q6k", "tl_embed_row_q6k", -1},
+    {8, context::tc_weight::q80, "tl_gemv_q80_row", "tl_dequant_f16_q80", "tl_embed_row_q80", 1},
+};
+static_assert(sizeof(quant_fmts_) / sizeof(quant_fmts_[0]) <= context::quant_fmts_max, "slots");
+// The row of `type` where rows of k weights are a whole number of its blocks, else -1.
+inline int quant_fmt_(int type, int64_t k) {
+  for (int i = 0; i < (int)(sizeof(quant_fmts_) / sizeof(quant_fmts_[0])); i++) {
+    if (quant_fmts_[i].type != type) continue;
+    uint64_t elems = 0, bytes = 0;
+    gguf::ggml_block(static_cast<gguf::ggml_type>(type), elems, bytes);
+    return k > 0 && k % (int64_t)elems == 0 ? i : -1;
+  }
+  return -1;
+}
+// The bytes of a row of k weights of `type`.
+inline size_t quant_row_bytes(int type, int64_t k) {
+  uint64_t elems = 0, bytes = 0;
+  gguf::ggml_block(static_cast<gguf::ggml_type>(type), elems, bytes);
+  return (size_t)k / elems * bytes;
+}
+inline bool own_nn::quant_reads(int type, int64_t k) { return quant_fmt_(type, k) >= 0; }
+
 // The MMQ GEMM (tl_gemm_mmq_*): A (f16, M x K) rounded to int8 into a scratch, then the
-// product with the Q4_K / Q8_0 rows at W into out: f32 C columns (epi 0), or f16
-// act(gate) * up of a fused gate|up W, n the outputs (epi 1 + glu_act: context::mmq_).
-// False where the GLU would need K split (the caller then takes the unfused path).
-inline bool mmq_run_(context& c, int type, int epi, void* pa, void* pw, void* out, unsigned uM,
+// product with the block rows at W (a format with MMQ kernels: quant_fmt::mmq, here
+// `mq`) into out: f32 C columns (epi 0), or f16 act(gate) * up of a fused gate|up W, n
+// the outputs (epi 1 + glu_act: context::mmq_). False where the GLU would need K split
+// (the caller then takes the unfused path).
+inline bool mmq_run_(context& c, int mq, int epi, void* pa, void* pw, void* out, unsigned uM,
                      unsigned uN, unsigned uK, unsigned ldc) {
   constexpr unsigned tile = context::mmq_tile;
   // A tile a block and one block an SM: a grid short of the SMs (a narrow projection,
@@ -366,7 +406,7 @@ inline bool mmq_run_(context& c, int type, int epi, void* pa, void* pw, void* ou
   const size_t scales = (size_t)(uK / 32) * mpad * 8;  // float2 (d, d * sum) a group and row
   const CUdeviceptr scr = c.mmq_scratch_(scales + (size_t)mpad * uK);
   CUfunction quant = c.cached_(c.mmq_quant_fn, "tl_quant_act_mmq");
-  CUfunction gemm = c.mmq_(type, epi);
+  CUfunction gemm = c.mmq_(mq, epi);
   if (!scr || !quant || !gemm) return false;
   void* ps = reinterpret_cast<void*>(scr);
   void* pq = reinterpret_cast<char*>(ps) + scales;
@@ -386,46 +426,35 @@ inline bool mmq_run_(context& c, int type, int epi, void* pa, void* pw, void* ou
          c.launch_(reduce, {(uM * (uN / 2) + 255) / 256}, {256}, 0, pp, out, uM, uN, ldc, z, stride);
 }
 
-// A block format the CUDA readers take as their format index (WF in
-// cuda_nn.cuh: Q4_K 1, Q6_K 2, Q8_0 3), or -1 for any other type or for a k that
-// is not a whole number of its blocks.
-inline int quant_wf_(int type, int64_t k) {
-  const int wf = type == 12 ? 1 : type == 14 ? 2 : type == 8 ? 3 : -1;
-  return wf > 0 && k > 0 && k % (wf == 3 ? 32 : 256) == 0 ? wf : -1;
-}
 
 inline bool own_nn::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
                              int64_t n, int64_t k, int64_t ldc, bool mmq) {
   auto& c = context::get();
-  const int wf = quant_wf_(type, k);
-  if (!c.ready || m <= 0 || n <= 0 || wf < 0 || n % 2 || ldc % 2 || ldc < n) return false;
+  const int fi = quant_fmt_(type, k);
+  if (!c.ready || m <= 0 || n <= 0 || fi < 0 || n % 2 || ldc % 2 || ldc < n) return false;
+  const quant_fmt& f = quant_fmts_[fi];
   float* pa = context::off_(A.buf, A.off);
   float* pw = context::off_(W.buf, W.off);
   float* pc = context::off_(C.buf, C.off);
   c.device_read_(A.buf);
   c.device_read_(W.buf);
   c.device_rmw_(C.buf);  // a part writes some columns of a shared output
-  const context::tc_weight qw = type == 12 ? context::tc_weight::q4k
-                                : type == 14 ? context::tc_weight::q6k : context::tc_weight::q80;
-  if (mmq && a16 && (type == 12 || type == 8) && k % 256 == 0)
-    return mmq_run_(c, type, 0, pa, pw, pc, (unsigned)m, (unsigned)n, (unsigned)k, (unsigned)ldc);
+  if (mmq && a16 && f.mmq >= 0 && k % 256 == 0)
+    return mmq_run_(c, f.mmq, 0, pa, pw, pc, (unsigned)m, (unsigned)n, (unsigned)k, (unsigned)ldc);
   if (!a16) {  // the exact form dequantizes in the GEMM's staging
     return gemm_tc_run_(c, context::tc_form::f32, pa, pw, pc, (unsigned)m, (unsigned)n, (unsigned)k,
-                        (unsigned)ldc, qw);
+                        (unsigned)ldc, f.wf);
   }
   // The fast form: the weight to f16 first, a slab of rows at a time (the GEMM then
   // streams plain f16 and runs at 72 TFLOPS rather than the 45 of dequantizing in
   // every row block of the activation). The values are the staging's, rounded the
   // same, so the product is the same bits.
-  // Bytes a row of k weights takes: Q4_K 144 per 256, Q6_K 210 per 256, Q8_0 34 per 32.
-  const size_t row_bytes = type == 12 ? (size_t)k / 256 * 144 : type == 14 ? (size_t)k / 256 * 210 : (size_t)k / 32 * 34;
+  const size_t row_bytes = quant_row_bytes(type, k);
   // 192 MB: a 27B's largest projection (down, 5120 x 17408) in one slab. Split in two it left
   // each GEMM too few blocks for the long-K tile (pp512 1027 -> 1140 tok/s on the 27B).
   constexpr size_t slab_bytes = 192u << 20;
   const int64_t slab = std::max<int64_t>(128, (int64_t)(slab_bytes / ((size_t)k * 2)) / 128 * 128);
-  static const char* const dequant_names[3] = {"tl_dequant_f16_q4k", "tl_dequant_f16_q6k",
-                                               "tl_dequant_f16_q80"};
-  const CUfunction fn = c.cached_(c.dequant_fn[wf - 1], dequant_names[wf - 1]);
+  const CUfunction fn = c.cached_(c.dequant_fn[fi], f.dequant);
   const CUdeviceptr scr = c.dequant_scratch_((size_t)std::min<int64_t>(n, slab) * k * 2);
   if (!fn || !scr) return false;
   for (int64_t r0 = 0; r0 < n; r0 += slab) {
@@ -445,7 +474,9 @@ inline bool own_nn::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu
 inline bool own_nn::gemm_quant_glu(int type, gpu::glu_act act, gpu::span A16, gpu::span W,
                                  gpu::span H16, int64_t m, int64_t ff, int64_t k) {
   auto& c = context::get();
-  if (!c.ready || m <= 0 || ff <= 0 || ff % 2 || k % 256 || (type != 12 && type != 8)) return false;
+  const int fi = quant_fmt_(type, k);
+  if (!c.ready || m <= 0 || ff <= 0 || ff % 2 || k % 256 || fi < 0 || quant_fmts_[fi].mmq < 0)
+    return false;
   void* pa = context::off_(A16.buf, A16.off);
   void* pw = context::off_(W.buf, W.off);
   void* ph = context::off_(H16.buf, H16.off);
@@ -457,7 +488,8 @@ inline bool own_nn::gemm_quant_glu(int type, gpu::glu_act act, gpu::span A16, gp
     case gpu::glu_act::silu: epi = 1; break;
     case gpu::glu_act::gelu_tanh: epi = 2; break;
   }
-  return mmq_run_(c, type, epi, pa, pw, ph, (unsigned)m, (unsigned)ff, (unsigned)k, (unsigned)ff);
+  return mmq_run_(c, quant_fmts_[fi].mmq, epi, pa, pw, ph, (unsigned)m, (unsigned)ff, (unsigned)k,
+                  (unsigned)ff);
 }
 
 inline own_nn::act_layout own_nn::act_layout_(gpu::act_form f, int64_t k) {
@@ -524,16 +556,15 @@ inline bool own_nn::gemv_q4k_act(gpu::act_form f, gpu::span pa, gpu::span W, gpu
 inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n,
                              int64_t k) {
   auto& c = context::get();
-  if (!c.ready || n <= 0 || quant_wf_(type, k) < 0) return false;
+  const int fi = quant_fmt_(type, k);
+  if (!c.ready || n <= 0 || fi < 0) return false;
   float* pa = context::off_(a.buf, a.off);
   float* pw = context::off_(W.buf, W.off);
   c.device_read_(a.buf);
   c.device_read_(W.buf);
   c.device_write_(y.buf);
   constexpr unsigned threads = 128;  // 4 warps a row
-  return c.launch_(type == 12   ? c.cached_(c.gemv_q4k_fn, "tl_gemv_q4k_row")
-                   : type == 14 ? c.cached_(c.gemv_q6k_fn, "tl_gemv_q6k_row")
-                                : c.cached_(c.gemv_q80_fn, "tl_gemv_q80_row"),
+  return c.launch_(c.cached_(c.gemv_quant_fn[fi], quant_fmts_[fi].gemv),
                    {(unsigned)n}, {threads}, threads / 32 * sizeof(float), pa,
                    reinterpret_cast<unsigned char*>(pw),
                    context::off_(y.buf, y.off), (unsigned)n, (unsigned)k);

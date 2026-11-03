@@ -213,16 +213,17 @@ inline bool own_llm::attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
 
 // Row idx[0] of a table into f32 (gpu_ops_llm.h's contract): a thread an
 // element by strides for f32 / bf16, eight weights a thread for the block
-// formats, whose rows gemv_quant's K bounds (K % 256, Q8_0's K % 32) keep whole.
+// formats (cuda_nn.h's quant_fmts_), whose rows K keeps whole.
 inline bool own_llm::embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
                                int64_t rows, int64_t row_stride, int64_t col_stride, float scale) {
   auto& c = context::get();
-  // 0 f32, 1 bf16, then the block formats on gemv_quant's terms (quant_wf_).
-  const int wf = quant_wf_(type, k), e = type == 0 ? 0 : type == 30 ? 1 : wf > 0 ? wf + 1 : -1;
-  if (!c.ready || e < 0) return false;
-  static const char* const names[5] = {"tl_embed_row_f32", "tl_embed_row_bf16", "tl_embed_row_q4k",
-                                       "tl_embed_row_q6k", "tl_embed_row_q80"};
-  CUfunction f = c.cached_(c.embed_row_fn[e], names[e]);
+  // An f32 (type 0) or bf16 (30) table by strides, else a block format's rows.
+  const bool plain = type == 0 || type == 30;
+  const int fi = plain ? -1 : quant_fmt_(type, k);
+  if (!c.ready || (!plain && fi < 0)) return false;
+  CUfunction f = plain ? c.cached_(c.embed_row_fn[type ? 1 : 0],
+                                   type ? "tl_embed_row_bf16" : "tl_embed_row_f32")
+                       : c.cached_(c.embed_quant_fn[fi], quant_fmts_[fi].embed);
   void* pw = context::off_(W.buf, W.off);
   float* pi = context::off_(idx.buf, idx.off);
   float* po = context::off_(out.buf, out.off);
@@ -232,7 +233,7 @@ inline bool own_llm::embed_row(int type, gpu::span W, gpu::span idx, gpu::span o
   c.device_read_(W.buf);
   c.device_read_(idx.buf);
   c.device_write_(out.buf);
-  if (e < 2) {
+  if (plain) {
     const unsigned rs = (unsigned)row_stride, cs = (unsigned)col_stride;
     return c.launch_(f, {(uk + threads - 1) / threads}, {threads}, 0, pw, pi, po, uk, urows, rs, cs,
                      scale);

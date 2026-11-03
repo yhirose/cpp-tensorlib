@@ -434,18 +434,6 @@ inline void gemv_q(const qmat& Q, gpu::span a, gpu::span y,
   }
 }
 
-// Whether every tensor of the parts is a block-quantized whose rows (in) are whole blocks.
-inline bool quantizable(const gg::model& m, const std::vector<wpart>& parts, int64_t in) {
-  for (const auto& p : parts) {
-    const auto* t = m.tensor(p.name);
-    if (!t || !gg::is_quant(t->type)) return false;
-    uint64_t elems, bytes;
-    gg::ggml_block(t->type, elems, bytes);
-    if (in % (int64_t)elems) return false;
-  }
-  return true;
-}
-
 // Parts' rows (the subset a wpart names, if strided) uploaded straight from the
 // file's mapping, no host copy in between.
 inline qmat load_q_cat(const gg::model& m, const std::vector<wpart>& parts, int64_t in) {
@@ -456,9 +444,9 @@ inline qmat load_q_cat(const gg::model& m, const std::vector<wpart>& parts, int6
     const auto* t = need(m, p.name);
     uint64_t elems, bytes;
     gg::ggml_block(t->type, elems, bytes);
-    if (!gg::is_quant(t->type) || in % (int64_t)elems) {
-      std::fprintf(stderr, "tensor %s: native quantized weights need a Q4_K / Q6_K / Q8_0 tensor, K a whole number of blocks\n",
-                   p.name.c_str());
+    if (!gpu::quant_reads((int)t->type, in)) {
+      std::fprintf(stderr, "tensor %s: this backend does not read its blocks (ggml type %d, %lld "
+                   "weights a row) as they are\n", p.name.c_str(), (int)t->type, (long long)in);
       std::exit(2);
     }
     const int64_t row_bytes = in / (int64_t)elems * (int64_t)bytes, type = (int64_t)t->type;
