@@ -4622,13 +4622,20 @@ inline int64_t auto_matmul_threshold() {
   return detail::graph::auto_matmul_threshold_();
 }
 
+// As numpy's (equal_nan false): a NaN is close to nothing, an infinity only to the
+// same infinity, and finite values within atol + rtol * |b|. Written as the test
+// that passes, not the one that fails, so that a NaN fails it.
 inline bool allclose(const array& a, const array& b, float rtol, float atol) {
   if (a.shape() != b.shape()) return false;
   auto ac = a.clone(), bc = b.clone();
   const auto* pa = ac.data();
   const auto* pb = bc.data();
   for (int64_t i = 0; i < ac.size(); i++) {
-    if (std::abs(pa[i] - pb[i]) > atol + rtol * std::abs(pb[i])) return false;
+    const float x = pa[i], y = pb[i];
+    const bool close = std::isfinite(x) && std::isfinite(y)
+                           ? std::abs(x - y) <= atol + rtol * std::abs(y)
+                           : x == y;
+    if (!close) return false;
   }
   return true;
 }

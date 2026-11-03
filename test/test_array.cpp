@@ -3,6 +3,8 @@
 
 #include "test_util.h"
 
+#include <limits>
+
 TEST_CASE("creation and introspection") {
   auto a = array::zeros({2, 3});
   CHECK(a.rank() == 2);
@@ -23,6 +25,23 @@ TEST_CASE("creation and introspection") {
   CHECK(s.item() == 5.0f);
 
   CHECK_THROWS(array::from({1, 2, 3}, {2, 2}));
+}
+
+TEST_CASE("allclose and array_equal: a NaN is close to nothing, an infinity only to itself") {
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float inf = std::numeric_limits<float>::infinity();
+  auto v = [](std::initializer_list<float> x) {
+    return array::from(std::vector<float>(x), {(int64_t)x.size()});
+  };
+  CHECK_FALSE(allclose(v({1, nan}), v({1, nan})));
+  CHECK_FALSE(allclose(v({1, nan}), v({1, 2})));
+  CHECK_FALSE(allclose(v({1, 2}), v({1, nan})));
+  CHECK_FALSE(array_equal(v({nan}), v({1})));
+  CHECK_FALSE(allclose(v({inf}), v({-inf})));
+  CHECK_FALSE(allclose(v({inf}), v({3e38f})));
+  CHECK(allclose(v({inf, -inf, 1}), v({inf, -inf, 1})));
+  CHECK(array_equal(v({inf, 2}), v({inf, 2})));
+  CHECK(allclose(v({1, 2}), v({1, 2.00001f})));
 }
 
 TEST_CASE("a size past int64 is refused, not wrapped into a small buffer") {
