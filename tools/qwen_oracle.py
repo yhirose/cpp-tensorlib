@@ -8,18 +8,28 @@ is F16, and the two drift apart within a few tokens.) Writes a C++ header with
 the checkpoints the check compares: last-token embedding, layer-0 residual, final
 norm, top-5 logits, and the greedy continuation.
 
-A Gemma 3 GGUF is block-quantized (Q4_K / Q6_K): its weights are read with the
-gguf package (llama.cpp's gguf-py) and dequantized to f32 when a step reads
-them, layer by layer, so no f32 copy of the whole model is held.
+A Gemma 3 GGUF is block-quantized (Q4_K / Q6_K / Q5_0 / Q8_0): its weights are
+read with the gguf package (llama.cpp's gguf-py) and dequantized to f32, all at
+once when that copy is under KEEP_ALL_BYTES (Gemma 3 1B's 4 GB), else when a step
+reads them, layer by layer, so no f32 copy of the whole model is held (the 4B's
+16 GB). Its local layers attend the last `sliding_window` positions.
 
-  python3 -I tools/qwen_oracle.py MODEL.gguf NAMESPACE > bench/models/X_oracle_data.h
+  python3 -I tools/qwen_oracle.py MODEL.gguf NAMESPACE [LLAMA_TOKENIZE] > bench/models/X_oracle_data.h
 
 The prompt is fixed token ids (the chat template around one user sentence), so
 no tokenizer is involved; Qwen2.5 and Qwen3 differ only in the system prompt.
+Given llama.cpp's llama-tokenize, the user turn is LONG_USER instead, tokenized
+by it: a prompt past a sliding window (Gemma 3 1B's 512), so the oracle holds
+the window.
 """
+import math
 import mmap
+import os
 import struct
+import subprocess
 import sys
+import tempfile
+import time
 
 import numpy as np
 
@@ -29,6 +39,22 @@ QWEN2_SYS = [151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465, 553, 54364,
              14817, 13, 1446, 525, 264, 10950, 17847, 13, 151645, 198]
 GEMMA_USER = [46762, 786, 496, 2822, 12650, 531, 2455, 5192, 4681, 236761]  # same sentence, Gemma 3 vocab
 N_GREEDY = 30
+KEEP_ALL_BYTES = 8 << 30
+
+# The long user turn: 760 tokens of prose (Gemma 3) and a question on its beginning.
+LONG_USER = """The lighthouse at Gray Point stands on a narrow spit of granite where two currents meet. It was first lit in the autumn of 1841, after a winter in which three cargo ships ran aground within sight of the village harbor. The first keeper, a former ship's carpenter named Elias Brandt, kept a logbook from the night the lamp was lit, and his successors kept it after him for one hundred and twelve years. The volumes, bound in canvas and stored in a dry room beneath the lantern gallery, record the weather twice a day, every ship that passed, the oil burned each night, and the small events of a life lived far from town.
+
+Brandt's entries are short and practical. He notes the direction of the wind, the height of the swell, and the hours when fog closed over the point. In the spring of 1843 he writes that the lamp's wick had to be trimmed eleven times in one night because the oil was poor, and that he had written to the harbor board to complain. Three weeks later he records, with obvious satisfaction, the arrival of a better grade of oil and a new set of brass tools. Most of his entries end with the same phrase: all well at the light.
+
+His daughter, Margarethe, took over the logbook when his eyesight began to fail. Her handwriting is smaller and neater, and her entries are longer. She describes the birds that struck the lantern glass during migration, the seals that rested on the rocks at low tide, and the children from the village who rowed out on summer afternoons to ask for a tour of the tower. She also kept careful records of the fog signal, a bell that had to be rung by hand every thirty seconds whenever visibility fell below a mile. During one week in November 1867, she and her husband rang the bell in shifts for ninety hours without a break.
+
+The logbook changes again at the end of the century. A clockwork mechanism replaced the hand-rung bell in 1889, and a kerosene lamp with a larger lens replaced the old oil lamp in 1896. The entries from these years are filled with notes about adjustments, broken springs, and the slow work of learning a new machine. The keepers, now employed by the national lighthouse service rather than the harbor board, were also required to send monthly reports to an inspector in the city, and the logbook begins to read more like an official record than a diary.
+
+Electricity reached Gray Point in 1931, carried along poles that followed the coast road. The keeper at the time, Thomas Okafor, wrote that the new lamp was so bright that fishermen ten miles out could read their charts by it, which was surely an exaggeration, but his pride is easy to understand. With electric light and an automatic fog horn, the work of the station became lighter, and the families who lived there had more time for gardens, for teaching their children, and for the long walks along the cliffs that several keepers mention.
+
+The last entry in the logbook was written on the first of March, 1953, the day the station was fully automated. The final keeper, a quiet man named Samuel Reyes, wrote only a few lines. He listed the weather, noted that a fishing boat had passed to the north at dawn, and then, after a blank line, added the words his predecessors had written so many times before: all well at the light. The logbooks are now kept in the village museum, where visitors can read them in a glass case near the door.
+
+Who kept the logbook first, and what phrase did the keepers often write? Answer briefly."""
 
 
 class Reader:
@@ -97,8 +123,9 @@ def load_gguf(path, read=True):
 
 
 class Dequantized:
-    """name -> f32 array, dequantized from the GGUF's blocks on each read
-    (small tensors and the embedding kept)."""
+    """name -> f32 array, dequantized from the GGUF's blocks: each once and kept when
+    the whole f32 copy is under KEEP_ALL_BYTES, else on each read (small tensors and
+    the embedding kept)."""
 
     def __init__(self, path):
         from gguf import GGUFReader
@@ -108,6 +135,7 @@ class Dequantized:
         self.info = {t.name: t for t in r.tensors}
         self.kv = {k: f.contents() for k, f in r.fields.items() if not k.startswith("tokenizer.")}
         self.kept = {}
+        self.keep_all = sum(int(t.n_elements) for t in r.tensors) * 4 < KEEP_ALL_BYTES
 
     def __contains__(self, name):
         return name in self.info
@@ -121,7 +149,7 @@ class Dequantized:
         t = self.info[name]
         a = np.asarray(self.dequantize(t.data, t.tensor_type), np.float32)
         a = a.reshape([int(d) for d in t.shape[::-1]])
-        if a.size < 1 << 20 or name == "token_embd.weight":
+        if self.keep_all or a.size < 1 << 20 or name == "token_embd.weight":
             self.kept[name] = a
         return a
 
@@ -143,7 +171,7 @@ def rope(x, pos, base, rot=None):  # x [H, D]; rotates the first `rot` dims, hal
 
 
 def gelu(x):  # tanh form: ggml's, and PyTorch's approximate='tanh'
-    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * x * (1 + 0.044715 * x * x)))
+    return 0.5 * x * (1 + np.tanh(math.sqrt(2 / math.pi) * x * (1 + 0.044715 * x * x)))
 
 
 def sigmoid(x):
@@ -189,7 +217,8 @@ class Model:
         linear = kv.get(f"{arch}.rope.scaling.type") == "linear"
         self.scale = 1 / g("rope.scaling.factor") if linear else 1.0
         self.local = [False] * self.nl
-        if arch == "gemma3" and kv.get(f"{arch}.attention.sliding_window", 0) > 0:
+        self.window = kv.get(f"{arch}.attention.sliding_window", 0) if arch == "gemma3" else 0
+        if self.window > 0:
             pat = kv.get(f"{arch}.attention.sliding_window_pattern", 6)
             self.local = ([bool(b) for b in pat] if isinstance(pat, list)
                           else [pat == 0 or l % pat < pat - 1 for l in range(self.nl)])
@@ -214,7 +243,7 @@ class Model:
         self.conv_state[l] = win[1:]
         mixed = silu((win * t[p + "ssm_conv1d.weight"].T).sum(0))
         q, k, v = (mixed[i * H * dk:(i + 1) * H * dk].reshape(H, dk) for i in range(3))
-        q, k = l2norm(q) / np.sqrt(dk), l2norm(k)
+        q, k = l2norm(q) / math.sqrt(dk), l2norm(k)
         beta = sigmoid(h @ t[p + "ssm_beta.weight"].T)
         a = h @ t[p + "ssm_alpha.weight"].T + t[p + "ssm_dt.bias"]
         decay = np.exp(t[p + "ssm_a"] * np.logaddexp(0, a))  # ssm_a = -exp(A_log) < 0
@@ -248,11 +277,14 @@ class Model:
         q, k = rope(q, p_, base, self.rot), rope(k, p_, base, self.rot)
         self.k[l].append(k)
         self.v[l].append(v)
-        K, V = np.stack(self.k[l], 1), np.stack(self.v[l], 1)  # [kv, T, D]
+        # A local layer reads the last `window` positions, this one the last of them
+        # (llama.cpp's is_masked_swa; gpu::attn_window_lo).
+        lo = max(0, pos + 1 - self.window) if self.local[l] else 0
+        K, V = np.stack(self.k[l][lo:], 1), np.stack(self.v[l][lo:], 1)  # [kv, T, D]
         g = self.nh // self.nkv
         out = np.empty_like(q)
         for hh in range(self.nh):
-            s = K[hh // g] @ q[hh] / np.sqrt(self.hd)
+            s = K[hh // g] @ q[hh] / math.sqrt(self.hd)
             e = np.exp(s - s.max())
             out[hh] = (e / e.sum()) @ V[hh // g]
         if gate is not None:
@@ -282,6 +314,9 @@ class Model:
             x = self.layer(l, x, pos)
             if l == 0:
                 l0 = x.copy()
+        # float32 throughout: under numpy 2 a numpy float64 scalar (np.sqrt(2 / np.pi))
+        # times a float32 array is float64, and every GEMV after it widens its weights.
+        assert x.dtype == np.float32, x.dtype
         fn = rmsnorm(x, self.t["output_norm.weight"], self.eps)
         return emb, l0, fn, fn @ self.lm.T
 
@@ -292,24 +327,48 @@ def arr(name, ctype, a):
     return f"inline const {ctype} {name}[{len(a)}] = {{{body}}};"
 
 
+def tokenize(exe, model, text):
+    """llama.cpp's ids for `text` (no BOS, special tokens parsed), as tools/tokenizer_oracle.py."""
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write(text)
+        path = f.name
+    try:
+        out = subprocess.run(
+            [exe, "-m", model, "-f", path, "--ids", "--no-bos", "--no-escape", "--log-disable"],
+            check=True, capture_output=True, text=True).stdout
+    finally:
+        os.unlink(path)
+    return [int(i) for i in out.strip().splitlines()[-1].strip("[]").split(",")]
+
+
 def main():
     path, ns = sys.argv[1], sys.argv[2]
     m = Model(path)
+    long = tokenize(sys.argv[3], path, LONG_USER) if len(sys.argv) > 3 else None
     if m.arch == "gemma3":  # <bos><start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n
-        prompt = [2, 105, 2364, 107] + GEMMA_USER + [106, 107, 105, 4368, 107]
+        prompt = [2, 105, 2364, 107] + (long or GEMMA_USER) + [106, 107, 105, 4368, 107]
     elif m.arch == "qwen35":  # thinking template: ends with "<think>\n"
-        prompt = [248045, 846, 198] + USER35 + [248046, 198, 248045, 74455, 198, 248068, 198]
+        prompt = [248045, 846, 198] + (long or USER35) + [248046, 198, 248045, 74455, 198, 248068, 198]
     else:
-        prompt = (QWEN2_SYS if m.arch == "qwen2" else []) + [151644, 872, 198] + USER + [151645, 198, 151644, 77091, 198]
+        prompt = ((QWEN2_SYS if m.arch == "qwen2" else []) + [151644, 872, 198] + (long or USER) +
+                  [151645, 198, 151644, 77091, 198])
+    total, t0 = len(prompt) + N_GREEDY, time.perf_counter()
+
+    def step(tok, pos):  # a run takes minutes to an hour: its progress on stderr
+        out = m.step(tok, pos)
+        if pos == 0 or (pos + 1) % 25 == 0 or pos + 1 == total:
+            print(f"{pos + 1}/{total} tokens, {time.perf_counter() - t0:.0f} s", file=sys.stderr, flush=True)
+        return out
+
     pos = 0
     for tok in prompt:
-        emb, l0, fn, logits = m.step(tok, pos)
+        emb, l0, fn, logits = step(tok, pos)
         pos += 1
     top5 = np.argsort(-logits)[:5]
     greedy, nxt = [], int(np.argmax(logits))
     for _ in range(N_GREEDY):
         greedy.append(nxt)
-        nxt = int(np.argmax(m.step(nxt, pos)[3]))
+        nxt = int(np.argmax(step(nxt, pos)[3]))
         pos += 1
     print("#pragma once")
     print(f"// Generated by tools/qwen_oracle.py from {path.split('/')[-1]} ({m.arch}); do not edit.")

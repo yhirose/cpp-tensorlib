@@ -1,8 +1,9 @@
 // M9 "actually chat" — numeric proof. Load a real Qwen2.5-0.5B-Instruct, Qwen3
-// or Qwen3.5 GGUF (F16 or BF16 weights), or Gemma 3 4B (Q4_K_M), and run the
+// or Qwen3.5 GGUF (F16 or BF16 weights), or Gemma 3 4B or 1B (Q4_K_M), and run the
 // decoder end to end, verified against a tight numpy reference that reads the
 // SAME weights (tools/qwen_oracle.py wrote qwen_oracle_data.h / qwen3_oracle_data.h
-// / qwen35_oracle_data.h / gemma3_oracle_data.h; the model's arch picks one). Identical
+// / qwen35_oracle_data.h / gemma3_oracle_data.h / gemma3_1b_oracle_data.h, the 1B's
+// over a prompt past its 512-position window; the model's arch and shape pick one). Identical
 // weights => the C++ forward must match the reference to ~1e-4 at every checkpoint
 // (embedding, layer-0 residual, final norm, top-5 logits) AND reproduce the greedy
 // token sequence exactly. Proves weight loading + GGML->our layout transpose +
@@ -10,6 +11,7 @@
 // gpu:: resolves to. Tokenizer/sampling are
 // separate (see chat_qwen). Model path: argv[1] or ~/models/...fp16.gguf.
 
+#include "gemma3_1b_oracle_data.h"
 #include "gemma3_oracle_data.h"
 #include "qwen.h"
 #include "qwen35_oracle_data.h"
@@ -266,8 +268,9 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   // the imperative ones, after the prompt and after the first step: where the
   // backend captures, its warm-up forward must leave the DeltaNet state as it
   // found it, and a drift too small to move a short greedy run is a large one
-  // here (~0.3, where the bf16 rounding is ~3e-3; over the whole vocabulary
-  // the rounding reaches ~0.1 in the tail, which is printed but not held).
+  // here (~0.3, where the bf16 rounding is ~3e-3 on Qwen and Gemma 3 4B, 1.9e-2 on
+  // Gemma 3 1B over its 769-token prompt, the most sensitive to it; over the whole
+  // vocabulary the rounding reaches ~0.1 in the tail, which is printed but not held).
   qm::reset_cache(B);
   qm::captured_decoder dec;
   std::vector<int> ids(O.prompt_ids, O.prompt_ids + NP);
@@ -305,7 +308,7 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   const double smr = maxrel(got_step, imp_step.data(), B.c.VOCAB);
   const double p5 = qm::top5_maxrel(got_prompt.data(), imp_prompt.data(), B.c.VOCAB),
                s5 = qm::top5_maxrel(got_step.data(), imp_step.data(), B.c.VOCAB);
-  const bool logits_ok = p5 < 1e-2 && s5 < 1e-2;
+  const bool logits_ok = p5 < 5e-2 && s5 < 5e-2;
   std::printf("\ndecoder (%s prefill) top-5 logits vs imperative: prompt maxrel %.2e, "
               "first step %.2e %s (whole vocabulary %.2e, %.2e)",
               dec.batched ? "batched" : "token-by-token", p5, s5, logits_ok ? "OK" : "FAIL",
@@ -410,10 +413,12 @@ int main(int argc, char** argv) {
     const char* arch;
     int64_t nl, ne;
     Oracle o;
-  } oracles[] = {{"qwen2", 24, 896, TL_ORACLE(qwenoracle)},      // Qwen2.5-0.5B
-                 {"qwen3", 28, 1024, TL_ORACLE(qwen3oracle)},    // Qwen3-0.6B
-                 {"qwen35", 24, 1024, TL_ORACLE(qwen35oracle)},  // Qwen3.5-0.8B
-                 {"gemma3", 34, 2560, TL_ORACLE(gemma3oracle)}}; // Gemma 3 4B
+  } oracles[] = {
+      {"qwen2", 24, 896, TL_ORACLE(qwenoracle)},         // Qwen2.5-0.5B
+      {"qwen3", 28, 1024, TL_ORACLE(qwen3oracle)},       // Qwen3-0.6B
+      {"qwen35", 24, 1024, TL_ORACLE(qwen35oracle)},     // Qwen3.5-0.8B
+      {"gemma3", 34, 2560, TL_ORACLE(gemma3oracle)},     // Gemma 3 4B
+      {"gemma3", 26, 1152, TL_ORACLE(gemma3_1boracle)}}; // Gemma 3 1B
   const Oracle* found = nullptr;
   for (const auto& r : oracles)
     if (C.arch == r.arch && C.NL == r.nl && C.NE == r.ne) found = &r.o;
