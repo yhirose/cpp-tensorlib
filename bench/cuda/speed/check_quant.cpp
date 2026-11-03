@@ -1,17 +1,15 @@
-// A Q4_K_M GGUF run two ways on the same tokens: its block-quantized blocks dequantized
-// to bf16 at load (the existing paths, the oracle) and kept as blocks, read by
-// the block-quantized GEMVs (Model.quant). Both decode by the imperative step and the
-// native run is fed the oracle's own tokens (teacher forcing), so the only
-// difference is how a weight's bytes are read: each step's logits agree to the
-// bf16 rounding the oracle applies to every dequantized weight, and the top
-// token agrees except where the oracle's top two are within that rounding.
+// A block-quantized GGUF run two ways on the same tokens: its blocks dequantized to
+// f32 at load (exactly: the oracle) and kept as blocks, read by the block-quantized
+// GEMVs (Model.quant). Both decode by the imperative step and the native run is fed
+// the oracle's own tokens (teacher forcing), so what differs is how a weight's bytes
+// are read and summed, and how the activation is read: each step's logits agree to a
+// bound per form, and the top token agrees except where the oracle's top two are
+// closer than that bound (a near tie).
 //
 // The native run is made once per form the Q4_K GEMVs read their activation in
-// (Model::gemv_form, every one the backend has): f32 (the exact one, which should
-// agree to the oracle's bf16 rounding), h16 (the activation rounded to f16, held to the
-// same bound) and q8 (the dp4a form: the activation rounded to 8 bits per 32 values, as
-// llama.cpp does), which is held to a looser bound and to the same top token except at
-// near ties.
+// (Model::gemv_form, every one the backend has): f32 (the order of the sums alone),
+// h16 (the activation rounded to f16 too) and q8 (the dp4a form: the activation
+// rounded to 8 bits per 32 values, as llama.cpp does), held to a looser bound.
 //
 // Usage: check_quant model-Q4_K_M.gguf [steps=32]
 
@@ -23,6 +21,13 @@
 #include <vector>
 
 namespace qm = qwenmodel;
+
+// The logits' bound (|d| / (1 + max |logit|)) by what a form rounds besides the order of
+// its sums: nothing, or the activation to f16 (BOUND_EXACT); both operands to bf16, as
+// the exact prefill's tensor-core GEMMs do (BOUND_BF16: Gemma 3 1B, the most sensitive
+// here, 1.5e-2, where a misread eighth of a block's weights is past 1); the activation
+// to 8 bits (BOUND_Q8).
+constexpr double BOUND_EXACT = 1e-2, BOUND_BF16 = 5e-2, BOUND_Q8 = 3e-1;
 
 // Decode `steps` tokens; `force` (when given) is the token fed at each step,
 // else the greedy one. Returns the fed tokens, logits per step.
@@ -47,24 +52,35 @@ int main(int argc, char** argv) {
   const int steps = argc > 2 ? std::atoi(argv[2]) : 32;
   qm::gg::model m(argv[1]);
   tl::use_gpu();
+  // The oracle (the blocks dequantized to f32, 4 bytes a weight: loaded once): `steps`
+  // greedy tokens, then the prefill's prompt (below) a token at a time, since f32
+  // weights have no batched form.
+  const std::vector<int> ids = qm::spread_ids(200, qm::config_from_gguf(m).VOCAB);
   std::vector<std::vector<float>> la;
   std::vector<int64_t> fed;
+  std::vector<float> pa_;
   {
-    qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, false, true, /*quant=*/false);
+    qm::Model M = qm::build(m, tl::dtype::f32, false, false, 4096, /*oracle=*/false);
     fed = run(M, steps, la, nullptr);
+    qm::reset_cache(M);
+    int64_t pos = 0;
+    const float* lg = nullptr;
+    for (int id : ids) lg = qm::imperative_logits(M, id, pos++);
+    pa_.assign(lg, lg + M.c.VOCAB);
   }
+  const int64_t ta0 = qm::argmax(pa_);
   bool ok_all = true;
   {
     qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, false, true, /*quant=*/true);
     if (!M.quant) { std::printf("native block-quantized path unavailable\n"); return 1; }
-    // Each form's bound on the logits: f32 and h16 (whose f16 rounding is 8x finer than
-    // the oracle's bf16) the oracle's bf16 rounding, q8 its 8-bit one (a form without one
-    // is held to 0, so it fails until it is given its own).
+    // Each form's bound on the logits (|d| / (1 + max |logit|)): f32 and h16 (an
+    // f16 rounding of the activation, 2^-11 of it) the sums', q8 its 8-bit rounding's (a
+    // form without one is held to 0, so it fails until it is given its own).
     auto bound_of = [](tl::gpu::act_form f) {
       switch (f) {
         case tl::gpu::act_form::f32:
-        case tl::gpu::act_form::h16: return 2e-2;
-        case tl::gpu::act_form::q8: return 3e-1;
+        case tl::gpu::act_form::h16: return BOUND_EXACT;
+        case tl::gpu::act_form::q8: return BOUND_Q8;
       }
       return 0.0;
     };
@@ -92,10 +108,10 @@ int main(int argc, char** argv) {
         worst = tl::max_err(worst, mx / (1.0 + ref));
         const int64_t ta = qm::argmax(la[s]), tb = qm::argmax(lb[s]);
         if (ta == tb) { agree++; continue; }
-        // A different top token is fine only if the oracle itself had them within
-        // the rounding it carries (a near tie).
+        // A different top token is fine only if the oracle's top two were closer than
+        // the form may move a logit (a near tie).
         const double gap = la[s][ta] - la[s][tb];
-        if (gap < 4e-2 * (1.0 + ref)) tie_flips++; else bad++;
+        if (gap < bound * (1.0 + ref)) tie_flips++; else bad++;
       }
       const bool ok = bad == 0 && worst < bound;
       ok_all = ok_all && ok;
@@ -104,25 +120,24 @@ int main(int argc, char** argv) {
     }
   }
   // The batched prefill over the same blocks: a prompt through GEMMs that
-  // dequantize as they stage, against the bf16 weights' prefill, in the exact
-  // form a non-finite prompt is redone in (f32 sums: held to the bf16 rounding)
-  // and the fast one (f16 sums, and the blocks' MMQ rounding activations to int8,
-  // which moves a model by its own amount — Gemma 3 4B's ~30x Qwen's,
-  // docs/llama-cpp-comparison.md — so held by the KL of the two distributions,
-  // a bound a broken path is far past). A spread-out prompt, which no prediction
-  // is sure of, so the distributions show it.
+  // dequantize as they stage, against the f32 weights' prompt, in the exact
+  // form a non-finite prompt is redone in (the operands rounded to bf16, the sums f32:
+  // held to BOUND_BF16) and the fast one (f16 sums, and the blocks' MMQ rounding
+  // activations to int8, which moves a model by its own amount — Gemma 3 4B's ~30x
+  // Qwen's, docs/llama-cpp-comparison.md — so held by the KL of the two distributions,
+  // a bound a broken path is far past, and its ties by q8's). A spread-out prompt,
+  // which no prediction is sure of, so the distributions show it.
   bool prefill_ok = true;
   for (bool exact : {true, false}) {
-    std::vector<float> pa_, pb_;
-    int64_t ta0 = -1, tb0 = -1;
-    const std::vector<int> ids = qm::spread_ids(200, qm::config_from_gguf(m).VOCAB);
-    for (int pass = 0; pass < 2; pass++) {
-      qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, false, true, /*quant=*/pass == 1);
+    const double bound = exact ? BOUND_BF16 : BOUND_Q8;
+    std::vector<float> pb_;
+    int64_t tb0 = -1;
+    {
+      qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, false, true, /*quant=*/true);
       qm::reset_cache(M);
-      const int64_t t = qm::prefill_batched(M, ids, qm::PREFILL_CHUNK, exact);
+      tb0 = qm::prefill_batched(M, ids, qm::PREFILL_CHUNK, exact);
       const float* lg = qm::host_read(M.scratch.logits);
-      (pass ? pb_ : pa_).assign(lg, lg + M.c.VOCAB);
-      (pass ? tb0 : ta0) = t;
+      pb_.assign(lg, lg + M.c.VOCAB);
     }
     double pmx = 0, pref = 0;
     for (size_t i = 0; i < pa_.size(); i++) {
@@ -130,8 +145,8 @@ int main(int argc, char** argv) {
       pref = std::max(pref, (double)std::fabs(pa_[i]));
     }
     const double err = pmx / (1.0 + pref), kl = qm::kl_div(pa_, pb_);
-    const bool near = ta0 == tb0 || pa_[ta0] - pa_[tb0] < 4e-2 * (1.0 + pref);
-    const bool ok = near && (exact ? err < 2e-2 : kl < 0.3);
+    const bool near = ta0 == tb0 || pa_[ta0] - pa_[tb0] < bound * (1.0 + pref);
+    const bool ok = near && (exact ? err < bound : kl < 0.3);
     prefill_ok = prefill_ok && ok;
     std::printf("prefill 200 tokens (%s) | first token %lld vs %lld | logits worst |d|/(1+max) %.2e, "
                 "KL %.2e %s\n",
