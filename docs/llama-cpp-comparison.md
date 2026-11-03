@@ -86,6 +86,12 @@ each engine, alternated):
 |  | tg128 @ d2048 | 40.3-40.4 | 36.4-36.9 | 1.09-1.11 |
 |  | pp512 | 1,722-1,734 | 1,698-1,702 | 1.01-1.02 |
 |  | pp512 @ d2048 | 1,650-1,664 | 1,674-1,682 | 0.98-0.99 |
+| Gemma 3 4B Q4_K_M | tg128 | 215-216 | 199-201 | 1.07-1.08 |
+|  | pp512 | 10,580-10,902 | 10,753-10,769 | 0.98-1.01 |
+
+Gemma 3's rows were taken later (2026-11-03), the two engines alternated in
+the same way; its context stops at its 1024-token sliding window here, so it
+has no row at depth 2048.
 
 The 27B's prefill is level: ahead at 512 tokens, 1-2% behind with 2048 cached.
 It trailed by 3-6% until the DeltaNet rule became one kernel on llama.cpp's
@@ -188,6 +194,41 @@ pp512 measured:
 What is left there is mostly the GEMM: this library's runs at ~46% of the
 71 TFLOPS ceiling, and the narrow projections (QKV, O, down) fall to its
 64x64 tile to fill the GPU.
+
+## Accuracy of the quantized paths
+
+How far each path's logits move from an f32 reference, on the same tokens:
+`tensorlib_dump_logits` runs a 200-token prompt and six more tokens through
+every path, beside an f32 build of the same file (its blocks widened to f32
+exactly, f32 activations, sums and KV cache) whose token-by-token logits are
+the reference; `tools/precision_logits.py` reports the KL divergence from it
+(nats, mean over the prompt's last token and the six steps, as llama.cpp's
+`perplexity --kl-divergence` measures quantization). llama.cpp's logits for
+the same tokens (the prompt in one `llama_decode`, then a token at a time, its
+defaults: flash attention, f16 KV) are written by `tools/llama_logits.cpp`.
+
+| model (GGUF) | chat path (batched prompt, then steps) | without int8 activations | llama.cpp |
+|---|---:|---:|---:|
+| Qwen3-0.6B Q4_K_M | 2.2e-3 | 3.9e-5 | 2.3e-3 |
+| Qwen3.5-0.8B Q4_K_M | 3.4e-3 | 3.4e-5 | 2.0e-3 |
+| Gemma 3 4B Q4_K_M | 6.0e-2 | 4.4e-3 | 2.1e-1 |
+
+The error is the int8 activations', not the f16 sums': the decode's Q4_K
+GEMVs read their activation rounded to int8 (`Model::q8act`, dp4a) and the
+prefill's MMQ GEMMs too, as llama.cpp's do (q8_1). Gemma 3 is far more
+sensitive to that rounding than Qwen: rounding every GEMV input to int8 per
+32 values in a numpy forward (no kernel of either engine involved) moves its
+logits by KL 0.13 against Qwen3-0.6B's 0.002, though the inputs themselves are
+rounded alike (relative error ~1e-2 in both; no outliers past Qwen's). Every
+one of the four inputs contributes (the MLP's input most), and the residual's
+error grows with depth, from ~8e-3 after the first layer to ~4e-2 after the
+last. Token by token through the int8 decode, a 200-token Gemma prompt ends at
+KL 0.30 (top token 5 of 7); llama.cpp's path, at 0.21, is no better.
+
+`TL_NO_Q8ACT=1` (float activations in the decode GEMVs) and `TL_NO_MMQ=1` (the
+prefill's block GEMMs through f16 instead of int8) take the int8 rounding
+out, at a cost on Gemma 3 4B: tg128 213 -> 161 tok/s, pp512 10,640 -> 7,020.
+On Qwen they cost less (tg -8%, pp -11% on Qwen3-0.6B) and buy little.
 
 ## What differs between the two runs
 

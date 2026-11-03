@@ -1,23 +1,29 @@
-// The logits of every forward path on fixed prompts, written to one file: run it
+// The logits of every forward path on fixed tokens, written to one file: run it
 // before and after a change and compare the two files byte for byte (cmp), so a
 // change meant to leave the numbers alone is checked on all of them at once, and
 // one meant to move them shows where.
 //
 //   tensorlib_dump_logits model.gguf out.bin [fixed]
 //
-// Some paths are not bit-reproducible: the GEMVs that split K add their partial
-// sums with atomics, in no fixed order, so two runs of the same code differ in
-// the last bits (tools/compare_logits.py holds them to that spread). `fixed`
-// turns the split off (CUDA's set_no_splitk) so that every section is the same
-// bytes run after run and a change that should leave the numbers alone can be
-// held to identity; the split-K paths themselves are then not the ones run.
+// Some paths are not bit-reproducible: the GEMVs and GEMMs that split K add their
+// partial sums with atomics, in no fixed order, so two runs of the same code
+// differ in the last bits (tools/compare_logits.py holds them to that spread).
+// `fixed` turns the split off (CUDA's set_no_splitk) so that every section is the
+// same bytes run after run and a change that should leave the numbers alone can
+// be held to identity; the split-K paths themselves are then not the ones run.
 //
-// Each build (the chat's weights: kept as blocks for a quantized file, else bf16;
-// and the f32 one) runs the imperative step token by token, the captured decoder
-// (its begin(), batched where the build allows, then step()), and the batched
-// prefill in its fast and its exact form. A section is its name, its float count
-// and the floats; the names and a checksum are also printed, so a difference can
-// be found without a second tool.
+// The tokens come first (tokens/prompt, tokens/steps, as floats; tools/
+// llama_logits.cpp reads them). Each build (the chat's weights: kept as blocks for
+// a quantized file, else bf16; and the f32 one) runs the prompt, then the steps'
+// tokens one at a time, through each path: the imperative step token by token,
+// the captured decoder (its begin(), batched where the build allows, then step()),
+// and the batched prefill in its exact form (begin()'s is the fast one). A section
+// is named build/path/what, what being prompt (the logits after the prompt) or
+// stepN (after the N+1-th step's token), so the same path/what in two builds is
+// the same computation: the f32 build's imperative sections, f32 throughout, are
+// the reference tools/precision_logits.py holds the others to. A section is its
+// name, its float count and the floats; the names and a checksum are also
+// printed, so a difference can be found without a second tool.
 
 #include "qwen.h"
 
@@ -38,55 +44,56 @@ void section(const std::string& name, const float* v, int64_t n) {
   for (int64_t i = 0; i < n * 4; i++) h = (h ^ b[i]) * 1099511628211ull;
   std::printf("  %-36s %016llx\n", name.c_str(), (unsigned long long)h);
   const uint32_t len = (uint32_t)name.size();
-  const int64_t count = n;
   std::fwrite(&len, 4, 1, out);
   std::fwrite(name.data(), 1, len, out);
-  std::fwrite(&count, 8, 1, out);
+  std::fwrite(&n, 8, 1, out);
   std::fwrite(v, 4, (size_t)n, out);
 }
 
-// Spread-out token ids, the same on every run.
-std::vector<int> prompt(int64_t n, int64_t vocab) {
-  std::vector<int> ids((size_t)n);
-  for (int64_t i = 0; i < n; i++) ids[(size_t)i] = (int)(100 + (i * 7919 + 13) % (std::min<int64_t>(vocab, 30000) - 100));
+// Spread-out token ids, the same on every run: the prompt, then the tokens the
+// steps feed.
+constexpr int64_t kPrompt = 200, kSteps = 6;
+std::vector<int> tokens(int64_t vocab) {
+  std::vector<int> ids((size_t)(kPrompt + kSteps));
+  for (size_t i = 0; i < ids.size(); i++)
+    ids[i] = (int)(100 + ((int64_t)i * 7919 + 13) % (std::min<int64_t>(vocab, 30000) - 100));
   return ids;
 }
 
 void run(qm::Model& M, const std::string& tag) {
-  const int64_t V = M.c.VOCAB, steps = 6;
+  const int64_t V = M.c.VOCAB;
   auto logits = [&] { return qm::host_read(M.scratch.logits); };
-  // Token by token on the imperative step, then greedy steps.
+  const std::vector<int> all = tokens(V), ids(all.begin(), all.begin() + kPrompt);
+  // Token by token on the imperative step.
   {
     qm::reset_cache(M);
-    const std::vector<int> ids = prompt(8, V);
-    int64_t pos = 0, tok = 0;
-    for (int id : ids) tok = qm::step_imperative(M, id, pos++);
-    section(tag + "/imperative/prompt", logits(), V);
-    for (int64_t s = 0; s < steps; s++) {
-      tok = qm::step_imperative(M, tok, pos++);
-      section(tag + "/imperative/step" + std::to_string(s), logits(), V);
+    int64_t pos = 0;
+    const float* lg = nullptr;
+    for (int id : ids) lg = qm::imperative_logits(M, id, pos++);
+    section(tag + "/imperative/prompt", lg, V);
+    for (int64_t s = 0; s < kSteps; s++) {
+      lg = qm::imperative_logits(M, all[(size_t)(kPrompt + s)], pos++);
+      section(tag + "/imperative/step" + std::to_string(s), lg, V);
     }
   }
-  // The chat's decoder over a prompt long enough to batch.
+  // The chat's decoder: the prompt through begin(), batched where it can.
   {
     qm::reset_cache(M);
     qm::captured_decoder dec;
-    int64_t tok = dec.begin(M, prompt(200, V));
-    section(tag + (dec.batched ? "/decoder/batched" : "/decoder/tokens"), logits(), V);
-    for (int64_t s = 0; s < steps; s++) {
-      tok = dec.step(M, tok);
+    dec.begin(M, ids);
+    std::printf("  (decoder prompt %s)\n", dec.batched ? "batched" : "token by token");
+    section(tag + "/decoder/prompt", logits(), V);
+    for (int64_t s = 0; s < kSteps; s++) {
+      dec.step(M, all[(size_t)(kPrompt + s)]);
       section(tag + "/decoder/step" + std::to_string(s), logits(), V);
     }
     dec.destroy();
   }
-  // The batched prefill alone, fast and exact.
-  const std::vector<int> ids = prompt(300, V);
+  // The batched prefill in its exact form (f32 sums; begin() ran the fast one).
   if (qm::can_prefill_batched(M, (int64_t)ids.size())) {
-    for (const bool exact : {false, true}) {
-      qm::reset_cache(M);
-      qm::prefill_batched(M, ids, qm::PREFILL_CHUNK, exact);
-      section(tag + (exact ? "/prefill/exact" : "/prefill/fast"), logits(), V);
-    }
+    qm::reset_cache(M);
+    qm::prefill_batched(M, ids, qm::PREFILL_CHUNK, /*exact=*/true);
+    section(tag + "/prefill_exact/prompt", logits(), V);
   }
 }
 
@@ -94,7 +101,7 @@ void run(qm::Model& M, const std::string& tag) {
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    std::printf("usage: %s model.gguf out.bin\n", argv[0]);
+    std::printf("usage: %s model.gguf out.bin [fixed]\n", argv[0]);
     return 2;
   }
   if (!tl::gpu_available()) {
@@ -109,8 +116,14 @@ int main(int argc, char** argv) {
 #ifdef TENSORLIB_CUDA
     tl::cuda::set_no_splitk(true);
 #else
-    std::printf("`fixed` is CUDA's (its split-K GEMVs); nothing to fix here\n");
+    std::printf("`fixed` is CUDA's (its split-K GEMVs and GEMMs); nothing to fix here\n");
 #endif
+  }
+  {
+    const std::vector<int> all = tokens(qm::config_from_gguf(m).VOCAB);
+    const std::vector<float> f(all.begin(), all.end());
+    section("tokens/prompt", f.data(), kPrompt);
+    section("tokens/steps", f.data() + kPrompt, kSteps);
   }
   {
     qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false,
