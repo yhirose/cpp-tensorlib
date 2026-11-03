@@ -46,6 +46,24 @@ static std::vector<int64_t> run(qm::Model& M, int steps, std::vector<std::vector
   return fed;
 }
 
+// One set of logits against the oracle's: the worst |d| / (1 + max |logit|), and
+// whether the top token agrees, or differs only where the oracle's top two were
+// closer than `bound` lets a logit move (a near tie).
+struct compared {
+  double err;
+  bool same_top, near_tie;
+};
+static compared compare(const std::vector<float>& want, const std::vector<float>& got,
+                        double bound) {
+  double mx = 0, ref = 0;
+  for (size_t i = 0; i < want.size(); i++) {
+    mx = tl::max_err(mx, (double)std::fabs(want[i] - got[i]));
+    ref = std::max(ref, (double)std::fabs(want[i]));
+  }
+  const int64_t ta = qm::argmax(want), tb = qm::argmax(got);
+  return {mx / (1.0 + ref), ta == tb, ta != tb && want[ta] - want[tb] < bound * (1.0 + ref)};
+}
+
 int main(int argc, char** argv) {
   if (!tl::gpu_available()) { std::printf("no CUDA device — skipping\n"); return 0; }
   if (argc < 2) { std::fprintf(stderr, "usage: %s model-Q4_K_M.gguf [steps]\n", argv[0]); return 2; }
@@ -58,67 +76,54 @@ int main(int argc, char** argv) {
   const std::vector<int> ids = qm::spread_ids(200, qm::config_from_gguf(m).VOCAB);
   std::vector<std::vector<float>> la;
   std::vector<int64_t> fed;
-  std::vector<float> pa_;
+  std::vector<float> oracle_prompt;
   {
     qm::Model M = qm::build(m, tl::dtype::f32, false, false, 4096, /*oracle=*/false);
     fed = run(M, steps, la, nullptr);
     qm::reset_cache(M);
-    int64_t pos = 0;
-    const float* lg = nullptr;
-    for (int id : ids) lg = qm::imperative_logits(M, id, pos++);
-    pa_.assign(lg, lg + M.c.VOCAB);
+    for (size_t i = 0; i + 1 < ids.size(); i++) qm::step_imperative(M, ids[i], (int64_t)i);
+    const float* lg = qm::imperative_logits(M, ids.back(), (int64_t)ids.size() - 1);
+    oracle_prompt.assign(lg, lg + M.c.VOCAB);
   }
-  const int64_t ta0 = qm::argmax(pa_);
+  qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, false, true, /*quant=*/true);
+  if (!M.quant) { std::printf("native block-quantized path unavailable\n"); return 1; }
   bool ok_all = true;
-  {
-    qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, false, true, /*quant=*/true);
-    if (!M.quant) { std::printf("native block-quantized path unavailable\n"); return 1; }
-    // Each form's bound on the logits (|d| / (1 + max |logit|)): f32 and h16 (an
-    // f16 rounding of the activation, 2^-11 of it) the sums', q8 its 8-bit rounding's (a
-    // form without one is held to 0, so it fails until it is given its own).
-    auto bound_of = [](tl::gpu::act_form f) {
-      switch (f) {
-        case tl::gpu::act_form::f32:
-        case tl::gpu::act_form::h16: return BOUND_EXACT;
-        case tl::gpu::act_form::q8: return BOUND_Q8;
-      }
-      return 0.0;
-    };
-    std::vector<tl::gpu::act_form> forms{tl::gpu::act_form::f32};
-    forms.insert(forms.end(), std::begin(tl::gpu::prepared_act_forms),
-                 std::end(tl::gpu::prepared_act_forms));
-    for (const tl::gpu::act_form form : forms) {
-      const double bound = bound_of(form);
-      if (!qm::gemv_form_available(form)) {
-        std::printf("%s activations: the backend has not got the form, skipped\n",
-                    qm::act_form_name(form));
-        continue;
-      }
-      M.gemv_form = form;
-      std::vector<std::vector<float>> lb;
-      run(M, steps, lb, &fed);
-      double worst = 0;
-      int agree = 0, tie_flips = 0, bad = 0;
-      for (int s = 0; s < steps; s++) {
-        double mx = 0, ref = 0;
-        for (size_t i = 0; i < la[s].size(); i++) {
-          mx = tl::max_err(mx, (double)std::fabs(la[s][i] - lb[s][i]));
-          ref = std::max(ref, (double)std::fabs(la[s][i]));
-        }
-        worst = tl::max_err(worst, mx / (1.0 + ref));
-        const int64_t ta = qm::argmax(la[s]), tb = qm::argmax(lb[s]);
-        if (ta == tb) { agree++; continue; }
-        // A different top token is fine only if the oracle's top two were closer than
-        // the form may move a logit (a near tie).
-        const double gap = la[s][ta] - la[s][tb];
-        if (gap < bound * (1.0 + ref)) tie_flips++; else bad++;
-      }
-      const bool ok = bad == 0 && worst < bound;
-      ok_all = ok_all && ok;
-      std::printf("%d steps, %s activations | top-1 agrees %d, near-tie flips %d, real misses %d | logits worst |d|/(1+max) %.2e (< %.0e) %s\n",
-                  steps, qm::act_form_name(form), agree, tie_flips, bad, worst, bound, ok ? "OK" : "FAIL");
+  // A form without a bound is held to 0, so it fails until it is given its own.
+  auto bound_of = [](tl::gpu::act_form f) {
+    switch (f) {
+      case tl::gpu::act_form::f32:
+      case tl::gpu::act_form::h16: return BOUND_EXACT;
+      case tl::gpu::act_form::q8: return BOUND_Q8;
     }
+    return 0.0;
+  };
+  const tl::gpu::act_form chat_form = M.gemv_form;
+  std::vector<tl::gpu::act_form> forms{tl::gpu::act_form::f32};
+  forms.insert(forms.end(), std::begin(tl::gpu::prepared_act_forms),
+               std::end(tl::gpu::prepared_act_forms));
+  for (const tl::gpu::act_form form : forms) {
+    const double bound = bound_of(form);
+    if (!qm::gemv_form_available(form)) {
+      std::printf("%s activations: the backend has not got the form, skipped\n",
+                  qm::act_form_name(form));
+      continue;
+    }
+    M.gemv_form = form;
+    std::vector<std::vector<float>> lb;
+    run(M, steps, lb, &fed);
+    double worst = 0;
+    int agree = 0, tie_flips = 0, bad = 0;
+    for (int s = 0; s < steps; s++) {
+      const compared c = compare(la[s], lb[s], bound);
+      worst = tl::max_err(worst, c.err);
+      c.same_top ? agree++ : c.near_tie ? tie_flips++ : bad++;
+    }
+    const bool ok = bad == 0 && worst < bound;
+    ok_all = ok_all && ok;
+    std::printf("%d steps, %s activations | top-1 agrees %d, near-tie flips %d, real misses %d | logits worst |d|/(1+max) %.2e (< %.0e) %s\n",
+                steps, qm::act_form_name(form), agree, tie_flips, bad, worst, bound, ok ? "OK" : "FAIL");
   }
+  M.gemv_form = chat_form;
   // The batched prefill over the same blocks: a prompt through GEMMs that
   // dequantize as they stage, against the f32 weights' prompt, in the exact
   // form a non-finite prompt is redone in (the operands rounded to bf16, the sums f32:
@@ -127,30 +132,20 @@ int main(int argc, char** argv) {
   // Qwen's, docs/llama-cpp-comparison.md — so held by the KL of the two distributions,
   // a bound a broken path is far past, and its ties by q8's). A spread-out prompt,
   // which no prediction is sure of, so the distributions show it.
-  bool prefill_ok = true;
   for (bool exact : {true, false}) {
     const double bound = exact ? BOUND_BF16 : BOUND_Q8;
-    std::vector<float> pb_;
-    int64_t tb0 = -1;
-    {
-      qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, false, true, /*quant=*/true);
-      qm::reset_cache(M);
-      tb0 = qm::prefill_batched(M, ids, qm::PREFILL_CHUNK, exact);
-      const float* lg = qm::host_read(M.scratch.logits);
-      pb_.assign(lg, lg + M.c.VOCAB);
-    }
-    double pmx = 0, pref = 0;
-    for (size_t i = 0; i < pa_.size(); i++) {
-      pmx = tl::max_err(pmx, (double)std::fabs(pa_[i] - pb_[i]));
-      pref = std::max(pref, (double)std::fabs(pa_[i]));
-    }
-    const double err = pmx / (1.0 + pref), kl = qm::kl_div(pa_, pb_);
-    const bool near = ta0 == tb0 || pa_[ta0] - pa_[tb0] < bound * (1.0 + pref);
-    const bool ok = near && (exact ? err < bound : kl < 0.3);
-    prefill_ok = prefill_ok && ok;
+    qm::reset_cache(M);
+    qm::prefill_batched(M, ids, qm::PREFILL_CHUNK, exact);
+    const float* lg = qm::host_read(M.scratch.logits);
+    const std::vector<float> got(lg, lg + M.c.VOCAB);
+    const compared c = compare(oracle_prompt, got, bound);
+    const double kl = qm::kl_div(oracle_prompt, got);
+    const bool ok = (c.same_top || c.near_tie) && (exact ? c.err < bound : kl < 0.3);
+    ok_all = ok_all && ok;
     std::printf("prefill 200 tokens (%s) | first token %lld vs %lld | logits worst |d|/(1+max) %.2e, "
                 "KL %.2e %s\n",
-                exact ? "exact" : "f16 sums", (long long)ta0, (long long)tb0, err, kl, ok ? "OK" : "FAIL");
+                exact ? "exact" : "f16 sums", (long long)qm::argmax(oracle_prompt),
+                (long long)qm::argmax(got), c.err, kl, ok ? "OK" : "FAIL");
   }
-  return ok_all && prefill_ok ? 0 : 1;
+  return ok_all ? 0 : 1;
 }
