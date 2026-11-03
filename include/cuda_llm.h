@@ -23,7 +23,7 @@ struct own_llm {
                                gpu::span out, int64_t n_q_heads,
                                int64_t n_kv_heads, gpu::span d_pos,
                                int64_t kv_max, int64_t D, float scale,
-                               gpu::span partials, bool kv_f16 = false);
+                               gpu::span partials, bool kv_f16, int64_t window);
   static bool incr_u32(gpu::span d_pos);
   // A decode step run ahead (gpu_ops_llm.h): its input row gathered from the
   // token on the device.
@@ -182,7 +182,7 @@ inline bool own_llm::attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
                                   gpu::span out, int64_t n_q_heads,
                                   int64_t n_kv_heads, gpu::span d_pos,
                                   int64_t kv_max, int64_t D, float scale,
-                                  gpu::span partials, bool kv_f16) {
+                                  gpu::span partials, bool kv_f16, int64_t window) {
   auto& c = context::get();
   if (!c.ready || !attn_decode_head_ok(D) || !partials.buf) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
@@ -200,10 +200,12 @@ inline bool own_llm::attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
   unsigned uh = (unsigned)n_q_heads, uD = (unsigned)D;
   unsigned kv_stride = (unsigned)(kv_max * D);
   unsigned group = (unsigned)(n_q_heads / n_kv_heads);
-  unsigned S = attn_split_count(uh, kv_max);
+  // A window (< kv_max) bounds the live keys, and so the splits, at its length; the
+  // partials, sized from kv_max, hold at least as many.
+  unsigned S = attn_split_count(uh, window > 0 ? window : kv_max);
   attn_partials p(context::off_(partials.buf, partials.off), (size_t)uh * S);
   if (!c.launch_(c.attn_(context::attn_k::split_dpos, D, kv_f16), {uh, S}, {uD}, 0, pq, pk, pv, p.pm,
-                 p.pl, p.pacc, pp, kv_stride, group, scale)) {
+                 p.pl, p.pacc, pp, kv_stride, group, scale, (unsigned)window)) {
     return false;
   }
   return p.combine(c, po, uh, uD, S);

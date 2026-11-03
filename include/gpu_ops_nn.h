@@ -806,13 +806,27 @@ TL_GPU_F16_OP(merge_heads_h16, (span src, span dst16, int64_t T, int64_t H, int6
 TL_GPU_F16_OP(cvt_h16, (span src, span dst16, int64_t n), (src, dst16, n))
 #undef TL_GPU_F16_OP
 
+// A sliding window of w keys (Gemma 3's local layers): a query at position n - 1
+// attends the keys [n - w, n), itself the last, so its first is attn_window_lo(n, w);
+// w = 0 is no window. The CUDA kernels' attn_window_lo_ is the device twin.
+inline int64_t attn_window_lo(int64_t n, int64_t w) { return w > 0 && n > w ? n - w : 0; }
+
 // One decode step: q [n_q_heads, D] against a [n_kv_heads, kv_max, D] cache
-// read over [0, ctx). GQA by the head ratio; the cache is f32, or f16 with kv_f16.
+// read over [0, ctx), or over its last `window` rows. GQA by the head ratio; the
+// cache is f32, or f16 with kv_f16.
 TL_GPU_DETECT_OWN(attn_decode)
 template <class Own = own>
 inline bool attn_decode(span q, span K, span V, span o, int64_t n_q_heads,
                         int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
-                        int64_t D, float scale, bool kv_f16 = false) {
+                        int64_t D, float scale, bool kv_f16 = false, int64_t window = 0) {
+  // The window's rows [lo, ctx) are a cache of their own: K and V from row lo (the
+  // stride between heads is the cache's still), ctx - lo of them.
+  if (const int64_t lo = attn_window_lo(ctx, window); lo > 0) {
+    const int64_t at = lo * D * (kv_f16 ? 2 : 4);
+    K = K.at(at);
+    V = V.at(at);
+    ctx -= lo;
+  }
   if constexpr (detail::owns_attn_decode<Own>::value) {
     if (detail::ran(Own::attn_decode(q, K, V, o, n_q_heads, n_kv_heads, ctx, kv_max, D, scale, kv_f16))) {
       return true;

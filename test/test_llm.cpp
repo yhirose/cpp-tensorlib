@@ -249,6 +249,78 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
     }
   }
 
+  SUBCASE("kv_cache: a sliding window attends only the last rows") {
+    // The decode step at position T - 1 of a cache with a window of W attends the keys
+    // [T - W, T) (gpu::attn_window_lo). Two keys of q head 0's kv head are planted to
+    // dominate its scores: row lo - 1, which the window leaves out, and row lo, which
+    // it keeps, so either off by one moves the output by O(1), not by noise. A window
+    // of 100 runs in one block, one of 300 split.
+    auto held16 = [](std::vector<float> v) {
+      for (float& x : v) x = tl::f16_to_f32(tl::f32_to_f16(x));
+      return v;
+    };
+    for (int64_t D : {64, 256}) {
+      for (const bool f16 : {false, true}) {
+        if (f16 && !gpu::caps::kv_f16) continue;
+        for (const int64_t W : {100, 300}) {
+          CAPTURE(D);
+          CAPTURE(f16);
+          CAPTURE(W);
+          const int64_t HQ = 4, HKV = 2, MAXC = 600, T = 520, lo = T - W;
+          const float scale = 1.0f / std::sqrt((float)D);
+          array q = dev(random_array({HQ, D}, 920));
+          std::vector<float> Kh = host_values(random_array({HKV, T, D}, 921)),
+                             Vh = host_values(random_array({HKV, T, D}, 922));
+          const std::vector<float> qh = host_values(q);
+          double qq = 0;
+          for (int64_t d = 0; d < D; d++) qq += (double)qh[d] * qh[d];
+          for (const auto [row, s, v] : {std::tuple<int64_t, double, float>{lo - 1, 20.0, 5.0f},
+                                         {lo, 8.0, -5.0f}}) {
+            for (int64_t d = 0; d < D; d++) {  // kv head 0: score s against q head 0
+              Kh[(size_t)(row * D + d)] = (float)(s / (scale * qq)) * qh[d];
+              Vh[(size_t)(row * D + d)] = v;
+            }
+          }
+          if (f16) {
+            Kh = held16(Kh);
+            Vh = held16(Vh);
+          }
+          tl::kv_cache cache;
+          REQUIRE(cache.init(HKV, MAXC, D, f16, W));
+          array K = array::from(std::vector<float>(Kh), {HKV, T, D}),
+                V = array::from(std::vector<float>(Vh), {HKV, T, D});
+          for (int64_t t = 0; t < T; t++) {
+            array k = dev(K.slice(1, t, 1).clone()), v = dev(V.slice(1, t, 1).clone());
+            REQUIRE(cache.append(k.device_span(), v.device_span()));
+          }
+          array out = array::empty({HQ, D});
+          REQUIRE(cache.attn(q.device_span(), out.device_span(), HQ, scale));
+          std::vector<float> want((size_t)HQ * D);
+          for (int64_t h = 0; h < HQ; h++) {
+            const int64_t kh = h / (HQ / HKV);
+            std::vector<double> sc(T);
+            double m = -1e300, sum = 0;
+            for (int64_t j = lo; j < T; j++) {
+              double a = 0;
+              for (int64_t d = 0; d < D; d++)
+                a += (double)qh[(size_t)(h * D + d)] * Kh[(size_t)((kh * T + j) * D + d)];
+              sc[j] = a * scale;
+              m = std::max(m, sc[j]);
+            }
+            for (int64_t j = lo; j < T; j++) sum += (sc[j] = std::exp(sc[j] - m));
+            for (int64_t d = 0; d < D; d++) {
+              double e = 0;
+              for (int64_t j = lo; j < T; j++) e += sc[j] * Vh[(size_t)((kh * T + j) * D + d)];
+              want[(size_t)(h * D + d)] = (float)(e / sum);
+            }
+          }
+          tl::gpu::flush();
+          CHECK(same(out, array::from(want, {HQ, D}), 1e-4f));
+        }
+      }
+    }
+  }
+
   SUBCASE("rmsnorm, rmsnorm_res and swiglu per row") {
     const int64_t rows = 3, n = 896, ff = 4864;
     array x = dev(random_array({rows, n}, 910)), d = dev(random_array({rows, n}, 911));

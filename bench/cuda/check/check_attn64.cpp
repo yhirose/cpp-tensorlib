@@ -72,7 +72,7 @@ int main() {
     const int64_t checks[] = {1,   2,   63,  64,   127, 128, 255,
                               256, 257, 512, 1024, 2047};
     size_t ci = 0;
-    double maxrel = 0;
+    double maxrel = 0, maxrel_w = 0;
     std::vector<float> scores(MAXC);
     const int64_t STEPS = 2047;
     for (int64_t step = 1; step <= STEPS; step++) {
@@ -92,49 +92,59 @@ int main() {
         ci++;
         for (int64_t i = 0; i < HQ * D; i++) hq[i] = rnd();
         sync_to_host(q, true);
-        cache.attn({q, 0}, {o, 0}, HQ, scale);
-        flush();
-        sync_to_host(o, false);
-        // Lockstep guard: attn_dpos (split-KV on the capacity-static grid,
-        // *d_pos = pos so ctx matches) must be BIT-identical to attn — the
-        // device attn_dpos_chunk twins the host attn_split_count/attn_split_chunk
-        // heuristic, and the capacity grid's empty splits combine as exact zeros.
-        upload_u32(dp, (unsigned)pos);
-        cache.attn_dpos({q, 0}, {o2, 0}, HQ, {dp, 0}, scale);
-        flush();
-        sync_to_host(o2, false);
-        if (std::memcmp(ho, ho2, (size_t)HQ * D * 4) != 0) {
-          dpos_eq = false;
-          std::printf("  attn_dpos != attn at ctx %lld\n", (long long)step);
-        }
-        int64_t L = step;
-        for (int64_t qh = 0; qh < HQ; qh++) {
-          int64_t kvh = qh / group;
-          const float* qhp = hq + qh * D;
-          const float* Kh = Khist.data() + (size_t)kvh * MAXC * D;
-          const float* Vh = Vhist.data() + (size_t)kvh * MAXC * D;
-          float mx = -1e30f;
-          for (int64_t j = 0; j < L; j++) {
-            float s = 0;
-            for (int64_t d = 0; d < D; d++) s += qhp[d] * Kh[j * D + d];
-            scores[j] = s * scale;
-            mx = std::max(mx, scores[j]);
+        // Unwindowed, then the same cache under sliding windows (one single-block,
+        // one split): the keys [lo, step) of the window's own lo, as attn reads them
+        // and as attn_dpos does.
+        for (const int64_t W : {int64_t{0}, int64_t{100}, int64_t{300}}) {
+          cache.window = W;
+          cache.attn({q, 0}, {o, 0}, HQ, scale);
+          flush();
+          sync_to_host(o, false);
+          // Lockstep guard: attn_dpos (split-KV on the capacity-static grid,
+          // *d_pos = pos so ctx matches) must be BIT-identical to attn — the
+          // device attn_dpos_chunk twins the host attn_split_count/attn_split_chunk
+          // heuristic, and the capacity grid's empty splits combine as exact zeros.
+          upload_u32(dp, (unsigned)pos);
+          cache.attn_dpos({q, 0}, {o2, 0}, HQ, {dp, 0}, scale);
+          flush();
+          sync_to_host(o2, false);
+          if (std::memcmp(ho, ho2, (size_t)HQ * D * 4) != 0) {
+            dpos_eq = false;
+            std::printf("  attn_dpos != attn at ctx %lld, window %lld\n", (long long)step,
+                        (long long)W);
           }
-          float sum = 0;
-          for (int64_t j = 0; j < L; j++) { scores[j] = std::exp(scores[j] - mx); sum += scores[j]; }
-          for (int64_t d = 0; d < D; d++) {
-            float acc = 0;
-            for (int64_t j = 0; j < L; j++) acc += scores[j] * Vh[j * D + d];
-            float ref = acc / sum, got = ho[qh * D + d];
-            maxrel = tl::max_err(maxrel, std::fabs(got - ref) / (1.0 + std::fabs(ref)));
+          const int64_t L = step, lo = L > W && W > 0 ? L - W : 0;
+          double& worst = W ? maxrel_w : maxrel;
+          for (int64_t qh = 0; qh < HQ; qh++) {
+            int64_t kvh = qh / group;
+            const float* qhp = hq + qh * D;
+            const float* Kh = Khist.data() + (size_t)kvh * MAXC * D;
+            const float* Vh = Vhist.data() + (size_t)kvh * MAXC * D;
+            float mx = -1e30f;
+            for (int64_t j = lo; j < L; j++) {
+              float s = 0;
+              for (int64_t d = 0; d < D; d++) s += qhp[d] * Kh[j * D + d];
+              scores[j] = s * scale;
+              mx = std::max(mx, scores[j]);
+            }
+            float sum = 0;
+            for (int64_t j = lo; j < L; j++) { scores[j] = std::exp(scores[j] - mx); sum += scores[j]; }
+            for (int64_t d = 0; d < D; d++) {
+              float acc = 0;
+              for (int64_t j = lo; j < L; j++) acc += scores[j] * Vh[j * D + d];
+              float ref = acc / sum, got = ho[qh * D + d];
+              worst = tl::max_err(worst, std::fabs(got - ref) / (1.0 + std::fabs(ref)));
+            }
           }
         }
+        cache.window = 0;
       }
     }
-    ok &= maxrel < 1e-4;
+    ok &= maxrel < 1e-4 && maxrel_w < 1e-4;
     std::printf("  D=%lld %s kv cache grow to %lld tokens (%zu checkpoints, split-KV @>=256) "
-                "— maxrel %.1e %s\n", (long long)D, f16 ? "f16" : "f32", (long long)cache.pos,
-                sizeof(checks) / sizeof(checks[0]), maxrel, maxrel < 1e-4 ? "OK" : "FAIL");
+                "— maxrel %.1e, windows 100 / 300 %.1e %s\n", (long long)D, f16 ? "f16" : "f32",
+                (long long)cache.pos, sizeof(checks) / sizeof(checks[0]), maxrel, maxrel_w,
+                maxrel < 1e-4 && maxrel_w < 1e-4 ? "OK" : "FAIL");
     ok &= dpos_eq;
     std::printf("  attn_dpos (capacity-grid split) vs attn — bit-equal at every "
                 "checkpoint %s\n", dpos_eq ? "OK" : "FAIL");

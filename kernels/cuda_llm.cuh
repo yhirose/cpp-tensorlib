@@ -36,13 +36,16 @@ __device__ __forceinline__ unsigned attn_dpos_chunk(unsigned ctx, unsigned H) {
   return chunk ? chunk : 4u;
 }
 // tl_attn_decode_split_dpos_{f32,f16}_{64,128,256}
+// A window (win > 0) reads the rows [lo, ctx) as the host path does: K and V from row lo,
+// ctx - lo of them, split by their count.
 #define TL_ATTN_SPLIT_DPOS(AD, KT, TN)                                                               \
   extern "C" __global__ void tl_attn_decode_split_dpos_##TN##_##AD(                                  \
       const float* q, const KT* K, const KT* V, float* pm, float* pl, float* pacc,                   \
-      const unsigned* __restrict__ d_pos, unsigned kv_stride, unsigned group, float scale) {         \
-    const unsigned ctx = *d_pos + 1u;                                                                \
-    attn_decode_split_core<AD, KT>(q, K, V, pm, pl, pacc, ctx, kv_stride, group,                     \
-                                   attn_dpos_chunk(ctx, gridDim.x), scale);                          \
+      const unsigned* __restrict__ d_pos, unsigned kv_stride, unsigned group, float scale,           \
+      unsigned win) {                                                                                \
+    const unsigned ctx = *d_pos + 1u, lo = attn_window_lo_(ctx, win), n = ctx - lo;                 \
+    attn_decode_split_core<AD, KT>(q, K + (size_t)lo * AD, V + (size_t)lo * AD, pm, pl, pacc, n,    \
+                                   kv_stride, group, attn_dpos_chunk(n, gridDim.x), scale);          \
   }
 TL_ATTN_SPLIT_DPOS(64, float, f32)
 TL_ATTN_SPLIT_DPOS(128, float, f32)

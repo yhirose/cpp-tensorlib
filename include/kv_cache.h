@@ -20,6 +20,9 @@
 // host `pos`, so a captured forward replays at the advancing position (CUDA
 // graph capture, gpu::caps::graph_capture). They leave the host `pos` alone;
 // the caller keeps it in step out-of-band.
+//
+// A cache with a window (init's `win`, Gemma 3's local layers) keeps every row
+// but attends only the last `window` of them (gpu::attn_window_lo).
 
 #include <gpu.h>
 #include <storage.h>
@@ -31,14 +34,16 @@ namespace tl {
 
 struct kv_cache {
   storage K, V;
-  int64_t n_kv_heads = 0, max_ctx = 0, D = 0, pos = 0;
+  int64_t n_kv_heads = 0, max_ctx = 0, D = 0, pos = 0, window = 0;
   bool f16 = false;
 
-  bool init(int64_t kv_heads, int64_t maxctx, int64_t d, bool f16_cache = false) {
+  bool init(int64_t kv_heads, int64_t maxctx, int64_t d, bool f16_cache = false,
+            int64_t win = 0) {
     n_kv_heads = kv_heads;
     max_ctx = maxctx;
     D = d;
     pos = 0;
+    window = win;
     f16 = f16_cache;
     // An f16 cache is raw device bytes, two elements in each f32 of a storage
     // half as long (tl::dtype has no f16; nothing reads the cache but kernels).
@@ -62,7 +67,7 @@ struct kv_cache {
   // q/out: [n_q_heads, D] device views. Attends over the cached prefix.
   bool attn(gpu::span q, gpu::span out, int64_t n_q_heads, float scale) {
     return gpu::attn_decode(q, K.device_span(), V.device_span(), out, n_q_heads,
-                            n_kv_heads, pos, max_ctx, D, scale, f16);
+                            n_kv_heads, pos, max_ctx, D, scale, f16, window);
   }
 
   // T tokens at once: k_src/v_src [n_kv_heads, T, D] appended at `pos`, and
@@ -109,7 +114,7 @@ struct kv_cache {
     }
     return gpu::attn_decode_dpos(q, K.device_span(), V.device_span(), out,
                                  n_q_heads, n_kv_heads, d_pos, max_ctx, D, scale,
-                                 dpos_partials.device_span(), f16);
+                                 dpos_partials.device_span(), f16, window);
   }
 };
 

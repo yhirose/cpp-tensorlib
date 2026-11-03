@@ -2562,6 +2562,12 @@ __device__ __forceinline__ float kv_ld(__half x) { return __half2float(x); }
 __device__ __forceinline__ void kv_st(float* p, float x) { *p = x; }
 __device__ __forceinline__ void kv_st(__half* p, float x) { *p = __float2half_rn(x); }
 
+// The first key a query at position n - 1 attends under a sliding window of w keys
+// (w = 0: none), as the host's gpu::attn_window_lo.
+__device__ __forceinline__ unsigned attn_window_lo_(unsigned n, unsigned w) {
+  return w && n > w ? n - w : 0u;
+}
+
 // Shared middle of the decode-attention family. Stages the head's query into
 // shared memory, runs the online-softmax score loop over keys [k0, k1) (each
 // warp owns keys i = k0+warp, +NW, ...; its 32 lanes cooperatively reduce the

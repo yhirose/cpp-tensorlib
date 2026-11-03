@@ -120,9 +120,11 @@ TL_GPU_DETECT_OWN(attn_decode_dpos)
 template <class Own = own>
 inline bool attn_decode_dpos(span q, span K, span V, span o, int64_t n_q_heads,
                              int64_t n_kv_heads, span d_pos, int64_t kv_max,
-                             int64_t D, float scale, span partials, bool kv_f16 = false) {
+                             int64_t D, float scale, span partials, bool kv_f16 = false,
+                             int64_t window = 0) {
+  if (window >= kv_max) window = 0;  // no position the cache holds is past it
   if constexpr (detail::owns_attn_decode_dpos<Own>::value) {
-    return detail::ran(Own::attn_decode_dpos(q, K, V, o, n_q_heads, n_kv_heads, d_pos, kv_max, D, scale, partials, kv_f16));
+    return detail::ran(Own::attn_decode_dpos(q, K, V, o, n_q_heads, n_kv_heads, d_pos, kv_max, D, scale, partials, kv_f16, window));
   } else {
     return false;
   }
