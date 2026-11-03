@@ -64,8 +64,10 @@ int main(int argc, char** argv) {
   // default system prompt. Qwen3 and Qwen3.5 have none, and think by default:
   // Qwen3 opens a <think> block itself, which "nothink" (argv[5]) closes up
   // front, exactly what the template's enable_thinking=false does.
-  // Qwen3.5's template opens the <think> block itself.
-  const bool qwen3 = M.c.arch == "qwen3", qwen35 = M.c.arch == "qwen35";
+  // Qwen3.5's template opens the <think> block itself. Gemma 3's opens with
+  // <bos> and has no system turn.
+  const bool qwen3 = M.c.arch == "qwen3", qwen35 = M.c.arch == "qwen35",
+             gemma3 = M.c.arch == "gemma3";
   bool nothink = false;
   tl::gpu::sampling sampler;
   for (int i = 5; i < argc; i++) {
@@ -86,12 +88,14 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::string templated =
-      std::string(qwen3 || qwen35 ? "" : "<|im_start|>system\nYou are Qwen, created by "
-                                           "Alibaba Cloud. You are a helpful "
-                                           "assistant.<|im_end|>\n") +
-      "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n" +
-      ((qwen3 || qwen35) && nothink ? "<think>\n\n</think>\n\n"
-                                    : qwen35 ? "<think>\n" : "");
+      gemma3 ? "<bos><start_of_turn>user\n" + user + "<end_of_turn>\n<start_of_turn>model\n"
+             : std::string(qwen3 || qwen35 ? ""
+                                           : "<|im_start|>system\nYou are Qwen, created by "
+                                             "Alibaba Cloud. You are a helpful "
+                                             "assistant.<|im_end|>\n") +
+                   "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n" +
+                   ((qwen3 || qwen35) && nothink ? "<think>\n\n</think>\n\n"
+                                                 : qwen35 ? "<think>\n" : "");
   std::vector<int> ids = tok.encode(templated);
   if (sampler.greedy()) {
     std::printf("prompt: %s\n%zu prompt tokens; generating (greedy)...\n\n", user.c_str(),

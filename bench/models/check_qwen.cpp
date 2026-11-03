@@ -1,8 +1,8 @@
 // M9 "actually chat" — numeric proof. Load a real Qwen2.5-0.5B-Instruct, Qwen3
-// or Qwen3.5 GGUF (F16 or BF16 weights) and run the decoder end to end, verified
-// against a tight numpy reference that reads the SAME weights (tools/qwen_oracle.py
-// wrote qwen_oracle_data.h / qwen3_oracle_data.h / qwen35_oracle_data.h; the
-// model's arch picks one). Identical
+// or Qwen3.5 GGUF (F16 or BF16 weights), or Gemma 3 4B (Q4_K_M), and run the
+// decoder end to end, verified against a tight numpy reference that reads the
+// SAME weights (tools/qwen_oracle.py wrote qwen_oracle_data.h / qwen3_oracle_data.h
+// / qwen35_oracle_data.h / gemma3_oracle_data.h; the model's arch picks one). Identical
 // weights => the C++ forward must match the reference to ~1e-4 at every checkpoint
 // (embedding, layer-0 residual, final norm, top-5 logits) AND reproduce the greedy
 // token sequence exactly. Proves weight loading + GGML->our layout transpose +
@@ -10,6 +10,7 @@
 // gpu:: resolves to. Tokenizer/sampling are
 // separate (see chat_qwen). Model path: argv[1] or ~/models/...fp16.gguf.
 
+#include "gemma3_oracle_data.h"
 #include "qwen.h"
 #include "qwen35_oracle_data.h"
 #include "qwen3_oracle_data.h"
@@ -141,20 +142,24 @@ static bool check_sampled(qm::Model& B, const std::vector<int>& prompt) {
   return ok;
 }
 
-// A hybrid model (Qwen3.5) has no array path, so its checkpoints are read off
-// the imperative forward: the final norm the last layer's seam leaves in
-// scratch, the logits, and the greedy continuation, at F32 against the oracle.
-// Then the bf16 weights (the chat's) must reproduce the same greedy opening.
-static bool check_hybrid(const qm::gg::model& m, const Oracle& O) {
+// A model the array path does not model (Qwen3.5's DeltaNet, Gemma 3's post
+// norms: Config::array_path()) has its checkpoints read off the imperative
+// forward: the final norm the last layer's seam leaves in scratch, the logits,
+// and the greedy continuation, at F32 against the oracle. Then the bf16 weights
+// (the chat's) must reproduce the same greedy opening.
+static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   const int64_t NP = (int64_t)O.n_prompt, NG = (int64_t)O.n_greedy;
   std::vector<int64_t> want;
   bool ok;
   {
     qm::Model M = qm::build(m, tl::dtype::f32);
     const qm::Config& C = M.c;
-    std::printf("model built — %lld layers (%lld attention), head_dim=%lld, DeltaNet %lldx[%lld,%lld]\n",
-                (long long)C.NL, (long long)(C.NL / C.INTERVAL), (long long)C.HD,
-                (long long)C.SH, (long long)C.SDK, (long long)C.SDV);
+    std::printf("model built — %lld layers (%lld attention), head_dim=%lld", (long long)C.NL,
+                (long long)(C.NL / C.INTERVAL), (long long)C.HD);
+    if (C.hybrid())
+      std::printf(", DeltaNet %lldx[%lld,%lld]", (long long)C.SH, (long long)C.SDK,
+                  (long long)C.SDV);
+    std::printf("\n");
     for (int64_t i = 0; i + 1 < NP; i++) qm::step_imperative(M, O.prompt_ids[i], i);
     const float* lp = qm::imperative_logits(M, O.prompt_ids[NP - 1], NP - 1);
     std::vector<float> logits(lp, lp + C.VOCAB);
@@ -301,19 +306,20 @@ int main(int argc, char** argv) {
   qm::gg::model m(path);
   const qm::Config C = qm::config_from_gguf(m);
   // Checkpoints exist for Qwen2.5-0.5B (24 layers, 896 wide), Qwen3-0.6B (28,
-  // 1024) and Qwen3.5-0.8B (24, 1024).
-  const bool q3 = C.arch == "qwen3", q35 = C.arch == "qwen35";
-  const int64_t want_nl = q3 ? 28 : 24, want_ne = q3 || q35 ? 1024 : 896;
+  // 1024), Qwen3.5-0.8B (24, 1024) and Gemma 3 4B (34, 2560).
+  const bool q3 = C.arch == "qwen3", q35 = C.arch == "qwen35", g3 = C.arch == "gemma3";
+  const int64_t want_nl = g3 ? 34 : q3 ? 28 : 24, want_ne = g3 ? 2560 : q3 || q35 ? 1024 : 896;
   if (C.NL != want_nl || C.NE != want_ne) {
     std::printf("config mismatch — no oracle for this model\n");
     return 2;
   }
-  const Oracle O = q35 ? TL_ORACLE(qwen35oracle)
-                   : q3 ? TL_ORACLE(qwen3oracle)
-                        : TL_ORACLE(qwenoracle);
+  const Oracle O = g3    ? TL_ORACLE(gemma3oracle)
+                   : q35 ? TL_ORACLE(qwen35oracle)
+                   : q3  ? TL_ORACLE(qwen3oracle)
+                         : TL_ORACLE(qwenoracle);
   tl::use_gpu();
-  if (C.hybrid()) {
-    const bool ok = check_hybrid(m, O);
+  if (!C.array_path()) {
+    const bool ok = check_imperative(m, O);
     std::printf("\n%s\n", ok ? "ALL OK" : "FAILURES");
     return ok ? 0 : 1;
   }

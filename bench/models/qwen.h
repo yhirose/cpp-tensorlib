@@ -40,12 +40,13 @@ using tl::storage;
 namespace gg = tl::gguf;
 namespace gpu = tl::gpu;
 
-// The shape of one Qwen decoder, read from the GGUF metadata (config_from_gguf)
-// rather than compiled in, so Qwen2.5, Qwen3 and Qwen3.5 — and every size of
-// each — share one forward. Everything that differs between those families is
-// a field here: the dims, the norm eps / rope base, and the structural switches.
+// The shape of one decoder, read from the GGUF metadata (config_from_gguf)
+// rather than compiled in, so Qwen2.5, Qwen3, Qwen3.5 and Gemma 3 — and every
+// size of each — share one forward. Everything that differs between those
+// families is a field here: the dims, the norm eps / rope base, and the
+// structural switches.
 struct Config {
-  std::string arch;  // "qwen2" | "qwen3" | "qwen35": the family, for drivers
+  std::string arch;  // "qwen2" | "qwen3" | "qwen35" | "gemma3": the family, for drivers
   int64_t NL = 0, NE = 0, NH = 0, NKV = 0, HD = 0, FF = 0, VOCAB = 0;
   int64_t MAXC = 4096;  // KV capacity per layer (f32): NKV*MAXC*HD*8 B per layer
   float EPS = 1e-6f, ROPE_BASE = 1e6f;
@@ -67,8 +68,28 @@ struct Config {
   int64_t INTERVAL = 1, SH = 0, SK = 0, SDK = 0, SDV = 0, SCONV = 0;
   std::string ffn_norm = "ffn_norm.weight";  // Qwen3.5: post_attention_norm
   float L2EPS = 1e-6f;  // DeltaNet's q / k L2 norms (the reference's constant)
-  float scale() const { return 1.0f / std::sqrt((float)HD); }
+  // Gemma 3: the embedding times sqrt(NE); an RMSNorm after the attention and
+  // after the MLP too (their outputs normalized before the residual adds); the
+  // MLP's gate through GELU (tanh form) rather than SiLU; and sliding-window
+  // attention on all but every SWA_PATTERN-th layer (a local layer sees the
+  // last SWA positions; layer l is local when l % SWA_PATTERN < SWA_PATTERN - 1),
+  // whose RoPE turns at ROPE_BASE_LOCAL, unscaled, while a global layer's
+  // turns at ROPE_BASE with the position times ROPE_SCALE (a linear scaling).
+  float EMB_SCALE = 1.0f;
+  bool post_norms = false, gelu = false;
+  int64_t SWA = 0, SWA_PATTERN = 0;
+  float ROPE_BASE_LOCAL = 10000.0f, ROPE_SCALE = 1.0f;
+  bool is_local(int64_t l) const { return SWA > 0 && l % SWA_PATTERN < SWA_PATTERN - 1; }
+  float rope_base(int64_t l) const { return is_local(l) ? ROPE_BASE_LOCAL : ROPE_BASE; }
+  float rope_scale(int64_t l) const { return is_local(l) ? 1.0f : ROPE_SCALE; }
+  // The attention's q scale: 1 / sqrt(HD), unless the family says otherwise
+  // (QSCALE > 0: Gemma 3 27B's 1 / sqrt(NE / NH)).
+  float QSCALE = 0.0f;
+  float scale() const { return QSCALE > 0.0f ? QSCALE : 1.0f / std::sqrt((float)HD); }
   bool hybrid() const { return INTERVAL > 1; }
+  // The array path (forward(), the per-op oracle) models the plain decoder:
+  // no DeltaNet layers, no Gemma post norms.
+  bool array_path() const { return !hybrid() && !post_norms; }
   bool is_delta(int64_t l) const { return hybrid() && (l + 1) % INTERVAL != 0; }
   // Output widths of the fused projections (and so of the scratch they land in).
   int64_t attn_proj() const { return (NH + 2 * NKV) * HD + (attn_gate ? NH * HD : 0); }
@@ -93,7 +114,7 @@ struct Config {
 // architecture this forward does not implement.
 inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
   const std::string& arch = m.kv("general.architecture").as_str();
-  if (arch != "qwen2" && arch != "qwen3" && arch != "qwen35")
+  if (arch != "qwen2" && arch != "qwen3" && arch != "qwen35" && arch != "gemma3")
     throw std::runtime_error("qwen: unsupported architecture " + arch);
   auto u32 = [&](const char* k) { return (int64_t)m.kv(arch + "." + k).as_u32(); };
   Config c;
@@ -134,7 +155,27 @@ inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
   if (!wq) throw std::runtime_error("qwen: " + a0 + "attn_q.weight missing");
   c.attn_gate = (int64_t)wq->dims[1] == 2 * c.NH * c.HD;
   c.tied_output = m.tensor("output.weight") == nullptr;
-  if (m.tensor("blk.0.post_attention_norm.weight")) c.ffn_norm = "post_attention_norm.weight";
+  // Qwen3.5 names the MLP's input norm post_attention_norm; Gemma 3 has an
+  // ffn_norm and a post_attention_norm both (and a post_ffw_norm).
+  if (!m.tensor("blk.0.ffn_norm.weight") && m.tensor("blk.0.post_attention_norm.weight"))
+    c.ffn_norm = "post_attention_norm.weight";
+  if (arch == "gemma3") {
+    // As llama.cpp's gemma3 (src/models/gemma3.cpp): its norms' weights carry
+    // Gemma's +1 already (the GGUF conversion adds it).
+    c.EMB_SCALE = std::sqrt((float)c.NE);
+    c.post_norms = c.gelu = true;
+    if (m.has(arch + ".attention.sliding_window")) {
+      c.SWA = u32("attention.sliding_window");
+      c.SWA_PATTERN = 6;
+    }
+    if (m.has(arch + ".rope.scaling.type") && m.kv(arch + ".rope.scaling.type").as_str() == "linear")
+      c.ROPE_SCALE = 1.0f / m.kv(arch + ".rope.scaling.factor").as_f32();
+    // The 27B (62 layers) scales q by 1 / sqrt(NE / NH), the others by 1 / sqrt(HD).
+    if (c.NL == 62) c.QSCALE = 1.0f / std::sqrt((float)(c.NE / c.NH));
+    // A local layer's window is not in the attention kernels yet: within it, a
+    // local layer attends exactly as a global one, so the context stops there.
+    if (c.SWA > 0) c.MAXC = std::min(c.MAXC, c.SWA);
+  }
   return c;
 }
 // Prompt tokens per batched prefill pass. Sets the PrefillScratch size (linear in
@@ -470,6 +511,9 @@ struct Layer {
   // rule's state [SH, SDK, SDV].
   array wssm, wsout, wconv, adt, sn;
   storage conv_state, ssm_state;
+  // Gemma 3 (Config::post_norms): the norms of the attention's and the MLP's
+  // outputs, [NE] each.
+  array pa, pf;
 };
 
 // Persistent device scratch for the imperative decode step (C1): every per-step
@@ -882,7 +926,10 @@ inline void stage_embed_rows_(Model& M, const std::vector<int>& ids, int64_t fro
 // and it must fit the cache. One place answers it, so build(), begin() and
 // prefill_batched() cannot disagree.
 inline bool can_prefill_batched(const Model& M, int64_t T) {
+  // Gemma 3's prefill (post norms, GELU, its RoPE) is not batched yet: its
+  // prompt runs token by token.
   return gpu::caps::bf16_gemm && M.row && !M.q4_mlp && (!M.quant || gpu::has_gemm_quant) &&
+         M.c.arch != "gemma3" &&
          !M.layers.empty() &&
          T >= PREFILL_MIN && seq_cache(M).pos + T <= M.c.MAXC;
 }
@@ -974,7 +1021,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
   // is no array-path oracle and no q4 copy.
   const bool nat = quant && row && gpu::has_gemv_quant;
   if (quant && !nat) throw std::runtime_error("qwen: this backend cannot read block-quantized weights natively");
-  const bool oracle_w = oracle && !c.hybrid() && !nat;
+  const bool oracle_w = oracle && c.array_path() && !nat;
   const bool col_wo = oracle_w || (!row && !nat);
   const tl::dtype f32 = tl::dtype::f32;
   Model M{
@@ -1036,6 +1083,10 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
         .qgu = qfused(gu_parts, c.NE),
         .qo = {},
         .qd = qfused({{p + "ffn_down.weight", c.NE}}, c.FF)};
+    if (c.post_norms) {
+      L.pa = load_f32(m, p + "post_attention_norm.weight", c.NE);
+      L.pf = load_f32(m, p + "post_ffw_norm.weight", c.NE);
+    }
     if (c.is_delta(l)) {
       // Gated DeltaNet. The fused projection's order puts z right before the
       // slot the rule writes its output to (Config::ssm_proj).
@@ -1157,7 +1208,7 @@ inline array forward(Model& M, int64_t id, int64_t pos,
   const Config& c = M.c;
   if (!M.layers[0].wq.defined())
     throw std::logic_error(
-        "qwen: the array path needs build(..., oracle=true) and a non-hybrid model");
+        "qwen: the array path needs build(..., oracle=true) and a plain decoder (array_path())");
   double t = prof ? StepProf::now_ms() : 0.0;
   array x = embed_row(M, id);
   if (prof) { prof->embed += StepProf::now_ms() - t; }
@@ -1319,6 +1370,10 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
     else gemv_w(W, a, y, n, k);
   };
   gpu::span x = x0;
+  if (c.EMB_SCALE != 1.0f) {  // Gemma 3: the embedding times sqrt(NE), into res[1] (layer 0 writes res[0])
+    x = sp(S.res[1]);
+    gpu::unary(gpu::kop::affine, x0, x, c.NE, c.EMB_SCALE, 0.0f);
+  }
   gpu::rmsnorm(x, sp(M.layers[0].an), sp(S.hb), c.NE, c.EPS);
   for (int64_t l = 0; l < c.NL; l++) {
     Layer& L = M.layers[l];
@@ -1354,12 +1409,13 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
         gpu::rmsnorm(qp, sp(L.qn), qp, c.HD, c.EPS, c.NH);
         gpu::rmsnorm(kp, sp(L.kn), kp, c.HD, c.EPS, c.NKV);
       }
+      const float base = c.rope_base(l), pscale = c.rope_scale(l);
       if (cap) {
-        gpu::rope_dpos(qp, qp, c.NH, 1, c.HD, d_pos, c.ROPE_BASE, sp(L.bq), c.ROT);
-        gpu::rope_dpos(kp, kp, c.NKV, 1, c.HD, d_pos, c.ROPE_BASE, sp(L.bk), c.ROT);
+        gpu::rope_dpos(qp, qp, c.NH, 1, c.HD, d_pos, base, sp(L.bq), c.ROT, pscale);
+        gpu::rope_dpos(kp, kp, c.NKV, 1, c.HD, d_pos, base, sp(L.bk), c.ROT, pscale);
       } else {
-        gpu::rope(qp, qp, c.NH, 1, c.HD, pos, c.ROPE_BASE, sp(L.bq), c.ROT);
-        gpu::rope(kp, kp, c.NKV, 1, c.HD, pos, c.ROPE_BASE, sp(L.bk), c.ROT);
+        gpu::rope(qp, qp, c.NH, 1, c.HD, pos, base, sp(L.bq), c.ROT, pscale);
+        gpu::rope(kp, kp, c.NKV, 1, c.HD, pos, base, sp(L.bk), c.ROT, pscale);
       }
       if (c.qkv_bias) gpu::binary(gpu::kop::add, vp, sp(L.bv), vp, c.NKV * c.HD, 1, 0);
       if (cap) {
@@ -1380,14 +1436,17 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
       }
       gv(row ? L.wo_row : L.wo, L.qo, ao, ro, c.NE, c.NH * c.HD);  // ro = attn @ wo
     }
+    if (c.post_norms) gpu::rmsnorm(ro, sp(L.pa), ro, c.NE, c.EPS);  // Gemma 3
     // x1 = x + (attn@wo); h2 = rmsnorm(x1, fn) — fused.
     gpu::rmsnorm_res(ro, x, sp(L.fn), ro, sp(S.h2b), c.NE, c.EPS);
-    // Fused gate|up: one GEMV -> [gate(FF) | up(FF)] in S.gub; swiglu reads both.
+    // Fused gate|up: one GEMV -> [gate(FF) | up(FF)] in S.gub; the GLU reads both.
     if (M.q4_mlp) gemv_q4_w(L.wgu_q4, sp(S.h2b), sp(S.gub));  // [NE, 2*FF]
     else gv(L.wgu, L.qgu, sp(S.h2b), sp(S.gub), 2 * c.FF, c.NE);
-    gpu::swiglu(sp(S.gub), sp(S.mb), c.FF);
+    if (c.gelu) gpu::geglu(sp(S.gub), sp(S.mb), c.FF);
+    else gpu::swiglu(sp(S.gub), sp(S.mb), c.FF);
     if (M.q4_mlp) gemv_q4_w(L.wd_q4, sp(S.mb), sp(S.mdb));  // [FF, NE]
     else gv(row ? L.wd_row : L.wd, L.qd, sp(S.mb), sp(S.mdb), c.NE, c.FF);
+    if (c.post_norms) gpu::rmsnorm(sp(S.mdb), sp(L.pf), sp(S.mdb), c.NE, c.EPS);
     // x2 = x1 + mlp; next input norm = rmsnorm(x2, next an | final onorm) — fused.
     const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
     gpu::rmsnorm_res(ro, sp(S.mdb), nextw, ro, sp(S.hb), c.NE, c.EPS);
