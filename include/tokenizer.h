@@ -1,16 +1,26 @@
 #pragma once
-// GPT-2 byte-level BPE tokenizer — the family Qwen2, GPT-2 and their
-// relatives share. Loads the vocab/merges/special tokens from a GGUF model's
-// metadata (tokenizer.ggml.*) and implements the GPT-2 pretokenizer regex
-// (hand-rolled — no std::regex), the byte->unicode symbol mapping, and greedy
-// rank-ordered BPE merging. encode() reproduces HF's fast tokenizer for such a
-// model token-for-token (checked against Qwen2TokenizerFast); decode() inverts
-// it back to raw UTF-8 bytes (special tokens decode to their literal <|...|>
-// text).
+// The tokenizers GGUF files name in tokenizer.ggml.model, loaded from the
+// file's metadata (tokenizer.ggml.*):
+//
+//  - "gpt2": byte-level BPE, the family Qwen2, GPT-2 and their relatives share.
+//    The GPT-2 pretokenizer regex (hand-rolled, no std::regex), the
+//    byte->unicode symbol mapping and rank-ordered merges; token for token HF's
+//    fast tokenizer (checked against Qwen2TokenizerFast).
+//  - "llama": SentencePiece BPE (Gemma, Llama 2). Spaces become U+2581, then
+//    adjacent pieces merge highest score first where the pair is a token, as
+//    llama.cpp's SPM tokenizer does (checked against its llama-tokenize); a
+//    piece the vocabulary lacks falls back to its bytes' <0xXX> tokens.
+//
+// Either way special tokens in the text (CONTROL and USER_DEFINED) are matched
+// whole, and decode() gives back the raw UTF-8 (special tokens as their text).
 //
 // Header-only, C++17, stdlib only (gguf.h adds POSIX mmap).
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <queue>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -32,19 +42,44 @@ class tokenizer {
     for (size_t i = 0; i < tokens_.size(); i++)
       token2id_.emplace(tokens_[i], static_cast<int>(i));
 
-    auto merges = m.kv("tokenizer.ggml.merges").as_str_array();
-    merge_rank_.reserve(merges.size() * 2);
-    for (size_t i = 0; i < merges.size(); i++)
-      merge_rank_.emplace(merges[i], static_cast<int>(i));
+    const auto& tt = m.kv("tokenizer.ggml.token_type");
+    spm_ = m.kv("tokenizer.ggml.model").as_str() == "llama";
+    if (spm_) {
+      const auto& sc = m.kv("tokenizer.ggml.scores");
+      scores_.reserve(sc.arr.size());
+      for (const auto& v : sc.arr) scores_.push_back(static_cast<float>(v.f));
+      if (scores_.size() != tokens_.size())
+        throw std::runtime_error("tokenizer: one score a token");
+      // SentencePiece's default is to prefix a space; Gemma says not to.
+      add_space_prefix_ = !m.has("tokenizer.ggml.add_space_prefix") ||
+                          m.kv("tokenizer.ggml.add_space_prefix").u != 0;
+      for (int b = 0; b < 256; b++) {
+        char name[7];
+        std::snprintf(name, sizeof name, "<0x%02X>", b);
+        auto it = token2id_.find(name);
+        byte_id_[b] = it == token2id_.end() ? -1 : it->second;
+      }
+      for (size_t i = 0; i < tt.arr.size() && i < tokens_.size(); i++)
+        if (tt.arr[i].i == 6) is_byte_.push_back(static_cast<int>(i));
+    } else {
+      auto merges = m.kv("tokenizer.ggml.merges").as_str_array();
+      merge_rank_.reserve(merges.size() * 2);
+      for (size_t i = 0; i < merges.size(); i++)
+        merge_rank_.emplace(merges[i], static_cast<int>(i));
+    }
 
     // Special tokens are matched atomically in encode: CONTROL (type 3, the chat
     // markers) and USER_DEFINED (type 4: HF "added tokens" that are not marked
     // special, e.g. Qwen3's <think> / </think>). Both are literal text the model
     // was trained to see as one id, so neither may fall through to BPE.
-    const auto& tt = m.kv("tokenizer.ggml.token_type");
+    // Indexed by first byte, longest first (Gemma has 6,415 of them).
     for (size_t i = 0; i < tt.arr.size() && i < tokens_.size(); i++)
-      if (tt.arr[i].i == 3 || tt.arr[i].i == 4)
-        specials_.emplace_back(tokens_[i], static_cast<int>(i));
+      if ((tt.arr[i].i == 3 || tt.arr[i].i == 4) && !tokens_[i].empty())
+        specials_[static_cast<uint8_t>(tokens_[i][0])].emplace_back(tokens_[i],
+                                                                    static_cast<int>(i));
+    for (auto& v : specials_)
+      std::stable_sort(v.begin(), v.end(),
+                       [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
 
     eos_id_ = static_cast<int>(m.kv("tokenizer.ggml.eos_token_id").as_u32());
     // Qwen3.5 has no BOS (the template never adds one); -1 marks "none".
@@ -65,32 +100,36 @@ class tokenizer {
     std::vector<int> out;
     size_t seg_start = 0;  // start of the pending normal-text segment
     size_t i = 0;
+    bool after_special = true;  // SentencePiece prefixes a space here (add_space_prefix)
     while (i < text.size()) {
       // Longest special-token match at position i, if any.
       int best_id = -1;
       size_t best_len = 0;
-      for (const auto& sp : specials_) {
-        const std::string& s = sp.first;
-        if (s.size() > best_len && text.compare(i, s.size(), s) == 0) {
-          best_len = s.size();
+      for (const auto& sp : specials_[static_cast<uint8_t>(text[i])]) {
+        if (text.compare(i, sp.first.size(), sp.first) == 0) {
+          best_len = sp.first.size();
           best_id = sp.second;
+          break;
         }
       }
       if (best_id >= 0) {
-        encode_segment_(text.data() + seg_start, i - seg_start, out);
+        if (i > seg_start) encode_segment_(text.data() + seg_start, i - seg_start, after_special, out);
         out.push_back(best_id);
+        after_special = true;
         i += best_len;
         seg_start = i;
       } else {
         i++;
       }
     }
-    encode_segment_(text.data() + seg_start, text.size() - seg_start, out);
+    if (text.size() > seg_start)
+      encode_segment_(text.data() + seg_start, text.size() - seg_start, after_special, out);
     return out;
   }
 
   // Decode ids back to raw UTF-8 bytes (inverse of the byte2cp mapping).
   std::string decode(const std::vector<int>& ids) const {
+    if (spm_) return decode_spm_(ids);
     std::string joined;
     for (int id : ids) {
       if (id < 0 || static_cast<size_t>(id) >= tokens_.size())
@@ -158,9 +197,12 @@ class tokenizer {
   }
 
   // ---- encode pipeline for one normal-text segment --------------------------
-  void encode_segment_(const char* data, size_t len,
+  // One run of text between special tokens; after_special: it follows one
+  // (or opens the text), where SentencePiece may prefix a space.
+  void encode_segment_(const char* data, size_t len, bool after_special,
                        std::vector<int>& out) const {
     if (len == 0) return;
+    if (spm_) return encode_spm_(data, len, after_special, out);
     std::string seg(data, len);
 
     // Decode to codepoints, keeping each codepoint's byte offset (off[k] is the
@@ -300,11 +342,110 @@ class tokenizer {
     }
   }
 
+  // ---- SentencePiece BPE (tokenizer.ggml.model "llama") ----------------------
+  // Spaces as U+2581; one piece a UTF-8 character; then, until none is left,
+  // the adjacent pair whose concatenation is the highest-scoring token (the
+  // leftmost among equal scores) becomes one piece. A piece that is no token
+  // is emitted as its bytes' <0xXX> tokens. llama.cpp's
+  // llm_tokenizer_spm_session, which keeps a priority queue of candidate pairs.
+  void encode_spm_(const char* data, size_t len, bool after_special,
+                   std::vector<int>& out) const {
+    std::string text;
+    if (add_space_prefix_ && after_special) text = "\xe2\x96\x81";
+    for (size_t k = 0; k < len; k++) {
+      if (data[k] == ' ') text += "\xe2\x96\x81";
+      else text += data[k];
+    }
+    struct piece {
+      size_t at, n;
+      int prev, next;
+    };
+    std::vector<piece> ps;
+    for (size_t at = 0; at < text.size();) {
+      const auto c = static_cast<uint8_t>(text[at]);
+      const size_t n = std::min<size_t>(text.size() - at, c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4);
+      ps.push_back({at, n, static_cast<int>(ps.size()) - 1, static_cast<int>(ps.size()) + 1});
+      at += n;
+    }
+    if (ps.empty()) return;
+    ps.back().next = -1;
+    struct pair_ {
+      int left, right;
+      float score;
+      size_t n;
+    };
+    // The top is the highest score, the leftmost among equals.
+    auto lower = [](const pair_& a, const pair_& b) {
+      return a.score < b.score || (a.score == b.score && a.left > b.left);
+    };
+    std::priority_queue<pair_, std::vector<pair_>, decltype(lower)> queue(lower);
+    auto offer = [&](int l, int r) {
+      if (l < 0 || r < 0) return;
+      auto it = token2id_.find(text.substr(ps[l].at, ps[l].n + ps[r].n));
+      if (it != token2id_.end()) queue.push({l, r, scores_[it->second], ps[l].n + ps[r].n});
+    };
+    for (size_t k = 1; k < ps.size(); k++) offer(static_cast<int>(k) - 1, static_cast<int>(k));
+    while (!queue.empty()) {
+      const pair_ b = queue.top();
+      queue.pop();
+      piece &l = ps[b.left], &r = ps[b.right];
+      if (l.n == 0 || r.n == 0 || l.n + r.n != b.n) continue;  // a side merged since
+      l.n += r.n;
+      r.n = 0;
+      l.next = r.next;
+      if (r.next >= 0) ps[r.next].prev = b.left;
+      offer(l.prev, b.left);
+      offer(b.left, l.next);
+    }
+    for (int k = 0; k != -1; k = ps[k].next) {
+      auto it = token2id_.find(text.substr(ps[k].at, ps[k].n));
+      if (it != token2id_.end()) {
+        out.push_back(it->second);
+        continue;
+      }
+      for (size_t j = 0; j < ps[k].n; j++) {
+        const int id = byte_id_[static_cast<uint8_t>(text[ps[k].at + j])];
+        if (id < 0) throw std::runtime_error("tokenizer: no byte token for a piece");
+        out.push_back(id);
+      }
+    }
+  }
+  // U+2581 back to a space, a <0xXX> token to its byte; a leading space the
+  // encoder prefixed is dropped.
+  std::string decode_spm_(const std::vector<int>& ids) const {
+    std::string out;
+    for (int id : ids) {
+      if (id < 0 || static_cast<size_t>(id) >= tokens_.size())
+        throw std::runtime_error("tokenizer: id out of range");
+      if (std::binary_search(is_byte_.begin(), is_byte_.end(), id)) {
+        out += static_cast<char>(std::strtol(tokens_[id].c_str() + 3, nullptr, 16));
+        continue;
+      }
+      const std::string& t = tokens_[id];
+      for (size_t k = 0; k < t.size(); k++) {
+        if (t.compare(k, 3, "\xe2\x96\x81") == 0) {
+          out += ' ';
+          k += 2;
+        } else {
+          out += t[k];
+        }
+      }
+    }
+    if (add_space_prefix_ && !out.empty() && out[0] == ' ') out.erase(0, 1);
+    return out;
+  }
+
   std::vector<std::string> tokens_;                    // id -> vocab string
   std::unordered_map<std::string, int> token2id_;      // vocab string -> id
-  std::unordered_map<std::string, int> merge_rank_;    // "A B" -> rank
-  std::vector<std::pair<std::string, int>> specials_;  // CONTROL + USER_DEFINED tokens
-  std::unordered_map<uint32_t, uint8_t> cp2byte_;      // inverse byte2cp
+  std::unordered_map<std::string, int> merge_rank_;    // "A B" -> rank (gpt2)
+  // CONTROL + USER_DEFINED tokens by first byte, longest first.
+  std::vector<std::pair<std::string, int>> specials_[256];
+  std::unordered_map<uint32_t, uint8_t> cp2byte_;      // inverse byte2cp (gpt2)
+  bool spm_ = false;                                   // tokenizer.ggml.model "llama"
+  std::vector<float> scores_;                          // a token's merge score (spm)
+  bool add_space_prefix_ = true;                       // (spm)
+  int byte_id_[256] = {};                              // <0xXX>'s id (spm)
+  std::vector<int> is_byte_;                           // the byte tokens' ids, ascending (spm)
   int eos_id_ = -1;
   int bos_id_ = -1;
 };

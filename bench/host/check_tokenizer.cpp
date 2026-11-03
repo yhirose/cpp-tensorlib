@@ -1,5 +1,7 @@
-// Token-exact check of tl::tokenizer (include/tokenizer.h) against HF
-// Qwen2.5-0.5B-Instruct ground truth (bench/host/tokenizer_oracle_data.h).
+// Token-exact check of tl::tokenizer (include/tokenizer.h) against ground
+// truth for the file's family: HF's Qwen2.5-0.5B-Instruct tokenizer
+// (tokenizer_oracle_data.h, GPT-2 BPE) or llama.cpp's llama-tokenize on Gemma 3
+// (tokenizer_oracle_gemma3.h, SentencePiece; tools/tokenizer_oracle.py).
 // argv[1] = gguf path. Exit 0 iff every case encodes to the exact id
 // sequence and decode() round-trips the text.
 
@@ -9,6 +11,7 @@
 
 #include "../../include/tokenizer.h"
 #include "tokenizer_oracle_data.h"
+#include "tokenizer_oracle_gemma3.h"
 
 static void print_ids(const char* label, const std::vector<int>& v) {
   std::printf("  %s [", label);
@@ -27,7 +30,16 @@ int main(int argc, char** argv) {
               tok.bos_id(), tok.eos_id());
 
   bool all_ok = true;
-  auto cases = tokoracle::cases();
+  struct oracle_case {
+    std::string text;
+    std::vector<int> ids;
+  };
+  std::vector<oracle_case> cases;
+  if (tl::gguf::model(path).kv("general.architecture").as_str() == "gemma3") {
+    for (auto& c : tokoracle_gemma3::cases()) cases.push_back({c.text, c.ids});
+  } else {
+    for (auto& c : tokoracle::cases()) cases.push_back({c.text, c.ids});
+  }
   for (size_t c = 0; c < cases.size(); c++) {
     const auto& cs = cases[c];
     std::vector<int> got = tok.encode(cs.text);
