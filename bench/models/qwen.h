@@ -1028,10 +1028,13 @@ inline const char* act_form_name(gpu::act_form f) {
   }
   return "?";
 }
-// The decode GEMVs' activation form: TL_GEMV_ACT names it (f32, q8 or h16; q8 when unset),
-// and a form the backend has not got for k-wide inputs falls back to f32.
+// The decode GEMVs' activation form: TL_GEMV_ACT names it (f32, q8 or h16; h16 when
+// unset: as fast as q8 on large models, a few percent behind on small ones, and far
+// closer to f32: Gemma 3 4B's decode KL from the f32 forward 5e-7 against q8's 3e-3,
+// docs/llama-cpp-comparison.md), and a form the backend has not got for k-wide inputs
+// falls back to f32.
 inline gpu::act_form gemv_form_env(int64_t k) {
-  gpu::act_form f = gpu::act_form::q8;
+  gpu::act_form f = gpu::act_form::h16;
   if (const char* e = std::getenv("TL_GEMV_ACT")) {
     bool known = std::strcmp(e, act_form_name(gpu::act_form::f32)) == 0;
     f = gpu::act_form::f32;

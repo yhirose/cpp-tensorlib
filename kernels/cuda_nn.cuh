@@ -2201,11 +2201,11 @@ __global__ void tl_gemv_q4k_q8_row(const signed char* __restrict__ qa, const flo
 
 // ---- Q4_K . f16 activations on the tensor cores (form h16): exact products and f32
 // sums, so the result is the float kernel's on the activation rounded to f16 (to f32
-// summation), near the int8 kernel's speed (decode the same on a 27B model, a few
-// percent behind on small ones, where 16-row blocks fill fewer multiprocessors).
-// The float kernel pays ~12 instructions a
-// weight (above); here a pair of nibbles becomes f16 in two instructions and the
-// tensor cores do the multiplying and adding, ~1.5 a weight. Marlin (IST-DASLab) runs
+// summation), near the int8 kernel's speed. The float kernel pays ~12 instructions
+// a weight (above); here a pair of nibbles becomes f16 in two instructions and the
+// tensor cores do the multiplying and adding, ~3.3 a weight with a thread's scales
+// and addressing (int8's ~2.8): the same decode speed on a 27B model, a few percent
+// behind on small ones, whose memory wait does not hide it. Marlin (IST-DASLab) runs
 // f16 x int4 at small batches the same way; here the blocks are read where they lie
 // (no reshuffle) and a group's scale goes into the f16 operand exactly.
 

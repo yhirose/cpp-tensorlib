@@ -173,7 +173,7 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   const int64_t NP = (int64_t)O.n_prompt, NG = (int64_t)O.n_greedy;
   std::vector<int64_t> want;
   // The f32 forward's logits after a spread-out prompt (a quantized file's: the
-  // reference its int8 forms are held to below).
+  // reference its default forms are held to below).
   const std::vector<int> spread = qm::spread_ids(200, qm::config_from_gguf(m).VOCAB);
   std::vector<float> ref_spread;
   bool ok;
@@ -221,14 +221,15 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
     }
   }
   // The chat's weights: a quantized file's blocks as they lie, else bf16 (a
-  // backend without the bf16 GEMV builds f32 instead, and says so). Its int8
-  // activations (the decode's Q4_K GEMVs, the prefill's MMQ) round each GEMV
-  // input to 8 bits, which moves the logits by an amount that is the model's
-  // (Gemma 3 ~70x Qwen's: docs/llama-cpp-comparison.md, "Accuracy"), so the
-  // structural checks below read the blocks with float activations, where their
-  // bounds hold for every model, and the int8 forms are held to the f32
-  // reference after them. The checks run the f32 sums, so their bounds stay
-  // tight; check_f16_sums holds the default f16 ones to the same prompts after.
+  // backend without the bf16 GEMV builds f32 instead, and says so). Its default
+  // activation forms (the decode's Q4_K GEMVs read f16, the prefill's MMQ int8)
+  // round each GEMV input, the MMQ to 8 bits, which moves the logits by an amount
+  // that is the model's (Gemma 3 ~70x Qwen's: docs/llama-cpp-comparison.md,
+  // "Accuracy"), so the structural checks below read the blocks with float
+  // activations, where their bounds hold for every model, and the default forms
+  // are held to the f32 reference after them. The checks run the f32 sums, so
+  // their bounds stay tight; check_f16_sums holds the default f16 ones to the
+  // same prompts after.
   const int64_t NB = 8;
   qm::Model B = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false,
                           /*f16_acc=*/false, /*quant=*/qm::quant_file(m));
@@ -363,7 +364,7 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   const bool f16_ok = !qm::can_prefill_batched(B, (int64_t)longp.size()) ||
                       check_f16_sums(B, longp, imp_long);
 
-  // The chat's own defaults, int8 activations and f16 sums: the decoder's logits
+  // The chat's own defaults, its activation forms and f16 sums: the decoder's logits
   // after a spread-out prompt, held to the f32 forward's by the KL of their
   // distributions (a chat prompt's next token is too certain for one position to
   // show anything: Gemma 3 4B's KL there is ~1e-13 though its logits move by up to
