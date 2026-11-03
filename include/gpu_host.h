@@ -229,30 +229,21 @@ inline bool rmsnorm(const gpu::arg* v, const void* params, const gpu::grid& g,
   }
   return true;
 }
-inline bool geglu(const gpu::arg* v, const void* params, const gpu::grid& g) {
+// out[r, f] = act(gate) * up over the fused gate|up rows: swiglu and geglu.
+template <class Act>
+inline bool glu(const gpu::arg* v, const void* params, const gpu::grid& g, Act act) {
   const uint32_t ff = as<gpu::swiglu_params>(params).ff;
   const float* gu = at<const float>(v[0]);
   float* o = at<float>(v[1]);
   for (uint32_t r = 0; r < g.gy; r++) {  // rows ride on the grid's y
-    for (uint32_t f = 0; f < ff; f++) {
-      const float x = gu[size_t(r) * 2 * ff + f], up = gu[size_t(r) * 2 * ff + ff + f];
-      const float t = std::tanh(0.79788456080286535587989211986876f * x * (1.0f + 0.044715f * x * x));
-      o[size_t(r) * ff + f] = 0.5f * x * (1.0f + t) * up;
-    }
+    for (uint32_t f = 0; f < ff; f++)
+      o[size_t(r) * ff + f] = act(gu[size_t(r) * 2 * ff + f]) * gu[size_t(r) * 2 * ff + ff + f];
   }
   return true;
 }
-inline bool swiglu(const gpu::arg* v, const void* params, const gpu::grid& g) {
-  const uint32_t ff = as<gpu::swiglu_params>(params).ff;
-  const float* gu = at<const float>(v[0]);
-  float* o = at<float>(v[1]);
-  for (uint32_t r = 0; r < g.gy; r++) {  // rows ride on the grid's y
-    for (uint32_t f = 0; f < ff; f++) {
-      const float gate = gu[size_t(r) * 2 * ff + f], up = gu[size_t(r) * 2 * ff + ff + f];
-      o[size_t(r) * ff + f] = gate / (1.0f + std::exp(-gate)) * up;
-    }
-  }
-  return true;
+inline float silu(float x) { return x / (1.0f + std::exp(-x)); }
+inline float gelu_tanh(float x) {  // GELU's tanh form
+  return 0.5f * x * (1.0f + std::tanh(0.79788456080286535587989211986876f * x * (1.0f + 0.044715f * x * x)));
 }
 inline bool ssm_conv(const gpu::arg* v, const void* params) {
   const auto& p = as<gpu::ssm_conv_params>(params);
@@ -491,8 +482,8 @@ inline bool kernel_(kop k, const gpu::arg* v, const void* params,
     case kop::adam_step_: return d::adam_step(v, params);
     case kop::rmsnorm_: return d::rmsnorm(v, params, g, false);
     case kop::add_rmsnorm_: return d::rmsnorm(v, params, g, true);
-    case kop::swiglu_: return d::swiglu(v, params, g);
-    case kop::geglu_: return d::geglu(v, params, g);
+    case kop::swiglu_: return d::glu(v, params, g, d::silu);
+    case kop::geglu_: return d::glu(v, params, g, d::gelu_tanh);
     case kop::gemv_bf16_row_: return d::gemv_bf16_row(v, params);
     case kop::gemv_q4_: return d::gemv_q4(v, params);
     case kop::kv_append_: return d::kv_append(v, params, g);

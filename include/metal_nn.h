@@ -95,9 +95,10 @@ struct own_nn {
                          int64_t ldc, bool mmq);
   static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                    int64_t D, int64_t pos, float base, gpu::span bias = {});
+  // A scaled position (pos_scale != 1) is not in its kernel: false, the composition.
   static bool rope_partial(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                            int64_t D, int64_t pos, float base, gpu::span bias,
-                           int64_t rot);
+                           int64_t rot, float pos_scale = 1.0f);
   static bool rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T,
                            int64_t D, int64_t pos, float base, int64_t rot,
                            float eps);
@@ -198,9 +199,10 @@ inline bool own_nn::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
 }
 inline bool own_nn::rope_partial(gpu::span x, gpu::span out, int64_t rows,
                               int64_t T, int64_t D, int64_t pos, float base,
-                              gpu::span bias, int64_t rot) {
+                              gpu::span bias, int64_t rot, float pos_scale) {
   auto& c = context::get();
-  if (!c.device || D <= 0 || (D & 1) || rot <= 0 || (rot & 1) || rot > D)
+  if (!c.device || D <= 0 || (D & 1) || rot <= 0 || (rot & 1) || rot > D ||
+      pos_scale != 1.0f)
     return false;
   int64_t half = D / 2;
   int64_t n = rows * half;

@@ -94,33 +94,34 @@ inline bool rmsnorm_res(span x, span delta, span w, span xout, span hout,
          rmsnorm(sum, w, hout, n, eps, rows);
 }
 
-inline bool swiglu(span gu, span o, int64_t ff, int64_t rows) {
-  scratch zero(1, true), g(rows * ff), s(rows * ff), silu(rows * ff);
-  if (!zero || !g || !s || !silu) return false;
-  zero.contents[0] = 0.0f;
-  // gate out of the fused [rows, 2ff] buffer, silu(gate) = gate * sigmoid(gate),
-  // times up read in place.
-  return copy_2d(gu, 2 * ff, 1, zero, g, rows, ff) &&
-         unary(kop::sigmoid, g, s, rows * ff, 1.0f, 0.0f) &&
-         binary(kop::mul, g, s, silu, rows * ff, 1.0f, 0.0f) &&
-         binary_bcast(kop::bmul, silu, ff, 1, gu.at(ff * 4), 2 * ff, 1, o, rows,
-                      ff, 1.0f, 0.0f);
-}
-
-// gelu(gate) * up, GELU's tanh form: 0.5 g (1 + tanh(sqrt(2/pi) g (1 + 0.044715
-// g^2))), each step an affine epilogue of the one before (no launch writes a
-// buffer it reads: WebGPU refuses that).
-inline bool geglu(span gu, span o, int64_t ff, int64_t rows) {
+// out[rows, ff] = gate * factor(gate) * up from the fused [rows, 2ff] buffer:
+// the gate copied out, `factor(g, a, b, n)` writing its factor into a (b free
+// for its steps), and up read in place. No launch writes a buffer it reads
+// (WebGPU refuses that).
+template <class Factor>
+inline bool glu(span gu, span o, int64_t ff, int64_t rows, Factor factor) {
   const int64_t n = rows * ff;
   scratch zero(1, true), g(n), a(n), b(n);
   if (!zero || !g || !a || !b) return false;
   zero.contents[0] = 0.0f;
-  return copy_2d(gu, 2 * ff, 1, zero, g, rows, ff) &&
-         binary(kop::mul, g, g, a, n, 0.044715f, 1.0f) &&                 // 1 + c g^2
-         binary(kop::mul, g, a, b, n, 0.79788456080286535587989211986876f, 0.0f) &&
-         unary_ext(unary_ext_op::tanh_, b, a, n, 0.5f, 0.5f) &&           // (1 + tanh) / 2
+  return copy_2d(gu, 2 * ff, 1, zero, g, rows, ff) && factor(g, a, b, n) &&
          binary(kop::mul, g, a, b, n, 1.0f, 0.0f) &&
          binary_bcast(kop::bmul, b, ff, 1, gu.at(ff * 4), 2 * ff, 1, o, rows, ff, 1.0f, 0.0f);
+}
+// silu(g) = g sigmoid(g).
+inline bool swiglu(span gu, span o, int64_t ff, int64_t rows) {
+  return glu(gu, o, ff, rows, [](span g, span a, span, int64_t n) {
+    return unary(kop::sigmoid, g, a, n, 1.0f, 0.0f);
+  });
+}
+// GELU's tanh form: g (1 + tanh(sqrt(2/pi) g (1 + 0.044715 g^2))) / 2, each
+// step an affine epilogue of the one before.
+inline bool geglu(span gu, span o, int64_t ff, int64_t rows) {
+  return glu(gu, o, ff, rows, [](span g, span a, span b, int64_t n) {
+    return binary(kop::mul, g, g, a, n, 0.044715f, 1.0f) &&  // 1 + c g^2
+           binary(kop::mul, g, a, b, n, 0.79788456080286535587989211986876f, 0.0f) &&
+           unary_ext(unary_ext_op::tanh_, b, a, n, 0.5f, 0.5f);  // (1 + tanh) / 2
+  });
 }
 
 // A GEMV is a GEMM with one row.
@@ -576,35 +577,25 @@ inline bool split_heads(span src, span bias, span dst, int64_t T, int64_t ld,
 // each row, the partial RoPE of Qwen3.5: a backend's own `rope` turns the
 // whole row, and one that also has `rope_partial` takes the rest. pos_scale
 // multiplies the position (a linear RoPE scaling, Gemma 3's global layers):
-// a backend's own `rope_scaled` takes it, else the composition.
+// a scaled rope is `rope_partial`'s too, which returns false where the
+// backend cannot scale (the composition then).
 TL_GPU_DETECT_OWN(rope)
 TL_GPU_DETECT_OWN(rope_partial)
-TL_GPU_DETECT_OWN(rope_scaled)
 template <class Own = own>
 inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
                  int64_t pos, float base, span bias = {}, int64_t rot = 0,
                  float pos_scale = 1.0f) {
   if (rot == 0) rot = D;
-  if (pos_scale != 1.0f) {
-    if constexpr (detail::owns_rope_scaled<Own>::value) {
-      if (detail::ran(Own::rope_scaled(x, o, rows, T, D, pos, base, bias, rot, pos_scale)))
-        return true;
-    }
-    return generic::rope(x, o, rows, T, D, pos, base, bias, rot, pos_scale);
-  }
+  const bool plain = rot == D && pos_scale == 1.0f;
   if constexpr (detail::owns_rope<Own>::value) {
-    if (rot == D &&
-        detail::ran(Own::rope(x, o, rows, T, D, pos, base, bias))) {
-      return true;
-    }
+    if (plain && detail::ran(Own::rope(x, o, rows, T, D, pos, base, bias))) return true;
   }
   if constexpr (detail::owns_rope_partial<Own>::value) {
-    if (rot != D &&
-        detail::ran(Own::rope_partial(x, o, rows, T, D, pos, base, bias, rot))) {
+    if (!plain &&
+        detail::ran(Own::rope_partial(x, o, rows, T, D, pos, base, bias, rot, pos_scale)))
       return true;
-    }
   }
-  return generic::rope(x, o, rows, T, D, pos, base, bias, rot);
+  return generic::rope(x, o, rows, T, D, pos, base, bias, rot, pos_scale);
 }
 
 // ---- the GEMVs and GEMMs over bf16, f16 and block-quantized weights, the

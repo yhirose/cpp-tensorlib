@@ -90,42 +90,44 @@ extern "C" __global__ void tl_add_rmsnorm_h16(const float* __restrict__ a,
   rmsnorm_core<true>(a, b, w, xout, hout, n, eps, hout16);
 }
 
-extern "C" {
 // SwiGLU straight out of the FUSED gate|up projection: gu is [rows, 2*ff] (row r
 // holds gate(ff) then up(ff)), out is [rows, ff]. Both paths already produce
 // that fused layout, so neither has to split it into two projections.
-// out = silu(gate) * up; grid = (ceil(ff/256), rows).
-extern "C" __global__ void tl_swiglu(const float* __restrict__ gu,
-                                     float* __restrict__ out, unsigned ff) {
-  unsigned f = blockIdx.x * blockDim.x + threadIdx.x;
-  if (f >= ff) return;
-  const size_t src = (size_t)blockIdx.y * 2u * ff + f;
-  float g = gu[src];
-  out[(size_t)blockIdx.y * ff + f] = (g / (1.0f + expf(-g))) * gu[src + ff];
-}
+// out = act(gate) * up; grid = (ceil(ff/256), rows).
+struct silu_act_ {
+  __device__ float operator()(float g) const { return g / (1.0f + expf(-g)); }
+};
 // GELU, tanh form (ggml's and PyTorch's approximate='tanh'), as their CUDA
 // kernels write it: Gemma's activation.
-__device__ __forceinline__ float gelu_tanh_(float x) {
-  return 0.5f * x * (1.0f + tanhf(0.79788456080286535587989211986876f * x * (1.0f + 0.044715f * x * x)));
-}
-// out[rows, ff] = gelu(gate) * up from the fused gate|up buffer: tl_swiglu's
-// layout and grid.
-extern "C" __global__ void tl_geglu(const float* __restrict__ gu,
-                                    float* __restrict__ out, unsigned ff) {
+struct gelu_tanh_act_ {
+  __device__ float operator()(float x) const {
+    return 0.5f * x * (1.0f + tanhf(0.79788456080286535587989211986876f * x * (1.0f + 0.044715f * x * x)));
+  }
+};
+__device__ __forceinline__ void glu_store_(float* p, float v) { *p = v; }
+__device__ __forceinline__ void glu_store_(__half* p, float v) { *p = __float2half(v); }
+template <class Act, class Out>
+__device__ __forceinline__ void glu_core_(const float* __restrict__ gu, Out* __restrict__ out,
+                                          unsigned ff) {
   unsigned f = blockIdx.x * blockDim.x + threadIdx.x;
   if (f >= ff) return;
   const size_t src = (size_t)blockIdx.y * 2u * ff + f;
-  out[(size_t)blockIdx.y * ff + f] = gelu_tanh_(gu[src]) * gu[src + ff];
+  glu_store_(out + (size_t)blockIdx.y * ff + f, Act{}(gu[src]) * gu[src + ff]);
+}
+extern "C" __global__ void tl_swiglu(const float* __restrict__ gu,
+                                     float* __restrict__ out, unsigned ff) {
+  glu_core_<silu_act_>(gu, out, ff);
+}
+extern "C" __global__ void tl_geglu(const float* __restrict__ gu,
+                                    float* __restrict__ out, unsigned ff) {
+  glu_core_<gelu_tanh_act_>(gu, out, ff);
 }
 // tl_swiglu writing only f16: the activation only the down GEMM reads.
 extern "C" __global__ void tl_swiglu_h16(const float* __restrict__ gu,
                                          __half* __restrict__ out, unsigned ff) {
-  unsigned f = blockIdx.x * blockDim.x + threadIdx.x;
-  if (f >= ff) return;
-  const size_t src = (size_t)blockIdx.y * 2u * ff + f;
-  float g = gu[src];
-  out[(size_t)blockIdx.y * ff + f] = __float2half((g / (1.0f + expf(-g))) * gu[src + ff]);
+  glu_core_<silu_act_>(gu, out, ff);
 }
+extern "C" {
 // Qwen3.5's gated norm of the DeltaNet output: out[t, h D + d] = silu(z) * o * w[d] /
 // sqrt(mean_d o^2 + eps), o's rows (t H + h) D wide and contiguous, z's at t ldz + h D.
 // One warp a row, so a short row is not a block of mostly idle threads, and bit for bit

@@ -102,9 +102,6 @@ struct own_nn {
   static bool rope_partial(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                            int64_t D, int64_t pos, float base, gpu::span bias,
                            int64_t rot, float pos_scale = 1.0f);
-  static bool rope_scaled(gpu::span x, gpu::span out, int64_t rows, int64_t T, int64_t D,
-                          int64_t pos, float base, gpu::span bias, int64_t rot,
-                          float pos_scale);
   static bool layer_norm_bwd(gpu::span x, gpu::span g, gpu::span dy,
                              gpu::span dx, gpu::span dg, gpu::span db,
                              gpu::span stats, gpu::span partials, int64_t rows,
@@ -885,11 +882,6 @@ inline bool own_nn::attn_prefill_dkv(gpu::span q, gpu::span K, gpu::span V,
 inline bool own_nn::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                       int64_t D, int64_t pos, float base, gpu::span bias) {
   return rope_partial(x, out, rows, T, D, pos, base, bias, D);
-}
-inline bool own_nn::rope_scaled(gpu::span x, gpu::span out, int64_t rows, int64_t T,
-                                int64_t D, int64_t pos, float base, gpu::span bias,
-                                int64_t rot, float pos_scale) {
-  return rope_partial(x, out, rows, T, D, pos, base, bias, rot, pos_scale);
 }
 inline bool own_nn::rope_partial(gpu::span x, gpu::span out, int64_t rows,
                               int64_t T, int64_t D, int64_t pos, float base,
