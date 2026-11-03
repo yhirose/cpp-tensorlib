@@ -206,25 +206,35 @@ inline bool layer_norm(const gpu::arg* v, const void* params) {
   }
   return true;
 }
-// hout = v * rsqrt(mean(v^2) + eps) * w per row, v = x (+ delta, also stored).
+// 1 / sqrt(mean(v^2) + eps) over a row of n.
+inline float rms_inv(const float* v, uint32_t n, float eps) {
+  double ss = 0;
+  for (uint32_t i = 0; i < n; i++) ss += double(v[i]) * v[i];
+  return static_cast<float>(1.0 / std::sqrt(ss / n + eps));
+}
+// hout = v * rsqrt(mean(v^2) + eps) * w per row, v = x (+ delta, also stored;
+// norm_delta: + rmsnorm(delta) * wd, the operands x, delta, wd, w, xout, hout).
 inline bool rmsnorm(const gpu::arg* v, const void* params, const gpu::grid& g,
-                    bool add) {
+                    bool add, bool norm_delta = false) {
   const auto& p = as<gpu::rmsnorm_params>(params);
+  const int k = norm_delta ? 1 : 0;  // wd's slot shifts w, xout and hout
   const float* x = at<const float>(v[0]);
   const float* delta = add ? at<const float>(v[1]) : nullptr;
-  const float* w = at<const float>(v[add ? 2 : 1]);
-  float* xout = add ? at<float>(v[3]) : nullptr;
-  float* hout = at<float>(v[add ? 4 : 2]);
+  const float* wd = norm_delta ? at<const float>(v[2]) : nullptr;
+  const float* w = at<const float>(v[add ? 2 + k : 1]);
+  float* xout = add ? at<float>(v[3 + k]) : nullptr;
+  float* hout = at<float>(v[add ? 4 + k : 2]);
   for (uint32_t r = 0; r < g.gx; r++) {  // one group a row
     const size_t base = size_t(r) * p.n;
-    double ss = 0;
-    for (uint32_t i = 0; i < p.n; i++) {
-      const float val = add ? x[base + i] + delta[base + i] : x[base + i];
-      if (add) xout[base + i] = val;
-      ss += double(val) * val;
+    const float invd = norm_delta ? rms_inv(delta + base, p.n, p.eps) : 0.0f;
+    if (add) {
+      for (uint32_t i = 0; i < p.n; i++) {
+        const float d = norm_delta ? delta[base + i] * invd * wd[i] : delta[base + i];
+        xout[base + i] = x[base + i] + d;
+      }
     }
-    const float inv = static_cast<float>(1.0 / std::sqrt(ss / p.n + p.eps));
     const float* src = add ? xout : x;
+    const float inv = rms_inv(src + base, p.n, p.eps);
     for (uint32_t i = 0; i < p.n; i++) hout[base + i] = src[base + i] * inv * w[i];
   }
   return true;
@@ -482,6 +492,7 @@ inline bool kernel_(kop k, const gpu::arg* v, const void* params,
     case kop::adam_step_: return d::adam_step(v, params);
     case kop::rmsnorm_: return d::rmsnorm(v, params, g, false);
     case kop::add_rmsnorm_: return d::rmsnorm(v, params, g, true);
+    case kop::norm_add_rmsnorm_: return d::rmsnorm(v, params, g, true, true);
     case kop::swiglu_: return d::glu(v, params, g, d::silu);
     case kop::geglu_: return d::glu(v, params, g, d::gelu_tanh);
     case kop::gemv_bf16_row_: return d::gemv_bf16_row(v, params);

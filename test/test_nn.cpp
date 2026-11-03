@@ -977,6 +977,24 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     CHECK(same(xa, xb, 0.0f));
     CHECK(same(ha, hb, 1e-5f));
 
+    // The branch normalized first (wd), xout written over delta as the decode has
+    // it: the op, and the composition, against the two ops it stands for.
+    array wd = dev(random_array({n}, 957));
+    array nd = array::empty({rows, n}), xr = array::empty({rows, n}), hr = array::empty({rows, n});
+    REQUIRE(gen::rmsnorm(d.device_span(), wd.device_span(), nd.device_span(), n, 1e-6f, rows));
+    REQUIRE(gen::rmsnorm_res(x.device_span(), nd.device_span(), w.device_span(), xr.device_span(),
+                             hr.device_span(), n, 1e-6f, rows));
+    for (const bool op : {true, false}) {
+      CAPTURE(op);
+      array dd = dev(d * 1.0f), hd = array::empty({rows, n});
+      const auto run = op ? &gpu::rmsnorm_res : &gen::rmsnorm_res;
+      REQUIRE(run(x.device_span(), dd.device_span(), w.device_span(), dd.device_span(),
+                  hd.device_span(), n, 1e-6f, rows, wd.device_span()));
+      tl::gpu::flush();
+      CHECK(same(dd, xr, 1e-5f));
+      CHECK(same(hd, hr, 1e-5f));
+    }
+
     array gu = dev(random_array({rows, 2 * ff}, 953));
     array oa = array::empty({rows, ff}), ob = array::empty({rows, ff});
     REQUIRE(gpu::swiglu(gu.device_span(), oa.device_span(), ff, rows));

@@ -25,31 +25,56 @@ extern "C" {
 // same reduction either way, so ONE core serves both, with ADD a template
 // parameter so the fused-add path compiles out of the plain kernel by
 // construction rather than by trusting constant propagation.
+//
+// NORM_B normalizes the branch first, xout = a + rmsnorm(b) * wb (Gemma's norms
+// of the attention's and the MLP's outputs), bit for bit tl_rmsnorm of b then
+// tl_add_rmsnorm: the same sum of squares, and the normalized value rounded
+// before the add (__fmul_rn: no FMA folds it into the sum).
 }  // extern "C"
-template <bool ADD>
-__device__ __forceinline__ void rmsnorm_core(
-    const float* __restrict__ a, const float* __restrict__ b,
-    const float* __restrict__ w, float* __restrict__ xout,
-    float* __restrict__ hout, unsigned n, float eps, __half* __restrict__ h16 = nullptr) {
+// 1 / sqrt(mean(v^2) + eps) for the row, from each thread's partial sum of
+// squares: the one tree every norm here sums in. Returns after a barrier, so a
+// second norm in the same block may reuse the shared memory.
+__device__ __forceinline__ float rms_inv_(float acc, unsigned n, float eps) {
   extern __shared__ float sm[];
-  const size_t base = (size_t)blockIdx.x * n;
-  unsigned t = threadIdx.x, T = blockDim.x;
-  float acc = 0.0f;
-  for (unsigned i = t; i < n; i += T) {
-    float v = a[base + i];
-    if constexpr (ADD) {
-      v += b[base + i];
-      xout[base + i] = v;
-    }
-    acc += v * v;
-  }
+  const unsigned t = threadIdx.x, T = blockDim.x;
   sm[t] = acc;
   __syncthreads();
   for (unsigned s = T >> 1; s > 0; s >>= 1) {
     if (t < s) sm[t] += sm[t + s];
     __syncthreads();
   }
-  float inv = 1.0f / sqrtf(sm[0] / (float)n + eps);
+  const float inv = 1.0f / sqrtf(sm[0] / (float)n + eps);
+  __syncthreads();
+  return inv;
+}
+template <bool ADD, bool NORM_B = false>
+__device__ __forceinline__ void rmsnorm_core(
+    const float* __restrict__ a, const float* __restrict__ b,
+    const float* __restrict__ w, float* __restrict__ xout,
+    float* __restrict__ hout, unsigned n, float eps, __half* __restrict__ h16 = nullptr,
+    const float* __restrict__ wb = nullptr) {
+  const size_t base = (size_t)blockIdx.x * n;
+  unsigned t = threadIdx.x, T = blockDim.x;
+  float invb = 0.0f;
+  if constexpr (NORM_B) {
+    float accb = 0.0f;
+    for (unsigned i = t; i < n; i += T) {
+      float v = b[base + i];
+      accb += v * v;
+    }
+    invb = rms_inv_(accb, n, eps);
+  }
+  float acc = 0.0f;
+  for (unsigned i = t; i < n; i += T) {
+    float v = a[base + i];
+    if constexpr (ADD) {
+      if constexpr (NORM_B) v += __fmul_rn(__fmul_rn(b[base + i], invb), wb[i]);
+      else v += b[base + i];
+      xout[base + i] = v;
+    }
+    acc += v * v;
+  }
+  const float inv = rms_inv_(acc, n, eps);
   for (unsigned i = t; i < n; i += T) {
     const float h = (ADD ? xout[base + i] : a[base + i]) * inv * w[i];
     if (hout) hout[base + i] = h;  // null: only the f16 copy is read
@@ -88,6 +113,26 @@ extern "C" __global__ void tl_add_rmsnorm_h16(const float* __restrict__ a,
                                               __half* __restrict__ hout16,
                                               unsigned n, float eps) {
   rmsnorm_core<true>(a, b, w, xout, hout, n, eps, hout16);
+}
+// tl_add_rmsnorm / _h16 with the branch b normalized first (wb its weight).
+extern "C" __global__ void tl_norm_add_rmsnorm(const float* __restrict__ a,
+                                               const float* __restrict__ b,
+                                               const float* __restrict__ wb,
+                                               const float* __restrict__ w,
+                                               float* __restrict__ xout,
+                                               float* __restrict__ hout, unsigned n,
+                                               float eps) {
+  rmsnorm_core<true, true>(a, b, w, xout, hout, n, eps, nullptr, wb);
+}
+extern "C" __global__ void tl_norm_add_rmsnorm_h16(const float* __restrict__ a,
+                                                   const float* __restrict__ b,
+                                                   const float* __restrict__ wb,
+                                                   const float* __restrict__ w,
+                                                   float* __restrict__ xout,
+                                                   float* __restrict__ hout,
+                                                   __half* __restrict__ hout16,
+                                                   unsigned n, float eps) {
+  rmsnorm_core<true, true>(a, b, w, xout, hout, n, eps, hout16, wb);
 }
 
 // SwiGLU straight out of the FUSED gate|up projection: gu is [rows, 2*ff] (row r

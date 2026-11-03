@@ -57,6 +57,7 @@ namespace gpu {
   X(layer_norm_bwd_dx_) X(layer_norm_bwd_gb_) X(layer_norm_bwd_gb_fold_)       \
   X(rmsnorm_) X(add_rmsnorm_) X(swiglu_) X(split_heads_) X(merge_heads_)       \
   X(geglu_)          /* gelu(gate) * up: Gemma's MLP */                        \
+  X(norm_add_rmsnorm_) /* x + rmsnorm(delta), then rmsnorm (post norms) */     \
   X(gemv_f32_) X(gemv_bf16_) X(gemv_q4_) /* decode GEMVs, per weight dtype */  \
   X(gemv_combine_)   /* their split-K partials */                              \
   X(gemv_bf16_row_)  /* ... and the [N,K] weight layout's own */               \

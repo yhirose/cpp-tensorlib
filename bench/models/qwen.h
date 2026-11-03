@@ -533,7 +533,7 @@ struct Layer {
   array wssm, wsout, wconv, adt, sn;
   storage conv_state, ssm_state;
   // Config::post_norms (Gemma 3): the norms of the attention's and the MLP's
-  // outputs, [NE] each.
+  // outputs, [NE] each (rmsnorm_res's wd); empty otherwise.
   array pa, pf;
 };
 
@@ -1457,19 +1457,18 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
       }
       gv(row ? L.wo_row : L.wo, L.qo, ao, ro, c.NE, c.NH * c.HD);  // ro = attn @ wo
     }
-    if (c.post_norms) gpu::rmsnorm(ro, sp(L.pa), ro, c.NE, c.EPS);  // Gemma 3
-    // x1 = x + (attn@wo); h2 = rmsnorm(x1, fn) — fused.
-    gpu::rmsnorm_res(ro, x, sp(L.fn), ro, sp(S.h2b), c.NE, c.EPS);
+    // x1 = x + (attn@wo) (Gemma 3: normalized by pa first); h2 = rmsnorm(x1, fn) — fused.
+    gpu::rmsnorm_res(x, ro, sp(L.fn), ro, sp(S.h2b), c.NE, c.EPS, 1, sp(L.pa));
     // Fused gate|up: one GEMV -> [gate(FF) | up(FF)] in S.gub; the GLU reads both.
     if (M.q4_mlp) gemv_q4_w(L.wgu_q4, sp(S.h2b), sp(S.gub));  // [NE, 2*FF]
     else gv(L.wgu, L.qgu, sp(S.h2b), sp(S.gub), 2 * c.FF, c.NE);
     gpu::glu(c.act, sp(S.gub), sp(S.mb), c.FF);
     if (M.q4_mlp) gemv_q4_w(L.wd_q4, sp(S.mb), sp(S.mdb));  // [FF, NE]
     else gv(row ? L.wd_row : L.wd, L.qd, sp(S.mb), sp(S.mdb), c.NE, c.FF);
-    if (c.post_norms) gpu::rmsnorm(sp(S.mdb), sp(L.pf), sp(S.mdb), c.NE, c.EPS);
-    // x2 = x1 + mlp; next input norm = rmsnorm(x2, next an | final onorm) — fused.
+    // x2 = x1 + mlp (Gemma 3: normalized by pf first); next input norm = rmsnorm(x2,
+    // next an | final onorm) — fused.
     const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
-    gpu::rmsnorm_res(ro, sp(S.mdb), nextw, ro, sp(S.hb), c.NE, c.EPS);
+    gpu::rmsnorm_res(ro, sp(S.mdb), nextw, ro, sp(S.hb), c.NE, c.EPS, 1, sp(L.pf));
     x = ro;
   }
   // hb now holds the final RMSNorm output (folded into the last layer's seam).

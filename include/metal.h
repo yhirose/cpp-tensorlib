@@ -267,6 +267,7 @@ struct context {
       case kop::argmax_: return "argmax_";
       case kop::rmsnorm_: return "rmsnorm_";
       case kop::add_rmsnorm_: return "add_rmsnorm_";
+      case kop::norm_add_rmsnorm_: return "";  // no kernel here: the composition
       case kop::swiglu_: return "swiglu_";
       case kop::geglu_: return "";  // no kernel here: the composition (gpu_ops_nn.h)
       case kop::split_heads_: return "split_heads_";

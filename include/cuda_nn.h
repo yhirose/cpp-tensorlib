@@ -48,9 +48,10 @@ struct own_nn {
                                       int64_t M, int64_t N, int64_t K);
   static bool rmsnorm_h16(gpu::span x, gpu::span w, gpu::span o, gpu::span o16,
                           int64_t n, float eps, int64_t rows);
+  // (wd: the branch normalized first, as gpu::rmsnorm_res's)
   static bool rmsnorm_res_h16(gpu::span x, gpu::span delta, gpu::span w,
                               gpu::span xout, gpu::span hout, gpu::span hout16,
-                              int64_t n, float eps, int64_t rows);
+                              int64_t n, float eps, int64_t rows, gpu::span wd = {});
   static bool swiglu_h16(gpu::span gu, gpu::span o16, int64_t ff, int64_t rows);
   static bool geglu_h16(gpu::span gu, gpu::span o16, int64_t ff, int64_t rows);
   // out = silu(z) * rmsnorm(o) * w over T x H rows of D (tl_gated_rmsnorm): o contiguous,
@@ -524,10 +525,16 @@ inline bool own_nn::rmsnorm_h16(gpu::span x, gpu::span w, gpu::span o, gpu::span
 }
 inline bool own_nn::rmsnorm_res_h16(gpu::span x, gpu::span delta, gpu::span w,
                                  gpu::span xout, gpu::span hout, gpu::span hout16,
-                                 int64_t n, float eps, int64_t rows) {
+                                 int64_t n, float eps, int64_t rows, gpu::span wd) {
   auto& c = context::get();
   if (!c.ready) return false;
   const gpu::rmsnorm_params p{static_cast<uint32_t>(n), eps};
+  if (wd.buf) {
+    const gpu::arg args[] = {gpu::in(x),     gpu::in(delta), gpu::in(wd),    gpu::in(w),
+                             gpu::out(xout), gpu::out(hout), gpu::out(hout16)};
+    return c.dispatch_(c.cached_(c.norm_add_rmsnorm_h16_fn, "tl_norm_add_rmsnorm_h16"), args, 7,
+                       &p, sizeof(p), gpu::policy::one_group_per_row(rows));
+  }
   const gpu::arg args[] = {gpu::in(x),    gpu::in(delta), gpu::in(w),
                            gpu::out(xout), gpu::out(hout), gpu::out(hout16)};
   return c.dispatch_(c.cached_(c.add_rmsnorm_h16_fn, "tl_add_rmsnorm_h16"), args, 6, &p,

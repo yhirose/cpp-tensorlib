@@ -263,6 +263,7 @@ inline const char* kernel_name_(kop op) {
     case kop::adam_step_: return "tl_adam_step";
     case kop::rmsnorm_: return "tl_rmsnorm";
     case kop::add_rmsnorm_: return "tl_add_rmsnorm";
+    case kop::norm_add_rmsnorm_: return "tl_norm_add_rmsnorm";
     case kop::swiglu_: return "tl_swiglu";
     case kop::geglu_: return "tl_geglu";
     case kop::ssm_conv_: return "tl_ssm_conv";
@@ -648,7 +649,7 @@ struct context {
   CUfunction rmsnorm_rope_fn[3] = {};  // D 64, 128, 256
   CUfunction gated_rmsnorm_fn[2] = {};
   CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, swiglu_h16_fn = nullptr,
-             geglu_h16_fn = nullptr,
+             geglu_h16_fn = nullptr, norm_add_rmsnorm_h16_fn = nullptr,
              merge_heads_h16_fn = nullptr, cvt_h16_fn = nullptr;  // the f16 activation's producers
   CUfunction conv_tok_fn = nullptr, conv_state_fn = nullptr;  // a prefill's conv
   CUfunction conv_tok_() { return cached_(conv_tok_fn, "tl_ssm_conv_tokens"); }

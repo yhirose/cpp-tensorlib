@@ -82,12 +82,17 @@ inline bool rmsnorm(span x, span w, span o, int64_t n, float eps,
 }
 
 inline bool rmsnorm_res(span x, span delta, span w, span xout, span hout,
-                        int64_t n, float eps, int64_t rows) {
-  if (xout.buf != x.buf) {
+                        int64_t n, float eps, int64_t rows, span wd = {}) {
+  if (wd.buf) {  // the branch normalized first, into a buffer of this layer's own
+    scratch nd(rows * n);
+    return nd && rmsnorm(delta, wd, nd, n, eps, rows) &&
+           rmsnorm_res(x, nd, w, xout, hout, n, eps, rows);
+  }
+  if (xout.buf != x.buf && xout.buf != delta.buf) {
     return binary(kop::add, x, delta, xout, rows * n, 1.0f, 0.0f) &&
            rmsnorm(xout, w, hout, n, eps, rows);
   }
-  // xout aliases x: the sum goes through a buffer of this layer's own.
+  // xout aliases an input: the sum goes through a buffer of this layer's own.
   scratch sum(rows * n);
   return sum && binary(kop::add, x, delta, sum, rows * n, 1.0f, 0.0f) &&
          unary(kop::affine, sum, xout, rows * n, 1.0f, 0.0f) &&
@@ -427,15 +432,20 @@ inline bool rmsnorm(span x, span w, span o, int64_t n, float eps,
 }
 
 // xout = x + delta and hout = rmsnorm(xout) * w: a residual add folded into
-// the norm that follows it. xout may alias x.
+// the norm that follows it. With wd the branch is normalized first, xout = x +
+// rmsnorm(delta) * wd (Gemma's norms of the attention's and the MLP's outputs).
+// xout may alias x or delta.
 inline bool rmsnorm_res(span x, span delta, span w, span xout, span hout,
-                        int64_t n, float eps, int64_t rows = 1) {
+                        int64_t n, float eps, int64_t rows = 1, span wd = {}) {
   if (n <= 0 || rows <= 0) return false;
-  return launch(kop::add_rmsnorm_,
-                {in(x), in(delta), in(w), out(xout), out(hout)},
-                rmsnorm_params{static_cast<uint32_t>(n), eps},
-                policy::one_group_per_row(rows)) ||
-         generic::rmsnorm_res(x, delta, w, xout, hout, n, eps, rows);
+  const rmsnorm_params p{static_cast<uint32_t>(n), eps};
+  const bool ran =
+      wd.buf ? launch(kop::norm_add_rmsnorm_,
+                      {in(x), in(delta), in(wd), in(w), out(xout), out(hout)}, p,
+                      policy::one_group_per_row(rows))
+             : launch(kop::add_rmsnorm_, {in(x), in(delta), in(w), out(xout), out(hout)}, p,
+                      policy::one_group_per_row(rows));
+  return ran || generic::rmsnorm_res(x, delta, w, xout, hout, n, eps, rows, wd);
 }
 
 // out[rows, ff] = act(gate) * up out of the fused gate|up buffer [rows, 2ff].
@@ -760,8 +770,8 @@ TL_GPU_F16_OP(rmsnorm_h16, (span x, span w, span o, span o16, int64_t n, float e
               (x, w, o, o16, n, eps, rows))
 TL_GPU_F16_OP(rmsnorm_res_h16,
               (span x, span delta, span w, span xout, span hout, span hout16, int64_t n, float eps,
-               int64_t rows),
-              (x, delta, w, xout, hout, hout16, n, eps, rows))
+               int64_t rows, span wd = {}),
+              (x, delta, w, xout, hout, hout16, n, eps, rows, wd))
 TL_GPU_F16_OP(swiglu_h16, (span gu, span o16, int64_t ff, int64_t rows), (gu, o16, ff, rows))
 TL_GPU_F16_OP(geglu_h16, (span gu, span o16, int64_t ff, int64_t rows), (gu, o16, ff, rows))
 TL_GPU_F16_OP(merge_heads_h16, (span src, span dst16, int64_t T, int64_t H, int64_t D),

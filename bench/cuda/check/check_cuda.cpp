@@ -408,6 +408,61 @@ int main() {
     for (void* b : {o, z, w, f, h, zc, zn, r, rh}) release(b, 0, nullptr);
   }
 
+  // ---- Gemma's norm of a branch before the residual add, in one pass (rmsnorm_res with
+  // wd) against rmsnorm then rmsnorm_res, bit for bit: xout, hout, and the f16 form's
+  // xout, hout and hout16 (the f32 hout rounded). The f32 form writes xout over delta,
+  // as the decode does. n = 2560 is Gemma 3 4B's, past the 256 threads; 1 row a decode
+  // step, 37 a prefill chunk.
+  for (const int64_t rows : {1, 37}) {
+    const int64_t n = 2560, N = rows * n;
+    float *cx = nullptr, *cd = nullptr, *cd2 = nullptr, *cwd = nullptr, *cw = nullptr,
+          *cnd = nullptr, *cxr = nullptr, *chr = nullptr, *chf = nullptr, *cxh = nullptr,
+          *chh = nullptr, *ch16 = nullptr;
+    void* x = alloc(N * 4, &cx);
+    void* dl = alloc(N * 4, &cd);    // the branch; the fused f32 form's xout too
+    void* dl2 = alloc(N * 4, &cd2);  // the same branch, for the f16 form
+    void* wd = alloc(n * 4, &cwd);
+    void* w = alloc(n * 4, &cw);
+    void* nd = alloc(N * 4, &cnd);   // the composition: rmsnorm(delta) * wd,
+    void* xr = alloc(N * 4, &cxr);   // then its xout
+    void* hr = alloc(N * 4, &chr);   // and hout
+    void* hf = alloc(N * 4, &chf);   // the fused f32 form's hout
+    void* xh = alloc(N * 4, &cxh);   // the f16 form's xout, hout and hout16
+    void* hh = alloc(N * 4, &chh);
+    void* h16 = alloc(N * 2, &ch16);
+    for (int64_t i = 0; i < N; i++) {
+      cx[i] = d(g) * 40.0f;
+      cd[i] = cd2[i] = d(g) * 3.0f;
+    }
+    for (int64_t i = 0; i < n; i++) {
+      cwd[i] = 0.5f + d(g);
+      cw[i] = 0.5f + d(g);
+    }
+    const float eps = 1e-6f;
+    const bool ok = tl::gpu::rmsnorm({dl, 0}, {wd, 0}, {nd, 0}, n, eps, rows) &&
+                    tl::gpu::rmsnorm_res({x, 0}, {nd, 0}, {w, 0}, {xr, 0}, {hr, 0}, n, eps, rows) &&
+                    tl::gpu::rmsnorm_res_h16({x, 0}, {dl2, 0}, {w, 0}, {xh, 0}, {hh, 0}, {h16, 0}, n,
+                                             eps, rows, {wd, 0}) &&
+                    tl::gpu::rmsnorm_res({x, 0}, {dl, 0}, {w, 0}, {dl, 0}, {hf, 0}, n, eps, rows,
+                                         {wd, 0});
+    for (void* b : {dl, hf, xr, hr, xh, hh, h16}) sync_to_host(b, false);
+    int64_t dx = 0, dh = 0, dx16 = 0, dh16 = 0, d16 = 0;
+    for (int64_t i = 0; i < N; i++) {
+      dx += std::memcmp(&cd[i], &cxr[i], 4) != 0;
+      dh += std::memcmp(&chf[i], &chr[i], 4) != 0;
+      dx16 += std::memcmp(&cxh[i], &cxr[i], 4) != 0;
+      dh16 += std::memcmp(&chh[i], &chr[i], 4) != 0;
+      d16 += reinterpret_cast<const uint16_t*>(ch16)[i] != tl::f32_to_f16(chr[i]);
+    }
+    std::printf("  rmsnorm_res wd rows=%lld: f32 form %lld xout %lld hout, f16 form %lld xout %lld hout"
+                " %lld hout16 of %lld differ from rmsnorm + rmsnorm_res\n",
+                (long long)rows, (long long)dx, (long long)dh, (long long)dx16, (long long)dh16,
+                (long long)d16, (long long)N);
+    check(ok && dx + dh + dx16 + dh16 + d16 == 0,
+          rows == 1 ? "rmsnorm_res wd rows=1" : "rmsnorm_res wd rows=37");
+    for (void* b : {x, dl, dl2, wd, w, nd, xr, hr, hf, xh, hh, h16}) release(b, 0, nullptr);
+  }
+
   // ---- Qwen3's q / k norm and rotation in one pass (rmsnorm_rope) against rmsnorm then
   // rope, bit for bit: the head widths the kernel takes (Qwen3's 128, Qwen3.5's 256
   // turning 64, and 64), and two it refuses (rot 32, D 320), which gpu::rmsnorm_rope
