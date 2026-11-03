@@ -347,10 +347,12 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   const bool sample_ok = check_sampled(B, ids);
 
   // A prompt past one chunk of the delta rule (32 tokens), so the batched
-  // prefill takes the backend's chunked form where it has one: its last
+  // prefill takes the backend's chunked form where it has one, and past a
+  // sliding window (Gemma 3's local layers), so both paths read one: its last
   // token's top-5 logits against the imperative path's.
   std::vector<int> longp;
-  for (int64_t i = 0; i < 96; i++) longp.push_back(O.prompt_ids[i % NP]);
+  const int64_t n_long = std::max<int64_t>(96, B.c.SWA > 0 ? B.c.SWA + 64 : 0);
+  for (int64_t i = 0; i < n_long; i++) longp.push_back(O.prompt_ids[i % NP]);
   qm::reset_cache(B);
   for (int64_t i = 0; i < (int64_t)longp.size(); i++) qm::step_imperative(B, longp[i], i);
   const std::vector<float> imp_long = logits_of(B);
@@ -359,8 +361,8 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   if (qm::prefill_batched(B, longp) >= 0) {
     const double l5 = qm::top5_maxrel(logits_of(B).data(), imp_long.data(), B.c.VOCAB);
     long_ok = l5 < 1e-2;
-    std::printf("\n96-token prompt, batched vs imperative: top-5 logits maxrel %.2e %s\n", l5,
-                long_ok ? "OK" : "FAIL");
+    std::printf("\n%lld-token prompt, batched vs imperative: top-5 logits maxrel %.2e %s\n",
+                (long long)longp.size(), l5, long_ok ? "OK" : "FAIL");
   }
   const bool f16_ok = !qm::can_prefill_batched(B, (int64_t)longp.size()) ||
                       check_f16_sums(B, longp, imp_long);

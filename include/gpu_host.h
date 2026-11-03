@@ -641,6 +641,8 @@ struct traits {
   static constexpr int64_t fill_groups = 1;  // a loop: a split is only more passes
 };
 struct caps {
+  // A sliding window: the attention's compositions read one, and the caches here are f32.
+  static constexpr bool attn_window = true;
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = true;
   static constexpr bool bf16_gemm = false;

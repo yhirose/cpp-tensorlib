@@ -1114,6 +1114,9 @@ struct traits {
 };
 
 struct caps {
+  // Its attention is the compositions', which read a window over its f32 caches, but
+  // nothing here runs a windowed model or its tests, so none is claimed.
+  static constexpr bool attn_window = false;
   static constexpr bool graph_capture = false;
   static constexpr bool row_gemv = false;
   static constexpr bool bf16_gemm = false;

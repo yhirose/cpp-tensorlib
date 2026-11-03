@@ -1,9 +1,10 @@
 // llama.cpp's logits for the tokens a tensorlib_dump_logits file holds (its
 // tokens/prompt and tokens/steps sections, bench/models/dump_logits.cpp), in that
 // file's format, so tools/precision_logits.py holds them to the same f32
-// reference: the prompt in one llama_decode, then the steps' tokens one at a
-// time, every layer on the GPU and llama.cpp's other defaults. Sections
-// llama/decoder/prompt and llama/decoder/stepN.
+// reference: the prompt in llama_decode calls of 512 tokens, then the steps'
+// tokens one at a time, every layer on the GPU and llama.cpp's other defaults (a
+// context as long as the tokens). Sections llama/decoder/prompt and
+// llama/decoder/stepN.
 //
 // Not part of the build (it links llama.cpp's):
 //   L=path/to/llama.cpp
@@ -12,6 +13,7 @@
 //   ./llama_logits model.gguf dump.bin llama.bin
 #include <llama.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -65,7 +67,7 @@ int main(int argc, char** argv) {
   llama_model* model = llama_model_load_from_file(argv[1], mp);
   if (!model) return 1;
   llama_context_params cp = llama_context_default_params();
-  cp.n_ctx = 1024;
+  cp.n_ctx = (uint32_t)std::max<size_t>(1024, (prompt.size() + steps.size() + 255) / 256 * 256);
   cp.n_batch = 512;
   cp.n_ubatch = 512;
   llama_context* ctx = llama_init_from_model(model, cp);
@@ -73,7 +75,10 @@ int main(int argc, char** argv) {
   const int64_t V = llama_vocab_n_tokens(llama_model_get_vocab(model));
   out = std::fopen(argv[3], "wb");
   if (!out) return 2;
-  if (llama_decode(ctx, llama_batch_get_one(prompt.data(), (int32_t)prompt.size()))) return 1;
+  for (size_t at = 0; at < prompt.size(); at += cp.n_batch) {
+    const int32_t n = (int32_t)std::min<size_t>(cp.n_batch, prompt.size() - at);
+    if (llama_decode(ctx, llama_batch_get_one(prompt.data() + at, n))) return 1;
+  }
   section("llama/decoder/prompt", llama_get_logits_ith(ctx, -1), V);
   for (size_t s = 0; s < steps.size(); s++) {
     if (llama_decode(ctx, llama_batch_get_one(&steps[s], 1))) return 1;

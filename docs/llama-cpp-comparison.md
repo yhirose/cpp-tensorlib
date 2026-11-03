@@ -87,11 +87,18 @@ each engine, alternated):
 |  | pp512 | 1,722-1,734 | 1,698-1,702 | 1.01-1.02 |
 |  | pp512 @ d2048 | 1,650-1,664 | 1,674-1,682 | 0.98-0.99 |
 | Gemma 3 4B Q4_K_M | tg128 | 198-199 | 184-186 | 1.07-1.08 |
+|  | tg128 @ d2048 | 200-208 | 187-189 | 1.06-1.11 |
 |  | pp512 | 10,580-10,902 | 10,753-10,769 | 0.98-1.01 |
+|  | pp512 @ d2048 | 9,810-10,107 | 9,829-9,916 | 0.99-1.03 |
 
 Gemma 3's rows were taken later (2026-11-03), the two engines alternated in
-the same way; its context stops at its 1024-token sliding window here, so it
-has no row at depth 2048. The Q4_K_M files' decode rows were taken again then,
+the same way. Five of its six layers attend a sliding window of 1024 tokens
+(their caches keep every token; the attention reads the last 1024), so its decode
+at depth 2048 runs as fast as at 0. Past the window, on a BOS and 1599 spread-out
+ids, llama.cpp's logits are as close to this library's f32 forward (KL 3.2e-3 at
+the prompt, 2.3e-3 over six steps) as on 200 tokens, and the chat path's
+(8.7e-4, 2.1e-4) closer; with the window dropped they move by KL 0.6-1.4. The
+Q4_K_M files' decode rows were taken again then,
 after the decode's Q4_K GEMV moved to f16 activations (below), on a noisier day
 (llama.cpp's own runs moved by up to 9%); the int8 form (`TL_GEMV_ACT=q8`), run
 in the same rounds, was up to 11% faster on the 0.6-4B files and level on the

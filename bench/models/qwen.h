@@ -72,7 +72,7 @@ struct Config {
   // gpu::embed_row); an RMSNorm after the attention and after the MLP too (their
   // outputs normalized before the residual adds); the MLP's gate through GELU (tanh
   // form) rather than SiLU (act); and sliding-window attention on the layers `local`
-  // marks (a local layer sees the last SWA positions), whose RoPE turns at
+  // marks (a local layer sees the last SWA positions: its KV cache's window), whose RoPE turns at
   // ROPE_BASE_LOCAL, unscaled, while a global layer's turns at ROPE_BASE with the
   // position times ROPE_SCALE (a linear scaling, which any family's GGUF may state).
   float EMB_SCALE = 1.0f;
@@ -193,9 +193,6 @@ inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
     if (m.has(arch + ".rope.freq_base_swa")) c.ROPE_BASE_LOCAL = m.kv(arch + ".rope.freq_base_swa").as_f32();
     // The 27B (62 layers) scales q by 1 / sqrt(NE / NH), the others by 1 / sqrt(HD).
     if (c.NL == 62) c.QSCALE = 1.0f / std::sqrt((float)(c.NE / c.NH));
-    // A local layer's window is not in the attention kernels yet: within it, a
-    // local layer attends exactly as a global one, so the context stops there.
-    if (c.SWA > 0) c.MAXC = std::min(c.MAXC, c.SWA);
   }
   return c;
 }
@@ -697,6 +694,13 @@ struct Model {
   bool kv_f16 = false;
 };
 
+// The KV cache's appends and attentions fail only on a caller's mistake (a position
+// past the capacity, an op the backend can neither run nor compose); the forward
+// stops there rather than carry stale scratch on.
+inline void cache_ok_(bool ok) {
+  if (!ok) throw std::logic_error("qwen: the KV cache refused an append or an attention");
+}
+
 // Decode GEMV picking the weight-dtype kernel: y(n) = a(1,k) @ W[k,n].
 inline bool gemv_w(const array& W, gpu::span a, gpu::span y, int64_t n,
                    int64_t k) {
@@ -891,7 +895,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
         gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, base, {}, c.ROT, pscale);
         gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, base, {}, c.ROT, pscale);
       }
-      L.cache.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale(), exact);
+      cache_ok_(L.cache.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale(), exact));
       // Qwen3.5: times sigmoid of the gate, the tail of each projection row —
       // an f32 product, so only the plain form is rounded where it is made.
       gpu::span ao = sp(P.at);
@@ -1059,7 +1063,10 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
                    bool q4_mlp = false, bool q4_lmhead = false,
                    int64_t maxc = 4096, bool oracle = true, bool f16_acc = true,
                    bool quant = false) {
-  const Config c = config_from_gguf(m, maxc);
+  Config c = config_from_gguf(m, maxc);
+  // A backend whose attention reads no window holds the context to it: within the
+  // window a local layer attends as a global one does.
+  if (c.SWA > 0 && !gpu::caps::attn_window) c.MAXC = std::min(c.MAXC, c.SWA);
   // bf16 weights need the backend's bf16 [K,N] GEMV: the lm_head reads it in
   // every mode, and so does every projection off the row path. It has no
   // composition to fall back to, so a backend without it would leave the
@@ -1211,7 +1218,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
                                   {p + "attn_v.bias", c.NKV * c.HD}});
       if (row && !nat) L.wo_row = load_w_T_row(m, p + "attn_output.weight", Q, c.NE);
       L.qo = qfused({{p + "attn_output.weight", c.NE}}, Q);
-      L.cache.init(c.NKV, c.MAXC, c.HD, M.kv_f16);
+      L.cache.init(c.NKV, c.MAXC, c.HD, M.kv_f16, c.is_local(l) ? c.SWA : 0);
     }
     M.layers.push_back(std::move(L));
   }
@@ -1295,9 +1302,9 @@ inline array forward(Model& M, int64_t id, int64_t pos,
     // see the writes. Removes 3 CtxSynchronize/layer.
     q.realize(); k.realize(); v.realize();
     if (prof) { prof->qkv_eval += StepProf::now_ms() - t; t = StepProf::now_ms(); }
-    L.cache.append(sp(k), sp(v));
+    cache_ok_(L.cache.append(sp(k), sp(v)));
     array a_out = array::empty({c.NH, c.HD});
-    L.cache.attn(sp(q), sp(a_out), c.NH, c.scale());
+    cache_ok_(L.cache.attn(sp(q), sp(a_out), c.NH, c.scale()));
     if (prof) { prof->cache += StepProf::now_ms() - t; t = StepProf::now_ms(); }
     array x1 = x + a_out.reshape({1, c.NH * c.HD}).dot(L.wo);
     array h2 = array::rmsnorm(x1, L.fn, c.EPS);
@@ -1494,13 +1501,9 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
         gpu::rope(kp, kp, c.NKV, 1, c.HD, pos, base, sp(L.bk), c.ROT, pscale);
       }
       if (c.qkv_bias) gpu::binary(gpu::kop::add, vp, sp(L.bv), vp, c.NKV * c.HD, 1, 0);
-      if (cap) {
-        L.cache.append_dpos(kp, vp, d_pos);
-        L.cache.attn_dpos(qp, sp(S.ab), c.NH, d_pos, c.scale());
-      } else {
-        L.cache.append(kp, vp);
-        L.cache.attn(qp, sp(S.ab), c.NH, c.scale());
-      }
+      cache_ok_(cap ? L.cache.append_dpos(kp, vp, d_pos) &&
+                          L.cache.attn_dpos(qp, sp(S.ab), c.NH, d_pos, c.scale())
+                    : L.cache.append(kp, vp) && L.cache.attn(qp, sp(S.ab), c.NH, c.scale()));
       // Qwen3.5: the attention output times sigmoid of its gate (q|k|v's tail).
       gpu::span ao = sp(S.ab);
       if (c.attn_gate) {
