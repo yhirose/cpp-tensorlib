@@ -50,15 +50,9 @@ void section(const std::string& name, const float* v, int64_t n) {
   std::fwrite(v, 4, (size_t)n, out);
 }
 
-// Spread-out token ids, the same on every run: the prompt, then the tokens the
-// steps feed.
+// The prompt, then the tokens the steps feed.
 constexpr int64_t kPrompt = 200, kSteps = 6;
-std::vector<int> tokens(int64_t vocab) {
-  std::vector<int> ids((size_t)(kPrompt + kSteps));
-  for (size_t i = 0; i < ids.size(); i++)
-    ids[i] = (int)(100 + ((int64_t)i * 7919 + 13) % (std::min<int64_t>(vocab, 30000) - 100));
-  return ids;
-}
+std::vector<int> tokens(int64_t vocab) { return qm::spread_ids(kPrompt + kSteps, vocab); }
 
 void run(qm::Model& M, const std::string& tag) {
   const int64_t V = M.c.VOCAB;

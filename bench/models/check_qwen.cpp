@@ -172,6 +172,10 @@ static std::vector<std::vector<float>> cache_rows(qm::Model& M, int64_t n) {
 static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   const int64_t NP = (int64_t)O.n_prompt, NG = (int64_t)O.n_greedy;
   std::vector<int64_t> want;
+  // The f32 forward's logits after a spread-out prompt (a quantized file's: the
+  // reference its int8 forms are held to below).
+  const std::vector<int> spread = qm::spread_ids(200, qm::config_from_gguf(m).VOCAB);
+  std::vector<float> ref_spread;
   bool ok;
   {
     qm::Model M = qm::build(m, tl::dtype::f32);
@@ -209,13 +213,27 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
     }
     std::printf("\n  greedy %s\n", greedy_ok ? "MATCH" : "DIVERGE");
     ok = fn_mr < 5e-3 && logit_mr < 5e-3 && top1 == O.top5_ids[0] && greedy_ok;
+    if (qm::quant_file(m)) {
+      qm::reset_cache(M);
+      const float* sl = nullptr;
+      for (size_t i = 0; i < spread.size(); i++) sl = qm::imperative_logits(M, spread[i], (int64_t)i);
+      ref_spread.assign(sl, sl + C.VOCAB);
+    }
   }
-  // A backend without the bf16 GEMV builds f32 instead (build()), and says so.
+  // The chat's weights: a quantized file's blocks as they lie, else bf16 (a
+  // backend without the bf16 GEMV builds f32 instead, and says so). Its int8
+  // activations (the decode's Q4_K GEMVs, the prefill's MMQ) round each GEMV
+  // input to 8 bits, which moves the logits by an amount that is the model's
+  // (Gemma 3 ~70x Qwen's: docs/llama-cpp-comparison.md, "Accuracy"), so the
+  // structural checks below read the blocks with float activations, where their
+  // bounds hold for every model, and the int8 forms are held to the f32
+  // reference after them. The checks run the f32 sums, so their bounds stay
+  // tight; check_f16_sums holds the default f16 ones to the same prompts after.
   const int64_t NB = 8;
-  // The structural checks below run the f32 sums, so their bounds stay tight;
-  // check_f16_sums holds the default f16 ones to the same prompts after.
   qm::Model B = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false,
-                          /*f16_acc=*/false);
+                          /*f16_acc=*/false, /*quant=*/qm::quant_file(m));
+  const bool int8_q8act = B.q8act, int8_mmq = B.mmq;
+  B.q8act = B.mmq = false;
   int64_t tok = 0, p = 0;
   auto logits_of = [&](qm::Model& X) {
     const float* l = qm::host_read(X.scratch.logits);
@@ -226,8 +244,9 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   const auto imp_cache = cache_rows(B, NP);           // and the k / v the prompt left
   std::vector<float> imp_step;                         // and the first decode step's
   bool bf16_ok = true;
-  std::printf("\nbf16 weights (built as %s), greedy %lld:\n  cpp:",
-              B.outwT.dt() == tl::dtype::bf16 ? "bf16" : "f32", (long long)NB);
+  std::printf("\nthe chat's weights (%s), greedy %lld:\n  cpp:",
+              B.quant ? "blocks" : B.outwT.dt() == tl::dtype::bf16 ? "bf16" : "f32",
+              (long long)NB);
   for (int64_t i = 0; i < NB; i++) {
     std::printf(" %lld", (long long)tok);
     if (tok != want[i]) bf16_ok = false;
@@ -251,20 +270,29 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   tok = dec.begin(B, ids);
   const std::vector<float> got_prompt = logits_of(B);
   // The k and v the batched prompt left, held to the token-by-token steps' layer
-  // by layer: a wrong position or RoPE in one layer shows here in full (Gemma's
-  // global layers turned unscaled: 5.9), where the logits see it only through the
-  // attention it feeds. The prefill's activations rounded to bf16 move the deepest
-  // layers' by up to ~8e-2 (Gemma 3 4B; Qwen3.5 0.8B 3e-2).
+  // by layer, as ||got - want|| / ||want||: a wrong position or RoPE in one layer
+  // moves the whole layer (Gemma's global layers turned unscaled: 0.13 at the
+  // first, 0.17 at the last), where the logits see it only through the attention
+  // it feeds. The two paths' roundings leave every layer within ~5e-3 (Gemma 3 4B's
+  // blocks, Qwen3.5 0.8B), about as much deep as shallow; a single element can
+  // differ far more (a large v), which a norm does not let decide.
   const auto got_cache = cache_rows(B, NP);
-  double cache_mr = 0;
+  double cache_err = 0;
   int64_t cache_worst = -1;
   for (size_t l = 0; l < got_cache.size(); l++) {
-    const double mr = maxrel(got_cache[l], imp_cache[l].data(), (int64_t)imp_cache[l].size());
-    if (mr > cache_mr) cache_mr = mr, cache_worst = (int64_t)l;
+    double dd = 0, ww = 0;
+    for (size_t i = 0; i < imp_cache[l].size(); i++) {
+      const double e = (double)got_cache[l][i] - imp_cache[l][i];
+      dd += e * e;
+      ww += (double)imp_cache[l][i] * imp_cache[l][i];
+    }
+    const double err = std::sqrt(dd / ww);
+    if (err > cache_err) cache_err = err, cache_worst = (int64_t)l;
   }
-  const bool cache_ok = cache_mr < 0.3;
-  std::printf("\ndecoder (%s prefill) k / v cache vs imperative: maxrel %.2e (attention layer %lld) %s",
-              dec.batched ? "batched" : "token-by-token", cache_mr, (long long)cache_worst,
+  const bool cache_ok = cache_err < 3e-2;
+  std::printf("\ndecoder (%s prefill) k / v cache vs imperative: relative error %.2e (attention "
+              "layer %lld) %s",
+              dec.batched ? "batched" : "token-by-token", cache_err, (long long)cache_worst,
               cache_ok ? "OK" : "FAIL");
   const double pmr = maxrel(got_prompt, imp_prompt.data(), B.c.VOCAB);
   const int64_t first = tok;
@@ -332,7 +360,33 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   }
   const bool f16_ok = !qm::can_prefill_batched(B, (int64_t)longp.size()) ||
                       check_f16_sums(B, longp, imp_long);
-  return ok && bf16_ok && logits_ok && cache_ok && dec_ok && turn2_ok && sample_ok && long_ok && f16_ok;
+
+  // The chat's own defaults, int8 activations and f16 sums: the decoder's logits
+  // after a spread-out prompt, held to the f32 forward's by the KL of their
+  // distributions (a chat prompt's next token is too certain for one position to
+  // show anything: Gemma 3 4B's KL there is ~1e-13 though its logits move by up to
+  // 1). How far int8 moves a model is the model's (Gemma 3 4B 1.4e-2, Qwen3-0.6B
+  // 5e-4: docs/llama-cpp-comparison.md); the bound holds an int8 path that broke
+  // (Gemma's GLU epilogue run as SiLU: 3.7).
+  bool int8_ok = true;
+  if (int8_q8act || int8_mmq) {
+    B.q8act = int8_q8act;
+    B.mmq = int8_mmq;
+    B.f16_acc = true;
+    qm::reset_cache(B);
+    qm::captured_decoder d;
+    d.begin(B, spread);
+    const std::vector<float> got = logits_of(B);
+    d.destroy();
+    const double kl = qm::kl_div(ref_spread, got);
+    const bool top = qm::argmax(got) == qm::argmax(ref_spread);
+    int8_ok = top && kl < 0.3;
+    std::printf("\nthe chat's defaults (int8 activations, f16 sums), a spread-out prompt: KL %.2e "
+                "from the f32 forward, top token %s %s\n",
+                kl, top ? "same" : "different", int8_ok ? "OK" : "FAIL");
+  }
+  return ok && bf16_ok && logits_ok && cache_ok && dec_ok && turn2_ok && sample_ok && long_ok && f16_ok &&
+         int8_ok;
 }
 
 int main(int argc, char** argv) {

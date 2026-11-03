@@ -89,13 +89,18 @@ int main(int argc, char** argv) {
     }
   }
   // The batched prefill over the same blocks: a prompt through GEMMs that
-  // dequantize as they stage, against the bf16 weights' prefill, in the fast
-  // form (f16 sums) and the exact one a non-finite prompt is redone in.
+  // dequantize as they stage, against the bf16 weights' prefill, in the exact
+  // form a non-finite prompt is redone in (f32 sums: held to the bf16 rounding)
+  // and the fast one (f16 sums, and the blocks' MMQ rounding activations to int8,
+  // which moves a model by its own amount — Gemma 3 4B's ~30x Qwen's,
+  // docs/llama-cpp-comparison.md — so held by the KL of the two distributions,
+  // a bound a broken path is far past). A spread-out prompt, which no prediction
+  // is sure of, so the distributions show it.
   bool prefill_ok = true;
-  for (bool exact : {false, true}) {
+  for (bool exact : {true, false}) {
     std::vector<float> pa_, pb_;
     int64_t ta0 = -1, tb0 = -1;
-    const std::vector<int> ids = qm::fixture_ids(200);
+    const std::vector<int> ids = qm::spread_ids(200, qm::config_from_gguf(m).VOCAB);
     for (int pass = 0; pass < 2; pass++) {
       qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, false, true, /*quant=*/pass == 1);
       qm::reset_cache(M);
@@ -109,11 +114,13 @@ int main(int argc, char** argv) {
       pmx = std::max(pmx, (double)std::fabs(pa_[i] - pb_[i]));
       pref = std::max(pref, (double)std::fabs(pa_[i]));
     }
-    const double err = pmx / (1.0 + pref);
-    const bool ok = err < 2e-2 && (ta0 == tb0 || pa_[ta0] - pa_[tb0] < 4e-2 * (1.0 + pref));
+    const double err = pmx / (1.0 + pref), kl = qm::kl_div(pa_, pb_);
+    const bool near = ta0 == tb0 || pa_[ta0] - pa_[tb0] < 4e-2 * (1.0 + pref);
+    const bool ok = near && (exact ? err < 2e-2 : kl < 0.3);
     prefill_ok = prefill_ok && ok;
-    std::printf("prefill 200 tokens (%s) | first token %lld vs %lld | logits worst |d|/(1+max) %.2e %s\n",
-                exact ? "exact" : "f16 sums", (long long)ta0, (long long)tb0, err, ok ? "OK" : "FAIL");
+    std::printf("prefill 200 tokens (%s) | first token %lld vs %lld | logits worst |d|/(1+max) %.2e, "
+                "KL %.2e %s\n",
+                exact ? "exact" : "f16 sums", (long long)ta0, (long long)tb0, err, kl, ok ? "OK" : "FAIL");
   }
   return ok_all && prefill_ok ? 0 : 1;
 }

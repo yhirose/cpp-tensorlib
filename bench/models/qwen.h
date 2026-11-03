@@ -1342,6 +1342,25 @@ inline double top5_maxrel(const float* got, const float* ref, int64_t n) {
   return mr;
 }
 
+// KL(ref || got) of the two logit vectors' distributions, in nats: how far a
+// path's predictions move from a reference's, as llama.cpp's perplexity
+// --kl-divergence measures a quantization.
+inline double kl_div(const std::vector<float>& ref, const std::vector<float>& got) {
+  auto log_softmax = [](const std::vector<float>& x) {
+    const double m = *std::max_element(x.begin(), x.end());
+    double z = 0;
+    for (float v : x) z += std::exp(v - m);
+    const double lz = std::log(z);
+    std::vector<double> r(x.size());
+    for (size_t i = 0; i < x.size(); i++) r[i] = x[i] - m - lz;
+    return r;
+  };
+  const std::vector<double> lp = log_softmax(ref), lq = log_softmax(got);
+  double kl = 0;
+  for (size_t i = 0; i < lp.size(); i++) kl += std::exp(lp[i]) * (lp[i] - lq[i]);
+  return kl;
+}
+
 inline int64_t argmax(const std::vector<float>& v) {
   int64_t bi = 0;
   for (int64_t i = 1; i < (int64_t)v.size(); i++)
@@ -1843,6 +1862,15 @@ constexpr int PREFILL_IDS[4] = {40, 2610, 264, 3974};
 inline std::vector<int> fixture_ids(int64_t n) {
   std::vector<int> ids((size_t)n);
   for (int64_t i = 0; i < n; i++) ids[(size_t)i] = PREFILL_IDS[i % 4];
+  return ids;
+}
+// n token ids spread over the first 30000 of the vocabulary, the same on every
+// run: a context no prediction is sure of, where a precision measurement (its
+// KL from the f32 forward) sees the whole distribution move.
+inline std::vector<int> spread_ids(int64_t n, int64_t vocab) {
+  std::vector<int> ids((size_t)n);
+  for (int64_t i = 0; i < n; i++)
+    ids[(size_t)i] = (int)(100 + (i * 7919 + 13) % (std::min<int64_t>(vocab, 30000) - 100));
   return ids;
 }
 
