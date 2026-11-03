@@ -58,9 +58,8 @@ class tokenizer {
         std::snprintf(name, sizeof name, "<0x%02X>", b);
         auto it = token2id_.find(name);
         byte_id_[b] = it == token2id_.end() ? -1 : it->second;
+        if (byte_id_[b] >= 0) byte_of_[byte_id_[b]] = static_cast<uint8_t>(b);
       }
-      for (size_t i = 0; i < tt.arr.size() && i < tokens_.size(); i++)
-        if (tt.arr[i].i == 6) is_byte_.push_back(static_cast<int>(i));
     } else {
       auto merges = m.kv("tokenizer.ggml.merges").as_str_array();
       merge_rank_.reserve(merges.size() * 2);
@@ -113,7 +112,7 @@ class tokenizer {
         }
       }
       if (best_id >= 0) {
-        if (i > seg_start) encode_segment_(text.data() + seg_start, i - seg_start, after_special, out);
+        encode_segment_(text.data() + seg_start, i - seg_start, after_special, out);
         out.push_back(best_id);
         after_special = true;
         i += best_len;
@@ -122,8 +121,7 @@ class tokenizer {
         i++;
       }
     }
-    if (text.size() > seg_start)
-      encode_segment_(text.data() + seg_start, text.size() - seg_start, after_special, out);
+    encode_segment_(text.data() + seg_start, text.size() - seg_start, after_special, out);
     return out;
   }
 
@@ -363,7 +361,8 @@ class tokenizer {
     std::vector<piece> ps;
     for (size_t at = 0; at < text.size();) {
       const auto c = static_cast<uint8_t>(text[at]);
-      const size_t n = std::min<size_t>(text.size() - at, c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4);
+      // llama.cpp's unicode_len_utf8: by the lead byte, a stray continuation one byte.
+      const size_t n = std::min<size_t>(text.size() - at, c < 0xC0 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4);
       ps.push_back({at, n, static_cast<int>(ps.size()) - 1, static_cast<int>(ps.size()) + 1});
       at += n;
     }
@@ -417,8 +416,8 @@ class tokenizer {
     for (int id : ids) {
       if (id < 0 || static_cast<size_t>(id) >= tokens_.size())
         throw std::runtime_error("tokenizer: id out of range");
-      if (std::binary_search(is_byte_.begin(), is_byte_.end(), id)) {
-        out += static_cast<char>(std::strtol(tokens_[id].c_str() + 3, nullptr, 16));
+      if (const auto b = byte_of_.find(id); b != byte_of_.end()) {
+        out += static_cast<char>(b->second);
         continue;
       }
       const std::string& t = tokens_[id];
@@ -445,7 +444,7 @@ class tokenizer {
   std::vector<float> scores_;                          // a token's merge score (spm)
   bool add_space_prefix_ = true;                       // (spm)
   int byte_id_[256] = {};                              // <0xXX>'s id (spm)
-  std::vector<int> is_byte_;                           // the byte tokens' ids, ascending (spm)
+  std::unordered_map<int, uint8_t> byte_of_;           // and back (spm)
   int eos_id_ = -1;
   int bos_id_ = -1;
 };

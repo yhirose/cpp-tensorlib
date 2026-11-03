@@ -37,12 +37,28 @@ CASES = [
     "zzzzzzz aaaaaaaaaaa ........ ~~~~~ hhhhhhhhhhh!!!!",
     "ababababab xyzxyzxyzxyz qqqqqqqqqqqqqqqqqqqqqqqqqqq",
     "Donaudampfschifffahrtsgesellschaftskapitän",
+    # Not UTF-8: a stray continuation byte (one byte, as llama.cpp's
+    # unicode_len_utf8 has it, so the letters after it still merge) and a lead
+    # byte the text cuts short.
+    b"stray \x80bytes then a cut \xe3\x81",
 ]
 
 
+def raw(text):
+    return text if isinstance(text, bytes) else text.encode("utf-8")
+
+
+def cpp_string(text):
+    """A C++ string literal of the case's bytes: raw where it is UTF-8, escaped where not."""
+    if isinstance(text, str):
+        return f'std::string(R"TOK({text})TOK")'
+    body = "".join(chr(b) if 32 <= b < 127 and chr(b) not in '\\"' else f"\\x{b:02x}\"\"" for b in text)
+    return f'std::string("{body}")'
+
+
 def tokenize(exe, model, text):
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as f:
-        f.write(text)
+    with tempfile.NamedTemporaryFile("wb", suffix=".txt", delete=False) as f:
+        f.write(raw(text))
         path = f.name
     try:
         out = subprocess.run(
@@ -64,7 +80,7 @@ def main():
     print("inline std::vector<Case> cases() { return {")
     for text in CASES:
         ids = tokenize(exe, model, text)
-        print(f'  {{ std::string(R"TOK({text})TOK"), {{{",".join(map(str, ids))}}} }},')
+        print(f'  {{ {cpp_string(text)}, {{{",".join(map(str, ids))}}} }},')
     print("};}\n}")
 
 

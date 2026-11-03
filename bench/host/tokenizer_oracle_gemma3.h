@@ -38,5 +38,6 @@ What is 2+2?<end_of_turn>
   { std::string(R"TOK(zzzzzzz aaaaaaaaaaa ........ ~~~~~ hhhhhhhhhhh!!!!)TOK"), {9961,9961,231064,496,128820,9236,151784,2578,40100,534,201485,27989,21693} },
   { std::string(R"TOK(ababababab xyzxyzxyzxyz qqqqqqqqqqqqqqqqqqqqqqqqqqq)TOK"), {111507,111507,596,126169,56660,56660,56660,3752,34311,34311,34311,34311,34311,34311,34311,34311,34311,34311,34311,34311,34311} },
   { std::string(R"TOK(Donaudampfschifffahrtsgesellschaftskapitän)TOK"), {236796,4267,689,1414,236760,6652,584,736,9099,1412,127689,103333,509,7526} },
+  { std::string("stray \x80""bytes then a cut \xe3""\x81"""), {540,1254,236743,366,18222,1299,496,3463,236743,465,367} },
 };}
 }
