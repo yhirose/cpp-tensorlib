@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tight numpy oracle for bench/models/check_qwen.cpp (Qwen2.5, Qwen3, Qwen3.5).
+"""Tight numpy oracle for bench/models/check_qwen.cpp (Qwen2.5, Qwen3, Qwen3.5, Gemma 3).
 
 Reads a Qwen2.5 / Qwen3 / Qwen3.5 F16 (or BF16) GGUF with its own minimal parser and runs the decoder
 in float32 numpy on the SAME weights the C++ loads, so the two must agree to
@@ -7,6 +7,10 @@ in float32 numpy on the SAME weights the C++ loads, so the two must agree to
 is F16, and the two drift apart within a few tokens.) Writes a C++ header with
 the checkpoints the check compares: last-token embedding, layer-0 residual, final
 norm, top-5 logits, and the greedy continuation.
+
+A Gemma 3 GGUF is block-quantized (Q4_K / Q6_K): its weights are read with the
+gguf package (llama.cpp's gguf-py) and dequantized to f32 when a step reads
+them, layer by layer, so no f32 copy of the whole model is held.
 
   python3 -I tools/qwen_oracle.py MODEL.gguf NAMESPACE > bench/models/X_oracle_data.h
 
@@ -23,6 +27,7 @@ USER35 = [33963, 728, 264, 2716, 16308, 310, 3349, 3992, 3983, 13]  # same sente
 USER = [35127, 752, 264, 2805, 16800, 311, 3460, 4128, 4119, 13]  # "Give me a short introduction to large language models."
 QWEN2_SYS = [151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465, 553, 54364,
              14817, 13, 1446, 525, 264, 10950, 17847, 13, 151645, 198]
+GEMMA_USER = [46762, 786, 496, 2822, 12650, 531, 2455, 5192, 4681, 236761]  # same sentence, Gemma 3 vocab
 N_GREEDY = 30
 
 
@@ -88,6 +93,41 @@ def load_gguf(path):
     return kv, tensors
 
 
+class Dequantized:
+    """name -> f32 array, dequantized from the GGUF's blocks on each read
+    (small tensors and the embedding kept)."""
+
+    def __init__(self, path):
+        from gguf import GGUFReader
+        from gguf.quants import dequantize
+        self.dequantize = dequantize
+        self.r = GGUFReader(path)
+        self.info = {t.name: t for t in self.r.tensors}
+        self.kept = {}
+
+    def __contains__(self, name):
+        return name in self.info
+
+    def get(self, name, default=None):
+        return self[name] if name in self.info else default
+
+    def __getitem__(self, name):
+        if name in self.kept:
+            return self.kept[name]
+        t = self.info[name]
+        a = np.asarray(self.dequantize(t.data, t.tensor_type), np.float32)
+        a = a.reshape([int(d) for d in t.shape[::-1]])
+        if a.size < 1 << 20 or name == "token_embd.weight":
+            self.kept[name] = a
+        return a
+
+
+def gguf_kv(path):
+    from gguf import GGUFReader
+    return {k: f.contents() for k, f in GGUFReader(path).fields.items()
+            if not k.startswith("tokenizer.")}
+
+
 def rmsnorm(x, w, eps):
     return x / np.sqrt((x * x).mean(-1, keepdims=True) + eps) * w
 
@@ -98,6 +138,10 @@ def rope(x, pos, base, rot=None):  # x [H, D]; rotates the first `rot` dims, hal
     c, s = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
     a, b, rest = x[..., : rot // 2], x[..., rot // 2: rot], x[..., rot:]
     return np.concatenate([a * c - b * s, a * s + b * c, rest], -1)
+
+
+def gelu(x):  # tanh form: ggml's, and PyTorch's approximate='tanh'
+    return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * x * (1 + 0.044715 * x * x)))
 
 
 def sigmoid(x):
@@ -115,8 +159,10 @@ def l2norm(x, eps=1e-6):
 
 class Model:
     def __init__(self, path):
-        kv, self.t = load_gguf(path)
+        kv = gguf_kv(path)
         arch = kv["general.architecture"]
+        # Gemma 3's GGUFs are block-quantized; Qwen's are read whole as F16 / BF16.
+        self.t = Dequantized(path) if arch == "gemma3" else load_gguf(path)[1]
         g = lambda k: kv[f"{arch}.{k}"]
         self.nl, self.ne = g("block_count"), g("embedding_length")
         self.nh, self.nkv = g("attention.head_count"), g("attention.head_count_kv")
@@ -132,6 +178,10 @@ class Model:
             self.ssm_conv = g("ssm.conv_kernel")
             self.conv_state = [None] * self.nl  # [conv-1, C] last inputs
             self.state = [None] * self.nl       # [heads, dk, dv]
+        if arch == "gemma3":  # see qwen.h's Config: as llama.cpp's src/models/gemma3.cpp
+            self.swa_pattern = 6
+            linear = kv.get(f"{arch}.rope.scaling.type") == "linear"
+            self.scale = 1 / g("rope.scaling.factor") if linear else 1.0
         self.k = [[] for _ in range(self.nl)]
         self.v = [[] for _ in range(self.nl)]
         self.lm = self.t.get("output.weight", self.t["token_embd.weight"])
@@ -182,7 +232,12 @@ class Model:
         if p + "attn_q_norm.weight" in t:  # Qwen3: per-head q/k RMSNorm before rope
             q = rmsnorm(q, t[p + "attn_q_norm.weight"], self.eps)
             k = rmsnorm(k, t[p + "attn_k_norm.weight"], self.eps)
-        q, k = rope(q, pos, self.base, self.rot), rope(k, pos, self.base, self.rot)
+        if self.arch == "gemma3":
+            local = l % self.swa_pattern < self.swa_pattern - 1
+            base, p_ = (10000.0, pos) if local else (self.base, pos * self.scale)
+            q, k = rope(q, p_, base, self.rot), rope(k, p_, base, self.rot)
+        else:
+            q, k = rope(q, pos, self.base, self.rot), rope(k, pos, self.base, self.rot)
         self.k[l].append(k)
         self.v[l].append(v)
         K, V = np.stack(self.k[l], 1), np.stack(self.v[l], 1)  # [kv, T, D]
@@ -194,20 +249,27 @@ class Model:
             out[hh] = (e / e.sum()) @ V[hh // g]
         if gate is not None:
             out = out * sigmoid(gate)
-        x = x + out.reshape(-1) @ t[p + "attn_output.weight"].T
-        return self.mlp(l, x)
+        o = out.reshape(-1) @ t[p + "attn_output.weight"].T
+        if self.arch == "gemma3":
+            o = rmsnorm(o, t[p + "post_attention_norm.weight"], self.eps)
+        return self.mlp(l, x + o)
 
     def mlp(self, l, x):
         t, p = self.t, f"blk.{l}."
         # Qwen3.5 names the pre-FFN norm post_attention_norm.
-        n = p + ("post_attention_norm.weight" if p + "post_attention_norm.weight" in t else "ffn_norm.weight")
+        n = p + ("ffn_norm.weight" if p + "ffn_norm.weight" in t else "post_attention_norm.weight")
         h2 = rmsnorm(x, t[n], self.eps)
         gt, up = h2 @ t[p + "ffn_gate.weight"].T, h2 @ t[p + "ffn_up.weight"].T
+        if self.arch == "gemma3":
+            o = (gelu(gt) * up) @ t[p + "ffn_down.weight"].T
+            return x + rmsnorm(o, t[p + "post_ffw_norm.weight"], self.eps)
         return x + (silu(gt) * up) @ t[p + "ffn_down.weight"].T
 
     def step(self, tok, pos):
         x = self.t["token_embd.weight"][tok]
         emb, l0 = x.copy(), None
+        if self.arch == "gemma3":
+            x = x * np.float32(np.sqrt(np.float32(self.ne)))
         for l in range(self.nl):
             x = self.layer(l, x, pos)
             if l == 0:
@@ -225,7 +287,9 @@ def arr(name, ctype, a):
 def main():
     path, ns = sys.argv[1], sys.argv[2]
     m = Model(path)
-    if m.arch == "qwen35":  # thinking template: ends with "<think>\n"
+    if m.arch == "gemma3":  # <bos><start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n
+        prompt = [2, 105, 2364, 107] + GEMMA_USER + [106, 107, 105, 4368, 107]
+    elif m.arch == "qwen35":  # thinking template: ends with "<think>\n"
         prompt = [248045, 846, 198] + USER35 + [248046, 198, 248045, 74455, 198, 248068, 198]
     else:
         prompt = (QWEN2_SYS if m.arch == "qwen2" else []) + [151644, 872, 198] + USER + [151645, 198, 151644, 77091, 198]
