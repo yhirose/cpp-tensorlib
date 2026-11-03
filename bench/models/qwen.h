@@ -256,24 +256,23 @@ inline void widen_(const gg::tensor_info* t, size_t first, size_t n, float* dst)
       for (size_t i = 0; i < n; i++) dst[i] = tl::bf16_to_f32(src[i]);
       return;
     }
-    case gg::ggml_type::q4_k:
-    case gg::ggml_type::q6_k:
-    case gg::ggml_type::q8_0: {  // whole blocks: a row of K a multiple of the block
-      uint64_t be = 0, bb = 0;
-      gg::ggml_block(t->type, be, bb);
-      if (first % be || n % be) {
-        std::fprintf(stderr, "tensor %s: a block-quantized read must cover whole %llu-weight blocks\n",
-                     t->name.c_str(), (unsigned long long)be);
-        std::exit(2);
-      }
-      gg::dequant_range(t->type, t->data, first, n, dst);
-      return;
-    }
     default:
-      std::fprintf(stderr, "tensor %s: ggml type %u is not a float the loader reads\n",
-                   t->name.c_str(), static_cast<unsigned>(t->type));
-      std::exit(2);
+      break;
   }
+  if (!gg::is_quant(t->type)) {
+    std::fprintf(stderr, "tensor %s: ggml type %u is not a format the loader reads\n",
+                 t->name.c_str(), static_cast<unsigned>(t->type));
+    std::exit(2);
+  }
+  // A block format (ggml_quant.h's): whole blocks, a row of K a multiple of the block.
+  uint64_t be = 0, bb = 0;
+  gg::ggml_block(t->type, be, bb);
+  if (first % be || n % be) {
+    std::fprintf(stderr, "tensor %s: a block-quantized read must cover whole %llu-weight blocks\n",
+                 t->name.c_str(), (unsigned long long)be);
+    std::exit(2);
+  }
+  gg::dequant_range(t->type, t->data, first, n, dst);
 }
 
 // Fused weight load: widen several GGML [out,in] tensors that share the same

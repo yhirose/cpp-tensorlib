@@ -1329,17 +1329,47 @@ __device__ __forceinline__ void dq8_q80_(const unsigned char* row, unsigned gk, 
     v[2 * i + 1] = (float)(signed char)(w >> 8) * d;
   }
 }
-// WF 1 Q4_K, 2 Q6_K, 3 Q8_0 (the GEMMs' weight formats below).
+// Q5_0, 22 bytes a block of 32 (2-byte aligned only): d, the fifth bits qh (bit j of
+// the 32-bit word element j's), then qs, whose byte j holds element j's low four bits
+// in its low nibble and element j + 16's in its high one. The eight q - 16 of the
+// elements o .. o + 7 of block b (o % 8 == 0), as ggml's dequantize_row_q5_0 has them.
+__device__ __forceinline__ void q50_vals_(const unsigned char* b, unsigned o, int (&q)[8]) {
+  const unsigned short* h16 = reinterpret_cast<const unsigned short*>(b + 2);
+  const unsigned qh = (unsigned)h16[0] | ((unsigned)h16[1] << 16);
+  const unsigned short* q16 = reinterpret_cast<const unsigned short*>(b + 6 + (o & 15u));
+  const unsigned sh = o & 16u ? 4u : 0u;  // elements 16.. are the high nibbles
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const unsigned w = q16[i], e = o + 2u * i;
+    q[2 * i] = (int)(((w >> sh) & 0xFu) | (((qh >> e) & 1u) << 4)) - 16;
+    q[2 * i + 1] = (int)(((w >> (8u + sh)) & 0xFu) | (((qh >> (e + 1u)) & 1u) << 4)) - 16;
+  }
+}
+__device__ __forceinline__ void dq8_q50_(const unsigned char* row, unsigned gk, float (&v)[8]) {
+  const unsigned char* b = row + (size_t)(gk >> 5) * 22u;
+  const float d = __half2float(*reinterpret_cast<const __half*>(b));
+  int q[8];
+  q50_vals_(b, gk & 31u, q);
+#pragma unroll
+  for (int i = 0; i < 8; i++) v[i] = (float)q[i] * d;
+}
+// WF 1 Q4_K, 2 Q6_K, 3 Q8_0, 5 Q5_0 (the GEMMs' weight formats below; 4 is f16 weights,
+// which nothing dequantizes).
 template <int WF>
 __device__ __forceinline__ void dq8_(const unsigned char* row, unsigned gk, float (&v)[8]) {
+  static_assert(WF >= 1 && WF <= 5 && WF != 4, "a block format");
   if constexpr (WF == 1) dq8_q4k_(row, gk, v);
   else if constexpr (WF == 2) dq8_q6k_(row, gk, v);
-  else dq8_q80_(row, gk, v);
+  else if constexpr (WF == 3) dq8_q80_(row, gk, v);
+  else dq8_q50_(row, gk, v);
 }
 // A row's bytes in format WF, K weights long (K % 256 == 0 for the K-quants).
 template <int WF>
 __device__ __forceinline__ size_t quant_row_bytes_(unsigned K) {
-  return WF == 1 ? (size_t)(K >> 8) * 144u : WF == 2 ? (size_t)(K >> 8) * 210u : (size_t)(K >> 5) * 34u;
+  return WF == 1   ? (size_t)(K >> 8) * 144u
+         : WF == 2 ? (size_t)(K >> 8) * 210u
+         : WF == 3 ? (size_t)(K >> 5) * 34u
+                   : (size_t)(K >> 5) * 22u;
 }
 template <bool F16>
 __device__ __forceinline__ uint4 tc_pack8_(const float (&v)[8]) {
@@ -1498,16 +1528,16 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
 // Three tiles, picked by how well the grid fills the GPU (gemm_tc_run_ in cuda.h):
 // L 128x128 for wide outputs, M 64x128 and S 64x64 for narrow ones. Dynamic
 // shared memory, (BM+BN)*(BK+8)*2 stages*2 bytes: 40/55/37 KB.
-// A and a bf16 / f16 B by 16-byte vectors, Q4_K's nibbles by 8, Q6_K's and Q8_0's
-// halves by 2; C by float2 stores.
+// A and a bf16 / f16 B by 16-byte vectors, Q4_K's nibbles by 8, Q6_K's, Q8_0's and
+// Q5_0's halves by 2; C by float2 stores.
 #define TL_GEMM_TC(NAME, BM, BN, BK, WM, WN, F16, AH, WF)                            \
-  TL_ALIGN(NAME, 16, (WF) == 1 ? 8 : (WF) == 2 || (WF) == 3 ? 2 : 16, 8)              \
+  TL_ALIGN(NAME, 16, (WF) == 1 ? 8 : (WF) == 2 || (WF) == 3 || (WF) == 5 ? 2 : 16, 8) \
   extern "C" __global__ void NAME(const void* __restrict__ A,                        \
       const void* __restrict__ B, float* __restrict__ C, unsigned M, unsigned N,     \
       unsigned K, unsigned ldc) {                                                    \
     gemm_nt_tc_core<BM, BN, BK, WM, WN, F16, AH, WF>(A, B, C, M, N, K, ldc);         \
   }
-// Per weight format: bf16 and the block-quantized ones (q4k, q6k, q80); per tile (l, m, s);
+// Per weight format: bf16 and the block-quantized ones (q4k, q6k, q80, q50); per tile (l, m, s);
 // per form: f32 (bf16 operands, f32 sums), f16 (f16 operands and sums, A f32), f16h
 // (as f16 with A already f16). The quantized weights have the exact form (f32) and
 // the f16h one: the prefill's two, as a backend that rounds activations where they
@@ -1526,6 +1556,8 @@ TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q6k, true, true, 2)
 TL_GEMM_TC_TILES(tl_gemm_tc_f32_q80, false, false, 3)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q80, true, true, 3)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_f16w, true, true, 4)
+TL_GEMM_TC_TILES(tl_gemm_tc_f32_q50, false, false, 5)
+TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q50, true, true, 5)
 #undef TL_GEMM_TC_TILES
 
 // The f16 weight's fourth tile, for the long-K GEMMs of a big model (a 27B's
@@ -1646,6 +1678,7 @@ __device__ __forceinline__ void dequant_f16_core(const unsigned char* __restrict
 TL_ALIGN(tl_dequant_f16_q4k, 8, 16)
 TL_ALIGN(tl_dequant_f16_q6k, 2, 16)
 TL_ALIGN(tl_dequant_f16_q80, 2, 16)
+TL_ALIGN(tl_dequant_f16_q50, 2, 16)
 extern "C" __global__ void tl_dequant_f16_q4k(const unsigned char* W, __half* out, unsigned rows, unsigned K) {
   dequant_f16_core<1>(W, out, rows, K);
 }
@@ -1654,6 +1687,9 @@ extern "C" __global__ void tl_dequant_f16_q6k(const unsigned char* W, __half* ou
 }
 extern "C" __global__ void tl_dequant_f16_q80(const unsigned char* W, __half* out, unsigned rows, unsigned K) {
   dequant_f16_core<3>(W, out, rows, K);
+}
+extern "C" __global__ void tl_dequant_f16_q50(const unsigned char* W, __half* out, unsigned rows, unsigned K) {
+  dequant_f16_core<5>(W, out, rows, K);
 }
 
 // ---- The prefill GEMM over block-quantized weights on the int8 tensor cores (llama.cpp's MMQ).
@@ -2395,6 +2431,34 @@ __global__ void tl_gemv_q80_row(const float* __restrict__ a, const unsigned char
       const unsigned w = q16[i];
       s += (float)(signed char)(w & 0xFFu) * v[2 * i] + (float)(signed char)(w >> 8) * v[2 * i + 1];
     }
+    acc += d * s;
+  }
+  gemv_row_block_store(acc, lane, warp, nwarps, y + n);
+}
+
+// Q5_0, 22 bytes a block of 32 (2-byte aligned only): as Q8_0's, a warp takes eight
+// blocks at a time, lane = 4 * which + j taking the elements 8j.. of its block
+// (q50_vals_) and the 8 activations they multiply. y_n = sum d * (q - 16) * a.
+TL_ALIGN(tl_gemv_q50_row, 16, 2)  // a by float4; Q5_0 by halves
+__global__ void tl_gemv_q50_row(const float* __restrict__ a, const unsigned char* __restrict__ W,
+                                float* __restrict__ y, unsigned N, unsigned K) {
+  const unsigned n = blockIdx.x;
+  if (n >= N) return;
+  const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
+  const unsigned nb = K / 32u, j = lane & 3u;
+  const unsigned char* row = W + (size_t)n * nb * 22u;
+  float acc = 0.0f;
+  for (unsigned ib = warp * 8u + (lane >> 2); ib < nb; ib += nwarps * 8u) {
+    const unsigned char* b = row + (size_t)ib * 22u;
+    const float d = __half2float(*reinterpret_cast<const __half*>(b));
+    int q[8];
+    q50_vals_(b, 8u * j, q);
+    const float* ap = a + (size_t)ib * 32u + 8u * j;
+    const float4 a0 = *reinterpret_cast<const float4*>(ap), a1 = *reinterpret_cast<const float4*>(ap + 4);
+    const float v[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+    float s = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; i++) s += (float)q[i] * v[i];
     acc += d * s;
   }
   gemv_row_block_store(acc, lane, warp, nwarps, y + n);
