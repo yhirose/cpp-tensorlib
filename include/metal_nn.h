@@ -86,8 +86,9 @@ struct own_nn {
                            int64_t N, int64_t K);
   static bool gemm_bf16_nt_f16acc(gpu::span A, gpu::span B, gpu::span C,
                                   int64_t M, int64_t N, int64_t K);
+  // A scale other than 1 is not in its kernels: false (the caller stages the row).
   static bool embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
-                        int64_t rows, int64_t row_stride, int64_t col_stride);
+                        int64_t rows, int64_t row_stride, int64_t col_stride, float scale);
   static bool gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y,
                          int64_t n, int64_t k);
   static bool gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
@@ -485,10 +486,11 @@ inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y,
 // terms (quant_ok_).
 inline bool own_nn::embed_row(int type, gpu::span W, gpu::span idx, gpu::span out,
                               int64_t k, int64_t rows, int64_t row_stride,
-                              int64_t col_stride) {
+                              int64_t col_stride, float scale) {
   auto& c = context::get();
   const bool q = type == 12 || type == 14 || type == 8;
-  if (!c.device || (q ? !detail_::quant_ok_(type, k, W) : type != 0 && type != 30))
+  if (!c.device || scale != 1.0f ||
+      (q ? !detail_::quant_ok_(type, k, W) : type != 0 && type != 30))
     return false;
   detail_::bind_(c, type == 0    ? nn_kernel::embed_row_f32
                     : type == 30 ? nn_kernel::embed_row_bf16

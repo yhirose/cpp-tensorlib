@@ -68,7 +68,8 @@ struct Config {
   int64_t INTERVAL = 1, SH = 0, SK = 0, SDK = 0, SDV = 0, SCONV = 0;
   std::string ffn_norm = "ffn_norm.weight";  // Qwen3.5: post_attention_norm
   float L2EPS = 1e-6f;  // DeltaNet's q / k L2 norms (the reference's constant)
-  // Gemma 3: the embedding times sqrt(NE); an RMSNorm after the attention and
+  // Gemma 3: the embedding times sqrt(NE) (the lookups scale it: gather_embed_rows_,
+  // gpu::embed_row); an RMSNorm after the attention and
   // after the MLP too (their outputs normalized before the residual adds); the
   // MLP's gate through GELU (tanh form) rather than SiLU (act); and sliding-window
   // attention on the layers `local` marks (a local layer sees the last SWA
@@ -930,6 +931,10 @@ inline void gather_embed_rows_(const Model& M, const int* ids, int64_t n,
   for (int64_t i = 0; i < n; i++) {
     widen_(M.embed, (size_t)ids[i] * c.NE, c.NE, dst + i * c.NE);
   }
+  // The lookup is scaled where the family says (Gemma: sqrt(NE)), as gpu::embed_row
+  // scales the row it gathers on the device: the same f32 product.
+  if (c.EMB_SCALE != 1.0f)
+    for (int64_t i = 0; i < n * c.NE; i++) dst[i] *= c.EMB_SCALE;
 }
 
 // Stage `n` prompt embeddings starting at ids[from] into the batched scratch.
@@ -1391,10 +1396,6 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
     else gemv_w(W, a, y, n, k);
   };
   gpu::span x = x0;
-  if (c.EMB_SCALE != 1.0f) {  // Gemma 3: the embedding times sqrt(NE), into res[1] (layer 0 writes res[0])
-    x = sp(S.res[1]);
-    gpu::unary(gpu::kop::affine, x0, x, c.NE, c.EMB_SCALE, 0.0f);
-  }
   gpu::rmsnorm(x, sp(M.layers[0].an), sp(S.hb), c.NE, c.EPS);
   for (int64_t l = 0; l < c.NL; l++) {
     Layer& L = M.layers[l];
@@ -1652,7 +1653,7 @@ struct captured_decoder {
   bool gather_(Model& M) {
     const embed_table t = device_embed(M);
     return gpu::embed_row(t.type, t.W, sp(d_tok), sp(M.scratch.embed), M.c.NE, M.c.VOCAB,
-                          t.row_stride, t.col_stride);
+                          t.row_stride, t.col_stride, M.c.EMB_SCALE);
   }
   // Token `id` as the next step's input: into d_tok, or its row gathered on
   // the host into S.embed. Both copies wait for the queued work (CUDA's is a

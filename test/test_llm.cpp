@@ -486,9 +486,28 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       std::vector<std::pair<int, quant_rows>> qs;
       if (gpu::has_gemv_quant)
         for (int type : {12, 14, 8}) qs.push_back({type, random_quant_rows(type, V, K, 990 + type)});
+      // Scaled (Gemma's embedding): each value times the scale, an f32 product. A
+      // backend whose kernels have no scale refuses it (Metal, WebGPU: the caller
+      // stages the row on the host); CUDA's and the host reference's take it.
+      auto scaled = [&](int type, const array& W, int64_t rs, int64_t cs, int64_t n,
+                        const std::vector<float>& w, bool exact) {
+        const float s = 50.596443f;
+        array idx = dev(array::from(std::vector<float>{(float)n}, {1})), out = dev(array::zeros({K}));
+        const bool ran = gpu::embed_row(type, W.device_span(), idx.device_span(), out.device_span(),
+                                        K, V, rs, cs, s);
+#if defined(TENSORLIB_CUDA) || defined(TENSORLIB_HOST_GPU)
+        CHECK(ran);
+#endif
+        if (!ran) return;
+        std::vector<float> r = want(w, n);
+        for (float& v : r) v *= s;
+        if (exact) CHECK(host_values(out) == r);
+        else CHECK(close(host_values(out), r));
+      };
       for (int64_t n : {int64_t(0), int64_t(137), V - 1, V}) {
         INFO("row " << n);
         CHECK(row(0, Wf, K, 1, n) == want(f, n));
+        scaled(0, Wf, K, 1, n, f, true);
         CHECK(row(0, Wft, 1, V, n) == want(f, n));
         if (gpu::caps::row_gemv) {  // a backend that decodes from bf16 weights
           CHECK(row(30, Wb, K, 1, n) == want(fb, n));
@@ -497,6 +516,7 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
         for (const auto& [type, q] : qs) {
           INFO("type " << type);
           CHECK(close(row(type, dev(q.W), 0, 0, n), want(q.w, n)));
+          scaled(type, dev(q.W), 0, 0, n, q.w, false);
         }
       }
       CHECK(past(0, Wf, K, 1));

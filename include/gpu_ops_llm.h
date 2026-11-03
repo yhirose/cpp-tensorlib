@@ -203,17 +203,18 @@ inline bool finish_read(pending_read& r, float* out) {
 // col_stride], so a [rows, k] table and its [k, rows] transpose both serve),
 // or a block format whose rows are whole blocks, read as gemv_quant reads them
 // (Q4_K 12, Q6_K 14, Q8_0 8; the strides unused). An index past the table
-// gives zeros. False for a format the backend has no reader for.
+// gives zeros. `scale` multiplies the row (Gemma's embedding, times sqrt of its
+// width). False for a format, or a scale, the backend has no reader for.
 TL_GPU_DETECT_OWN(embed_row)
 template <class Own = own>
 inline bool embed_row(int type, span W, span idx, span out, int64_t k, int64_t rows,
-                      int64_t row_stride, int64_t col_stride) {
+                      int64_t row_stride, int64_t col_stride, float scale = 1.0f) {
   if (!W || !idx || !out || k <= 0 || rows <= 0 || rows > policy::max_f32_index ||
       row_stride < 0 || col_stride < 0 || k > UINT32_MAX || row_stride > UINT32_MAX ||
       col_stride > UINT32_MAX)
     return false;
   if constexpr (detail::owns_embed_row<Own>::value) {
-    return detail::ran(Own::embed_row(type, W, idx, out, k, rows, row_stride, col_stride));
+    return detail::ran(Own::embed_row(type, W, idx, out, k, rows, row_stride, col_stride, scale));
   } else {
     return false;
   }

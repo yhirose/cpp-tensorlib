@@ -526,7 +526,7 @@ struct own {
   static bool read_later(gpu::span src, gpu::pending_read& r);
   static bool finish_read(gpu::pending_read& r, float* out);
   static bool embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
-                        int64_t rows, int64_t row_stride, int64_t col_stride);
+                        int64_t rows, int64_t row_stride, int64_t col_stride, float scale);
   static bool binary_bcast_nd(kop op, gpu::span a, const int64_t* a_strides,
                               gpu::span b, const int64_t* b_strides,
                               gpu::span out, const int64_t* out_shape, int rank,
@@ -1019,11 +1019,12 @@ inline bool own::argmax_to(gpu::span a, int64_t n, gpu::span idx) {
 }
 
 // Row idx[0] of an f32 table into out (gpu_ops_llm.h's contract): f32 only,
-// the one format this backend's buffers hold.
+// the one format this backend's buffers hold, and unscaled (its kernel has no
+// scale).
 inline bool own::embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
-                           int64_t rows, int64_t row_stride, int64_t col_stride) {
+                           int64_t rows, int64_t row_stride, int64_t col_stride, float scale) {
   using detail_::u32;
-  if (type != 0) return false;
+  if (type != 0 || scale != 1.0f) return false;
   const uint32_t p[] = {u32(k), u32(rows), u32(row_stride), u32(col_stride)};
   return detail_::launch_own_("embed_row", -1, {gpu::in(W), gpu::in(idx), gpu::out(out)}, p,
                               gpu::policy::flat(k));
