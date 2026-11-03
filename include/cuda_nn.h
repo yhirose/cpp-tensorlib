@@ -20,12 +20,14 @@ struct own_nn {
   // 128 or 256 and rot a multiple of 64, else false.
   static bool rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T, int64_t D,
                            int64_t pos, float base, int64_t rot, float eps);
-  // The activation a[K] prepared in form f into pa, and Q4_K rows dotted with it. q8:
-  // int8 blocks of 32 (K int8, then K/32 float2 of scale and sum), read with dp4a: the
-  // Q4_K GEMV with the activation's bytes cut four-fold. K % 256 == 0. act_layout_ is
-  // where a form keeps its parts, the one place the launchers and act_bytes read it.
+  // The activation a[K] prepared in form f into pa, and Q4_K rows dotted with it
+  // (K % 256 == 0). q8: int8 blocks of 32 (K int8, then K/32 float2 of scale and sum),
+  // read with dp4a. h16: K f16, K/32 f32 sums and K/256 f32 scales, read by the tensor
+  // cores (tl_gemv_q4k_h16_row). act_layout_ is where a form keeps its parts, the one
+  // place the launchers and act_bytes read it.
   struct act_layout {  // byte offsets from the start; bytes 0: no such form
-    int64_t meta = 0;   // q8: the float2 (scale, sum) of each 32
+    int64_t meta = 0;   // q8: the float2 (scale, sum) of each 32; h16: the f32 sum of each 32
+    int64_t scale = 0;  // h16: the f32 scale of each 256
     int64_t bytes = 0;
   };
   static act_layout act_layout_(gpu::act_form f, int64_t k);
@@ -461,7 +463,8 @@ inline bool own_nn::gemm_quant_glu(int type, gpu::glu_act act, gpu::span A16, gp
 inline own_nn::act_layout own_nn::act_layout_(gpu::act_form f, int64_t k) {
   if (k <= 0 || k % 256) return {};
   switch (f) {
-    case gpu::act_form::q8: return {k, k + k / 32 * 8};
+    case gpu::act_form::q8: return {k, 0, k + k / 32 * 8};
+    case gpu::act_form::h16: return {2 * k, 2 * k + k / 8, 2 * k + k / 8 + k / 64};
     case gpu::act_form::f32: break;
   }
   return {};
@@ -475,9 +478,20 @@ inline bool own_nn::prepare_act(gpu::act_form f, gpu::span a, gpu::span pa, int6
   char* pp = reinterpret_cast<char*>(context::off_(pa.buf, pa.off));
   c.device_read_(a.buf);
   c.device_write_(pa.buf);
-  const unsigned nblk = (unsigned)(k / 32);
-  return c.launch_(c.cached_(c.quant_act_fn, "tl_quant_act_q8"), {(nblk + 7) / 8}, {256}, 0, pf,
-                   reinterpret_cast<signed char*>(pp), reinterpret_cast<void*>(pp + L.meta), nblk);
+  switch (f) {
+    case gpu::act_form::q8: {
+      const unsigned nblk = (unsigned)(k / 32);
+      return c.launch_(c.cached_(c.quant_act_fn, "tl_quant_act_q8"), {(nblk + 7) / 8}, {256}, 0,
+                       pf, reinterpret_cast<signed char*>(pp),
+                       reinterpret_cast<void*>(pp + L.meta), nblk);
+    }
+    case gpu::act_form::h16:
+      return c.launch_(c.cached_(c.act_h16_fn, "tl_act_h16"), {(unsigned)(k / 256)}, {256}, 0,
+                       pf, reinterpret_cast<void*>(pp), reinterpret_cast<void*>(pp + L.meta),
+                       reinterpret_cast<void*>(pp + L.scale));
+    case gpu::act_form::f32: break;
+  }
+  return false;
 }
 
 inline bool own_nn::gemv_q4k_act(gpu::act_form f, gpu::span pa, gpu::span W, gpu::span y,
@@ -490,12 +504,21 @@ inline bool own_nn::gemv_q4k_act(gpu::act_form f, gpu::span pa, gpu::span W, gpu
   c.device_read_(pa.buf);
   c.device_read_(W.buf);
   c.device_write_(y.buf);
-  constexpr unsigned rows_per_block = 4;
-  return c.launch_(c.cached_(c.gemv_q4k_q8_fn, "tl_gemv_q4k_q8_row"),
-                   {((unsigned)n + rows_per_block - 1) / rows_per_block}, {rows_per_block * 32}, 0,
-                   reinterpret_cast<signed char*>(pp), reinterpret_cast<void*>(pp + L.meta),
-                   reinterpret_cast<unsigned char*>(pw), context::off_(y.buf, y.off), (unsigned)n,
-                   (unsigned)k);
+  switch (f) {
+    case gpu::act_form::q8:  // a warp a row, 4 rows a block
+      return c.launch_(c.cached_(c.gemv_q4k_q8_fn, "tl_gemv_q4k_q8_row"),
+                       {((unsigned)n + 3) / 4}, {128}, 0, reinterpret_cast<signed char*>(pp),
+                       reinterpret_cast<void*>(pp + L.meta), reinterpret_cast<unsigned char*>(pw),
+                       context::off_(y.buf, y.off), (unsigned)n, (unsigned)k);
+    case gpu::act_form::h16:  // 16 rows a block of 4 warps
+      return c.launch_(c.cached_(c.gemv_q4k_h16_fn, "tl_gemv_q4k_h16_row"),
+                       {((unsigned)n + 15) / 16}, {128}, 0, reinterpret_cast<void*>(pp),
+                       reinterpret_cast<void*>(pp + L.meta), reinterpret_cast<void*>(pp + L.scale),
+                       reinterpret_cast<unsigned char*>(pw), context::off_(y.buf, y.off),
+                       (unsigned)n, (unsigned)k);
+    case gpu::act_form::f32: break;
+  }
+  return false;
 }
 
 inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, int64_t n,

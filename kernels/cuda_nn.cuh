@@ -944,6 +944,14 @@ __device__ __forceinline__ void tc_mma_(float* c, const unsigned* a, unsigned b0
       : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
+__device__ __forceinline__ void tc_mma_(float* c, const unsigned* a, unsigned b0,
+                                        unsigned b1, __half) {  // f16 operands, f32 sums
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+      "{%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
 // An accumulator's two adjacent columns of one row, as f32.
 __device__ __forceinline__ float2 tc_pair_(const unsigned* c, int row_half) {
   return __half22float2(*reinterpret_cast<const __half2*>(&c[row_half]));
@@ -2119,14 +2127,15 @@ __global__ void tl_gemv_q4k_row(const float* __restrict__ a, const unsigned char
 }
 
 // ---- Q4_K . int8 activations (llama.cpp's q8_1 scheme, and what its Q4_K GEMV does).
-// The float kernel above spends its time on the activation loads: 8 float4 for
-// every 32 weights, each instruction spread over several cache lines (a Q4_K
-// GEMV at ~450 GB/s where the weights alone stream at ~850). Quantizing the
-// activation once per call to int8 (a scale d = max|x| / 127 per 32 values, and
-// the sum of the original 32, which the K-quants' min terms multiply) cuts those
-// bytes four-fold and turns the multiplies into dp4a, 4 a lane-instruction:
-// ~750 GB/s. The price is the rounding of the activation to 8 bits, as in
-// llama.cpp: ~0.5% relative error on a random matvec.
+// The float kernel above is bound by its instructions, not by bytes: every weight
+// is a nibble shifted out, converted and multiplied on its own, ~12 instructions a
+// weight, and it runs as slowly with its weights held in the cache (a Q4_K GEMV at
+// ~450 GB/s where the weights alone stream at ~850; reading the activation as f16,
+// or not at all, changes nothing). Quantizing the activation once per call to int8
+// (a scale d = max|x| / 127 per 32 values, and the sum of the original 32, which the
+// K-quants' min terms multiply) turns the multiplies into dp4a, 4 a lane-instruction,
+// ~3 instructions a weight: ~750 GB/s. The price is the rounding of the activation
+// to 8 bits, as in llama.cpp: ~0.5% relative error on a random matvec.
 // Layout of the quantized activation: K int8, then K/32 float2 (d, sum).
 TL_ALIGN(tl_quant_act_q8, 4, 1, 8)
 __global__ void tl_quant_act_q8(const float* __restrict__ a, signed char* __restrict__ qs,
@@ -2188,6 +2197,177 @@ __global__ void tl_gemv_q4k_q8_row(const signed char* __restrict__ qa, const flo
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
   if (lane == 0) y[n] = acc;
+}
+
+// ---- Q4_K . f16 activations on the tensor cores (form h16): exact products and f32
+// sums, so the result is the float kernel's on the activation rounded to f16 (to f32
+// summation), near the int8 kernel's speed (decode the same on a 27B model, a few
+// percent behind on small ones, where 16-row blocks fill fewer multiprocessors).
+// The float kernel pays ~12 instructions a
+// weight (above); here a pair of nibbles becomes f16 in two instructions and the
+// tensor cores do the multiplying and adding, ~1.5 a weight. Marlin (IST-DASLab) runs
+// f16 x int4 at small batches the same way; here the blocks are read where they lie
+// (no reshuffle) and a group's scale goes into the f16 operand exactly.
+
+// Prepare: a block of 256 threads a superblock of 256 values, rounded to f16 after a
+// scale s = 2^e that brings the superblock's largest |a| under f16's largest finite
+// (65504): s = 1 wherever that already holds, so the values are round16(a) there, and a
+// superblock past it is scaled rather than overflowed (Gemma 3's first-token activations
+// reach ~9e3, within 8x of it). Then each 32's sum of the rounded values, which the Q4_K min term
+// multiplies: the min term sees the activation the dot product sees.
+// Layout: K halves, K/32 f32 sums, K/256 f32 scales.
+TL_ALIGN(tl_act_h16, 4, 2, 4, 4)
+__global__ void tl_act_h16(const float* __restrict__ a, __half* __restrict__ h,
+                           float* __restrict__ sums, float* __restrict__ scales) {
+  __shared__ float wmax[8];
+  const unsigned sb = blockIdx.x, t = threadIdx.x, lane = t & 31u, warp = t >> 5;
+  const float x = a[(size_t)sb * 256u + t];
+  float m = fabsf(x);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+  if (lane == 0) wmax[warp] = m;
+  __syncthreads();
+#pragma unroll
+  for (int w = 0; w < 8; w++) m = fmaxf(m, wmax[w]);
+  // e is frexp's exponent of m / 65504 (= f 2^e, f < 1), so m / 2^e < 65504. An inf
+  // keeps s = 1 and reaches the logits as it is, as a NaN does (fmaxf passes over it).
+  float s = 1.0f;
+  if (m >= 65504.0f && isfinite(m)) {
+    int e;
+    frexpf(m / 65504.0f, &e);
+    s = ldexpf(1.0f, e);
+  }
+  const __half v = __float2half_rn(x * (1.0f / s));  // exact before the rounding: s is 2^e
+  float sum = __half2float(v);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+  h[(size_t)sb * 256u + t] = v;
+  if (lane == 0) sums[sb * 8u + warp] = sum;
+  if (t == 0) scales[sb] = s;
+}
+
+// The f16 pair (v, v), bits of an integer that f16 holds exactly.
+static __device__ __forceinline__ unsigned q4k_h16_pair_(int v) {
+  const __half2 p = __half2half2(__int2half_rn(v));
+  return *reinterpret_cast<const unsigned*>(&p);
+}
+// q * sc for the two nibbles a masked word holds in bits 0-3 and 16-19, as an f16 pair,
+// exactly: OR-ing 0x6400 makes each half 1024 + q, and fma(1024 + q, sc, -1024 sc) = q sc,
+// an integer <= 15 * 63 = 945 that f16 holds (as it does -1024 * 63 = -64512), rounded
+// once. sc2 / nsc2: q4k_h16_pair_(sc) and q4k_h16_pair_(-1024 * sc).
+static __device__ __forceinline__ unsigned q4k_h16_qsc_(unsigned nib2, unsigned sc2,
+                                                        unsigned nsc2) {
+  const unsigned w = (nib2 & 0x000F000Fu) | 0x64006400u;
+  const __half2 r = __hfma2(*reinterpret_cast<const __half2*>(&w),
+                            *reinterpret_cast<const __half2*>(&sc2),
+                            *reinterpret_cast<const __half2*>(&nsc2));
+  return *reinterpret_cast<const unsigned*>(&r);
+}
+// One 16-byte chunk of rows g and g + 8 (x, y): word j holds elements 4j..4j+3 of the
+// chunk, a byte each, its low nibble in group lo and its high one in group hi. A word's
+// bytes 0, 1 go to the mma k slots 2t, 2t+1 and bytes 2, 3 to 2t+8, 2t+9 (__byte_perm
+// spreads them to the halves); B, the activation's same four values (16 of group lo at
+// a, of group hi at a + 32), is the same in every column, so each column of the
+// accumulator is the row's sum: c[0] row g, c[2] row g + 8. 8 mma.
+static __device__ __forceinline__ void q4k_h16_chunk_(float* c, uint4 x, uint4 y,
+                                                      const unsigned* sx, const unsigned* sy,
+                                                      const __half* a) {
+  const uint4 l0 = *reinterpret_cast<const uint4*>(a), l1 = *reinterpret_cast<const uint4*>(a + 8);
+  const uint4 h0 = *reinterpret_cast<const uint4*>(a + 32),
+              h1 = *reinterpret_cast<const uint4*>(a + 40);
+  const unsigned la[8] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w};
+  const unsigned ha[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
+  const unsigned wx[4] = {x.x, x.y, x.z, x.w}, wy[4] = {y.x, y.y, y.z, y.w};
+#pragma unroll
+  for (int j = 0; j < 4; j++) {
+    const unsigned x01 = __byte_perm(wx[j], 0u, 0x4140u), x23 = __byte_perm(wx[j], 0u, 0x4342u);
+    const unsigned y01 = __byte_perm(wy[j], 0u, 0x4140u), y23 = __byte_perm(wy[j], 0u, 0x4342u);
+    // sx / sy: (sc, -1024 sc) pairs of group lo, then of group hi, for rows g / g + 8.
+    unsigned A[4] = {q4k_h16_qsc_(x01, sx[0], sx[1]), q4k_h16_qsc_(y01, sy[0], sy[1]),
+                     q4k_h16_qsc_(x23, sx[0], sx[1]), q4k_h16_qsc_(y23, sy[0], sy[1])};
+    tc_mma_(c, A, la[2 * j], la[2 * j + 1], __half());
+    A[0] = q4k_h16_qsc_(x01 >> 4, sx[2], sx[3]);
+    A[1] = q4k_h16_qsc_(y01 >> 4, sy[2], sy[3]);
+    A[2] = q4k_h16_qsc_(x23 >> 4, sx[2], sx[3]);
+    A[3] = q4k_h16_qsc_(y23 >> 4, sy[2], sy[3]);
+    tc_mma_(c, A, ha[2 * j], ha[2 * j + 1], __half());
+  }
+}
+// The GEMV: a block of 4 warps owns 16 rows, the warps splitting the superblocks, then
+// a sum over the warps. Lane 4g + t holds rows g and g + 8 and, of each superblock,
+// 16-byte chunks t and t + 4 (chunk c: pair c / 2, elements 16 (c % 2).. of its two
+// groups). A superblock's 16 mma sum into a fresh accumulator, which d and the
+// superblock's activation scale then multiply; the min term (dmin m times the group's
+// sum) is f32, its 8 groups split over the quad. ~110 registers; capping them for more
+// blocks a multiprocessor spills, at half the speed.
+TL_ALIGN(tl_gemv_q4k_h16_row, 16, 4, 4, 16)
+__global__ void __launch_bounds__(128, 1)
+    tl_gemv_q4k_h16_row(const __half* __restrict__ ah, const float* __restrict__ sums,
+                        const float* __restrict__ scales, const unsigned char* __restrict__ W,
+                        float* __restrict__ y, unsigned N, unsigned K) {
+  const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3u;
+  const unsigned nb = K / 256u, r0 = blockIdx.x * 16u + g;
+  // The last block's rows past N read row N - 1 and store nothing.
+  const unsigned char* row0 = W + (size_t)min(r0, N - 1u) * nb * 144u;
+  const unsigned char* row1 = W + (size_t)min(r0 + 8u, N - 1u) * nb * 144u;
+  const unsigned p0 = t >> 1, p1 = p0 + 2u, l0 = 16u * (t & 1u);
+  const bool odd = t & 1u;  // the min term's two groups: chunk t's (t even), chunk t + 4's
+  const unsigned gm = 2u * (odd ? p1 : p0);
+  float acc0 = 0.0f, acc1 = 0.0f, mn0 = 0.0f, mn1 = 0.0f;
+  for (unsigned ib = warp; ib < nb; ib += 4u) {
+    const unsigned char* b0 = row0 + (size_t)ib * 144u;
+    const unsigned char* b1 = row1 + (size_t)ib * 144u;
+    const float2 dd0 = __half22float2(*reinterpret_cast<const __half2*>(b0));  // d, dmin
+    const float2 dd1 = __half22float2(*reinterpret_cast<const __half2*>(b1));
+    const uint3 sw0 = *reinterpret_cast<const uint3*>(b0 + 4);
+    const uint3 sw1 = *reinterpret_cast<const uint3*>(b1 + 4);
+    const uint4 x0 = *reinterpret_cast<const uint4*>(b0 + 16 + 16 * t);
+    const uint4 x1 = *reinterpret_cast<const uint4*>(b0 + 16 + 16 * (t + 4));
+    const uint4 y0 = *reinterpret_cast<const uint4*>(b1 + 16 + 16 * t);
+    const uint4 y1 = *reinterpret_cast<const uint4*>(b1 + 16 + 16 * (t + 4));
+    // Scales and mins of groups 2p0, 2p0 + 1, 2p1, 2p1 + 1, rows g and g + 8.
+    int sc0[4], mn0g[4], sc1[4], mn1g[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      const int G = 2 * (int)(i < 2 ? p0 : p1) + (i & 1);
+      q4k_scale_min_(sw0, G, sc0[i], mn0g[i]);
+      q4k_scale_min_(sw1, G, sc1[i], mn1g[i]);
+    }
+    unsigned sx[8], sy[8];  // per chunk: (sc, -1024 sc) of its low group, then its high one
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      sx[2 * i] = q4k_h16_pair_(sc0[i]);
+      sx[2 * i + 1] = q4k_h16_pair_(-1024 * sc0[i]);
+      sy[2 * i] = q4k_h16_pair_(sc1[i]);
+      sy[2 * i + 1] = q4k_h16_pair_(-1024 * sc1[i]);
+    }
+    const __half* ab = ah + (size_t)ib * 256u;
+    float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    q4k_h16_chunk_(c, x0, y0, sx, sy, ab + 64u * p0 + l0);
+    q4k_h16_chunk_(c, x1, y1, sx + 4, sy + 4, ab + 64u * p1 + l0);
+    const float s = scales[ib];
+    acc0 += (s * dd0.x) * c[0];
+    acc1 += (s * dd1.x) * c[2];
+    const float S0 = sums[ib * 8u + gm], S1 = sums[ib * 8u + gm + 1u];
+    mn0 += (s * dd0.y) * ((float)(odd ? mn0g[2] : mn0g[0]) * S0 +
+                          (float)(odd ? mn0g[3] : mn0g[1]) * S1);
+    mn1 += (s * dd1.y) * ((float)(odd ? mn1g[2] : mn1g[0]) * S0 +
+                          (float)(odd ? mn1g[3] : mn1g[1]) * S1);
+  }
+  mn0 += __shfl_xor_sync(0xffffffffu, mn0, 1);
+  mn0 += __shfl_xor_sync(0xffffffffu, mn0, 2);
+  mn1 += __shfl_xor_sync(0xffffffffu, mn1, 1);
+  mn1 += __shfl_xor_sync(0xffffffffu, mn1, 2);
+  __shared__ float part[4][16];
+  if (t == 0) {
+    part[warp][g] = acc0 - mn0;
+    part[warp][g + 8] = acc1 - mn1;
+  }
+  __syncthreads();
+  if (warp == 0 && lane < 16) {
+    const unsigned r = blockIdx.x * 16u + lane;
+    if (r < N) y[r] = part[0][lane] + part[1][lane] + part[2][lane] + part[3][lane];
+  }
 }
 
 // Q8_0, 34 bytes a block of 32 (2-byte aligned only): a warp takes eight blocks
@@ -2805,11 +2985,7 @@ __device__ __forceinline__ unsigned h2_bits_(__half a, __half b) {
 }
 __device__ __forceinline__ void mma_f16_16816_(float* c, const unsigned* a,
                                                const unsigned* b) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+  tc_mma_(c, a, b[0], b[1], __half());
 }
 __device__ __forceinline__ void tc_ldsm4t_(unsigned& r0,unsigned& r1,unsigned& r2,unsigned& r3,const void* p){
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n":"=r"(r0),"=r"(r1),"=r"(r2),"=r"(r3):"r"((unsigned)__cvta_generic_to_shared(p)));}

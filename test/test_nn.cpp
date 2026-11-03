@@ -1582,6 +1582,129 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     }
   }
 
+  SUBCASE("Q4_K GEMV on f16 activations: the f32 one on the activation rounded to f16") {
+    // The h16 form: each 256 values scaled by the power of two s that brings the largest
+    // under 65504 (1 where it already is), rounded to f16, and each 32's sum of the
+    // rounded values; the GEMV is the f32 dot of the rows with s * those, summed by the
+    // tensor cores (which truncate as they add, ~16 adds of 2^-22 each of a
+    // superblock's magnitude): held to 1e-5 of the terms' magnitude, element by element.
+    const gpu::act_form h16 = gpu::act_form::h16;
+    if (gpu::has_gemv_quant && gpu::act_bytes(h16, 256) > 0) {
+      CHECK(gpu::act_bytes(h16, 300) == 0);  // K a whole number of superblocks
+      // Shapes: a 9-row tail (41 = 2 * 16 + 9); one superblock, so three of the four warps
+      // idle; ten superblocks over the four warps; and every superblock past f16's range
+      // (each of the others at unit size, so that the bound sees every superblock).
+      struct shape {
+        int64_t N, K;
+        bool past_range;
+      };
+      for (const shape sh : {shape{41, 2048, false}, {16, 256, false}, {33, 2560, false},
+                             {24, 1024, true}}) {
+        const int64_t N = sh.N, K = sh.K;
+        INFO("N " << N << " K " << K);
+        const int64_t nsb = K / 256;
+        const quant_rows q = random_quant_rows(12, N, K, (unsigned)(90 + K));
+        array W = dev(q.W);
+        // The activation: random; at unit size, superblock 1 positive values each 0.45 of
+        // an f16 step above one (rounding moves every one down: each 32's sum of the
+        // rounded values is ~3e-4 of it, ~1.6e-2, below the values'). Past the range, the superblocks
+        // times 1e5 and 2e5 by turns (s 2 and 4), the last times 1e4 with one value of
+        // exactly 65504 (the rule's edge: s 2).
+        std::vector<float> av = host_values(random_array({K}, (unsigned)(1090 + K)));
+        std::mt19937 rng((unsigned)K);
+        if (!sh.past_range) {
+          for (int64_t i = 256; i < std::min<int64_t>(512, K); i++) {
+            const uint16_t hb = tl::f32_to_f16(0.5f + (float)(rng() % 1024) / 512.0f);
+            const float h = tl::f16_to_f32(hb), up = tl::f16_to_f32((uint16_t)(hb + 1));
+            av[(size_t)i] = h + 0.45f * (up - h);
+          }
+        } else {
+          for (int64_t i = 0; i < K; i++)
+            av[(size_t)i] *= i >= K - 256 ? 1e4f : (i / 256) % 2 ? 2e5f : 1e5f;
+          av[(size_t)(K - 100)] = 65504.0f;
+        }
+        // What the form should hold, from the rule above.
+        std::vector<float> scale((size_t)nsb), r((size_t)K);
+        std::vector<uint16_t> half((size_t)K);
+        for (int64_t b = 0; b < nsb; b++) {
+          float m = 0;
+          for (int64_t i = 0; i < 256; i++) m = std::max(m, std::fabs(av[(size_t)(b * 256 + i)]));
+          int e = 0;
+          if (m >= 65504.0f) std::frexp(m / 65504.0f, &e);
+          scale[(size_t)b] = std::ldexp(1.0f, e);
+          for (int64_t i = b * 256; i < b * 256 + 256; i++) {
+            half[(size_t)i] = tl::f32_to_f16(av[(size_t)i] / scale[(size_t)b]);
+            r[(size_t)i] = tl::f16_to_f32(half[(size_t)i]) * scale[(size_t)b];
+          }
+        }
+        // (the data's own setup, not the kernel's: every superblock past the range scaled)
+        if (sh.past_range)
+          for (int64_t b = 0; b < nsb; b++) CHECK(scale[(size_t)b] > 1.0f);
+        array a = dev(array::from(std::vector<float>(av), {K}));
+        array pa = dev(array::zeros({gpu::act_bytes(h16, K) / 4}));
+        const int64_t pad = 16;  // y between sentinels: no row past N is stored
+        array yb = dev(array::from(std::vector<float>((size_t)(N + 2 * pad), 7.0f), {N + 2 * pad}));
+        REQUIRE(gpu::prepare_act(h16, a.device_span(), pa.device_span(), K));
+        REQUIRE(gpu::gemv_q4k_act(h16, pa.device_span(), W.device_span(),
+                                  yb.device_span().at(4 * pad), N, K));
+        tl::gpu::flush();
+        // The prepared activation: K halves, K/32 sums, K/256 scales.
+        const std::vector<float> pv = host_values(pa);
+        const auto* ph = reinterpret_cast<const uint16_t*>(pv.data());
+        const float* psum = pv.data() + K / 2;
+        const float* pscale = psum + K / 32;
+        bool halves = true, sums = true, scales = true;
+        for (int64_t i = 0; i < K; i++) halves = halves && ph[i] == half[(size_t)i];
+        for (int64_t g = 0; g < K / 32; g++) {
+          double s = 0;
+          for (int64_t i = 32 * g; i < 32 * g + 32; i++) s += tl::f16_to_f32(half[(size_t)i]);
+          sums = sums && std::fabs(psum[g] - s) <= 1e-6 * (1 + std::fabs(s));
+        }
+        for (int64_t b = 0; b < nsb; b++) scales = scales && pscale[b] == scale[(size_t)b];
+        CHECK(halves);
+        CHECK(sums);
+        CHECK(scales);
+        // The GEMV against the f64 dot of the dequantized rows with r.
+        const std::vector<float> yv = host_values(yb);
+        double worst = 0;
+        bool kept = true;
+        for (int64_t n = 0; n < N; n++) {
+          double ref = 0, mag = 0;
+          for (int64_t k = 0; k < K; k++) {
+            const double t = (double)q.w[(size_t)(n * K + k)] * r[(size_t)k];
+            ref += t;
+            mag += std::fabs(t);
+          }
+          const double e = std::fabs(yv[(size_t)(pad + n)] - ref) / mag;
+          if (!(e <= worst)) worst = e;  // a NaN stays (std::max would drop it)
+        }
+        for (int64_t i = 0; i < N + 2 * pad; i++)
+          if (i < pad || i >= pad + N) kept = kept && yv[(size_t)i] == 7.0f;
+        CHECK(worst < 1e-5);
+        CHECK(kept);
+        // Off the kernel's 16-byte vectors, the weight or the prepared activation: refused,
+        // or read right.
+        const std::vector<float> want = after_lead(yb, pad, N);
+        array Wl = dev(with_lead(W, 1)), pl = dev(with_lead(pa, 1));
+        array yw = dev(array::zeros({N})), yp = dev(array::zeros({N}));
+        check_misaligned(
+            "f16 Q4_K GEMV, W off 16 bytes",
+            [&] {
+              return gpu::gemv_q4k_act(h16, pa.device_span(), Wl.device_span().at(4),
+                                       yw.device_span(), N, K);
+            },
+            [&] { return host_close(host_values(yw), want, 1e-5f); });
+        check_misaligned(
+            "f16 Q4_K GEMV, the prepared activation off 16 bytes",
+            [&] {
+              return gpu::gemv_q4k_act(h16, pl.device_span().at(4), W.device_span(),
+                                       yp.device_span(), N, K);
+            },
+            [&] { return host_close(host_values(yp), want, 1e-5f); });
+      }
+    }
+  }
+
   SUBCASE("rope, split_heads, merge_heads and argmax") {
     const int64_t H = 14, T = 5, D = 64, ld = H * D;
     array x = dev(random_array({H * T, D}, 970)), b = dev(random_array({H * T, D}, 971));

@@ -646,7 +646,8 @@ struct context {
     return cached_(gemm_bf16_nt_sk_fn, "tl_gemm_bf16_nt_sk");
   }
   CUfunction gemv_q4k_fn = nullptr, gemv_q6k_fn = nullptr,
-             gemv_q80_fn = nullptr, quant_act_fn = nullptr, gemv_q4k_q8_fn = nullptr;
+             gemv_q80_fn = nullptr, quant_act_fn = nullptr, gemv_q4k_q8_fn = nullptr,
+             act_h16_fn = nullptr, gemv_q4k_h16_fn = nullptr;
   CUfunction rmsnorm_rope_fn[3] = {};  // D 64, 128, 256
   CUfunction gated_rmsnorm_fn[2] = {};
   CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, glu_h16_fn[2] = {},

@@ -106,11 +106,13 @@ Its Q4_K_M holds the MLP in Q4_K, `attn_output` and `output` in Q6_K and every
 other projection in Q8_0. The Q4_K GEMV (the MLP, half the bytes) reads the
 activation as int8, as llama.cpp's does: quantized once per call to 8 bits per
 32 values, then `dp4a`. With the activation as float that GEMV ran at ~450 GB/s,
-held back by the activation loads (8 `float4` a lane for every 32 weights), where
-the weights alone stream at ~850; on int8 it runs at ~750 and the 27B's decode
-goes from 24.9 to 35.6 tok/s. The price is the 8-bit rounding of the activation
-(`TL_GEMV_ACT=f32` turns it off; `check_quant` bounds both against the dequantized
-oracle). The Q8_0 and Q6_K GEMVs already ran at 700-850 GB/s on float activations
+held back by its instructions, not its bytes (each weight a nibble shifted out,
+converted and multiplied on its own, ~12 instructions a weight: it runs as slowly
+with its weights in the cache, and as slowly reading the activation as f16), where
+the weights alone stream at ~850; on int8 (`dp4a`, ~3 instructions a weight) it
+runs at ~750 and the 27B's decode goes from 24.9 to 35.6 tok/s. The price is the 8-bit rounding of the activation
+(`TL_GEMV_ACT=f32` turns it off, `TL_GEMV_ACT=h16` reads the activation as f16
+instead, below; `check_quant` bounds each form against the dequantized oracle). The Q8_0 and Q6_K GEMVs already ran at 700-850 GB/s on float activations
 and are unchanged. Without MMQ (`TL_NO_MMQ=1`, and for Q6_K always) the prefill
 dequantizes each projection to f16 once per chunk
 (a slab of rows at a time, ahead of the GEMM) rather than in the staging of every
@@ -229,6 +231,30 @@ KL 0.30 (top token 5 of 7); llama.cpp's path, at 0.21, is no better.
 prefill's block GEMMs through f16 instead of int8) take the int8 rounding
 out, at a cost on Gemma 3 4B: tg128 213 -> 161 tok/s, pp512 10,640 -> 7,020.
 On Qwen they cost less (tg -8%, pp -11% on Qwen3-0.6B) and buy little.
+
+`TL_GEMV_ACT=h16` takes the int8 rounding out of the decode at close to int8's
+speed: its Q4_K GEMV reads the activation as f16 on the tensor cores (exact
+products, f32 sums: the float GEMV of the activation rounded to f16, each 256
+values first scaled by a power of two where they would pass f16's range). The
+float GEMV's cost is its instructions, ~12 a weight, which f16 activations on the
+CUDA cores do not change; on the tensor cores a weight costs ~1.5. tg128, int8 /
+f16 / float, alternated in one session:
+
+| model (GGUF) | int8 | f16 | float |
+|---|---:|---:|---:|
+| Qwen3-0.6B Q4_K_M | 560-564 | 518-541 | 490-509 |
+| Qwen3.5-0.8B Q4_K_M | 593-623 | 572-596 | 541-546 |
+| Gemma 3 4B Q4_K_M | 202-211 | 191-208 | 155-157 |
+| Qwen3.8-27B Q4_K_M | 38.9-39.7 | 38.5-39.2 | 28.5-28.8 |
+
+The small models' gap is the 16-row blocks', which fill fewer multiprocessors
+at their widths. The prompts above are spread-out ids without a BOS, which
+Gemma 3's chat prompts start with; after one (its first-token activations reach
+~9e3) Gemma's distributions move far less, and the forms rank the same. Gemma 3
+4B, BOS then 199 spread-out ids, KL of the six steps after the batched prompt:
+int8 1.8e-3, f16 2.9e-4 (the float form's too: what is left comes from the
+prompt, through the MMQ's int8), f16 with `TL_NO_MMQ=1` 8.5e-5; llama.cpp 1.3e-3.
+Token by token through the decode alone, 2.7e-3 int8 against 5.3e-7 f16.
 
 ## What differs between the two runs
 

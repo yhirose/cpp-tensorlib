@@ -420,9 +420,10 @@ struct qmat {
 
 // y = Q . a, a GEMV a run. In a prepared form f (gpu::act_form, into `pa`, room for
 // gpu::act_bytes_max) the Q4_K runs read the activation as that form makes it,
-// prepared once for the call: int8 (q8) is what makes them run at the weights'
-// bandwidth rather than at the float kernel's instruction rate. The other formats,
-// f32, and a form the backend has not got read it as float.
+// prepared once for the call: int8 (q8) or f16 on the tensor cores (h16) is what
+// makes them run at the weights' bandwidth rather than at the float kernel's
+// instruction rate. The other formats, f32, and a form the backend has not got read
+// it as float.
 inline void gemv_q(const qmat& Q, gpu::span a, gpu::span y,
                    gpu::act_form f = gpu::act_form::f32, gpu::span pa = {}) {
   bool prepared = false;
@@ -1023,10 +1024,11 @@ inline const char* act_form_name(gpu::act_form f) {
   switch (f) {
     case gpu::act_form::f32: return "f32";
     case gpu::act_form::q8: return "q8";
+    case gpu::act_form::h16: return "h16";
   }
   return "?";
 }
-// The decode GEMVs' activation form: TL_GEMV_ACT names it (f32 or q8; q8 when unset),
+// The decode GEMVs' activation form: TL_GEMV_ACT names it (f32, q8 or h16; q8 when unset),
 // and a form the backend has not got for k-wide inputs falls back to f32.
 inline gpu::act_form gemv_form_env(int64_t k) {
   gpu::act_form f = gpu::act_form::q8;

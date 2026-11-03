@@ -8,9 +8,10 @@
 //
 // The native run is made once per form the Q4_K GEMVs read their activation in
 // (Model::gemv_form, every one the backend has): f32 (the exact one, which should
-// agree to the oracle's bf16 rounding) and q8 (the dp4a form: the activation rounded
-// to 8 bits per 32 values, as llama.cpp does), which is held to a looser bound and to
-// the same top token except at near ties.
+// agree to the oracle's bf16 rounding), h16 (the activation rounded to f16, held to the
+// same bound) and q8 (the dp4a form: the activation rounded to 8 bits per 32 values, as
+// llama.cpp does), which is held to a looser bound and to the same top token except at
+// near ties.
 //
 // Usage: check_quant model-Q4_K_M.gguf [steps=32]
 
@@ -56,11 +57,13 @@ int main(int argc, char** argv) {
   {
     qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, false, true, /*quant=*/true);
     if (!M.quant) { std::printf("native block-quantized path unavailable\n"); return 1; }
-    // Each form's bound on the logits: f32 the oracle's bf16 rounding, q8 its 8-bit one
-    // (a form without one is held to 0, so it fails until it is given its own).
+    // Each form's bound on the logits: f32 and h16 (whose f16 rounding is 8x finer than
+    // the oracle's bf16) the oracle's bf16 rounding, q8 its 8-bit one (a form without one
+    // is held to 0, so it fails until it is given its own).
     auto bound_of = [](tl::gpu::act_form f) {
       switch (f) {
-        case tl::gpu::act_form::f32: return 2e-2;
+        case tl::gpu::act_form::f32:
+        case tl::gpu::act_form::h16: return 2e-2;
         case tl::gpu::act_form::q8: return 3e-1;
       }
       return 0.0;
