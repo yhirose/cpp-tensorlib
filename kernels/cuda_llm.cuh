@@ -127,8 +127,8 @@ __global__ void tl_rope_dpos(const float* __restrict__ x,
                              const float* __restrict__ bias,
                              float* __restrict__ out, unsigned T, unsigned D,
                              const unsigned* __restrict__ d_pos, float base,
-                             unsigned rot) {
-  rope_core(x, bias, out, T, D, *d_pos, base, rot);
+                             unsigned rot, float pos_scale) {
+  rope_core(x, bias, out, T, D, *d_pos, base, rot, pos_scale);
 }
 
 // Device-scalar increment: *p += 1. Bumps the shared decode pos counter at the

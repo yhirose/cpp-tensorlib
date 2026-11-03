@@ -97,10 +97,14 @@ struct own_nn {
                                   int64_t n, int64_t k);
   static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                    int64_t D, int64_t pos, float base, gpu::span bias = {});
-  // rope over the first `rot` dims of each row only (Qwen3.5's partial RoPE).
+  // rope over the first `rot` dims of each row only (Qwen3.5's partial RoPE),
+  // and with the position scaled (a linear RoPE scaling: Gemma 3's global layers).
   static bool rope_partial(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                            int64_t D, int64_t pos, float base, gpu::span bias,
-                           int64_t rot);
+                           int64_t rot, float pos_scale = 1.0f);
+  static bool rope_scaled(gpu::span x, gpu::span out, int64_t rows, int64_t T, int64_t D,
+                          int64_t pos, float base, gpu::span bias, int64_t rot,
+                          float pos_scale);
   static bool layer_norm_bwd(gpu::span x, gpu::span g, gpu::span dy,
                              gpu::span dx, gpu::span dg, gpu::span db,
                              gpu::span stats, gpu::span partials, int64_t rows,
@@ -882,9 +886,14 @@ inline bool own_nn::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                       int64_t D, int64_t pos, float base, gpu::span bias) {
   return rope_partial(x, out, rows, T, D, pos, base, bias, D);
 }
+inline bool own_nn::rope_scaled(gpu::span x, gpu::span out, int64_t rows, int64_t T,
+                                int64_t D, int64_t pos, float base, gpu::span bias,
+                                int64_t rot, float pos_scale) {
+  return rope_partial(x, out, rows, T, D, pos, base, bias, rot, pos_scale);
+}
 inline bool own_nn::rope_partial(gpu::span x, gpu::span out, int64_t rows,
                               int64_t T, int64_t D, int64_t pos, float base,
-                              gpu::span bias, int64_t rot) {
+                              gpu::span bias, int64_t rot, float pos_scale) {
   auto& c = context::get();
   if (!c.ready || D <= 0 || (D & 1) || rot <= 0 || (rot & 1) || rot > D) return false;
   c.device_read_(x.buf);
@@ -897,7 +906,7 @@ inline bool own_nn::rope_partial(gpu::span x, gpu::span out, int64_t rows,
            upos = static_cast<unsigned>(pos), urot = static_cast<unsigned>(rot);
   return c.launch_(c.rope_(), {static_cast<unsigned>(rows)},
                    {static_cast<unsigned>(D / 2)}, 0, px, pbias, po, uT, uD,
-                   upos, base, urot);
+                   upos, base, urot, pos_scale);
 }
 
 // ---- Row-wise fused RMSNorm / SwiGLU. `rows` defaults to 1 (a decode step); a

@@ -15,7 +15,7 @@ struct own_llm {
   // step replays against an advancing cache row.
   static bool rope_dpos(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                         int64_t D, gpu::span d_pos, float base,
-                        gpu::span bias = {}, int64_t rot = 0);
+                        gpu::span bias = {}, int64_t rot = 0, float pos_scale = 1.0f);
   static bool kv_append_dpos(gpu::span Kc, gpu::span Vc, gpu::span k_new,
                              gpu::span v_new, gpu::span d_pos, int64_t kv_max,
                              int64_t n_kv_heads, int64_t D, bool kv_f16 = false);
@@ -119,7 +119,7 @@ inline void upload_u32(void* native, unsigned val) {
 // RoPE reading pos from *d_pos (else identical to rope_partial()).
 inline bool own_llm::rope_dpos(gpu::span x, gpu::span out, int64_t rows, int64_t T,
                            int64_t D, gpu::span d_pos, float base,
-                           gpu::span bias, int64_t rot) {
+                           gpu::span bias, int64_t rot, float pos_scale) {
   auto& c = context::get();
   if (rot == 0) rot = D;
   if (!c.ready || D <= 0 || (D & 1) || rot <= 0 || (rot & 1) || rot > D) return false;
@@ -133,7 +133,7 @@ inline bool own_llm::rope_dpos(gpu::span x, gpu::span out, int64_t rows, int64_t
   float* pp = context::off_(d_pos.buf, d_pos.off);
   unsigned uT = (unsigned)T, uD = (unsigned)D, urot = (unsigned)rot;
   return c.launch_(c.rope_dpos_(), {(unsigned)rows}, {(unsigned)(D / 2)}, 0, px,
-                   pbias, po, uT, uD, pp, base, urot);
+                   pbias, po, uT, uD, pp, base, urot, pos_scale);
 }
 
 // One-thread *d_pos += 1 (tail of a captured forward; advances the counter).

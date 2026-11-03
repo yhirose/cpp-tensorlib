@@ -289,6 +289,28 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
     CHECK(same(o, array::rope(x + b, 37, 1e6f), 1e-5f));
   }
 
+  SUBCASE("rope reading its position from the device matches rope, scaled or not") {
+    // A captured decode step reads pos from a device scalar; Gemma 3's global
+    // layers scale it. Where the backend has the form, the same rotation bit for bit.
+    const int64_t H = 8, D = 256;
+    array x = dev(random_array({H, D}, 922));
+    array pos = dev(array::zeros({1}));
+    const uint32_t p = 37;
+    float bits;
+    std::memcpy(&bits, &p, 4);
+    tl::gpu::upload(pos.device_span().buf, &bits, 1);
+    for (const float scale : {1.0f, 0.125f}) {
+      CAPTURE(scale);
+      array a = array::empty({H, D}), b = array::empty({H, D});
+      REQUIRE(gpu::rope(x.device_span(), a.device_span(), H, 1, D, p, 1e6f, {}, 0, scale));
+      if (gpu::rope_dpos(x.device_span(), b.device_span(), H, 1, D, pos.device_span(), 1e6f, {}, 0,
+                         scale)) {
+        tl::gpu::flush();
+        CHECK(same(a, b, 0.0f));
+      }
+    }
+  }
+
   SUBCASE("argmax reads back the smallest index among ties, or leaves it on the device") {
     // A backend may split the vector across groups and reduce their winners:
     // ties within one stretch and across two, a maximum at the ragged end, and

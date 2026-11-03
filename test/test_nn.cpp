@@ -902,32 +902,39 @@ TEST_CASE("xent_bwd: the fused pullback matches (softmax - onehot) * g") {
 // "generic compositions" case holds the two together); this holds either to
 // an independent program.
 TEST_CASE("partial rope rotates the first rot dims and keeps the rest") {
+  // And a scaled position (a linear RoPE scaling, Gemma 3's global layers): the
+  // angle is position * pos_scale * base^(-2j/rot), on the whole row and on part.
   if (!tl::gpu_available()) return;
   auto prev = tl::device_;
   tl::use_gpu();
-  const int64_t H = 3, T = 4, D = 256, rot = 64, pos = 11;
+  const int64_t H = 3, T = 4, D = 256, pos = 11;
   const float base = 1e7f;
-  array xh = random_array({H * T, D}, 990);
-  xh.eval();
-  std::vector<float> want((size_t)H * T * D);
-  for (int64_t r = 0; r < H * T; r++) {
-    const float* x = xh.raw() + r * D;
-    float* w = want.data() + r * D;
-    for (int64_t j = 0; j < D; j++) w[j] = x[j];
-    const double p = (double)(pos + r % T);
-    for (int64_t j = 0; j < rot / 2; j++) {
-      const double ang = p * std::pow((double)base, -2.0 * j / rot);
-      const float c = (float)std::cos(ang), s = (float)std::sin(ang);
-      w[j] = x[j] * c - x[j + rot / 2] * s;
-      w[j + rot / 2] = x[j] * s + x[j + rot / 2] * c;
+  for (const auto [rot, pos_scale] : {std::pair<int64_t, float>{64, 1.0f}, {256, 0.125f}, {64, 0.125f}}) {
+    CAPTURE(rot);
+    CAPTURE(pos_scale);
+    array xh = random_array({H * T, D}, 990);
+    xh.eval();
+    std::vector<float> want((size_t)H * T * D);
+    for (int64_t r = 0; r < H * T; r++) {
+      const float* x = xh.raw() + r * D;
+      float* w = want.data() + r * D;
+      for (int64_t j = 0; j < D; j++) w[j] = x[j];
+      const double p = (double)(pos + r % T) * pos_scale;
+      for (int64_t j = 0; j < rot / 2; j++) {
+        const double ang = p * std::pow((double)base, -2.0 * j / rot);
+        const float c = (float)std::cos(ang), s = (float)std::sin(ang);
+        w[j] = x[j] * c - x[j + rot / 2] * s;
+        w[j + rot / 2] = x[j] * s + x[j + rot / 2] * c;
+      }
     }
+    array x = xh.clone();
+    x.eval();
+    array o = array::empty({H * T, D});
+    REQUIRE(tl::gpu::rope(x.device_span(), o.device_span(), H * T, T, D, pos, base, {}, rot,
+                          pos_scale));
+    tl::gpu::flush();
+    CHECK(tl::allclose(o, array::from(std::move(want), {H * T, D}), 1e-5f, 1e-5f));
   }
-  array x = xh.clone();
-  x.eval();
-  array o = array::empty({H * T, D});
-  REQUIRE(tl::gpu::rope(x.device_span(), o.device_span(), H * T, T, D, pos, base, {}, rot));
-  tl::gpu::flush();
-  CHECK(tl::allclose(o, array::from(std::move(want), {H * T, D}), 1e-5f, 1e-5f));
   tl::device_ = prev;
 }
 

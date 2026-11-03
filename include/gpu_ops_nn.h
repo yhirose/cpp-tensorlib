@@ -149,9 +149,9 @@ inline bool split_heads(span src, span bias, span dst, int64_t T, int64_t ld,
 // of cos and of (-sin | +sin) over the two rotated halves (1 and 0 past rot),
 // and swap(x) the halves exchanged — a row gather of x seen as rows of rot/2,
 // which leaves the chunks past rot in place. Four launches a head over shared
-// tables.
+// tables. pos_scale multiplies the position (a linear RoPE scaling).
 inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
-                 int64_t pos, float base, span bias, int64_t rot) {
+                 int64_t pos, float base, span bias, int64_t rot, float pos_scale = 1.0f) {
   if (rows <= 0 || T <= 0 || D <= 0 || rot <= 0 || rot % 2 || rot > D ||
       rows % T || D % (rot / 2)) {
     return false;
@@ -161,7 +161,7 @@ inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
       xb(bias ? rows * D : 1), sw(T * D), xc(T * D), xs(T * D);
   if (!C || !S || !idx || (bias && !xb) || !sw || !xc || !xs) return false;
   for (int64_t t = 0; t < T; t++) {
-    const double position = static_cast<double>(pos + t);
+    const double position = static_cast<double>(pos + t) * pos_scale;
     for (int64_t j = 0; j < half; j++) {
       const double ang = position * std::pow(static_cast<double>(base),
                                              -2.0 * static_cast<double>(j) / rot);
@@ -549,13 +549,24 @@ inline bool split_heads(span src, span bias, span dst, int64_t T, int64_t ld,
 // Rotary embedding over [rows, T, D] at position `pos`, adding the optional
 // per-row bias first. `rot` (0: all of D) rotates only the first rot dims of
 // each row, the partial RoPE of Qwen3.5: a backend's own `rope` turns the
-// whole row, and one that also has `rope_partial` takes the rest.
+// whole row, and one that also has `rope_partial` takes the rest. pos_scale
+// multiplies the position (a linear RoPE scaling, Gemma 3's global layers):
+// a backend's own `rope_scaled` takes it, else the composition.
 TL_GPU_DETECT_OWN(rope)
 TL_GPU_DETECT_OWN(rope_partial)
+TL_GPU_DETECT_OWN(rope_scaled)
 template <class Own = own>
 inline bool rope(span x, span o, int64_t rows, int64_t T, int64_t D,
-                 int64_t pos, float base, span bias = {}, int64_t rot = 0) {
+                 int64_t pos, float base, span bias = {}, int64_t rot = 0,
+                 float pos_scale = 1.0f) {
   if (rot == 0) rot = D;
+  if (pos_scale != 1.0f) {
+    if constexpr (detail::owns_rope_scaled<Own>::value) {
+      if (detail::ran(Own::rope_scaled(x, o, rows, T, D, pos, base, bias, rot, pos_scale)))
+        return true;
+    }
+    return generic::rope(x, o, rows, T, D, pos, base, bias, rot, pos_scale);
+  }
   if constexpr (detail::owns_rope<Own>::value) {
     if (rot == D &&
         detail::ran(Own::rope(x, o, rows, T, D, pos, base, bias))) {
@@ -697,15 +708,17 @@ inline bool gemv_quant(int type, span a, span W, span y, int64_t n, int64_t k) {
 }
 
 // x[rows, D] = rope(rmsnorm(x) * w), in place, rows = heads * T: Qwen3's q and k
-// rows. One pass where the backend has it, else the two ops.
+// rows. One pass where the backend has it (an unscaled position), else the two ops.
 TL_GPU_DETECT_OWN(rmsnorm_rope)
 template <class Own = own>
 inline bool rmsnorm_rope(span x, span w, int64_t rows, int64_t T, int64_t D, int64_t pos,
-                         float base, int64_t rot, float eps) {
+                         float base, int64_t rot, float eps, float pos_scale = 1.0f) {
   if constexpr (detail::owns_rmsnorm_rope<Own>::value) {
-    if (detail::ran(Own::rmsnorm_rope(x, w, rows, T, D, pos, base, rot, eps))) return true;
+    if (pos_scale == 1.0f && detail::ran(Own::rmsnorm_rope(x, w, rows, T, D, pos, base, rot, eps)))
+      return true;
   }
-  return rmsnorm(x, w, x, D, eps, rows) && rope(x, x, rows, T, D, pos, base, {}, rot);
+  return rmsnorm(x, w, x, D, eps, rows) &&
+         rope<Own>(x, x, rows, T, D, pos, base, {}, rot, pos_scale);
 }
 
 // The f16 prefill's activations, rounded where they are made so the GEMM does

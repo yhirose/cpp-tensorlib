@@ -3452,10 +3452,12 @@ extern "C" {
 // unchanged from before rot existed) and copies the rest through, bias added.
 // blockDim = D/2: thread j turns the pair (j, j + rot/2) when j < rot/2, and
 // strides the pass-through dims from rot + j.
+// pos_scale multiplies the position (a linear RoPE scaling, Gemma 3's global
+// layers); at 1 the position is the same float.
 static __device__ __forceinline__ void rope_core(
     const float* __restrict__ x, const float* __restrict__ bias,
     float* __restrict__ out, unsigned T, unsigned D, unsigned pos, float base,
-    unsigned rot) {
+    unsigned rot, float pos_scale) {
   const unsigned r = blockIdx.x, j = threadIdx.x;  // j in 0..D/2-1
   const size_t bi = (size_t)r * D;
   for (unsigned d = rot + j; d < D; d += blockDim.x)
@@ -3469,14 +3471,14 @@ static __device__ __forceinline__ void rope_core(
     x0 += bias[bi + j];
     x1 += bias[bi + j + half];
   }
-  rope_pair_((float)(pos + t), j, rot, base, x0, x1);
+  rope_pair_((float)(pos + t) * pos_scale, j, rot, base, x0, x1);
   out[bi + j] = x0;
   out[bi + j + half] = x1;
 }
 __global__ void tl_rope(const float* __restrict__ x,
                         const float* __restrict__ bias, float* __restrict__ out,
                         unsigned T, unsigned D, unsigned pos, float base,
-                        unsigned rot) {
-  rope_core(x, bias, out, T, D, pos, base, rot);
+                        unsigned rot, float pos_scale) {
+  rope_core(x, bias, out, T, D, pos, base, rot, pos_scale);
 }
 }  // extern "C"
