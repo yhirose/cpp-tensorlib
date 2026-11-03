@@ -1552,11 +1552,15 @@ TEST_CASE("generic compositions agree with the fused kernels") {
             std::memcpy(packed.data(), b.data(), b.size());
             const int64_t nf = (int64_t)packed.size();
             array Wo = dev(array::from(std::move(packed), {nf})), yo = dev(array::zeros({N}));
-            const bool ran = gpu::gemv_quant(type, ad.device_span(), Wo.device_span().at(lead),
-                                             yo.device_span(), N, K);
-            tl::gpu::flush();
-            if (lead == 2) CHECK((ran && host_values(yo) == want));
-            else CHECK_FALSE(ran);
+            bool ran = false;
+            check_misaligned(
+                lead == 2 ? "Q5_0 GEMV, base 2 bytes off 4" : "Q5_0 GEMV, base 1 byte off 4",
+                [&] {
+                  return ran = gpu::gemv_quant(type, ad.device_span(), Wo.device_span().at(lead),
+                                               yo.device_span(), N, K);
+                },
+                [&] { return host_values(yo) == want; }, /*must_run=*/lead == 2);
+            if (lead == 1) CHECK_FALSE(ran);
           }
         }
       }

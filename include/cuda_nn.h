@@ -376,12 +376,6 @@ inline int quant_fmt_(int type, int64_t k) {
   }
   return -1;
 }
-// The bytes of a row of k weights of `type`.
-inline size_t quant_row_bytes(int type, int64_t k) {
-  uint64_t elems = 0, bytes = 0;
-  gguf::ggml_block(static_cast<gguf::ggml_type>(type), elems, bytes);
-  return (size_t)k / elems * bytes;
-}
 inline bool own_nn::quant_reads(int type, int64_t k) { return quant_fmt_(type, k) >= 0; }
 
 // The MMQ GEMM (tl_gemm_mmq_*): A (f16, M x K) rounded to int8 into a scratch, then the
@@ -450,7 +444,7 @@ inline bool own_nn::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu
   // streams plain f16 and runs at 72 TFLOPS rather than the 45 of dequantizing in
   // every row block of the activation). The values are the staging's, rounded the
   // same, so the product is the same bits.
-  const size_t row_bytes = quant_row_bytes(type, k);
+  const size_t row_bytes = gguf::bytes_of(static_cast<gguf::ggml_type>(type), (uint64_t)k);
   // 192 MB: a 27B's largest projection (down, 5120 x 17408) in one slab. Split in two it left
   // each GEMM too few blocks for the long-K tile (pp512 1027 -> 1140 tok/s on the 27B).
   constexpr size_t slab_bytes = 192u << 20;

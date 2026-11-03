@@ -283,9 +283,7 @@ class model {
       }
       t.type = static_cast<ggml_type>(rd_<uint32_t>(pos));
       t.rel_offset = rd_<uint64_t>(pos);
-      uint64_t be, bb;
-      ggml_block(t.type, be, bb);
-      t.nbytes = n_elems / be * bb;
+      t.nbytes = bytes_of(t.type, n_elems);
       index_.emplace(t.name, tensors_.size());
       tensors_.push_back(std::move(t));
     }

@@ -403,7 +403,7 @@ inline array load_f32(const gg::model& m, const std::string& n, int64_t len) {
 // projection is a GEMV per run, writing its slice of the same contiguous output.
 struct qmat {
   struct part {
-    int type;           // the ggml_type code (12 Q4_K, 14 Q6_K)
+    int type;           // the ggml_type code, a format gpu::quant_reads takes
     int64_t rows;       // output rows of this run
     int64_t byte_off;   // where its blocks start in `raw`
     int64_t row_off;    // its first output row
@@ -441,14 +441,12 @@ inline qmat load_q_cat(const gg::model& m, const std::vector<wpart>& parts, int6
   int64_t off = 0, rows_total = 0;
   for (const auto& p : parts) {
     const auto* t = need(m, p.name);
-    uint64_t elems, bytes;
-    gg::ggml_block(t->type, elems, bytes);
     if (!gpu::quant_reads((int)t->type, in)) {
       std::fprintf(stderr, "tensor %s: this backend does not read its blocks (ggml type %d, %lld "
                    "weights a row) as they are\n", p.name.c_str(), (int)t->type, (long long)in);
       std::exit(2);
     }
-    const int64_t row_bytes = in / (int64_t)elems * (int64_t)bytes, type = (int64_t)t->type;
+    const int64_t row_bytes = (int64_t)gg::bytes_of(t->type, in), type = (int64_t)t->type;
     if (Q.parts.empty() || Q.parts.back().type != type) {  // a new run, 256-byte aligned
       off = (off + 255) / 256 * 256;
       Q.parts.push_back({(int)type, 0, off, rows_total});
@@ -461,9 +459,7 @@ inline qmat load_q_cat(const gg::model& m, const std::vector<wpart>& parts, int6
   int64_t base = 0, pi = 0;
   for (const auto& p : parts) {
     const auto* t = m.tensor(p.name);
-    uint64_t elems, bytes;
-    gg::ggml_block(t->type, elems, bytes);
-    const int64_t row_bytes = in / (int64_t)elems * (int64_t)bytes;
+    const int64_t row_bytes = (int64_t)gg::bytes_of(t->type, in);
     while (pi + 1 < (int64_t)Q.parts.size() && Q.parts[pi + 1].row_off <= base) pi++;
     const auto& run_ = Q.parts[pi];
     // Source rows are contiguous runs (the whole tensor, or the blk rows of one

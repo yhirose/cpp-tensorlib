@@ -48,6 +48,13 @@ inline void ggml_block(ggml_type t, uint64_t& elems, uint64_t& bytes) {
   throw std::runtime_error("gguf: unknown ggml type " +
                            std::to_string(static_cast<uint32_t>(t)));
 }
+// The bytes of n elements of `t` (a row of n weights, a whole tensor), n a whole
+// number of blocks.
+inline uint64_t bytes_of(ggml_type t, uint64_t n) {
+  uint64_t elems = 0, bytes = 0;
+  ggml_block(t, elems, bytes);
+  return n / elems * bytes;
+}
 
 // half -> float, the exact conversion (subnormals included).
 inline float half_to_float(uint16_t h) {
