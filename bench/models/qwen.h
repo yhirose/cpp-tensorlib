@@ -71,15 +71,16 @@ struct Config {
   // Gemma 3: the embedding times sqrt(NE); an RMSNorm after the attention and
   // after the MLP too (their outputs normalized before the residual adds); the
   // MLP's gate through GELU (tanh form) rather than SiLU; and sliding-window
-  // attention on all but every SWA_PATTERN-th layer (a local layer sees the
-  // last SWA positions; layer l is local when l % SWA_PATTERN < SWA_PATTERN - 1),
-  // whose RoPE turns at ROPE_BASE_LOCAL, unscaled, while a global layer's
-  // turns at ROPE_BASE with the position times ROPE_SCALE (a linear scaling).
+  // attention on the layers `local` marks (a local layer sees the last SWA
+  // positions), whose RoPE turns at ROPE_BASE_LOCAL, unscaled, while a global
+  // layer's turns at ROPE_BASE with the position times ROPE_SCALE (a linear
+  // scaling, which any family's GGUF may state).
   float EMB_SCALE = 1.0f;
   bool post_norms = false, gelu = false;
-  int64_t SWA = 0, SWA_PATTERN = 0;
+  int64_t SWA = 0;
+  std::vector<bool> local;  // per layer; empty: every layer global
   float ROPE_BASE_LOCAL = 10000.0f, ROPE_SCALE = 1.0f;
-  bool is_local(int64_t l) const { return SWA > 0 && l % SWA_PATTERN < SWA_PATTERN - 1; }
+  bool is_local(int64_t l) const { return l < (int64_t)local.size() && local[l]; }
   float rope_base(int64_t l) const { return is_local(l) ? ROPE_BASE_LOCAL : ROPE_BASE; }
   float rope_scale(int64_t l) const { return is_local(l) ? 1.0f : ROPE_SCALE; }
   // The attention's q scale: 1 / sqrt(HD), unless the family says otherwise
@@ -88,8 +89,10 @@ struct Config {
   float scale() const { return QSCALE > 0.0f ? QSCALE : 1.0f / std::sqrt((float)HD); }
   bool hybrid() const { return INTERVAL > 1; }
   // The array path (forward(), the per-op oracle) models the plain decoder:
-  // no DeltaNet layers, no Gemma post norms.
-  bool array_path() const { return !hybrid() && !post_norms; }
+  // no DeltaNet layers, no Gemma post norms or GELU, every layer global.
+  bool array_path() const {
+    return !hybrid() && !post_norms && !gelu && local.empty() && ROPE_SCALE == 1.0f;
+  }
   bool is_delta(int64_t l) const { return hybrid() && (l + 1) % INTERVAL != 0; }
   // Output widths of the fused projections (and so of the scratch they land in).
   int64_t attn_proj() const { return (NH + 2 * NKV) * HD + (attn_gate ? NH * HD : 0); }
@@ -156,20 +159,36 @@ inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
   c.attn_gate = (int64_t)wq->dims[1] == 2 * c.NH * c.HD;
   c.tied_output = m.tensor("output.weight") == nullptr;
   // Qwen3.5 names the MLP's input norm post_attention_norm; Gemma 3 has an
-  // ffn_norm and a post_attention_norm both (and a post_ffw_norm).
-  if (!m.tensor("blk.0.ffn_norm.weight") && m.tensor("blk.0.post_attention_norm.weight"))
+  // ffn_norm and a post_attention_norm both, and a post_ffw_norm: the norms of
+  // the attention's and the MLP's outputs.
+  c.post_norms = m.tensor("blk.0.post_ffw_norm.weight") != nullptr;
+  if (!c.post_norms && m.tensor("blk.0.post_attention_norm.weight"))
     c.ffn_norm = "post_attention_norm.weight";
+  if (m.has(arch + ".rope.scaling.type") && m.kv(arch + ".rope.scaling.type").as_str() == "linear")
+    c.ROPE_SCALE = 1.0f / m.kv(arch + ".rope.scaling.factor").as_f32();
   if (arch == "gemma3") {
     // As llama.cpp's gemma3 (src/models/gemma3.cpp): its norms' weights carry
     // Gemma's +1 already (the GGUF conversion adds it).
     c.EMB_SCALE = std::sqrt((float)c.NE);
-    c.post_norms = c.gelu = true;
-    if (m.has(arch + ".attention.sliding_window")) {
+    c.gelu = true;
+    if (m.has(arch + ".final_logit_softcapping") &&
+        m.kv(arch + ".final_logit_softcapping").as_f32() != 0.0f)
+      throw std::runtime_error("qwen: a gemma3 with a final logit softcap");
+    if (m.has(arch + ".attention.sliding_window") && u32("attention.sliding_window") > 0) {
       c.SWA = u32("attention.sliding_window");
-      c.SWA_PATTERN = 6;
+      // As llama.cpp's load_swa_pattern: a per-layer array of flags, or n (layer
+      // l local when l % n < n - 1), 6 when the file says neither.
+      c.local.assign(c.NL, false);
+      const std::string key = arch + ".attention.sliding_window_pattern";
+      if (m.has(key) && m.kv(key).type == gg::val_type::array) {
+        const auto& a = m.kv(key).arr;
+        for (int64_t l = 0; l < c.NL && l < (int64_t)a.size(); l++) c.local[l] = a[l].u != 0;
+      } else {
+        const int64_t n = m.has(key) ? u32("attention.sliding_window_pattern") : 6;
+        for (int64_t l = 0; l < c.NL; l++) c.local[l] = n == 0 || l % n < n - 1;
+      }
     }
-    if (m.has(arch + ".rope.scaling.type") && m.kv(arch + ".rope.scaling.type").as_str() == "linear")
-      c.ROPE_SCALE = 1.0f / m.kv(arch + ".rope.scaling.factor").as_f32();
+    if (m.has(arch + ".rope.freq_base_swa")) c.ROPE_BASE_LOCAL = m.kv(arch + ".rope.freq_base_swa").as_f32();
     // The 27B (62 layers) scales q by 1 / sqrt(NE / NH), the others by 1 / sqrt(HD).
     if (c.NL == 62) c.QSCALE = 1.0f / std::sqrt((float)(c.NE / c.NH));
     // A local layer's window is not in the attention kernels yet: within it, a
@@ -511,7 +530,7 @@ struct Layer {
   // rule's state [SH, SDK, SDV].
   array wssm, wsout, wconv, adt, sn;
   storage conv_state, ssm_state;
-  // Gemma 3 (Config::post_norms): the norms of the attention's and the MLP's
+  // Config::post_norms (Gemma 3): the norms of the attention's and the MLP's
   // outputs, [NE] each.
   array pa, pf;
 };
