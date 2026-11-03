@@ -90,9 +90,17 @@ each engine, alternated):
 |  | tg128 @ d2048 | 200-208 | 187-189 | 1.06-1.11 |
 |  | pp512 | 10,580-10,902 | 10,753-10,769 | 0.98-1.01 |
 |  | pp512 @ d2048 | 9,810-10,107 | 9,829-9,916 | 0.99-1.03 |
+| Gemma 3 1B Q4_K_M | tg128 | 420 | 388-393 | 1.07-1.08 |
+|  | tg128 @ d2048 | 411-415 | 383-386 | 1.06-1.08 |
+|  | pp512 | 28,968-29,901 | 26,984-27,530 | 1.05-1.11 |
+|  | pp512 @ d2048 | 26,301-27,524 | 25,644-25,783 | 1.02-1.07 |
 
 Gemma 3's rows were taken later (2026-11-03), the two engines alternated in
-the same way. Five of its six layers attend a sliding window of 1024 tokens
+the same way (the 1B's after the 4B's, its llama.cpp tg128 taken a third time
+when one run swung by 153 tok/s). The 1B keeps q, k, gate, up and half of v as
+Q5_0 blocks, which its decode reads with a float activation (no prepared form)
+and its prefill dequantizes to f16; its local layers' window is 512. Five of the
+4B's six layers attend a sliding window of 1024 tokens
 (their caches keep every token; the attention reads the last 1024), so its decode
 at depth 2048 runs as fast as at 0. Past the window, on a BOS and 1599 spread-out
 ids, llama.cpp's logits are as close to this library's f32 forward (KL 3.2e-3 at
