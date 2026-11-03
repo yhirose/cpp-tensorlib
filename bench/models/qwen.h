@@ -69,13 +69,12 @@ struct Config {
   std::string ffn_norm = "ffn_norm.weight";  // Qwen3.5: post_attention_norm
   float L2EPS = 1e-6f;  // DeltaNet's q / k L2 norms (the reference's constant)
   // Gemma 3: the embedding times sqrt(NE) (the lookups scale it: gather_embed_rows_,
-  // gpu::embed_row); an RMSNorm after the attention and
-  // after the MLP too (their outputs normalized before the residual adds); the
-  // MLP's gate through GELU (tanh form) rather than SiLU (act); and sliding-window
-  // attention on the layers `local` marks (a local layer sees the last SWA
-  // positions), whose RoPE turns at ROPE_BASE_LOCAL, unscaled, while a global
-  // layer's turns at ROPE_BASE with the position times ROPE_SCALE (a linear
-  // scaling, which any family's GGUF may state).
+  // gpu::embed_row); an RMSNorm after the attention and after the MLP too (their
+  // outputs normalized before the residual adds); the MLP's gate through GELU (tanh
+  // form) rather than SiLU (act); and sliding-window attention on the layers `local`
+  // marks (a local layer sees the last SWA positions), whose RoPE turns at
+  // ROPE_BASE_LOCAL, unscaled, while a global layer's turns at ROPE_BASE with the
+  // position times ROPE_SCALE (a linear scaling, which any family's GGUF may state).
   float EMB_SCALE = 1.0f;
   bool post_norms = false;
   gpu::glu_act act = gpu::glu_act::silu;  // the MLP's gate activation
@@ -862,7 +861,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
                               c.EPS)) {
         gpu::rmsnorm(o, sp(L.sn), o, c.SDV, c.EPS, T * c.SH);
         rows_out(zp, PJ, z, V);
-        if (a16) gpu::swiglu_h16(z, sp(P.at16), T * V, 1);
+        if (a16) gpu::glu_h16(gpu::glu_act::silu, z, sp(P.at16), T * V, 1);
         else gpu::swiglu(z, sp(P.at), T * V);
       }
       gemm(sp(P.at), sp(P.at16), L.wsout, L.qsout, ro, c.NE, V);
@@ -933,12 +932,13 @@ inline void gather_embed_rows_(const Model& M, const int* ids, int64_t n,
                                float* dst) {
   const Config& c = M.c;
   for (int64_t i = 0; i < n; i++) {
-    widen_(M.embed, (size_t)ids[i] * c.NE, c.NE, dst + i * c.NE);
+    float* row = dst + i * c.NE;
+    widen_(M.embed, (size_t)ids[i] * c.NE, c.NE, row);
+    // Scaled where the family says (Gemma: sqrt(NE)), as gpu::embed_row scales the
+    // row it gathers on the device: the same f32 product.
+    if (c.EMB_SCALE != 1.0f)
+      for (int64_t j = 0; j < c.NE; j++) row[j] *= c.EMB_SCALE;
   }
-  // The lookup is scaled where the family says (Gemma: sqrt(NE)), as gpu::embed_row
-  // scales the row it gathers on the device: the same f32 product.
-  if (c.EMB_SCALE != 1.0f)
-    for (int64_t i = 0; i < n * c.NE; i++) dst[i] *= c.EMB_SCALE;
 }
 
 // Stage `n` prompt embeddings starting at ids[from] into the batched scratch.

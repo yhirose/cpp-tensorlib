@@ -459,11 +459,15 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       const std::vector<float> f = host_values(T), fb = host_values(Tb);
       const array Wf = dev(T), Wft = dev(T.transpose()), Wb = dev(T.to_bf16()),
                   Wbt = dev(T.transpose().to_bf16());
-      auto gather = [&](int type, const array& W, int64_t rs, int64_t cs, int64_t n, int64_t rows) {
+      // The row gathered, or empty where the backend refuses a scale (Metal's and
+      // WebGPU's kernels have none: the caller stages the row on the host).
+      auto gather = [&](int type, const array& W, int64_t rs, int64_t cs, int64_t n, int64_t rows,
+                        float scale = 1.0f) {
         array idx = dev(array::from(std::vector<float>{(float)n}, {1})), out = dev(array::zeros({K}));
-        REQUIRE(gpu::embed_row(type, W.device_span(), idx.device_span(), out.device_span(), K,
-                               rows, rs, cs));
-        return host_values(out);
+        const bool ran = gpu::embed_row(type, W.device_span(), idx.device_span(), out.device_span(),
+                                        K, rows, rs, cs, scale);
+        if (scale == 1.0f) REQUIRE(ran);
+        return ran ? host_values(out) : std::vector<float>{};
       };
       auto row = [&](int type, const array& W, int64_t rs, int64_t cs, int64_t n) {
         return gather(type, W, rs, cs, n, V);
@@ -486,23 +490,20 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       std::vector<std::pair<int, quant_rows>> qs;
       if (gpu::has_gemv_quant)
         for (int type : {12, 14, 8}) qs.push_back({type, random_quant_rows(type, V, K, 990 + type)});
-      // Scaled (Gemma's embedding): each value times the scale, an f32 product. A
-      // backend whose kernels have no scale refuses it (Metal, WebGPU: the caller
-      // stages the row on the host); CUDA's and the host reference's take it.
+      // Scaled (Gemma's embedding): each value times the scale, an f32 product,
+      // required where the kernels have it (CUDA's, the host reference's).
       auto scaled = [&](int type, const array& W, int64_t rs, int64_t cs, int64_t n,
                         const std::vector<float>& w, bool exact) {
         const float s = 50.596443f;
-        array idx = dev(array::from(std::vector<float>{(float)n}, {1})), out = dev(array::zeros({K}));
-        const bool ran = gpu::embed_row(type, W.device_span(), idx.device_span(), out.device_span(),
-                                        K, V, rs, cs, s);
+        const std::vector<float> got = gather(type, W, rs, cs, n, V, s);
 #if defined(TENSORLIB_CUDA) || defined(TENSORLIB_HOST_GPU)
-        CHECK(ran);
+        CHECK(!got.empty());
 #endif
-        if (!ran) return;
+        if (got.empty()) return;
         std::vector<float> r = want(w, n);
         for (float& v : r) v *= s;
-        if (exact) CHECK(host_values(out) == r);
-        else CHECK(close(host_values(out), r));
+        if (exact) CHECK(got == r);
+        else CHECK(close(got, r));
       };
       for (int64_t n : {int64_t(0), int64_t(137), V - 1, V}) {
         INFO("row " << n);

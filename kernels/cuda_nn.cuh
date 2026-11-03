@@ -31,21 +31,26 @@ extern "C" {
 // tl_add_rmsnorm: the same sum of squares, and the normalized value rounded
 // before the add (__fmul_rn: no FMA folds it into the sum).
 }  // extern "C"
-// 1 / sqrt(mean(v^2) + eps) for the row, from each thread's partial sum of
-// squares: the one tree every norm here sums in. Returns after a barrier, so a
-// second norm in the same block may reuse the shared memory.
-__device__ __forceinline__ float rms_inv_(float acc, unsigned n, float eps) {
-  extern __shared__ float sm[];
-  const unsigned t = threadIdx.x, T = blockDim.x;
-  sm[t] = acc;
+// Tree-sum one value per thread through the block's shared `s`, handing every
+// thread the total; the trailing barrier lets a second sum reuse `s`.
+__device__ __forceinline__ float tl_tree_sum_(float* s, unsigned t, unsigned T, float v) {
+  s[t] = v;
   __syncthreads();
-  for (unsigned s = T >> 1; s > 0; s >>= 1) {
-    if (t < s) sm[t] += sm[t + s];
+  for (unsigned h = T >> 1; h > 0; h >>= 1) {
+    if (t < h) s[t] += s[t + h];
     __syncthreads();
   }
-  const float inv = 1.0f / sqrtf(sm[0] / (float)n + eps);
+  const float total = s[0];
   __syncthreads();
-  return inv;
+  return total;
+}
+
+// 1 / sqrt(mean(v^2) + eps) for the row, from each thread's partial sum of
+// squares: the one tree every norm here sums in (a second norm in the block may
+// follow).
+__device__ __forceinline__ float rms_inv_(float acc, unsigned n, float eps) {
+  extern __shared__ float sm[];
+  return 1.0f / sqrtf(tl_tree_sum_(sm, threadIdx.x, blockDim.x, acc) / (float)n + eps);
 }
 template <bool ADD, bool NORM_B = false>
 __device__ __forceinline__ void rmsnorm_core(
@@ -245,20 +250,6 @@ extern "C" __global__ void tl_cvt_h16(const float* __restrict__ src,
                                       __half* __restrict__ dst, unsigned n) {
   unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) dst[i] = __float2half(src[i]);
-}
-
-// Tree-sum one value per thread through the block's shared `s`, handing every
-// thread the total; the trailing barrier lets a second sum reuse `s`.
-__device__ __forceinline__ float tl_tree_sum_(float* s, unsigned t, unsigned T, float v) {
-  s[t] = v;
-  __syncthreads();
-  for (unsigned h = T >> 1; h > 0; h >>= 1) {
-    if (t < h) s[t] += s[t + h];
-    __syncthreads();
-  }
-  const float total = s[0];
-  __syncthreads();
-  return total;
 }
 
 // tl_tree_sum_ for two values at once, in the same order; `s` holds 2·T.
@@ -1740,11 +1731,11 @@ __device__ __forceinline__ void tc_mma_s8_(int* c, const unsigned* a, unsigned b
 // other blocks find it in L2, where the weight-major order read it once per activation
 // tile: Qwen3.8-27B's prefill GEMMs take 2.6% (Q4_K) to 4.2% (Q8_0) less time.
 //
-// EPI 1 + gpu::glu_act (1 SiLU, 2 GELU), the GLU: W is a fused gate|up projection (rows
-// [0, N) the gate, [N, 2N) the up) and the output is act(gate) * up in f16, [M][N] ldc
-// apart, as tl_swiglu_h16 / tl_geglu_h16 round it: a
-// block's 128 weight rows are the gate and up rows of the same 64 outputs, a warp's
-// 64 columns 32 of each, so a thread holds both halves of its outputs. Not split.
+// EPI 1 (SiLU) or 2 (GELU), the GLU: W is a fused gate|up projection (rows [0, N) the
+// gate, [N, 2N) the up) and the output is act(gate) * up in f16, [M][N] ldc apart, as
+// tl_swiglu_h16 / tl_geglu_h16 round it: a block's 128 weight rows are the gate and up
+// rows of the same 64 outputs, a warp's 64 columns 32 of each, so a thread holds both
+// halves of its outputs. Not split.
 #define TL_MMQ_BM 128
 #define TL_MMQ_BN 128
 #define TL_MMQ_THREADS 256
@@ -1954,8 +1945,8 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
   }
 TL_GEMM_MMQ(tl_gemm_mmq_q4k, 1, 0)
 TL_GEMM_MMQ(tl_gemm_mmq_q80, 3, 0)
-TL_GEMM_MMQ(tl_gemm_mmq_glu_q4k, 1, 1)
-TL_GEMM_MMQ(tl_gemm_mmq_glu_q80, 3, 1)
+TL_GEMM_MMQ(tl_gemm_mmq_swiglu_q4k, 1, 1)
+TL_GEMM_MMQ(tl_gemm_mmq_swiglu_q80, 3, 1)
 TL_GEMM_MMQ(tl_gemm_mmq_geglu_q4k, 1, 2)
 TL_GEMM_MMQ(tl_gemm_mmq_geglu_q80, 3, 2)
 #undef TL_GEMM_MMQ

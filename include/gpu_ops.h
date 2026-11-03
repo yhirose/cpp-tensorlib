@@ -46,7 +46,10 @@ inline void census_reset() {
 // kernels, a host round trip — by declaring it as a static member of its `own`
 // struct, with the signature the op has here. An op that allows this asks
 // TL_GPU_OWNS whether the selected backend did; one that did not declare it
-// simply has no such member, so there are no stubs to keep in step.
+// simply has no such member, so there are no stubs to keep in step. An own op
+// takes every argument the op has and returns false for those its kernels
+// cannot honor (a RoPE position scale, an embedding scale, a misaligned
+// buffer): the op then composes it, or answers false itself.
 #define TL_GPU_DETECT_OWN(name)                                                \
   namespace detail {                                                           \
   template <class B, class = void>                                             \

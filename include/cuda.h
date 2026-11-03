@@ -333,9 +333,10 @@ struct context {
   // recording a CUDA graph, then restored — so no launcher needs a stream arg.
   CUstream stream = nullptr;
   CUstream cap_stream = nullptr;  // dedicated capture stream (created on demand)
-  // Diagnostic knob (M9 decode gemv census): when true, gemv_run_ forces gy=1
-  // (no split-K, so no MemsetD8Async + atomicAdd combine). Lets the bench and
-  // the decode loop A/B the split-K path at the small Qwen shapes. Default off.
+  // Diagnostic knob: when true, gemv_run_ forces gy=1 and gemm_bf16_nt one K
+  // slice (no split-K, so no MemsetD8Async + atomicAdd combine): the A/B of the
+  // split-K path at the small Qwen shapes, and bit-reproducible runs
+  // (tensorlib_dump_logits `fixed`). Default off.
   bool no_splitk = false;
   std::unordered_map<int, CUfunction> fns;
 
@@ -648,8 +649,8 @@ struct context {
              gemv_q80_fn = nullptr, quant_act_fn = nullptr, gemv_q4k_q8_fn = nullptr;
   CUfunction rmsnorm_rope_fn[3] = {};  // D 64, 128, 256
   CUfunction gated_rmsnorm_fn[2] = {};
-  CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, swiglu_h16_fn = nullptr,
-             geglu_h16_fn = nullptr, norm_add_rmsnorm_h16_fn = nullptr,
+  CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, glu_h16_fn[2] = {},
+             norm_add_rmsnorm_h16_fn = nullptr,
              merge_heads_h16_fn = nullptr, cvt_h16_fn = nullptr;  // the f16 activation's producers
   CUfunction conv_tok_fn = nullptr, conv_state_fn = nullptr;  // a prefill's conv
   CUfunction conv_tok_() { return cached_(conv_tok_fn, "tl_ssm_conv_tokens"); }
@@ -902,11 +903,11 @@ struct context {
   // shared memory (TL_MMQ_SMEM in tensorlib_cuda.cu, change them together), raised on first
   // lookup.
   static constexpr unsigned mmq_tile = 128, mmq_threads = 256, mmq_smem = (128 + 128) * (272 + 64);
-  // epi: 0 C in f32, 1 + gpu::glu_act the GLU epilogue of that activation (the kernels'
-  // EPI template argument).
+  // epi: 0 C in f32, 1 the SiLU GLU epilogue, 2 the GELU one (the kernels' EPI
+  // template argument; own_nn::gemm_quant_glu picks it by the activation).
   CUfunction mmq_(int type, int epi) {
     static const char* const names[3][2] = {{"tl_gemm_mmq_q4k", "tl_gemm_mmq_q80"},
-                                            {"tl_gemm_mmq_glu_q4k", "tl_gemm_mmq_glu_q80"},
+                                            {"tl_gemm_mmq_swiglu_q4k", "tl_gemm_mmq_swiglu_q80"},
                                             {"tl_gemm_mmq_geglu_q4k", "tl_gemm_mmq_geglu_q80"}};
     CUfunction& slot = mmq_fn[epi][type == 12 ? 0 : 1];
     if (!slot) {
@@ -1184,7 +1185,9 @@ inline const sgemm_tile& sgemm_tile_(int64_t m, int64_t n, int64_t k,
   return sgemm_tiles[big ? 1 : 0];
 }
 
-// Diagnostic knob: force gemv to skip split-K (gy=1). See context::no_splitk.
+// Diagnostic knob: the GEMV and the bf16 GEMM skip split-K (whose slices add
+// into the output with atomics, in no fixed order), so a run's numbers are the
+// same bytes every time. See context::no_splitk.
 inline void set_no_splitk(bool v) { context::get().no_splitk = v; }
 inline bool pending() { return context::get().pending; }
 

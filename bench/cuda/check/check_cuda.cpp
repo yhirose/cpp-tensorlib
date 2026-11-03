@@ -370,7 +370,7 @@ int main() {
 
   // ---- Qwen3.5's gated norm in one pass (gated_rmsnorm) against the norm and a swiglu ----
   // T x H rows of D, z strided as in the projection's rows; f32 and f16 outputs, each bit
-  // for bit the composition it replaces (rmsnorm, then swiglu / swiglu_h16 over [z | norm]).
+  // for bit the composition it replaces (rmsnorm, then swiglu / glu_h16 over [z | norm]).
   // D = 128 is Qwen3.5's; 320 runs past rmsnorm's 256 threads.
   for (const int64_t D : {128, 320}) {
     const int64_t T = 37, H = 6, V = H * D, ldz = 3 * V;
@@ -395,7 +395,8 @@ int main() {
         tl::gpu::gated_rmsnorm({o, 0}, {z, 4 * V}, ldz, {w, 0}, {h, 0}, true, T, H, D, 1e-6f) &&
         tl::gpu::copy_f32({zc, 0}, {zn, 0}, T * V) &&
         tl::gpu::rmsnorm({o, 0}, {w, 0}, {zn, 4 * T * V}, D, 1e-6f, T * H) &&
-        tl::gpu::swiglu({zn, 0}, {r, 0}, T * V) && tl::gpu::swiglu_h16({zn, 0}, {rh, 0}, T * V, 1);
+        tl::gpu::swiglu({zn, 0}, {r, 0}, T * V) &&
+        tl::gpu::glu_h16(tl::gpu::glu_act::silu, {zn, 0}, {rh, 0}, T * V, 1);
     for (void* b : {f, h, r, rh}) sync_to_host(b, false);
     int64_t d32 = 0, d16 = 0;
     for (int64_t i = 0; i < T * V; i++) {

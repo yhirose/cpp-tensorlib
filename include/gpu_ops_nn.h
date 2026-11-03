@@ -82,12 +82,7 @@ inline bool rmsnorm(span x, span w, span o, int64_t n, float eps,
 }
 
 inline bool rmsnorm_res(span x, span delta, span w, span xout, span hout,
-                        int64_t n, float eps, int64_t rows, span wd = {}) {
-  if (wd.buf) {  // the branch normalized first, into a buffer of this layer's own
-    scratch nd(rows * n);
-    return nd && rmsnorm(delta, wd, nd, n, eps, rows) &&
-           rmsnorm_res(x, nd, w, xout, hout, n, eps, rows);
-  }
+                        int64_t n, float eps, int64_t rows) {
   if (xout.buf != x.buf && xout.buf != delta.buf) {
     return binary(kop::add, x, delta, xout, rows * n, 1.0f, 0.0f) &&
            rmsnorm(xout, w, hout, n, eps, rows);
@@ -116,16 +111,19 @@ inline bool glu_by_(span gu, span o, int64_t ff, int64_t rows, Factor factor) {
 // act(gate) * up. silu(g) = g sigmoid(g); GELU's tanh form is g (1 + tanh(sqrt(2/pi)
 // g (1 + 0.044715 g^2))) / 2, each step an affine epilogue of the one before.
 inline bool glu(glu_act act, span gu, span o, int64_t ff, int64_t rows) {
-  if (act == glu_act::silu) {
-    return glu_by_(gu, o, ff, rows, [](span g, span a, span, int64_t n) {
-      return unary(kop::sigmoid, g, a, n, 1.0f, 0.0f);
-    });
+  switch (act) {
+    case glu_act::silu:
+      return glu_by_(gu, o, ff, rows, [](span g, span a, span, int64_t n) {
+        return unary(kop::sigmoid, g, a, n, 1.0f, 0.0f);
+      });
+    case glu_act::gelu_tanh:
+      return glu_by_(gu, o, ff, rows, [](span g, span a, span b, int64_t n) {
+        return binary(kop::mul, g, g, a, n, 0.044715f, 1.0f) &&  // 1 + c g^2
+               binary(kop::mul, g, a, b, n, 0.79788456080286535587989211986876f, 0.0f) &&
+               unary_ext(unary_ext_op::tanh_, b, a, n, 0.5f, 0.5f);  // (1 + tanh) / 2
+      });
   }
-  return glu_by_(gu, o, ff, rows, [](span g, span a, span b, int64_t n) {
-    return binary(kop::mul, g, g, a, n, 0.044715f, 1.0f) &&  // 1 + c g^2
-           binary(kop::mul, g, a, b, n, 0.79788456080286535587989211986876f, 0.0f) &&
-           unary_ext(unary_ext_op::tanh_, b, a, n, 0.5f, 0.5f);  // (1 + tanh) / 2
-  });
+  return false;
 }
 
 // A GEMV is a GEMM with one row.
@@ -439,20 +437,32 @@ inline bool rmsnorm_res(span x, span delta, span w, span xout, span hout,
                         int64_t n, float eps, int64_t rows = 1, span wd = {}) {
   if (n <= 0 || rows <= 0) return false;
   const rmsnorm_params p{static_cast<uint32_t>(n), eps};
-  const bool ran =
-      wd.buf ? launch(kop::norm_add_rmsnorm_,
-                      {in(x), in(delta), in(wd), in(w), out(xout), out(hout)}, p,
-                      policy::one_group_per_row(rows))
-             : launch(kop::add_rmsnorm_, {in(x), in(delta), in(w), out(xout), out(hout)}, p,
-                      policy::one_group_per_row(rows));
-  return ran || generic::rmsnorm_res(x, delta, w, xout, hout, n, eps, rows, wd);
+  if (!wd.buf) {
+    return launch(kop::add_rmsnorm_, {in(x), in(delta), in(w), out(xout), out(hout)}, p,
+                  policy::one_group_per_row(rows)) ||
+           generic::rmsnorm_res(x, delta, w, xout, hout, n, eps, rows);
+  }
+  if (launch(kop::norm_add_rmsnorm_, {in(x), in(delta), in(wd), in(w), out(xout), out(hout)}, p,
+             policy::one_group_per_row(rows)))
+    return true;
+  // No kernel for the two: the branch's norm into a buffer of this layer's own,
+  // then the plain seam, each the backend's best.
+  generic::scratch nd(rows * n);
+  const span ns = nd;  // a span, so the calls below are the ops here, not generic's
+  return nd && rmsnorm(delta, wd, ns, n, eps, rows) &&
+         rmsnorm_res(x, ns, w, xout, hout, n, eps, rows);
 }
 
 // out[rows, ff] = act(gate) * up out of the fused gate|up buffer [rows, 2ff].
 inline bool glu(glu_act act, span gu, span o, int64_t ff, int64_t rows = 1) {
   if (ff <= 0 || rows <= 0) return false;
-  return launch(act == glu_act::silu ? kop::swiglu_ : kop::geglu_, {in(gu), out(o)},
-                glu_params{static_cast<uint32_t>(ff)}, policy::flat_rows(ff, rows)) ||
+  kop k = kop::swiglu_;
+  switch (act) {  // a kernel id an activation
+    case glu_act::silu: k = kop::swiglu_; break;
+    case glu_act::gelu_tanh: k = kop::geglu_; break;
+  }
+  return launch(k, {in(gu), out(o)}, glu_params{static_cast<uint32_t>(ff)},
+                policy::flat_rows(ff, rows)) ||
          generic::glu(act, gu, o, ff, rows);
 }
 // SwiGLU, silu(gate) * up: the MLP of Qwen's, and Qwen3.5's gates, SiLU by definition.
@@ -750,8 +760,7 @@ inline bool rmsnorm_rope(span x, span w, int64_t rows, int64_t T, int64_t D, int
 TL_GPU_DETECT_OWN(gemm_bf16_nt_f16acc_a16)
 TL_GPU_DETECT_OWN(rmsnorm_h16)
 TL_GPU_DETECT_OWN(rmsnorm_res_h16)
-TL_GPU_DETECT_OWN(swiglu_h16)
-TL_GPU_DETECT_OWN(geglu_h16)
+TL_GPU_DETECT_OWN(glu_h16)
 TL_GPU_DETECT_OWN(merge_heads_h16)
 TL_GPU_DETECT_OWN(cvt_h16)
 inline constexpr bool f16_activations = has_gemm_bf16_nt_f16acc_a16;
@@ -772,18 +781,12 @@ TL_GPU_F16_OP(rmsnorm_res_h16,
               (span x, span delta, span w, span xout, span hout, span hout16, int64_t n, float eps,
                int64_t rows, span wd = {}),
               (x, delta, w, xout, hout, hout16, n, eps, rows, wd))
-TL_GPU_F16_OP(swiglu_h16, (span gu, span o16, int64_t ff, int64_t rows), (gu, o16, ff, rows))
-TL_GPU_F16_OP(geglu_h16, (span gu, span o16, int64_t ff, int64_t rows), (gu, o16, ff, rows))
+TL_GPU_F16_OP(glu_h16, (glu_act act, span gu, span o16, int64_t ff, int64_t rows),
+              (act, gu, o16, ff, rows))
 TL_GPU_F16_OP(merge_heads_h16, (span src, span dst16, int64_t T, int64_t H, int64_t D),
               (src, dst16, T, H, D))
 TL_GPU_F16_OP(cvt_h16, (span src, span dst16, int64_t n), (src, dst16, n))
 #undef TL_GPU_F16_OP
-// glu() writing only f16, by the activation.
-template <class Own = own>
-inline bool glu_h16(glu_act act, span gu, span o16, int64_t ff, int64_t rows) {
-  return act == glu_act::silu ? swiglu_h16<Own>(gu, o16, ff, rows)
-                              : geglu_h16<Own>(gu, o16, ff, rows);
-}
 
 // One decode step: q [n_q_heads, D] against a [n_kv_heads, kv_max, D] cache
 // read over [0, ctx). GQA by the head ratio; the cache is f32, or f16 with kv_f16.

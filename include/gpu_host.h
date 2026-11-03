@@ -212,18 +212,19 @@ inline float rms_inv(const float* v, uint32_t n, float eps) {
   for (uint32_t i = 0; i < n; i++) ss += double(v[i]) * v[i];
   return static_cast<float>(1.0 / std::sqrt(ss / n + eps));
 }
-// hout = v * rsqrt(mean(v^2) + eps) * w per row, v = x (+ delta, also stored;
-// norm_delta: + rmsnorm(delta) * wd, the operands x, delta, wd, w, xout, hout).
+// hout = v * rsqrt(mean(v^2) + eps) * w per row, v = x, or with add the sum
+// x + delta, also stored; norm_delta adds rmsnorm(delta) * wd instead. The
+// operands in that order: x, [delta, [wd]], w, [xout], hout.
 inline bool rmsnorm(const gpu::arg* v, const void* params, const gpu::grid& g,
                     bool add, bool norm_delta = false) {
   const auto& p = as<gpu::rmsnorm_params>(params);
-  const int k = norm_delta ? 1 : 0;  // wd's slot shifts w, xout and hout
-  const float* x = at<const float>(v[0]);
-  const float* delta = add ? at<const float>(v[1]) : nullptr;
-  const float* wd = norm_delta ? at<const float>(v[2]) : nullptr;
-  const float* w = at<const float>(v[add ? 2 + k : 1]);
-  float* xout = add ? at<float>(v[3 + k]) : nullptr;
-  float* hout = at<float>(v[add ? 4 + k : 2]);
+  int i = 0;
+  const float* x = at<const float>(v[i++]);
+  const float* delta = add ? at<const float>(v[i++]) : nullptr;
+  const float* wd = norm_delta ? at<const float>(v[i++]) : nullptr;
+  const float* w = at<const float>(v[i++]);
+  float* xout = add ? at<float>(v[i++]) : nullptr;
+  float* hout = at<float>(v[i++]);
   for (uint32_t r = 0; r < g.gx; r++) {  // one group a row
     const size_t base = size_t(r) * p.n;
     const float invd = norm_delta ? rms_inv(delta + base, p.n, p.eps) : 0.0f;

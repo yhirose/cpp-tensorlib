@@ -52,8 +52,7 @@ struct own_nn {
   static bool rmsnorm_res_h16(gpu::span x, gpu::span delta, gpu::span w,
                               gpu::span xout, gpu::span hout, gpu::span hout16,
                               int64_t n, float eps, int64_t rows, gpu::span wd = {});
-  static bool swiglu_h16(gpu::span gu, gpu::span o16, int64_t ff, int64_t rows);
-  static bool geglu_h16(gpu::span gu, gpu::span o16, int64_t ff, int64_t rows);
+  static bool glu_h16(gpu::glu_act act, gpu::span gu, gpu::span o16, int64_t ff, int64_t rows);
   // out = silu(z) * rmsnorm(o) * w over T x H rows of D (tl_gated_rmsnorm): o contiguous,
   // z's row t ldz apart, out f32 or (h16) f16 [T, H D]; bit for bit rmsnorm then swiglu.
   static bool gated_rmsnorm(gpu::span o, gpu::span z, int64_t ldz, gpu::span w, gpu::span out,
@@ -291,7 +290,7 @@ inline bool own_nn::gemm_bf16_nt(gpu::span a, gpu::span B, gpu::span out,
   // As a rule: four times the fill, slices in the 64 tile's 16-deep slabs.
   constexpr gpu::policy::split_rule rule{4 * traits::fill_groups, 0, 448, 16};
   unsigned z = 1;
-  if (blocks < 128 && c.d.MemsetD8Async) {
+  if (blocks < 128 && c.d.MemsetD8Async && !c.no_splitk) {
     z = (unsigned)gpu::policy::split_parts(blocks, k, rule);
   }
   if (z > 1) {
@@ -443,8 +442,12 @@ inline bool own_nn::gemm_quant_glu(int type, gpu::glu_act act, gpu::span A16, gp
   c.device_read_(A16.buf);
   c.device_read_(W.buf);
   c.device_write_(H16.buf);
-  return mmq_run_(c, type, 1 + static_cast<int>(act), pa, pw, ph, (unsigned)m, (unsigned)ff,
-                  (unsigned)k, (unsigned)ff);
+  int epi = 0;
+  switch (act) {  // context::mmq_'s epilogues
+    case gpu::glu_act::silu: epi = 1; break;
+    case gpu::glu_act::gelu_tanh: epi = 2; break;
+  }
+  return mmq_run_(c, type, epi, pa, pw, ph, (unsigned)m, (unsigned)ff, (unsigned)k, (unsigned)ff);
 }
 
 inline bool own_nn::quantize_act_q8(gpu::span a, gpu::span qa, int64_t k) {
@@ -540,20 +543,19 @@ inline bool own_nn::rmsnorm_res_h16(gpu::span x, gpu::span delta, gpu::span w,
   return c.dispatch_(c.cached_(c.add_rmsnorm_h16_fn, "tl_add_rmsnorm_h16"), args, 6, &p,
                      sizeof(p), gpu::policy::one_group_per_row(rows));
 }
-inline bool own_nn::swiglu_h16(gpu::span gu, gpu::span o16, int64_t ff, int64_t rows) {
+inline bool own_nn::glu_h16(gpu::glu_act act, gpu::span gu, gpu::span o16, int64_t ff,
+                            int64_t rows) {
   auto& c = context::get();
   if (!c.ready) return false;
+  int k = 0;
+  const char* name = nullptr;
+  switch (act) {
+    case gpu::glu_act::silu: k = 0, name = "tl_swiglu_h16"; break;
+    case gpu::glu_act::gelu_tanh: k = 1, name = "tl_geglu_h16"; break;
+  }
   const gpu::glu_params p{static_cast<uint32_t>(ff)};
   const gpu::arg args[] = {gpu::in(gu), gpu::out(o16)};
-  return c.dispatch_(c.cached_(c.swiglu_h16_fn, "tl_swiglu_h16"), args, 2, &p, sizeof(p),
-                     gpu::policy::flat_rows(ff, rows));
-}
-inline bool own_nn::geglu_h16(gpu::span gu, gpu::span o16, int64_t ff, int64_t rows) {
-  auto& c = context::get();
-  if (!c.ready) return false;
-  const gpu::glu_params p{static_cast<uint32_t>(ff)};
-  const gpu::arg args[] = {gpu::in(gu), gpu::out(o16)};
-  return c.dispatch_(c.cached_(c.geglu_h16_fn, "tl_geglu_h16"), args, 2, &p, sizeof(p),
+  return c.dispatch_(c.cached_(c.glu_h16_fn[k], name), args, 2, &p, sizeof(p),
                      gpu::policy::flat_rows(ff, rows));
 }
 inline bool own_nn::gated_rmsnorm(gpu::span o, gpu::span z, int64_t ldz, gpu::span w, gpu::span out,
