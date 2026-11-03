@@ -109,7 +109,7 @@ int main() {
         for (int64_t j = 0; j < ctx; j++) acc += scores[j] * Vh[j * D + d];
         float ref = acc / sum;
         float got = ho[h * D + d];
-        maxrel = std::max<double>(maxrel,
+        maxrel = tl::max_err(maxrel,
                                   std::fabs(got - ref) / (1.0 + std::fabs(ref)));
       }
     }
@@ -286,8 +286,7 @@ int main() {
             for (int64_t j = 0; j < L; j++) acc += scores[j] * Vh[j * D + d];
             float ref = acc / sum;
             float got = ho[qh * D + d];
-            maxrel = std::max<double>(
-                maxrel, std::fabs(got - ref) / (1.0 + std::fabs(ref)));
+            maxrel = tl::max_err(maxrel, std::fabs(got - ref) / (1.0 + std::fabs(ref)));
           }
         }
       }
@@ -386,8 +385,7 @@ int main() {
           for (int64_t j = 0; j <= p; j++) acc += scores[j] * Vh[j * D + d];
           float ref = acc / sum;
           float got = hop[(qh * T + p) * D + d];
-          maxrel = std::max<double>(
-              maxrel, std::fabs(got - ref) / (1.0 + std::fabs(ref)));
+          maxrel = tl::max_err(maxrel, std::fabs(got - ref) / (1.0 + std::fabs(ref)));
         }
       }
     }
@@ -443,7 +441,7 @@ int main() {
         }
         float ref = acc / sum;
         float got = ho1[qh * D + d];
-        drel = std::max<double>(drel,
+        drel = tl::max_err(drel,
                                 std::fabs(got - ref) / (1.0 + std::fabs(ref)));
       }
     }

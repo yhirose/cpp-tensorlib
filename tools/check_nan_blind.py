@@ -69,7 +69,7 @@ def findings(text):
         for start, end in differences(s):
             if re.match(r"\s*>", s[end:]):
                 yield line, "a |difference| tested with '>' (passes a NaN)"
-            for mx in re.finditer(r"\bstd::f?max\(", s):
+            for mx in re.finditer(r"\bstd::f?max\s*(?:<[^<>()]*>)?\s*\(", s):
                 if mx.start() < start and close_paren(s, mx.end()) >= end:
                     yield line, "a |difference| through std::max (drops a NaN)"
         if re.search(r"if\s*\(\s*!\s*\(\s*(\w+)\s*<=\s*(\w+)\s*\)\s*\)\s*\2\s*=\s*\1\b", s):
