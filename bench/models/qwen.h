@@ -479,10 +479,12 @@ inline wmat load_wmat(const gg::model& m, const std::vector<wpart>& parts, int64
   }
   const int64_t words = (off + 3) / 4;  // a Q6_K or Q8_0 row ends mid-word
   W.raw = storage::make_device(words, words * 4, tl::dtype::f32);
-  // Rows widened to f32 and rounded to bf16 per batch: about 4 MB of f32.
-  const int64_t batch = std::max<int64_t>(1, (4 << 20) / (in * 4));
+  // A part goes up in batches of rows, about 2 MB each, put together on the host:
+  // rows widened and rounded to bf16, or the file's blocks where its rows are
+  // scattered (a NORM-permuted q / k comes a row at a time). On CUDA each upload is
+  // a synchronous copy with a fixed cost, so one a row would add up.
   std::vector<float> wide;
-  std::vector<uint16_t> narrow;
+  std::vector<char> stage;
   int64_t base = 0;
   size_t pi = 0;
   for (size_t i = 0; i < parts.size(); i++) {
@@ -492,28 +494,38 @@ inline wmat load_wmat(const gg::model& m, const std::vector<wpart>& parts, int64
     while (pi + 1 < W.parts.size() && W.parts[pi + 1].row_off <= base) pi++;
     const wmat::part& run = W.parts[pi];
     const bool as_stored = run.type == static_cast<int>(t->type);
-    // Source rows are contiguous runs (the whole tensor, the blk rows of one head
-    // of an interleaved projection, or a single row of a NORM-permuted q / k):
-    // one upload a run, or a batch.
-    int64_t o = 0;
-    while (o < p.out) {
-      const int64_t s0 = p.src(o);
+    const char* data = static_cast<const char*>(t->data);
+    const int64_t dst0 = run.byte_off + (base - run.row_off) * rb;
+    // Source rows come in contiguous runs (the whole tensor, the blk rows of one
+    // head of an interleaved projection, or a single row of a NORM-permuted q / k):
+    // the length of the one starting at part row o, within the first `lim` rows.
+    auto run_len = [&](int64_t o, int64_t lim) {
       int64_t n = 1;
-      while (o + n < p.out && p.src(o + n) == s0 + n) n++;
-      const int64_t dst = run.byte_off + (base + o - run.row_off) * rb;
-      if (as_stored) {
-        gpu::upload_bytes(W.raw.native, dst, static_cast<const char*>(t->data) + s0 * rb, n * rb);
-      } else {
-        for (int64_t r = 0; r < n; r += batch) {
-          const int64_t k = std::min(batch, n - r), len = k * in;
-          wide.resize((size_t)len);
-          narrow.resize((size_t)len);
-          widen_(t, (size_t)(s0 + r) * in, (size_t)len, wide.data());
-          for (int64_t j = 0; j < len; j++) narrow[j] = tl::f32_to_bf16(wide[j]);
-          gpu::upload_bytes(W.raw.native, dst + r * rb, narrow.data(), k * rb);
+      while (o + n < lim && p.src(o + n) == p.src(o) + n) n++;
+      return n;
+    };
+    if (as_stored && run_len(0, p.out) == p.out) {  // in order in the file already
+      gpu::upload_bytes(W.raw.native, dst0, data + p.src(0) * rb, p.out * rb);
+    } else {
+      const int64_t batch = std::max<int64_t>(1, (2 << 20) / rb);
+      for (int64_t b = 0; b < p.out; b += batch) {
+        const int64_t lim = std::min(p.out, b + batch);
+        stage.resize((size_t)((lim - b) * rb));
+        for (int64_t o = b, n; o < lim; o += n) {
+          n = run_len(o, lim);
+          char* to = stage.data() + (o - b) * rb;
+          if (as_stored) {
+            std::memcpy(to, data + p.src(o) * rb, (size_t)(n * rb));
+          } else {
+            const int64_t len = n * in;
+            wide.resize((size_t)len);
+            widen_(t, (size_t)p.src(o) * in, (size_t)len, wide.data());
+            auto* narrow = reinterpret_cast<uint16_t*>(to);
+            for (int64_t j = 0; j < len; j++) narrow[j] = tl::f32_to_bf16(wide[j]);
+          }
         }
+        gpu::upload_bytes(W.raw.native, dst0 + b * rb, stage.data(), (lim - b) * rb);
       }
-      o += n;
     }
     base += p.out;
   }
