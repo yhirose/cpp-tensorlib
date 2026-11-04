@@ -37,6 +37,15 @@ CASES = [
     "zzzzzzz aaaaaaaaaaa ........ ~~~~~ hhhhhhhhhhh!!!!",
     "ababababab xyzxyzxyzxyz qqqqqqqqqqqqqqqqqqqqqqqqqqq",
     "Donaudampfschifffahrtsgesellschaftskapitän",
+    # Where the BPE pre-tokenizers differ: combining marks, which Qwen3.5's counts
+    # with the letters (Thai and Devanagari vowel signs, decomposed accents, emoji
+    # variation selectors), and digit runs, which Llama 3's takes three at a time.
+    "Thai: สวัสดีครับ ภาษาไทย; Hindi: नमस्ते दुनिया",
+    "decomposed: cafe\u0301 nai\u0308ve, a lone mark \u0301abc, emoji: ❤️ ✌️ 1️⃣",
+    "digits: 1234567890, 3.14159, 1,000,000 and ٣٤٥٦٧٨",
+    # Words Llama 3's vocabulary has whole but its merges never reach, which its
+    # pre-tokenizer takes as they are (ignore_merges).
+    "Tiếng Việt: nhiều việc ngoài; Türkçe: değiş, oluştur",
     # Not UTF-8: a stray continuation byte (one byte, as llama.cpp's
     # unicode_len_utf8 has it, so the letters after it still merge) and a lead
     # byte the text cuts short.

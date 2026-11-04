@@ -6,6 +6,7 @@
 
 #include <gguf.h>
 #include <kv_cache.h>
+#include <tokenizer.h>
 
 // The sampler's definition (gpu_abi_llm.h), which the device samplers are held
 // to: its random bits are Philox4x32-10's (Random123's known answers), and its
@@ -87,27 +88,34 @@ TEST_CASE("sample_ref draws as temperature, top_k and top_p say") {
   CHECK_FALSE(gpu::sampling{1e-39f, 20, 1.0f, 0}.valid());  // 1 / t is inf
 }
 
+// A GGUF file's bytes as the tests below write them, little-endian as the format is.
+struct gguf_bytes {
+  std::string f;
+  void put(const void* p, size_t n) { f.append(static_cast<const char*>(p), n); }
+  void u32(uint32_t v) { put(&v, 4); }
+  void u64(uint64_t v) { put(&v, 8); }
+  void str(const std::string& s) { u64(s.size()), put(s.data(), s.size()); }
+  void write(const std::string& path) const {
+    std::ofstream(path, std::ios::binary).write(f.data(), (std::streamsize)f.size());
+  }
+};
+
 // A BF16 tensor (ggml type 30, as BF16 GGUFs ship their weights) is read with
 // its size and bytes as the file has them. The smallest GGUF v3 that holds
 // one: no metadata, one 1-D tensor of four values, the data section aligned
 // to the default 32.
 TEST_CASE("gguf reads a BF16 tensor") {
-  std::string f;
-  auto put = [&](const void* p, size_t n) { f.append(static_cast<const char*>(p), n); };
-  auto u32 = [&](uint32_t v) { put(&v, 4); };
-  auto u64 = [&](uint64_t v) { put(&v, 8); };
-  put("GGUF", 4);
-  u32(3);  // version
-  u64(1);  // tensors
-  u64(0);  // metadata pairs
-  const std::string name = "w";
-  u64(name.size());
-  put(name.data(), name.size());
-  u32(1);   // dims
-  u64(4);   // ne[0]
-  u32(30);  // GGML_TYPE_BF16
-  u64(0);   // offset in the data section
-  f.resize((f.size() + 31) / 32 * 32, '\0');
+  gguf_bytes g;
+  g.put("GGUF", 4);
+  g.u32(3);  // version
+  g.u64(1);  // tensors
+  g.u64(0);  // metadata pairs
+  g.str("w");
+  g.u32(1);   // dims
+  g.u64(4);   // ne[0]
+  g.u32(30);  // GGML_TYPE_BF16
+  g.u64(0);   // offset in the data section
+  g.f.resize((g.f.size() + 31) / 32 * 32, '\0');
   // Exact in bf16, the last near the top of its range.
   const float want[4] = {1.0f, -2.5f, 0.15625f, std::ldexp(1.0f, 127)};
   uint16_t raw[4];
@@ -116,9 +124,9 @@ TEST_CASE("gguf reads a BF16 tensor") {
     std::memcpy(&bits, &want[i], 4);
     raw[i] = static_cast<uint16_t>(bits >> 16);
   }
-  put(raw, sizeof(raw));
+  g.put(raw, sizeof(raw));
   const std::string path = "gguf_bf16_test.gguf";  // the test's working directory
-  { std::ofstream(path, std::ios::binary).write(f.data(), (std::streamsize)f.size()); }
+  g.write(path);
   {
     tl::gguf::model m(path);
     const auto* t = m.tensor("w");
@@ -128,6 +136,58 @@ TEST_CASE("gguf reads a BF16 tensor") {
     const auto* got = static_cast<const uint16_t*>(t->data);
     for (int i = 0; i < 4; i++) CHECK(tl::bf16_to_f32(got[i]) == want[i]);
   }
+  std::remove(path.c_str());
+}
+
+// A byte-level BPE splits the text by the pre-tokenizer its file names
+// (tokenizer.ggml.pre), and refuses one it does not have. A vocabulary of a few
+// tokens, each rule's split telling in the ids: Llama 3 takes digits three at a
+// time and a whole word the vocabulary has whatever the merges; Qwen3.5 keeps a
+// combining mark (U+0301) in its word, where Qwen2 starts the next word at it,
+// and makes a word of a mark no letter follows, where Qwen2's punctuation takes it.
+TEST_CASE("the BPE pre-tokenizer is the one the file names") {
+  // Bytes 0xCC 0x81 (U+0301) as their GPT-2 symbols, U+00CC and U+0123.
+  const std::string cc = "\xC3\x8C", x81 = "\xC4\xA3";
+  const std::vector<std::string> tokens = {"1",   "2", "3",  "4",     "12", "123",    "a",
+                                           "b",   "ab", "<eos>", cc,  x81,  "a" + cc, ".",
+                                           x81 + "."},
+                                 merges = {"1 2", "12 3", "a " + cc, x81 + " ."};
+  // GGUF v3 with no tensors: the tokenizer's metadata only.
+  auto file = [&](const std::string& pre) {
+    gguf_bytes g;
+    auto strs = [&](const char* key, const std::vector<std::string>& v) {
+      g.str(key), g.u32(9), g.u32(8), g.u64(v.size());  // array of strings
+      for (const auto& s : v) g.str(s);
+    };
+    g.put("GGUF", 4), g.u32(3), g.u64(0), g.u64(6);  // version, tensors, metadata pairs
+    g.str("tokenizer.ggml.model"), g.u32(8), g.str("gpt2");
+    g.str("tokenizer.ggml.pre"), g.u32(8), g.str(pre);
+    strs("tokenizer.ggml.tokens", tokens);
+    strs("tokenizer.ggml.merges", merges);
+    g.str("tokenizer.ggml.token_type"), g.u32(9), g.u32(5), g.u64(tokens.size());  // i32s
+    for (size_t i = 0; i < tokens.size(); i++) g.u32(tokens[i] == "<eos>" ? 3 : 1);
+    g.str("tokenizer.ggml.eos_token_id"), g.u32(4), g.u32(9);
+    const std::string path = "tokenizer_pre_test.gguf";  // the test's working directory
+    g.write(path);
+    return path;
+  };
+  auto ids = [&](const std::string& pre, const std::string& text) {
+    const std::string path = file(pre);
+    const std::vector<int> v = tl::tokenizer(path).encode(text);
+    std::remove(path.c_str());
+    return v;
+  };
+  using v = std::vector<int>;
+  CHECK(ids("qwen2", "1234") == v{0, 1, 2, 3});
+  CHECK(ids("llama-bpe", "1234") == v{5, 3});
+  CHECK(ids("qwen2", "ab") == v{6, 7});
+  CHECK(ids("llama-bpe", "ab") == v{8});
+  CHECK(ids("qwen2", "a\xCC\x81" "b") == v{6, 10, 11, 7});
+  CHECK(ids("qwen35", "a\xCC\x81" "b") == v{12, 11, 7});
+  CHECK(ids("qwen2", "1\xCC\x81.") == v{0, 10, 14});
+  CHECK(ids("qwen35", "1\xCC\x81.") == v{0, 10, 11, 13});
+  const std::string path = file("not-a-pre-tokenizer");
+  CHECK_THROWS_AS(tl::tokenizer{path}, std::runtime_error);
   std::remove(path.c_str());
 }
 

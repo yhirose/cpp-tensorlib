@@ -3,9 +3,12 @@
 // file's metadata (tokenizer.ggml.*):
 //
 //  - "gpt2": byte-level BPE, the family Qwen2, GPT-2 and their relatives share.
-//    The GPT-2 pretokenizer regex (hand-rolled, no std::regex), the
-//    byte->unicode symbol mapping and rank-ordered merges; token for token HF's
-//    fast tokenizer (checked against Qwen2TokenizerFast).
+//    The pre-tokenizer regex the file names (tokenizer.ggml.pre: Qwen2's,
+//    Qwen3.5's, Llama 3's; hand-rolled, no std::regex), the byte->unicode
+//    symbol mapping and rank-ordered merges; token for token HF's fast
+//    tokenizer (checked against Qwen2TokenizerFast) and llama.cpp's
+//    llama-tokenize (Qwen3.5, Llama 3). Text that is not UTF-8 keeps its bytes,
+//    where llama.cpp reads each bad byte as U+FFFD.
 //  - "llama": SentencePiece BPE (Gemma, Llama 2). Spaces become U+2581, then
 //    adjacent pieces merge highest score first where the pair is a token, as
 //    llama.cpp's SPM tokenizer does (checked against its llama-tokenize); a
@@ -61,6 +64,7 @@ class tokenizer {
         if (byte_id_[b] >= 0) byte_of_[byte_id_[b]] = static_cast<uint8_t>(b);
       }
     } else {
+      pre_ = pre_rule_(m.has("tokenizer.ggml.pre") ? m.kv("tokenizer.ggml.pre").as_str() : "");
       auto merges = m.kv("tokenizer.ggml.merges").as_str_array();
       merge_rank_.reserve(merges.size() * 2);
       for (size_t i = 0; i < merges.size(); i++)
@@ -231,18 +235,40 @@ class tokenizer {
     }
     off.push_back(seg.size());
 
-    for (auto [i, e] : pretokenize_(cp))
+    for (auto [i, e] : pretokenize_(cp, pre_))
       bpe_(data + off[i], off[e] - off[i], out);
   }
 
-  // Hand-rolled GPT-2 pretokenizer regex. Returns [start,end) codepoint
-  // spans. At each position the FIRST matching alternative wins.
+  // The byte-level BPE's pre-tokenizers, as llama.cpp's llama_vocab::load maps
+  // the names (tokenizer.ggml.pre) and llm_tokenizer_bpe spells the regexes. The
+  // ones here share Qwen2's shape,
+  //   (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+
+  //   |\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+  // and differ in the digit run, the classes and one rule of the merges:
+  struct pretok_rule {
+    size_t digits = 1;           // \p{N}{1,digits}: Llama 3 takes three at a time
+    bool marks = false;          // [\p{L}\p{M}]+ words, \p{M} not punctuation (Qwen3.5)
+    bool ignore_merges = false;  // a pretoken the vocabulary has is that token (Llama 3)
+  };
+  static pretok_rule pre_rule_(const std::string& pre) {
+    for (const char* n : {"qwen2", "deepseek-r1-qwen", "kormo", "megrez"})
+      if (pre == n) return {};
+    if (pre == "qwen35") return {1, true, false};
+    for (const char* n : {"llama3", "llama-v3", "llama-bpe", "falcon3", "falcon-h1", "pixtral",
+                          "midm-2.0", "lfm2", "jina-v5-nano"})
+      if (pre == n) return {3, false, true};
+    throw std::runtime_error("tokenizer: no BPE pre-tokenizer \"" + pre + "\"");
+  }
+
+  // The pre-tokenizer regex (pretok_rule), hand-rolled. Returns [start,end)
+  // codepoint spans. At each position the FIRST matching alternative wins.
   static std::vector<std::pair<size_t, size_t>> pretokenize_(
-      const std::vector<uint32_t>& cp) {
+      const std::vector<uint32_t>& cp, const pretok_rule& rule) {
     using tokdata::is_L;
     using tokdata::is_N;
     using tokdata::is_WS;
-    auto punct = [](uint32_t c) { return !is_WS(c) && !is_L(c) && !is_N(c); };
+    auto word = [&](uint32_t c) { return is_L(c) || (rule.marks && tokdata::is_M(c)); };
+    auto punct = [&](uint32_t c) { return !is_WS(c) && !word(c) && !is_N(c); };
     auto lower = [](uint32_t c) -> uint32_t {
       return (c >= 'A' && c <= 'Z') ? c + 32 : c;
     };
@@ -268,24 +294,30 @@ class tokenizer {
         }
       }
 
-      // A2 — word: [^\r\n\p{L}\p{N}]?\p{L}+
+      // A2 — word: [^\r\n\p{L}\p{N}]?\p{L}+ (Qwen3.5: [\p{L}\p{M}]+). The prefix
+      // counts only when a word follows; else the regex backtracks to none, so a
+      // mark (in both classes) that no word follows is a word by itself.
       if (!e) {
         size_t j = static_cast<size_t>(-1);
-        if (cp[i] != 13 && cp[i] != 10 && !is_L(cp[i]) && !is_N(cp[i])) {
-          if (i + 1 < n && is_L(cp[i + 1])) j = i + 1;  // optional prefix used
-        } else if (is_L(cp[i])) {
+        if (cp[i] != 13 && cp[i] != 10 && !is_L(cp[i]) && !is_N(cp[i]) && i + 1 < n &&
+            word(cp[i + 1])) {
+          j = i + 1;  // optional prefix used
+        } else if (word(cp[i])) {
           j = i;
         }
         if (j != static_cast<size_t>(-1)) {
-          while (j < n && is_L(cp[j])) j++;
+          while (j < n && word(cp[j])) j++;
           e = j;
         }
       }
 
-      // A3 — single digit: \p{N}
-      if (!e && is_N(cp[i])) e = i + 1;
+      // A3 — digits: \p{N}{1,rule.digits}
+      if (!e && is_N(cp[i])) {
+        e = i + 1;
+        while (e < n && e - i < rule.digits && is_N(cp[e])) e++;
+      }
 
-      // A4 — punct run: ?[^\s\p{L}\p{N}]+[\r\n]*
+      // A4 — punct run: ?[^\s\p{L}\p{N}]+[\r\n]* (Qwen3.5: and not \p{M})
       if (!e) {
         size_t j = i;
         bool ok = true;
@@ -312,6 +344,10 @@ class tokenizer {
         else e = w;                     // A7 single ws char
       }
 
+      // Every codepoint starts some alternative's match (a word's A2, a digit's
+      // A3, whitespace's A5-A7, the rest A4), so each step moves on.
+      if (e <= i || e > n)
+        throw std::logic_error("tokenizer: a pre-tokenizer step matched nothing");
       toks.emplace_back(i, e);
       i = e;
     }
@@ -326,6 +362,14 @@ class tokenizer {
       std::string s;
       append_cp_(s, tokdata::byte2cp[static_cast<uint8_t>(bytes[k])]);
       sym.push_back(std::move(s));
+    }
+    if (pre_.ignore_merges && sym.size() > 1) {
+      std::string whole;
+      for (const auto& s : sym) whole += s;
+      if (auto it = token2id_.find(whole); it != token2id_.end()) {
+        out.push_back(it->second);
+        return;
+      }
     }
 
     while (sym.size() > 1) {
@@ -456,6 +500,7 @@ class tokenizer {
   // CONTROL + USER_DEFINED tokens by first byte, longest first.
   std::vector<std::pair<std::string, int>> specials_[256];
   std::unordered_map<uint32_t, uint8_t> cp2byte_;      // inverse byte2cp (gpt2)
+  pretok_rule pre_;                                    // (gpt2)
   bool spm_ = false;                                   // tokenizer.ggml.model "llama"
   std::vector<float> scores_;                          // a token's merge score (spm)
   bool add_space_prefix_ = true;                       // (spm)

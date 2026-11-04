@@ -381,9 +381,9 @@ add_test(NAME cpu_ukernel COMMAND tensorlib_check_cpu_ukernel)
 add_executable(check_gguf bench/host/check_gguf.cpp)
 target_link_libraries(check_gguf PRIVATE tensorlib)
 
-# Qwen2 BPE tokenizer check (include/tokenizer.h): encodes the HF-oracle test
-# strings from bench/host/tokenizer_oracle_data.h and asserts token-exact ids +
-# decode round-trip. Pure host code; not a ctest (needs the 1.2GB model file
-# outside the repo).
+# Tokenizer check (include/tokenizer.h): encodes the oracle strings of the file's
+# family (bench/host/tokenizer_oracle_*.h: HF's Qwen2.5 tokenizer, llama.cpp's on
+# Qwen3.5, Llama 3 and Gemma 3) and asserts token-exact ids + decode round-trip.
+# Pure host code; not a ctest (needs a model file outside the repo).
 add_executable(check_tokenizer bench/host/check_tokenizer.cpp)
 target_link_libraries(check_tokenizer PRIVATE tensorlib)
