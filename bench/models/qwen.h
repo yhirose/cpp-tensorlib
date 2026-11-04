@@ -688,8 +688,9 @@ struct Model {
   // half the bytes every decode step streams, and the values the tensor-core
   // prefill rounds K and V to anyway, as llama.cpp's default cache. The decode's
   // attention then reads K and V rounded to f16. An f32-weight model (the exact
-  // build, which the oracle checks run) keeps an f32 cache, and so does any with
-  // TL_KV_F32=1.
+  // build) keeps an f32 cache, and so does any with TL_KV_F32=1. init_kv_caches
+  // sets it with the caches (check_qwen's reference forward on a quantized file's
+  // blocks takes an f32 cache, then the chat's again).
   bool kv_f16 = false;
 };
 
@@ -772,6 +773,17 @@ struct delta_snapshot {
     }
   }
 };
+
+// The attention layers' KV caches, empty, in the form f16 says (Model::kv_f16):
+// build()'s, and a caller's that runs the same weights with an f32 cache (check_qwen's
+// reference forward, on a quantized file's own blocks).
+inline void init_kv_caches(Model& M, bool f16) {
+  const Config& c = M.c;
+  M.kv_f16 = f16;
+  for (int64_t l = 0; l < c.NL; l++)
+    if (!c.is_delta(l))
+      M.layers[l].cache.init(c.NKV, c.MAXC, c.HD, f16, c.is_local(l) ? c.SWA : 0);
+}
 
 // Reset the sequence to position 0 (replay from a fresh prefill): every KV
 // cache, and every DeltaNet layer's state. Used by the bench's
@@ -1246,10 +1258,10 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
                                   {p + "attn_k.bias", c.NKV * c.HD},
                                   {p + "attn_v.bias", c.NKV * c.HD}});
       L.wo_row = dev({{p + "attn_output.weight", c.NE}}, Q);
-      L.cache.init(c.NKV, c.MAXC, c.HD, M.kv_f16, c.is_local(l) ? c.SWA : 0);
     }
     M.layers.push_back(std::move(L));
   }
+  init_kv_caches(M, M.kv_f16);
   M.scratch.init(M.c);  // persistent imperative-step buffers (GPU must be active)
   // Pre-size AND warm the batched-prefill path. CUDA loads a kernel lazily on
   // first use, so without this the first prompt pays the module load plus the

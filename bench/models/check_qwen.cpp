@@ -8,9 +8,11 @@
 // (embedding, layer-0 residual, final norm, top-5 logits) AND reproduce the greedy
 // token sequence exactly. A file of other weights than its oracle's (another
 // quantization, or another quantizer's: held_to_oracle) skips those two, its paths
-// held to its own f32 greedy instead. Proves weight loading + GGML->our layout transpose +
-// Qwen2 structure + the head_dim=64 attention kernels, on whatever backend
-// gpu:: resolves to. Tokenizer/sampling are
+// held to its own f32 greedy instead. A block-quantized file runs on its own
+// blocks, as a chat does, its f32 reference reading them with f32 activations and
+// an f32 KV cache (check_imperative), not widened to four bytes a weight. Proves weight loading +
+// GGML->our layout transpose + Qwen2 structure + the head_dim=64 attention
+// kernels, on whatever backend gpu:: resolves to. Tokenizer/sampling are
 // separate (see chat_qwen). Model path: argv[1] or ~/models/...fp16.gguf.
 
 #include "gemma3_1b_oracle_data.h"
@@ -88,6 +90,19 @@ static double maxrel(const std::vector<float>& a, const float* b, int64_t n) {
   return mr;
 }
 
+// The logits the last forward left (scratch.logits), on the host.
+static std::vector<float> logits_of(qm::Model& M) {
+  const float* l = qm::host_read(M.scratch.logits);
+  return std::vector<float>(l, l + M.c.VOCAB);
+}
+
+// The imperative forward's logits after `ids`, from position 0.
+static std::vector<float> imperative_prompt(qm::Model& M, const std::vector<int>& ids) {
+  qm::reset_cache(M);
+  for (size_t i = 0; i < ids.size(); i++) qm::step_imperative(M, ids[i], (int64_t)i);
+  return logits_of(M);
+}
+
 // The batched prefill's f16 sums (the default where the backend has them),
 // against `ref`, an f32 forward's logits for the same prompt: the top-5
 // logits to 2e-2 and the same greedy token. Then the safety net: with the
@@ -98,10 +113,6 @@ static double maxrel(const std::vector<float>& a, const float* b, int64_t n) {
 // be off by far more).
 static bool check_f16_sums(qm::Model& B, const std::vector<int>& ids,
                            const std::vector<float>& ref) {
-  auto logits = [&] {
-    const float* l = qm::host_read(B.scratch.logits);
-    return std::vector<float>(l, l + B.c.VOCAB);
-  };
   const bool was = B.f16_acc;
   B.f16_acc = true;
   if (!qm::prefill_sums_f16(B, false)) {  // nothing to hold: its prefill sums in f32 still
@@ -111,7 +122,7 @@ static bool check_f16_sums(qm::Model& B, const std::vector<int>& ids,
   }
   qm::reset_cache(B);
   const int64_t tok = qm::prefill_batched(B, ids);
-  const double t5 = qm::top5_maxrel(logits().data(), ref.data(), B.c.VOCAB);
+  const double t5 = qm::top5_maxrel(logits_of(B).data(), ref.data(), B.c.VOCAB);
   const bool close = t5 < 2e-2 && tok == qm::argmax(ref);
   std::printf("\nf16 sums: top-5 logits maxrel %.2e vs f32, token %lld %s\n", t5, (long long)tok,
               close ? "OK" : "FAIL");
@@ -121,10 +132,10 @@ static bool check_f16_sums(qm::Model& B, const std::vector<int>& ids,
   const int64_t retries = B.f16_retries;
   qm::reset_cache(B);
   qm::prefill_batched(B, ids);
-  const std::vector<float> redone = logits();
+  const std::vector<float> redone = logits_of(B);
   qm::reset_cache(B);
   qm::prefill_batched(B, ids, qm::PREFILL_CHUNK, /*exact=*/true);
-  const std::vector<float> f32 = logits();
+  const std::vector<float> f32 = logits_of(B);
   B.layers[0].fn = fn;
   B.f16_acc = was;
   // Both finite first: a NaN compares unequal to nothing, so it would pass
@@ -214,65 +225,69 @@ static std::vector<std::vector<float>> cache_rows(qm::Model& M, int64_t n) {
   return out;
 }
 
-// A model the array path does not model (Qwen3.5's DeltaNet, Gemma 3's post
-// norms: Config::array_path()) has its checkpoints read off the imperative
-// forward: the final norm the last layer's seam leaves in scratch, the logits,
-// and the greedy continuation, at F32 against the oracle. Then the bf16 weights
-// (the chat's) must reproduce the same greedy opening.
-static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held) {
+// The reference forward's checks, on R: its checkpoints read off the imperative
+// forward (the final norm the last layer's seam leaves in scratch, the logits)
+// and the greedy continuation, against the oracle where it read these weights.
+// `want` gets the greedy run, which the chat's paths are held to after.
+static bool check_reference(qm::Model& R, const Oracle& O, bool held, std::vector<int64_t>& want) {
   const int64_t NP = (int64_t)O.n_prompt, NG = (int64_t)O.n_greedy;
+  const qm::Config& C = R.c;
+  std::printf("model built — %lld layers (%lld attention), head_dim=%lld", (long long)C.NL,
+              (long long)(C.NL / C.INTERVAL), (long long)C.HD);
+  if (C.hybrid())
+    std::printf(", DeltaNet %lldx[%lld,%lld]", (long long)C.SH, (long long)C.SDK,
+                (long long)C.SDV);
+  std::printf("\n");
+  const std::vector<float> logits =
+      imperative_prompt(R, std::vector<int>(O.prompt_ids, O.prompt_ids + NP));
+  const float* fp = qm::host_read(R.scratch.hb);
+  double fn_mr = maxrel(std::vector<float>(fp, fp + C.NE), O.fnorm_last, C.NE);
+  double logit_mr = 0;
+  for (int t = 0; t < 5; t++) {
+    const double ref = O.top5_vals[t];
+    logit_mr =
+        tl::max_err(logit_mr, std::fabs(logits[O.top5_ids[t]] - ref) / (1.0 + std::fabs(ref)));
+  }
+  const int64_t top1 = qm::argmax(logits);
+  if (held) {
+    std::printf("\ncheckpoints vs numpy-on-the-same-weights (imperative path):\n");
+    std::printf("  final norm maxrel %.2e %s\n", fn_mr, fn_mr < 5e-3 ? "OK" : "FAIL");
+    std::printf("  top5 logit maxrel %.2e %s\n", logit_mr, logit_mr < 5e-3 ? "OK" : "FAIL");
+    std::printf("  argmax id  cpp=%lld ref=%d %s\n", (long long)top1, O.top5_ids[0],
+                top1 == O.top5_ids[0] ? "OK" : "FAIL");
+  }
+  int64_t tok = top1, p = NP;
+  bool greedy_ok = true;
+  std::printf("\ngreedy %lld tokens:\n  cpp:", (long long)NG);
+  for (int64_t i = 0; i < NG; i++) {
+    std::printf(" %lld", (long long)tok);
+    want.push_back(tok);
+    if (tok != O.greedy30[i]) greedy_ok = false;
+    tok = qm::step_imperative(R, tok, p++);
+  }
+  if (held) std::printf("\n  greedy %s\n", greedy_ok ? "MATCH" : "DIVERGE");
+  else std::printf("\n");
+  return !held || (fn_mr < 5e-3 && logit_mr < 5e-3 && top1 == O.top5_ids[0] && greedy_ok);
+}
+
+// A model the array path does not model (Qwen3.5's DeltaNet, Gemma 3's post
+// norms: Config::array_path()), and any block-quantized file, whose blocks only
+// the imperative path reads, is checked here, on the imperative path. Its
+// reference forward is f32: a float file's weights widened exactly, a quantized
+// file's own blocks read with f32 activations, sums and KV cache. A GEMV
+// dequantizes each block exactly, so the latter are the widened weights' values,
+// summed in another order, at about the file's size rather than four bytes a
+// weight (Gemma 3 4B's check peaks at 4.5 GB on Metal, where its widened weights
+// alone are 15.5 GB). Then the chat's weights must reproduce the reference's
+// greedy opening, and its decoder the imperative path.
+static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held) {
+  const int64_t NP = (int64_t)O.n_prompt;
+  const bool quant = qm::quant_file(m);
   std::vector<int64_t> want;
-  // The f32 forward's logits after a spread-out prompt (a quantized file's: the
-  // reference its default forms are held to below).
-  const std::vector<int> spread = qm::spread_ids(200, qm::config_from_gguf(m).VOCAB);
-  std::vector<float> ref_spread;
-  bool ok;
-  {
+  bool ok = true;
+  if (!quant) {  // scoped so the f32 weights are back in the pool before the bf16 build
     qm::Model M = qm::build(m, tl::dtype::f32);
-    const qm::Config& C = M.c;
-    std::printf("model built — %lld layers (%lld attention), head_dim=%lld", (long long)C.NL,
-                (long long)(C.NL / C.INTERVAL), (long long)C.HD);
-    if (C.hybrid())
-      std::printf(", DeltaNet %lldx[%lld,%lld]", (long long)C.SH, (long long)C.SDK,
-                  (long long)C.SDV);
-    std::printf("\n");
-    for (int64_t i = 0; i + 1 < NP; i++) qm::step_imperative(M, O.prompt_ids[i], i);
-    const float* lp = qm::imperative_logits(M, O.prompt_ids[NP - 1], NP - 1);
-    std::vector<float> logits(lp, lp + C.VOCAB);
-    const float* fp = qm::host_read(M.scratch.hb);
-    double fn_mr = maxrel(std::vector<float>(fp, fp + C.NE), O.fnorm_last, C.NE);
-    double logit_mr = 0;
-    for (int t = 0; t < 5; t++) {
-      const double ref = O.top5_vals[t];
-      logit_mr =
-          tl::max_err(logit_mr, std::fabs(logits[O.top5_ids[t]] - ref) / (1.0 + std::fabs(ref)));
-    }
-    const int64_t top1 = qm::argmax(logits);
-    if (held) {
-      std::printf("\ncheckpoints vs numpy-on-the-same-weights (imperative path):\n");
-      std::printf("  final norm maxrel %.2e %s\n", fn_mr, fn_mr < 5e-3 ? "OK" : "FAIL");
-      std::printf("  top5 logit maxrel %.2e %s\n", logit_mr, logit_mr < 5e-3 ? "OK" : "FAIL");
-      std::printf("  argmax id  cpp=%lld ref=%d %s\n", (long long)top1, O.top5_ids[0],
-                  top1 == O.top5_ids[0] ? "OK" : "FAIL");
-    }
-    int64_t tok = top1, p = NP;
-    bool greedy_ok = true;
-    std::printf("\ngreedy %lld tokens:\n  cpp:", (long long)NG);
-    for (int64_t i = 0; i < NG; i++) {
-      std::printf(" %lld", (long long)tok);
-      want.push_back(tok);
-      if (tok != O.greedy30[i]) greedy_ok = false;
-      tok = qm::step_imperative(M, tok, p++);
-    }
-    if (held) std::printf("\n  greedy %s\n", greedy_ok ? "MATCH" : "DIVERGE");
-    else std::printf("\n");
-    ok = !held || (fn_mr < 5e-3 && logit_mr < 5e-3 && top1 == O.top5_ids[0] && greedy_ok);
-    if (qm::quant_file(m)) {
-      qm::reset_cache(M);
-      const float* sl = nullptr;
-      for (size_t i = 0; i < spread.size(); i++) sl = qm::imperative_logits(M, spread[i], (int64_t)i);
-      ref_spread.assign(sl, sl + C.VOCAB);
-    }
+    ok = check_reference(M, O, held, want);
   }
   // The chat's weights: a quantized file's blocks as they lie, else bf16 (a
   // backend without the bf16 GEMV builds f32 instead, and says so). Its default
@@ -286,16 +301,29 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   // same prompts after.
   const int64_t NB = 8;
   qm::Model B = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false,
-                          /*f16_acc=*/false, /*quant=*/qm::quant_file(m));
+                          /*f16_acc=*/false, /*quant=*/quant);
   const tl::gpu::act_form chat_form = B.gemv_form;
   const bool chat_mmq = B.mmq;
   B.gemv_form = tl::gpu::act_form::f32;
   B.mmq = false;
+  // A quantized file's reference is these weights in those forms with an f32 KV
+  // cache (the chat's rounds K and V to f16: Gemma 3's final norm 1e-2 off the
+  // oracle's for 4e-5), and so are its logits after a spread-out prompt, which its
+  // default forms are held to below.
+  const std::vector<int> spread = qm::spread_ids(200, B.c.VOCAB);
+  std::vector<float> ref_spread;
+  if (quant) {
+    const bool chat_kv = B.kv_f16;
+    qm::init_kv_caches(B, false);
+    ok = check_reference(B, O, held, want);
+    ref_spread = imperative_prompt(B, spread);
+    qm::init_kv_caches(B, chat_kv);
+    qm::reset_cache(B);
+  }
+  // The prompt again, token by token: the logits, cache and first step the
+  // decoder is held to below, and the greedy opening, the reference's (a
+  // quantized file's own, run again from a reset cache).
   int64_t tok = 0, p = 0;
-  auto logits_of = [&](qm::Model& X) {
-    const float* l = qm::host_read(X.scratch.logits);
-    return std::vector<float>(l, l + X.c.VOCAB);
-  };
   for (int64_t i = 0; i < NP; i++) tok = qm::step_imperative(B, O.prompt_ids[i], p++);
   const std::vector<float> imp_prompt = logits_of(B);  // the last prompt token's
   const auto imp_cache = cache_rows(B, NP);           // and the k / v the prompt left
@@ -406,9 +434,7 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   std::vector<int> longp;
   const int64_t n_long = std::max<int64_t>(96, B.c.SWA > 0 ? B.c.SWA + 64 : 0);
   for (int64_t i = 0; i < n_long; i++) longp.push_back(O.prompt_ids[i % NP]);
-  qm::reset_cache(B);
-  for (int64_t i = 0; i < (int64_t)longp.size(); i++) qm::step_imperative(B, longp[i], i);
-  const std::vector<float> imp_long = logits_of(B);
+  const std::vector<float> imp_long = imperative_prompt(B, longp);
   qm::reset_cache(B);
   bool long_ok = true;
   if (qm::prefill_batched(B, longp) >= 0) {
@@ -483,7 +509,10 @@ int main(int argc, char** argv) {
   const Oracle O = *found;
   const bool same = held_to_oracle(m, O);
   tl::use_gpu();
-  if (!C.array_path()) {
+  // The array path (forward(), the per-op oracle) reads float weights; a
+  // quantized file runs on its own blocks, as a chat does (a backend that reads
+  // no blocks refuses one: build() says so).
+  if (!C.array_path() || qm::quant_file(m)) {
     const bool ok = check_imperative(m, O, same);
     std::printf("\n%s\n", ok ? "ALL OK" : "FAILURES");
     return ok ? 0 : 1;
