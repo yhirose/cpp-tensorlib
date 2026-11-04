@@ -1130,6 +1130,7 @@ struct read_bf16_s_ {
 };
 struct embed_row_params {
   uint K, rows, rs, cs;
+  float scale;  // each value times it (Gemma's embedding; 1 unchanged)
 };
 #define TL_EMBED_ROW(name, T, READER)                                        \
   kernel void name(device const T* B [[buffer(0)]],                          \
@@ -1139,7 +1140,7 @@ struct embed_row_params {
                    uint j [[thread_position_in_grid]]) {                     \
     if (j >= p.K) return;                                                    \
     const uint n = uint(idx[0] + 0.5f);                                      \
-    out[j] = n < p.rows ? READER(n, j) : 0.0f;                               \
+    out[j] = n < p.rows ? READER(n, j) * p.scale : 0.0f;                     \
   }
 TL_EMBED_ROW(embed_row_f32_, float, (read_f32_s_{B, p.rs, p.cs}))
 TL_EMBED_ROW(embed_row_bf16_, ushort, (read_bf16_s_{B, p.rs, p.cs}))

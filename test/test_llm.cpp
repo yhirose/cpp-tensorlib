@@ -585,8 +585,8 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       const std::vector<float> f = host_values(T), fb = host_values(Tb);
       const array Wf = dev(T), Wft = dev(T.transpose()), Wb = dev(T.to_bf16()),
                   Wbt = dev(T.transpose().to_bf16());
-      // The row gathered, or empty where the backend refuses a scale (Metal's and
-      // WebGPU's kernels have none: the caller stages the row on the host).
+      // The row gathered, or empty where the backend refuses a scale (WebGPU's
+      // kernel has none: the caller stages the row on the host).
       auto gather = [&](int type, const array& W, int64_t rs, int64_t cs, int64_t n, int64_t rows,
                         float scale = 1.0f) {
         array idx = dev(array::from(std::vector<float>{(float)n}, {1})), out = dev(array::zeros({K}));
@@ -618,12 +618,12 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
         for (int type : {12, 14, 8, 6})
           if (reads_quant(type, K)) qs.push_back({type, random_quant_rows(type, V, K, 990 + type)});
       // Scaled (Gemma's embedding): each value times the scale, an f32 product,
-      // required where the kernels have it (CUDA's, the host reference's).
+      // required of every backend but WebGPU, whose kernel has no scale.
       auto scaled = [&](int type, const array& W, int64_t rs, int64_t cs, int64_t n,
                         const std::vector<float>& w, bool exact) {
         const float s = 50.596443f;
         const std::vector<float> got = gather(type, W, rs, cs, n, V, s);
-#if defined(TENSORLIB_CUDA) || defined(TENSORLIB_HOST_GPU)
+#if !(defined(TENSORLIB_WEBGPU) && defined(__EMSCRIPTEN__))
         CHECK(!got.empty());
 #endif
         if (got.empty()) return;

@@ -91,7 +91,6 @@ struct own_nn {
                            int64_t N, int64_t K);
   static bool gemm_bf16_nt_f16acc(gpu::span A, gpu::span B, gpu::span C,
                                   int64_t M, int64_t N, int64_t K);
-  // A scale other than 1 is not in its kernels: false (the caller stages the row).
   static bool embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
                         int64_t rows, int64_t row_stride, int64_t col_stride, float scale);
   static bool quant_reads(int type, int64_t k);  // Q4_K, Q6_K, Q8_0 and Q5_0
@@ -289,6 +288,11 @@ struct attn_params {
   uint32_t T, kv_stride, group, pos0;
   float scale;
   uint32_t window;  // the prefill's sliding window (gpu::attn_window_lo); 0 none
+};
+
+struct embed_row_params {  // metal_kernels_nn.metal's
+  uint32_t K, rows, rs, cs;
+  float scale;
 };
 
 struct gemv_params {
@@ -522,7 +526,7 @@ inline bool own_nn::embed_row(int type, gpu::span W, gpu::span idx, gpu::span ou
   auto& c = context::get();
   const bool plain = type == 0 || type == 30;
   const detail_::quant_fmt* f = plain ? nullptr : detail_::quant_ok_(type, k, W);
-  if (!c.device || scale != 1.0f || (!plain && !f)) return false;
+  if (!c.device || (!plain && !f)) return false;
   detail_::bind_(c, type == 0    ? nn_kernel::embed_row_f32
                     : type == 30 ? nn_kernel::embed_row_bf16
                                  : f->embed);
@@ -530,7 +534,7 @@ inline bool own_nn::embed_row(int type, gpu::span W, gpu::span idx, gpu::span ou
   detail_::set_buf_(c.enc, idx, 1ul);
   detail_::set_buf_(c.enc, out, 2ul);
   const auto u = [](int64_t v) { return static_cast<uint32_t>(v); };
-  const uint32_t p[] = {u(k), u(rows), u(row_stride), u(col_stride)};
+  const detail_::embed_row_params p{u(k), u(rows), u(row_stride), u(col_stride), scale};
   detail_::set_bytes_(c.enc, p, 3ul);
   detail_::dispatch_grid_(c.enc, {(static_cast<unsigned long>(k) + 255ul) / 256ul, 1, 1},
                           {256, 1, 1});
