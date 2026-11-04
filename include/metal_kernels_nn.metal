@@ -1824,22 +1824,32 @@ kernel void gated_rmsnorm_(device const float* o               [[buffer(0)]],
   }
 }
 
-// out[row, f] = silu(gate) · up out of the fused gate|up projection
-// gu[row, 2·ff]; grid (ceil(ff / 256), rows).
-struct swiglu_params {
+// out[row, f] = act(gate) · up out of the fused gate|up projection
+// gu[row, 2·ff], act SiLU (swiglu_) or GELU's tanh form (geglu_): cuda's
+// glu_core_. Grid (ceil(ff / 256), rows).
+struct glu_params {
   uint ff;
 };
-
-kernel void swiglu_(device const float* gu     [[buffer(0)]],
-                    device float* out          [[buffer(1)]],
-                    constant swiglu_params& p  [[buffer(2)]],
-                    uint2 gid [[thread_position_in_grid]]) {
+struct silu_act_ {
+  float operator()(float g) const { return silu_(g); }
+};
+struct gelu_tanh_act_ {
+  float operator()(float g) const { return gelu_tanh_(g); }
+};
+template <class Act>
+kernel void glu_(device const float* gu     [[buffer(0)]],
+                 device float* out          [[buffer(1)]],
+                 constant glu_params& p  [[buffer(2)]],
+                 uint2 gid [[thread_position_in_grid]]) {
   const uint f = gid.x, row = gid.y;
   if (f >= p.ff) return;
   const uint src = row * 2 * p.ff + f;
-  const float g = gu[src];
-  out[row * p.ff + f] = silu_(g) * gu[src + p.ff];
+  out[row * p.ff + f] = Act{}(gu[src]) * gu[src + p.ff];
 }
+template [[host_name("swiglu_")]] kernel void glu_<silu_act_>(
+    device const float*, device float*, constant glu_params&, uint2);
+template [[host_name("geglu_")]] kernel void glu_<gelu_tanh_act_>(
+    device const float*, device float*, constant glu_params&, uint2);
 
 // Token-major [T, ld] -> head-major [H, T, D] with an optional per-head bias
 // (`off` picks a column block of a fused projection, so q/k/v come from one

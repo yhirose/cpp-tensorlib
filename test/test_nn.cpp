@@ -1003,7 +1003,10 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     // 16, so tanh's argument reaches past 45, where a tanh built on exp(2x) fails.
     array gw = dev(random_array({rows, 2 * ff}, 956) * 16.0f);
     array ga = array::empty({rows, ff}), gb = array::empty({rows, ff});
+    gpu::census_reset();
     REQUIRE(gpu::glu(gpu::glu_act::gelu_tanh, gw.device_span(), ga.device_span(), ff, rows));
+    // The backend's kernel where it names one, not the composition standing in.
+    if (gpu::has_kernel(gpu::kop::geglu_)) CHECK(gpu::census(gpu::kop::geglu_) == 1);
     REQUIRE(gen::glu(gpu::glu_act::gelu_tanh, gw.device_span(), gb.device_span(), ff, rows));
     tl::gpu::flush();
     const std::vector<float> in = host_values(gw);

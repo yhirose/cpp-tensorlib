@@ -30,6 +30,13 @@ static inline float widen_(half h) { return float(h); }
 // SiLU, g * sigmoid(g): one function for every kernel that applies it, so a
 // fused kernel and the ones it replaces round it the same.
 static inline float silu_(float g) { return g / (1.0f + exp(-g)); }
+// GELU's tanh form (Gemma's MLP; ggml's and PyTorch's approximate='tanh'), as
+// silu_ one function for every kernel that applies it. The precise tanh: the
+// fast one is 0 at 44 and NaN past (below), which a gate of ~10 reaches.
+static inline float gelu_tanh_(float g) {
+  return 0.5f * g *
+         (1.0f + precise::tanh(0.79788456080286535587989211986876f * g * (1.0f + 0.044715f * g * g)));
+}
 static inline void narrow_(device float* dst, float v) { *dst = v; }
 static inline void narrow_(device half* dst, float v) { *dst = half(v); }
 // Four consecutive elements as a float4 (i4 counts float4s).
@@ -44,9 +51,10 @@ static inline float4 load4_(device const half* p, uint i4) {
 // of normal floats, so each takes the precise:: form: the library compiles with
 // fast math (no MTLCompileOptions), whose forms give way at the edges (tanh 0 at
 // 44 and NaN past, sin and cos losing their range reduction past ~40). This
-// contract covers the elementwise ops; the fused kernels keep the fast forms (a
-// softmax's exp of x - max <= 0, SiLU's exp). test_array holds every op here to
-// libm over the edges.
+// contract covers the elementwise ops; the fused kernels keep the fast forms
+// where their arguments stay inside those edges (a softmax's exp of x - max <=
+// 0, SiLU's exp) and take the precise ones where they do not (gelu_tanh_'s
+// tanh). test_array holds every op here to libm over the edges.
 #define EW_BINARY(name, expr)                                  \
   kernel void name(device const float* a [[buffer(0)]],        \
                    device const float* b [[buffer(1)]],        \
