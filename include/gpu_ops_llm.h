@@ -206,7 +206,7 @@ inline bool finish_read(pending_read& r, float* out) {
 // or a block format whose rows are whole blocks, read as gemv_quant reads them
 // (Q4_K 12, Q6_K 14, Q8_0 8; the strides unused). An index past the table
 // gives zeros. `scale` multiplies the row (Gemma's embedding, times sqrt of its
-// width). False for a format, or a scale, the backend has no reader for.
+// width). False for a format the backend has no reader for.
 TL_GPU_DETECT_OWN(embed_row)
 template <class Own = own>
 inline bool embed_row(int type, span W, span idx, span out, int64_t k, int64_t rows,

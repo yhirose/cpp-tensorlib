@@ -709,6 +709,10 @@ struct bcast_nd_params {
 struct where_nd_params { uint32_t n, rank; };
 struct copy_nd_params { uint32_t n, rank; };
 struct index_add_params { uint32_t n, row_size, k; };
+struct embed_row_params {
+  uint32_t k, rows, rs, cs;
+  float scale;
+};
 struct scatter_axis_params { uint32_t n, size; };
 struct rope_params {
   uint32_t n, t, d, pos, half;
@@ -1023,13 +1027,12 @@ inline bool own::argmax_to(gpu::span a, int64_t n, gpu::span idx) {
 }
 
 // Row idx[0] of an f32 table into out (gpu_ops_llm.h's contract): f32 only,
-// the one format this backend's buffers hold, and unscaled (its kernel has no
-// scale).
+// the one format this backend's buffers hold.
 inline bool own::embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
                            int64_t rows, int64_t row_stride, int64_t col_stride, float scale) {
   using detail_::u32;
-  if (type != 0 || scale != 1.0f) return false;
-  const uint32_t p[] = {u32(k), u32(rows), u32(row_stride), u32(col_stride)};
+  if (type != 0) return false;
+  const detail_::embed_row_params p{u32(k), u32(rows), u32(row_stride), u32(col_stride), scale};
   return detail_::launch_own_("embed_row", -1, {gpu::in(W), gpu::in(idx), gpu::out(out)}, p,
                               gpu::policy::flat(k));
 }

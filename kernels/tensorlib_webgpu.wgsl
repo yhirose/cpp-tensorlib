@@ -861,7 +861,7 @@ fn argmax(@builtin(local_invocation_index) lid : u32) {
 // Views: table, idx -> out. Row idx[0] (an f32 index) of a `rows`-row table,
 // read by strides in elements: out[j] = table[idx * rs + j * cs], zeros for an
 // index past the table (gpu_ops_llm.h's embed_row, f32).
-struct EmbedRowArgs { v : Views, k : u32, rows : u32, rs : u32, cs : u32 };
+struct EmbedRowArgs { v : Views, k : u32, rows : u32, rs : u32, cs : u32, scale : f32 };
 @group(0) @binding(3) var<uniform> er : EmbedRowArgs;
 
 @compute @workgroup_size(256, 1, 1)
@@ -870,7 +870,7 @@ fn embed_row(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (j >= er.k) { return; }
   let n = u32(in1[er.v.v1] + 0.5);
   var x = 0.0;
-  if (n < er.rows) { x = in0[er.v.v0 + n * er.rs + j * er.cs]; }
+  if (n < er.rows) { x = in0[er.v.v0 + n * er.rs + j * er.cs] * er.scale; }
   out2[er.v.v2 + j] = x;
 }
 
