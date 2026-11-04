@@ -238,6 +238,8 @@ struct rope_params {
   uint n;
   uint has_bias;
   uint rot;
+  float pos_scale;   // a linear scaling of the position (Gemma 3's global layers)
+  uint has_factors;  // factors divide each pair's angle (gpu::rope_freq's)
 };
 
 // The turn of the pair (x0, x1) at dims (j, j + rot/2) of a row at `position`:
@@ -246,10 +248,15 @@ struct rope_params {
 // (at position p it carries ~p 2^-24 rad of rounding against an exact angle);
 // its power, cos and sin are libm's, precise::, since the angle grows with the
 // position past where the fast forms keep their range reduction (~40) and
-// carries the power's relative error times the position.
+// carries the power's relative error times the position. factors are the
+// pairs', each dividing its angle as llama.cpp's freq factors do (precise::, so
+// that none, 1, leaves the angle as it was).
 static inline void rope_pair_(float position, uint j, uint rot, float base,
+                              device const float* factors, uint has_factors,
                               thread float& x0, thread float& x1) {
-  const float ang = position * precise::pow(base, -2.0f * float(j) / float(rot));
+  const float ff = has_factors ? factors[j] : 1.0f;
+  const float ang =
+      precise::divide(position * precise::pow(base, -2.0f * float(j) / float(rot)), ff);
   float c;
   const float s = precise::sincos(ang, c);  // one range reduction for both
   const float r0 = x0 * c - x1 * s;
@@ -263,6 +270,7 @@ kernel void rope_(device const float* x [[buffer(0)]],
                   device float* out [[buffer(1)]],
                   constant rope_params& p [[buffer(2)]],
                   device const float* bias [[buffer(3)]],
+                  device const float* factors [[buffer(4)]],
                   uint i [[thread_position_in_grid]]) {
   if (i >= p.n) return;
   const uint r = i / p.half_, j = i % p.half_, bi = r * p.D;
@@ -277,7 +285,7 @@ kernel void rope_(device const float* x [[buffer(0)]],
     x0 += bias[bi + j];
     x1 += bias[bi + j + h];
   }
-  rope_pair_(float(p.pos + t), j, p.rot, p.base, x0, x1);
+  rope_pair_(float(p.pos + t) * p.pos_scale, j, p.rot, p.base, factors, p.has_factors, x0, x1);
   out[bi + j] = x0;
   out[bi + j + h] = x1;
 }
@@ -1763,11 +1771,14 @@ struct rmsnorm_rope_params {
   float base;
   uint rot;
   float eps;
+  float pos_scale;   // rope_params's
+  uint has_factors;
 };
 template <uint D>
 kernel void rmsnorm_rope_(device float* x                  [[buffer(0)]],
                           device const float* w            [[buffer(1)]],
                           constant rmsnorm_rope_params& p  [[buffer(2)]],
+                          device const float* factors      [[buffer(3)]],
                           uint tg   [[threadgroup_position_in_grid]],
                           uint sgid [[simdgroup_index_in_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]]) {
@@ -1782,7 +1793,7 @@ kernel void rmsnorm_rope_(device float* x                  [[buffer(0)]],
     v[k] = xr[d] * inv * w[d];
   }
   const uint h = p.rot >> 1, P = h / 32;  // rotation pairs a lane
-  const float position = float(p.pos + row % p.T);
+  const float position = float(p.pos + row % p.T) * p.pos_scale;  // rope_'s
   for (uint k = 0; k < E; k++) {
     const uint d = lane + 32 * k;
     if (d >= p.rot) xr[d] = v[k];
@@ -1790,17 +1801,20 @@ kernel void rmsnorm_rope_(device float* x                  [[buffer(0)]],
   for (uint k = 0; k < P; k++) {
     const uint t = lane + 32 * k;
     float x0 = v[k], x1 = v[k + P];
-    rope_pair_(position, t, p.rot, p.base, x0, x1);
+    rope_pair_(position, t, p.rot, p.base, factors, p.has_factors, x0, x1);
     xr[t] = x0;
     xr[t + h] = x1;
   }
 }
 template [[host_name("rmsnorm_rope_64_")]] kernel void rmsnorm_rope_<64>(
-    device float*, device const float*, constant rmsnorm_rope_params&, uint, uint, uint);
+    device float*, device const float*, constant rmsnorm_rope_params&, device const float*,
+    uint, uint, uint);
 template [[host_name("rmsnorm_rope_128_")]] kernel void rmsnorm_rope_<128>(
-    device float*, device const float*, constant rmsnorm_rope_params&, uint, uint, uint);
+    device float*, device const float*, constant rmsnorm_rope_params&, device const float*,
+    uint, uint, uint);
 template [[host_name("rmsnorm_rope_256_")]] kernel void rmsnorm_rope_<256>(
-    device float*, device const float*, constant rmsnorm_rope_params&, uint, uint, uint);
+    device float*, device const float*, constant rmsnorm_rope_params&, device const float*,
+    uint, uint, uint);
 
 // Qwen3.5's gated norm, silu(z) * (rmsnorm(o) * w), a simdgroup a row and
 // eight a threadgroup: rmsnorm_ and swiglu_ in one pass, with their sum and

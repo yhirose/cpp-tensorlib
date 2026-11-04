@@ -833,7 +833,7 @@ inline auto graph::gpu_rope_(const node& n, const array& x) -> std::optional<arr
   array out = array::empty(x.shape());
   if (!out.storage_.native) return std::nullopt;
   if (!gpu::rope(x.device_span(), out.device_span(), rows, T, D, n.axis,
-                 n.arg0))
+                 gpu::rope_freq{n.arg0}))
     return std::nullopt;
   return out;
 }

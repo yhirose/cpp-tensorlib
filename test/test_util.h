@@ -82,6 +82,14 @@ array dev(const array& a) {
   c.eval();
   return c;
 }
+// n per-pair RoPE factors (gpu::rope_freq's), as Llama 3's rope_freqs divide its
+// angles: 1 to 4 in steps of 0.75, most of them no power of two, so the division rounds.
+std::vector<float> rope_factors(int64_t n) {
+  std::vector<float> f((size_t)n);
+  for (size_t j = 0; j < f.size(); j++) f[j] = 1.0f + 0.75f * (float)(j % 5);
+  return f;
+}
+
 // Whether `got` is within tol (absolute and relative) of `want`.
 bool same(const array& got, const array& want, float tol) {
   return tl::allclose(got, want, tol, tol);

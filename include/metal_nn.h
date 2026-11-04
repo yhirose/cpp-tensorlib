@@ -99,14 +99,11 @@ struct own_nn {
   static bool gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
                          gpu::span C, int64_t m, int64_t n, int64_t k,
                          int64_t ldc, bool mmq);
-  static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
-                   int64_t D, int64_t pos, float base, gpu::span bias = {});
-  // A scaled position (pos_scale != 1) is not in its kernel: false, the composition.
-  static bool rope_partial(gpu::span x, gpu::span out, int64_t rows, int64_t T,
-                           int64_t D, int64_t pos, float base, gpu::span bias,
-                           int64_t rot, float pos_scale = 1.0f);
+  // Every gpu::rope_freq: a part of the row, a scaled position, per-pair factors.
+  static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T, int64_t D,
+                   int64_t pos, const gpu::rope_freq& f, gpu::span bias);
   static bool rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T,
-                           int64_t D, int64_t pos, float base, int64_t rot,
+                           int64_t D, int64_t pos, const gpu::rope_freq& f,
                            float eps);
   static bool gated_rmsnorm(gpu::span o, gpu::span z, int64_t ldz, gpu::span w,
                             gpu::span out, bool h16, int64_t T, int64_t H,
@@ -175,12 +172,16 @@ struct rope_params {
   uint32_t n;
   uint32_t has_bias;
   uint32_t rot;
+  float pos_scale;
+  uint32_t has_factors;
 };
 struct rmsnorm_rope_params {
   uint32_t rows, T, pos;
   float base;
   uint32_t rot;
   float eps;
+  float pos_scale;
+  uint32_t has_factors;
 };
 struct gated_rmsnorm_params {
   uint32_t rows, H, D, ldz;
@@ -197,34 +198,31 @@ struct gated_rmsnorm_params {
 // in; array.h's gpu_rope_ never passes one). Dispatched flat over rows*(D/2)
 // (CUDA instead grids by row, blocks by D/2 -- this file's own kernels are
 // all flat-1D, same as sum_to/compare/unary_ext above).
-// rope and rope_partial are one kernel: the first `rot` dims turn (rot == D
-// for the whole row) and the rest are copied through, as cuda's tl_rope.
-inline bool own_nn::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
-                      int64_t D, int64_t pos, float base, gpu::span bias) {
-  return rope_partial(x, out, rows, T, D, pos, base, bias, D);
-}
-inline bool own_nn::rope_partial(gpu::span x, gpu::span out, int64_t rows,
-                              int64_t T, int64_t D, int64_t pos, float base,
-                              gpu::span bias, int64_t rot, float pos_scale) {
+// One kernel for every rope_freq, as cuda's tl_rope: the first f.rot dims turn
+// (all of the row at D) and the rest are copied through.
+inline bool own_nn::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T, int64_t D,
+                         int64_t pos, const gpu::rope_freq& f, gpu::span bias) {
   auto& c = context::get();
-  if (!c.device || D <= 0 || (D & 1) || rot <= 0 || (rot & 1) || rot > D ||
-      pos_scale != 1.0f)
-    return false;
+  const int64_t rot = f.rot_of(D);
+  if (!c.device || D <= 0 || (D & 1) || rot <= 0 || (rot & 1) || rot > D) return false;
   int64_t half = D / 2;
   int64_t n = rows * half;
   c.bind_(kop::rope_);
   detail_::set_buf_(c.enc, x, 0ul);
   detail_::set_buf_(c.enc, out, 1ul);
   detail_::set_buf_(c.enc, bias ? bias : x, 3ul);  // a slot must be bound
+  detail_::set_buf_(c.enc, f.factors ? f.factors : x, 4ul);
   detail_::rope_params p{};
   p.T = static_cast<uint32_t>(T);
   p.D = static_cast<uint32_t>(D);
   p.pos = static_cast<uint32_t>(pos);
   p.half_ = static_cast<uint32_t>(half);
-  p.base = base;
+  p.base = f.base;
   p.n = static_cast<uint32_t>(n);
   p.has_bias = bias.buf ? 1u : 0u;
   p.rot = static_cast<uint32_t>(rot);
+  p.pos_scale = f.pos_scale;
+  p.has_factors = f.factors ? 1u : 0u;
   detail_::set_bytes_(c.enc, p, 2ul);
   unsigned long groups = (static_cast<unsigned long>(n) + 255ul) / 256ul;
   detail_::dispatch_grid_(c.enc, {groups, 1, 1}, {256, 1, 1});
@@ -236,9 +234,10 @@ inline bool own_nn::rope_partial(gpu::span x, gpu::span out, int64_t rows,
 // sum and rope_'s turn. Other shapes are refused, and gpu::rmsnorm_rope runs
 // the two ops.
 inline bool own_nn::rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows,
-                              int64_t T, int64_t D, int64_t pos, float base,
-                              int64_t rot, float eps) {
+                              int64_t T, int64_t D, int64_t pos,
+                              const gpu::rope_freq& f, float eps) {
   auto& c = context::get();
+  const int64_t rot = f.rot_of(D);
   if (!c.device || (D != 64 && D != 128 && D != 256) || rows <= 0 || T <= 0 ||
       rot <= 0 || rot % 64 || rot > D || rows % T)
     return false;
@@ -247,9 +246,11 @@ inline bool own_nn::rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows,
                                : nn_kernel::rmsnorm_rope_256);
   detail_::set_buf_(c.enc, x, 0ul);
   detail_::set_buf_(c.enc, w, 1ul);
+  detail_::set_buf_(c.enc, f.factors ? f.factors : x, 3ul);  // a slot must be bound
   detail_::rmsnorm_rope_params p{static_cast<uint32_t>(rows), static_cast<uint32_t>(T),
-                                 static_cast<uint32_t>(pos), base,
-                                 static_cast<uint32_t>(rot), eps};
+                                 static_cast<uint32_t>(pos), f.base,
+                                 static_cast<uint32_t>(rot), eps, f.pos_scale,
+                                 f.factors ? 1u : 0u};
   detail_::set_bytes_(c.enc, p, 2ul);
   detail_::dispatch_grid_(c.enc, {(static_cast<unsigned long>(rows) + 7) / 8, 1, 1},
                           {256, 1, 1});

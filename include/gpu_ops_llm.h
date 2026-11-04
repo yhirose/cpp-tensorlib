@@ -96,10 +96,9 @@ inline bool kv_fill(span Kc, span Vc, span K, span V, int64_t T, int64_t kv_max,
 TL_GPU_DETECT_OWN(rope_dpos)
 template <class Own = own>
 inline bool rope_dpos(span x, span o, int64_t rows, int64_t T, int64_t D,
-                      span d_pos, float base, span bias = {}, int64_t rot = 0,
-                      float pos_scale = 1.0f) {
+                      span d_pos, const rope_freq& f, span bias = {}) {
   if constexpr (detail::owns_rope_dpos<Own>::value) {
-    return detail::ran(Own::rope_dpos(x, o, rows, T, D, d_pos, base, bias, rot, pos_scale));
+    return detail::ran(Own::rope_dpos(x, o, rows, T, D, d_pos, f, bias));
   } else {
     return false;
   }

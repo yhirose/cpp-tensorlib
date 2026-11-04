@@ -6,6 +6,7 @@
 // Included by cuda.h, after the device core.
 
 #include "gpu_abi_llm.h"
+#include "gpu_abi_nn.h"  // rope_freq
 
 namespace tl {
 namespace cuda {
@@ -14,8 +15,8 @@ struct own_llm {
   // The graph-capture forms: the position is a device scalar, so a captured
   // step replays against an advancing cache row.
   static bool rope_dpos(gpu::span x, gpu::span out, int64_t rows, int64_t T,
-                        int64_t D, gpu::span d_pos, float base,
-                        gpu::span bias = {}, int64_t rot = 0, float pos_scale = 1.0f);
+                        int64_t D, gpu::span d_pos, const gpu::rope_freq& f,
+                        gpu::span bias);
   static bool kv_append_dpos(gpu::span Kc, gpu::span Vc, gpu::span k_new,
                              gpu::span v_new, gpu::span d_pos, int64_t kv_max,
                              int64_t n_kv_heads, int64_t D, bool kv_f16 = false);
@@ -116,24 +117,26 @@ inline void upload_u32(void* native, unsigned val) {
 // Grids are pos-independent throughout: attn_decode_dpos gets its split grid
 // from the cache CAPACITY (max_ctx) and lets the kernel bound the work by pos.
 
-// RoPE reading pos from *d_pos (else identical to rope_partial()).
+// RoPE reading pos from *d_pos (else identical to own_nn::rope).
 inline bool own_llm::rope_dpos(gpu::span x, gpu::span out, int64_t rows, int64_t T,
-                           int64_t D, gpu::span d_pos, float base,
-                           gpu::span bias, int64_t rot, float pos_scale) {
+                           int64_t D, gpu::span d_pos, const gpu::rope_freq& f,
+                           gpu::span bias) {
   auto& c = context::get();
-  if (rot == 0) rot = D;
+  const int64_t rot = f.rot_of(D);
   if (!c.ready || D <= 0 || (D & 1) || rot <= 0 || (rot & 1) || rot > D) return false;
   c.device_read_(x.buf);
   if (bias.buf) c.device_read_(bias.buf);
+  if (f.factors) c.device_read_(f.factors.buf);
   c.device_write_(out.buf);
   c.device_read_(d_pos.buf);
   float* px = context::off_(x.buf, x.off);
   float* pbias = bias.buf ? context::off_(bias.buf, bias.off) : nullptr;
+  float* pf = f.factors ? context::off_(f.factors.buf, f.factors.off) : nullptr;
   float* po = context::off_(out.buf, out.off);
   float* pp = context::off_(d_pos.buf, d_pos.off);
   unsigned uT = (unsigned)T, uD = (unsigned)D, urot = (unsigned)rot;
   return c.launch_(c.rope_dpos_(), {(unsigned)rows}, {(unsigned)(D / 2)}, 0, px,
-                   pbias, po, uT, uD, pp, base, urot, pos_scale);
+                   pbias, po, uT, uD, pp, f.base, urot, f.pos_scale, pf);
 }
 
 // One-thread *d_pos += 1 (tail of a captured forward; advances the counter).

@@ -82,8 +82,11 @@ struct Config {
   std::vector<bool> local;  // per layer; empty: every layer global
   float ROPE_BASE_LOCAL = 10000.0f, ROPE_SCALE = 1.0f;
   bool is_local(int64_t l) const { return l < (int64_t)local.size() && local[l]; }
-  float rope_base(int64_t l) const { return is_local(l) ? ROPE_BASE_LOCAL : ROPE_BASE; }
-  float rope_scale(int64_t l) const { return is_local(l) ? 1.0f : ROPE_SCALE; }
+  // Layer l's RoPE frequencies: a local layer's base, unscaled, or a global one's.
+  gpu::rope_freq rope(int64_t l) const {
+    return is_local(l) ? gpu::rope_freq{ROPE_BASE_LOCAL, ROT}
+                       : gpu::rope_freq{ROPE_BASE, ROT, ROPE_SCALE};
+  }
   // The attention's q scale: 1 / sqrt(HD), unless the family says otherwise
   // (QSCALE > 0: Gemma 3 27B's 1 / sqrt(NE / NH)).
   float QSCALE = 0.0f;
@@ -932,13 +935,13 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       // Qwen3: every q / k head row (HD wide, one per h*T + t) is RMS-normalized
       // in place, before rope. v is untouched.
       // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
-      const float base = c.rope_base(l), pscale = c.rope_scale(l);
+      const gpu::rope_freq rf = c.rope(l);
       if (c.qk_norm) {
-        gpu::rmsnorm_rope(qh, sp(L.qn), c.NH * T, T, c.HD, pos0, base, c.ROT, c.EPS, pscale);
-        gpu::rmsnorm_rope(kh, sp(L.kn), c.NKV * T, T, c.HD, pos0, base, c.ROT, c.EPS, pscale);
+        gpu::rmsnorm_rope(qh, sp(L.qn), c.NH * T, T, c.HD, pos0, rf, c.EPS);
+        gpu::rmsnorm_rope(kh, sp(L.kn), c.NKV * T, T, c.HD, pos0, rf, c.EPS);
       } else {
-        gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, base, {}, c.ROT, pscale);
-        gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, base, {}, c.ROT, pscale);
+        gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, rf);
+        gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, rf);
       }
       cache_ok_(L.cache.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale(), exact));
       // Qwen3.5: times sigmoid of the gate, the tail of each projection row —
@@ -1526,13 +1529,13 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
         gpu::rmsnorm(qp, sp(L.qn), qp, c.HD, c.EPS, c.NH);
         gpu::rmsnorm(kp, sp(L.kn), kp, c.HD, c.EPS, c.NKV);
       }
-      const float base = c.rope_base(l), pscale = c.rope_scale(l);
+      const gpu::rope_freq rf = c.rope(l);
       if (cap) {
-        gpu::rope_dpos(qp, qp, c.NH, 1, c.HD, d_pos, base, sp(L.bq), c.ROT, pscale);
-        gpu::rope_dpos(kp, kp, c.NKV, 1, c.HD, d_pos, base, sp(L.bk), c.ROT, pscale);
+        gpu::rope_dpos(qp, qp, c.NH, 1, c.HD, d_pos, rf, sp(L.bq));
+        gpu::rope_dpos(kp, kp, c.NKV, 1, c.HD, d_pos, rf, sp(L.bk));
       } else {
-        gpu::rope(qp, qp, c.NH, 1, c.HD, pos, base, sp(L.bq), c.ROT, pscale);
-        gpu::rope(kp, kp, c.NKV, 1, c.HD, pos, base, sp(L.bk), c.ROT, pscale);
+        gpu::rope(qp, qp, c.NH, 1, c.HD, pos, rf, sp(L.bq));
+        gpu::rope(kp, kp, c.NKV, 1, c.HD, pos, rf, sp(L.bk));
       }
       if (c.qkv_bias) gpu::binary(gpu::kop::add, vp, sp(L.bv), vp, c.NKV * c.HD, 1, 0);
       cache_ok_(cap ? L.cache.append_dpos(kp, vp, d_pos) &&

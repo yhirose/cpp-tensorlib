@@ -20,6 +20,20 @@ namespace gpu {
 enum class act_form { f32, q8, h16 };
 inline constexpr act_form prepared_act_forms[] = {act_form::q8, act_form::h16};
 
+// RoPE's frequencies (gpu_ops_nn.h's rope and the forms that fuse it): the pair
+// (j, j + rot/2) of a row at position p turns by
+//   p * pos_scale * base^(-2j/rot) / factors[j],
+// rot the dims that turn (0: all of the row; Qwen3.5 turns a part), pos_scale a
+// linear scaling of the position (Gemma 3's global layers), factors rot/2 divisors
+// on the device (Llama 3's rope_freqs, llama.cpp's freq_factors; none: all 1).
+struct rope_freq {
+  float base = 10000.0f;
+  int64_t rot = 0;
+  float pos_scale = 1.0f;
+  span factors{};
+  int64_t rot_of(int64_t D) const { return rot ? rot : D; }  // the dims that turn in a row of D
+};
+
 struct layer_norm_params {
   uint32_t rows, cols;
   float eps, scale, offset;

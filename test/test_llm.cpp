@@ -470,27 +470,31 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
     const int64_t H = 14, D = 64;
     array x = dev(random_array({H, D}, 920)), b = dev(random_array({H, D}, 921));
     array o = array::empty({H, D});
-    REQUIRE(gpu::rope(x.device_span(), o.device_span(), H, 1, D, 37, 1e6f, b.device_span()));
+    REQUIRE(gpu::rope(x.device_span(), o.device_span(), H, 1, D, 37, {1e6f}, b.device_span()));
     tl::gpu::flush();
     CHECK(same(o, array::rope(x + b, 37, 1e6f), 1e-5f));
   }
 
   SUBCASE("rope reading its position from the device matches rope, scaled or not") {
     // A captured decode step reads pos from a device scalar; Gemma 3's global
-    // layers scale it. Where the backend has the form, the same rotation bit for bit.
+    // layers scale it, Llama 3's factors divide its pairs' angles. Where the
+    // backend has the form, the same rotation bit for bit.
     const int64_t H = 8, D = 256;
     array x = dev(random_array({H, D}, 922));
+    const array fac = dev(array::from(rope_factors(D / 2), {D / 2}));
     array pos = dev(array::zeros({1}));
     const uint32_t p = 37;
     float bits;
     std::memcpy(&bits, &p, 4);
     tl::gpu::upload(pos.device_span().buf, &bits, 1);
-    for (const float scale : {1.0f, 0.125f}) {
+    for (const auto [scale, factors] : {std::pair{1.0f, false}, {0.125f, false}, {0.125f, true}}) {
       CAPTURE(scale);
+      CAPTURE(factors);
+      if (factors && !gpu::caps::rope_factors) continue;
+      const gpu::rope_freq rf{1e6f, 0, scale, factors ? fac.device_span() : gpu::span{}};
       array a = array::empty({H, D}), b = array::empty({H, D});
-      REQUIRE(gpu::rope(x.device_span(), a.device_span(), H, 1, D, p, 1e6f, {}, 0, scale));
-      if (gpu::rope_dpos(x.device_span(), b.device_span(), H, 1, D, pos.device_span(), 1e6f, {}, 0,
-                         scale)) {
+      REQUIRE(gpu::rope(x.device_span(), a.device_span(), H, 1, D, p, rf));
+      if (gpu::rope_dpos(x.device_span(), b.device_span(), H, 1, D, pos.device_span(), rf)) {
         tl::gpu::flush();
         CHECK(same(a, b, 0.0f));
       }

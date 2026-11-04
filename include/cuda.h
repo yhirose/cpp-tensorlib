@@ -1257,6 +1257,7 @@ struct caps {
   static constexpr bool bf16_gemm = true;  // gemm_bf16_nt: the batched prefill
   static constexpr bool kv_f16 = true;     // an f16 KV cache, every head width and path
   static constexpr bool attn_window = true;  // a sliding window, every attention form
+  static constexpr bool rope_factors = true;  // gpu::rope_freq's factors, every rope form
 };
 using graph_exec = CUgraphExec;
 

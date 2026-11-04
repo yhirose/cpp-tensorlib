@@ -38,6 +38,7 @@
 #include <cstdint>
 
 #include "gpu_abi.h"  // the op vocabulary and the launch contract
+#include "gpu_abi_nn.h"  // rope_freq
 #include "profile.h"
 #include "shape.h"  // tl::contiguous_strides_into (concat_part's meta)
 #include "types.h"
@@ -556,8 +557,8 @@ struct own {
   static bool gemm(gpu::span a, int64_t lda, bool ta, gpu::span b, int64_t ldb,
                    bool tb, gpu::span out, int64_t m, int64_t n, int64_t k,
                    float scale, float offset);
-  static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
-                   int64_t D, int64_t pos, float base, gpu::span bias = {});
+  static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T, int64_t D,
+                   int64_t pos, const gpu::rope_freq& f, gpu::span bias);
 };
 inline bool pending() { return context::get().pending; }
 
@@ -1004,17 +1005,19 @@ inline bool own::concat_part(gpu::span a, gpu::span out, const int64_t* a_shape,
 // RoPE (rotary position embedding), half-split (GPT-NeoX / HF-llama)
 // convention -- mirrors cuda.h's/metal.h's own rope. x is [rows, D]
 // contiguous (rows = H*T); dispatched flat over rows*(D/2), one invocation a
-// rotated pair.
-inline bool own::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
-                      int64_t D, int64_t pos, float base, gpu::span bias) {
+// rotated pair. The whole row at an unscaled position, without factors or a
+// fused bias: the composition takes the rest.
+inline bool own::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T, int64_t D,
+                      int64_t pos, const gpu::rope_freq& f, gpu::span bias) {
   using detail_::u32;
-  if (D <= 0 || (D & 1) || bias.buf) return false;  // no fused bias
+  if (D <= 0 || (D & 1) || bias.buf || f.rot_of(D) != D || f.pos_scale != 1.0f || f.factors)
+    return false;
   const int64_t half = D / 2;
   const int64_t n = rows * half;
   if (n <= 0) return false;
   return detail_::launch_own_(
       "rope", -1, {gpu::in(x), gpu::out(out)},
-      detail_::rope_params{u32(n), u32(T), u32(D), u32(pos), u32(half), base},
+      detail_::rope_params{u32(n), u32(T), u32(D), u32(pos), u32(half), f.base},
       gpu::policy::flat(n));
 }
 
@@ -1128,6 +1131,8 @@ struct caps {
   static constexpr bool row_gemv = false;
   static constexpr bool bf16_gemm = false;
   static constexpr bool kv_f16 = false;
+  // Its rope turns a whole row at an unscaled position; the rest is the composition's.
+  static constexpr bool rope_factors = false;
 };
 using graph_exec = void*;
 inline bool graph_available() { return false; }

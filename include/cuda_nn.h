@@ -18,9 +18,9 @@ struct own_nn {
                           int64_t T, int64_t ld, int64_t off, int64_t H,
                           int64_t D);
   // x[rows, D] RMS-normalized by w and then rotated, in place (rows = heads * T); D 64,
-  // 128 or 256 and rot a multiple of 64, else false.
+  // 128 or 256 and f.rot a multiple of 64, else false.
   static bool rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T, int64_t D,
-                           int64_t pos, float base, int64_t rot, float eps);
+                           int64_t pos, const gpu::rope_freq& f, float eps);
   // The activation a[K] prepared in form f into pa, and Q4_K rows dotted with it
   // (K % 256 == 0). q8: int8 blocks of 32 (K int8, then K/32 float2 of scale and sum),
   // read with dp4a. h16: K f16, K/32 f32 sums and K/256 f32 scales, read by the tensor
@@ -110,13 +110,10 @@ struct own_nn {
                            int64_t n, int64_t k);
   static bool gemm_bf16_nt_f16acc(gpu::span a, gpu::span B, gpu::span out, int64_t m,
                                   int64_t n, int64_t k);
-  static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
-                   int64_t D, int64_t pos, float base, gpu::span bias = {});
-  // rope over the first `rot` dims of each row only (Qwen3.5's partial RoPE),
-  // and with the position scaled (a linear RoPE scaling: Gemma 3's global layers).
-  static bool rope_partial(gpu::span x, gpu::span out, int64_t rows, int64_t T,
-                           int64_t D, int64_t pos, float base, gpu::span bias,
-                           int64_t rot, float pos_scale = 1.0f);
+  // Every gpu::rope_freq: a part of the row (Qwen3.5), a scaled position (Gemma 3's
+  // global layers), per-pair factors (Llama 3).
+  static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T, int64_t D,
+                   int64_t pos, const gpu::rope_freq& f, gpu::span bias);
   static bool layer_norm_bwd(gpu::span x, gpu::span g, gpu::span dy,
                              gpu::span dx, gpu::span dg, gpu::span db,
                              gpu::span stats, gpu::span partials, int64_t rows,
@@ -566,7 +563,8 @@ inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, 
 }
 
 inline bool own_nn::rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T, int64_t D,
-                              int64_t pos, float base, int64_t rot, float eps) {
+                              int64_t pos, const gpu::rope_freq& f, float eps) {
+  const int64_t rot = f.rot_of(D);
   auto& c = context::get();
   // tl_rmsnorm_rope_<D>: a warp a row, for the head widths whose rotation pairs a lane
   // holds whole; other shapes are refused (gpu::rmsnorm_rope then runs rmsnorm and rope).
@@ -574,10 +572,12 @@ inline bool own_nn::rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t
   if (!c.ready || e < 0 || rows <= 0 || T <= 0 || rot <= 0 || rot % 64 || rot > D || rows % T) return false;
   c.device_rmw_(x.buf);
   c.device_read_(w.buf);
+  if (f.factors) c.device_read_(f.factors.buf);
+  float* pf = f.factors ? context::off_(f.factors.buf, f.factors.off) : nullptr;
   static const char* const names[3] = {"tl_rmsnorm_rope_64", "tl_rmsnorm_rope_128", "tl_rmsnorm_rope_256"};
   return c.launch_(c.cached_(c.rmsnorm_rope_fn[e], names[e]), {(unsigned)((rows + 7) / 8)}, {256u}, 0,
                    context::off_(x.buf, x.off), context::off_(w.buf, w.off), (unsigned)rows, (unsigned)T,
-                   (unsigned)pos, base, (unsigned)rot, eps);
+                   (unsigned)pos, f.base, (unsigned)rot, eps, f.pos_scale, pf);
 }
 
 // ---- The f16 activation: producers that write what the f16 GEMM reads, so it
@@ -966,26 +966,24 @@ inline bool own_nn::attn_prefill_dkv(gpu::span q, gpu::span K, gpu::span V,
 
 // RoPE: rotate a contiguous [rows, D] buffer (rows = H*T). Row r's position is
 // pos + (r % T); half-split (GPT-NeoX / HF-llama) convention. D must be even.
-inline bool own_nn::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T,
-                      int64_t D, int64_t pos, float base, gpu::span bias) {
-  return rope_partial(x, out, rows, T, D, pos, base, bias, D);
-}
-inline bool own_nn::rope_partial(gpu::span x, gpu::span out, int64_t rows,
-                              int64_t T, int64_t D, int64_t pos, float base,
-                              gpu::span bias, int64_t rot, float pos_scale) {
+inline bool own_nn::rope(gpu::span x, gpu::span out, int64_t rows, int64_t T, int64_t D,
+                         int64_t pos, const gpu::rope_freq& f, gpu::span bias) {
   auto& c = context::get();
+  const int64_t rot = f.rot_of(D);
   if (!c.ready || D <= 0 || (D & 1) || rot <= 0 || (rot & 1) || rot > D) return false;
   c.device_read_(x.buf);
   if (bias.buf) c.device_read_(bias.buf);
+  if (f.factors) c.device_read_(f.factors.buf);
   c.device_write_(out.buf);
   float* px = context::off_(x.buf, x.off);
   float* pbias = bias.buf ? context::off_(bias.buf, bias.off) : nullptr;
+  float* pf = f.factors ? context::off_(f.factors.buf, f.factors.off) : nullptr;
   float* po = context::off_(out.buf, out.off);
   unsigned uT = static_cast<unsigned>(T), uD = static_cast<unsigned>(D),
            upos = static_cast<unsigned>(pos), urot = static_cast<unsigned>(rot);
   return c.launch_(c.rope_(), {static_cast<unsigned>(rows)},
                    {static_cast<unsigned>(D / 2)}, 0, px, pbias, po, uT, uD,
-                   upos, base, urot, pos_scale);
+                   upos, f.base, urot, f.pos_scale, pf);
 }
 
 // ---- Row-wise fused RMSNorm / SwiGLU. `rows` defaults to 1 (a decode step); a

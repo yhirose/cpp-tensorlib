@@ -3702,10 +3702,14 @@ extern "C" __global__ void tl_attn_bwd_dkv_f32_64(const float* q, const float* K
 // The angle is formed in f32, as the frameworks the models are trained in form it;
 // its base^(-2j/rot), sin and cos are libm's (powf, sincosf), not the intrinsics':
 // the angle grows with the position past where __sinf / __cosf stay accurate
-// (|x| <= pi), and carries the power's relative error times the position.
+// (|x| <= pi), and carries the power's relative error times the position. factors
+// are the pairs' (gpu::rope_freq's), each dividing its angle as llama.cpp's freq
+// factors do; none (null) is 1, which leaves the angle as it was.
 __device__ __forceinline__ void rope_pair_(float position, unsigned j, unsigned rot, float base,
-                                           float& x0, float& x1) {
-  const float ang = position * powf(base, -2.0f * (float)j / (float)rot);
+                                           const float* __restrict__ factors, float& x0,
+                                           float& x1) {
+  const float ff = factors ? factors[j] : 1.0f;
+  const float ang = position * powf(base, -2.0f * (float)j / (float)rot) / ff;
   float s, c;
   sincosf(ang, &s, &c);
   // r1's fused multiply-add named (x0 s fused, x1 c rounded first, the form rope_core
@@ -3727,7 +3731,8 @@ __device__ __forceinline__ void rope_pair_(float position, unsigned j, unsigned 
 template <unsigned D>
 __device__ __forceinline__ void rmsnorm_rope_core_(float* __restrict__ x, const float* __restrict__ w,
                                                    unsigned rows, unsigned T, unsigned pos, float base,
-                                                   unsigned rot, float eps) {
+                                                   unsigned rot, float eps, float pos_scale,
+                                                   const float* __restrict__ factors) {
   constexpr int E = D / 32;
   const unsigned lane = threadIdx.x & 31, row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
   if (row >= rows) return;
@@ -3744,13 +3749,13 @@ __device__ __forceinline__ void rmsnorm_rope_core_(float* __restrict__ x, const 
     const unsigned d = lane + 32 * k;
     if (d >= rot) xr[d] = v[k] * inv * w[d];
   }
-  const float position = (float)(pos + row % T);
+  const float position = (float)(pos + row % T) * pos_scale;  // rope_core's
 #pragma unroll
   for (int k = 0; k < E / 2; k++) {
     if ((unsigned)k >= P) break;
     const unsigned t = lane + 32 * k;
     float x0 = v[k] * inv * w[t], x1 = v[k + P] * inv * w[t + half];
-    rope_pair_(position, t, rot, base, x0, x1);
+    rope_pair_(position, t, rot, base, factors, x0, x1);
     xr[t] = x0;
     xr[t + half] = x1;
   }
@@ -3758,8 +3763,9 @@ __device__ __forceinline__ void rmsnorm_rope_core_(float* __restrict__ x, const 
 #define TL_RMSNORM_ROPE(D)                                                                       \
   extern "C" __global__ void tl_rmsnorm_rope_##D(float* __restrict__ x, const float* __restrict__ w, \
                                                  unsigned rows, unsigned T, unsigned pos, float base, \
-                                                 unsigned rot, float eps) {                          \
-    rmsnorm_rope_core_<D>(x, w, rows, T, pos, base, rot, eps);                                     \
+                                                 unsigned rot, float eps, float pos_scale,           \
+                                                 const float* __restrict__ factors) {                \
+    rmsnorm_rope_core_<D>(x, w, rows, T, pos, base, rot, eps, pos_scale, factors);                 \
   }
 TL_RMSNORM_ROPE(64)
 TL_RMSNORM_ROPE(128)
@@ -3778,11 +3784,12 @@ extern "C" {
 // blockDim = D/2: thread j turns the pair (j, j + rot/2) when j < rot/2, and
 // strides the pass-through dims from rot + j.
 // pos_scale multiplies the position (a linear RoPE scaling, Gemma 3's global
-// layers); at 1 the position is the same float.
+// layers); at 1 the position is the same float. factors, when given, divide each
+// pair's angle (gpu::rope_freq's: Llama 3's rope_freqs).
 static __device__ __forceinline__ void rope_core(
     const float* __restrict__ x, const float* __restrict__ bias,
     float* __restrict__ out, unsigned T, unsigned D, unsigned pos, float base,
-    unsigned rot, float pos_scale) {
+    unsigned rot, float pos_scale, const float* __restrict__ factors) {
   const unsigned r = blockIdx.x, j = threadIdx.x;  // j in 0..D/2-1
   const size_t bi = (size_t)r * D;
   for (unsigned d = rot + j; d < D; d += blockDim.x)
@@ -3796,14 +3803,14 @@ static __device__ __forceinline__ void rope_core(
     x0 += bias[bi + j];
     x1 += bias[bi + j + half];
   }
-  rope_pair_((float)(pos + t) * pos_scale, j, rot, base, x0, x1);
+  rope_pair_((float)(pos + t) * pos_scale, j, rot, base, factors, x0, x1);
   out[bi + j] = x0;
   out[bi + j + half] = x1;
 }
 __global__ void tl_rope(const float* __restrict__ x,
                         const float* __restrict__ bias, float* __restrict__ out,
                         unsigned T, unsigned D, unsigned pos, float base,
-                        unsigned rot, float pos_scale) {
-  rope_core(x, bias, out, T, D, pos, base, rot, pos_scale);
+                        unsigned rot, float pos_scale, const float* __restrict__ factors) {
+  rope_core(x, bias, out, T, D, pos, base, rot, pos_scale, factors);
 }
 }  // extern "C"

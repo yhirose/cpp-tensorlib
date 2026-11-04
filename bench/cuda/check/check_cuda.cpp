@@ -479,9 +479,9 @@ int main() {
       void* r = alloc(rows * s.D * 4, &cr);
       for (int64_t i = 0; i < rows * s.D; i++) cx[i] = cf[i] = d(g) * 3.0f;
       for (int64_t i = 0; i < s.D; i++) cw[i] = 0.5f + d(g);
-      const bool ok = tl::gpu::rmsnorm_rope({f, 0}, {w, 0}, rows, T, s.D, 2000, 1e6f, s.rot, 1e-6f) &&
+      const bool ok = tl::gpu::rmsnorm_rope({f, 0}, {w, 0}, rows, T, s.D, 2000, {1e6f, s.rot}, 1e-6f) &&
                       tl::gpu::rmsnorm({x, 0}, {w, 0}, {r, 0}, s.D, 1e-6f, rows) &&
-                      tl::gpu::rope({r, 0}, {r, 0}, rows, T, s.D, 2000, 1e6f, {}, s.rot);
+                      tl::gpu::rope({r, 0}, {r, 0}, rows, T, s.D, 2000, {1e6f, s.rot});
       sync_to_host(f, false);
       sync_to_host(r, false);
       int64_t diff = 0;

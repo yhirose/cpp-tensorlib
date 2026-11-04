@@ -206,7 +206,7 @@ TEST_CASE("rope turns by libm's cos and sin at large positions") {
     INFO("position " << pos);
     array o = array::empty({1, D});
     gpu::census_reset();
-    REQUIRE(gpu::rope(x.device_span(), o.device_span(), 1, 1, D, pos, 10000.0f));
+    REQUIRE(gpu::rope(x.device_span(), o.device_span(), 1, 1, D, pos, {10000.0f}));
     // The backend's own kernel where it has one: one op, not the composition's several.
     if (gpu::has_rope) CHECK(gpu::ops_run() == 1);
     tl::gpu::flush();
@@ -935,16 +935,25 @@ TEST_CASE("xent_bwd: the fused pullback matches (softmax - onehot) * g") {
 // "generic compositions" case holds the two together); this holds either to
 // an independent program.
 TEST_CASE("partial rope rotates the first rot dims and keeps the rest") {
-  // And a scaled position (a linear RoPE scaling, Gemma 3's global layers): the
-  // angle is position * pos_scale * base^(-2j/rot), on the whole row and on part.
+  // And a scaled position (a linear RoPE scaling, Gemma 3's global layers) and
+  // per-pair factors (Llama 3's rope_freqs): the angle is
+  // position * pos_scale * base^(-2j/rot) / factors[j], on the whole row and on
+  // part. A backend without factors (caps::rope_factors) refuses them.
   if (!tl::gpu_available()) return;
   auto prev = tl::device_;
   tl::use_gpu();
   const int64_t H = 3, T = 4, D = 256, pos = 11;
   const float base = 1e7f;
-  for (const auto [rot, pos_scale] : {std::pair<int64_t, float>{64, 1.0f}, {256, 0.125f}, {64, 0.125f}}) {
+  const std::vector<float> fh = rope_factors(D / 2);
+  const array fac = dev(array::from(fh, {D / 2}));
+  struct form { int64_t rot; float pos_scale; bool factors; };
+  for (const form f : {form{64, 1.0f, false}, {256, 0.125f, false}, {64, 0.125f, false},
+                       {256, 1.0f, true}, {64, 0.125f, true}}) {
+    const auto [rot, pos_scale, factors] = f;
     CAPTURE(rot);
     CAPTURE(pos_scale);
+    CAPTURE(factors);
+    const tl::gpu::rope_freq rf{base, rot, pos_scale, factors ? fac.device_span() : tl::gpu::span{}};
     array xh = random_array({H * T, D}, 990);
     xh.eval();
     std::vector<float> want((size_t)H * T * D);
@@ -954,7 +963,7 @@ TEST_CASE("partial rope rotates the first rot dims and keeps the rest") {
       for (int64_t j = 0; j < D; j++) w[j] = x[j];
       const double p = (double)(pos + r % T) * pos_scale;
       for (int64_t j = 0; j < rot / 2; j++) {
-        const double ang = p * std::pow((double)base, -2.0 * j / rot);
+        const double ang = p * std::pow((double)base, -2.0 * j / rot) / (factors ? fh[j] : 1.0);
         const float c = (float)std::cos(ang), s = (float)std::sin(ang);
         w[j] = x[j] * c - x[j + rot / 2] * s;
         w[j + rot / 2] = x[j] * s + x[j + rot / 2] * c;
@@ -963,8 +972,9 @@ TEST_CASE("partial rope rotates the first rot dims and keeps the rest") {
     array x = xh.clone();
     x.eval();
     array o = array::empty({H * T, D});
-    REQUIRE(tl::gpu::rope(x.device_span(), o.device_span(), H * T, T, D, pos, base, {}, rot,
-                          pos_scale));
+    const bool ran = tl::gpu::rope(x.device_span(), o.device_span(), H * T, T, D, pos, rf);
+    REQUIRE(ran == (!factors || tl::gpu::caps::rope_factors));
+    if (!ran) continue;
     tl::gpu::flush();
     CHECK(tl::allclose(o, array::from(std::move(want), {H * T, D}), 1e-5f, 1e-5f));
   }
@@ -1065,14 +1075,23 @@ TEST_CASE("generic compositions agree with the fused kernels") {
 
   SUBCASE("rmsnorm_rope against rmsnorm then rope, and the gated norm") {
     // Qwen3's full turn (D 128) and Qwen3.5's partial one (D 256, 64 dims), a
-    // chunk of T tokens per head. Where the backend fuses them the two routes
+    // chunk of T tokens per head, at a plain position and at a scaled one with
+    // per-pair factors (where the backend has them). Where the backend fuses them the two routes
     // are different programs that agree to an ulp (Metal's fast math rounds
     // each kernel's products its own way); where it does not,
     // the fused call is the two ops and this is them against themselves.
-    struct shape { int64_t D, rot; };
-    for (const shape s : {shape{128, 128}, shape{256, 64}}) {
+    struct shape { int64_t D, rot; bool tuned; };
+    const array fac = dev(array::from(rope_factors(128), {128}));  // the widest rot / 2
+    for (const shape s : {shape{128, 128, false}, shape{256, 64, false}, shape{128, 128, true},
+                          shape{256, 64, true}}) {
+      CAPTURE(s.D);
+      CAPTURE(s.tuned);
       const int64_t H = 6, T = 5, rows = H * T, pos = 17;
-      const float base = 1e6f, eps = 1e-6f;
+      const float eps = 1e-6f;
+      const gpu::rope_freq rf =
+          !s.tuned ? gpu::rope_freq{1e6f, s.rot}
+                   : gpu::rope_freq{1e6f, s.rot, 0.125f,
+                                    gpu::caps::rope_factors ? fac.device_span() : gpu::span{}};
       array x = random_array({rows, s.D}, 1090), w = dev(random_array({s.D}, 1091));
       // Each side flushed on its own, the reference's norm into a buffer of
       // its own: both turn in place, which a backend whose launches cannot
@@ -1080,10 +1099,9 @@ TEST_CASE("generic compositions agree with the fused kernels") {
       // batch and leave a side as it was.
       array xa = dev(x), xd = dev(x), xn = array::empty({rows, s.D});
       REQUIRE(gpu::rmsnorm(xd.device_span(), w.device_span(), xn.device_span(), s.D, eps, rows));
-      REQUIRE(gpu::rope(xn.device_span(), xn.device_span(), rows, T, s.D, pos, base, {}, s.rot));
+      REQUIRE(gpu::rope(xn.device_span(), xn.device_span(), rows, T, s.D, pos, rf));
       tl::gpu::flush();
-      REQUIRE(gpu::rmsnorm_rope(xa.device_span(), w.device_span(), rows, T, s.D, pos, base,
-                                s.rot, eps));
+      REQUIRE(gpu::rmsnorm_rope(xa.device_span(), w.device_span(), rows, T, s.D, pos, rf, eps));
       tl::gpu::flush();
       CHECK(same(xa, xn, 1e-7f));
     }
@@ -1850,20 +1868,20 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     const int64_t H = 14, T = 5, D = 64, ld = H * D;
     array x = dev(random_array({H * T, D}, 970)), b = dev(random_array({H * T, D}, 971));
     array ra = array::empty({H * T, D}), rb = array::empty({H * T, D});
-    REQUIRE(gpu::rope(x.device_span(), ra.device_span(), H * T, T, D, 37, 1e6f, b.device_span()));
-    REQUIRE(gen::rope(x.device_span(), rb.device_span(), H * T, T, D, 37, 1e6f, b.device_span(), D));
+    REQUIRE(gpu::rope(x.device_span(), ra.device_span(), H * T, T, D, 37, {1e6f}, b.device_span()));
+    REQUIRE(gen::rope(x.device_span(), rb.device_span(), H * T, T, D, 37, {1e6f}, b.device_span()));
     tl::gpu::flush();
     CHECK(same(ra, rb, 1e-4f));
-    REQUIRE(gpu::rope(x.device_span(), ra.device_span(), H * T, T, D, 37, 1e6f));
-    REQUIRE(gen::rope(x.device_span(), rb.device_span(), H * T, T, D, 37, 1e6f, {}, D));
+    REQUIRE(gpu::rope(x.device_span(), ra.device_span(), H * T, T, D, 37, {1e6f}));
+    REQUIRE(gen::rope(x.device_span(), rb.device_span(), H * T, T, D, 37, {1e6f}, {}));
     tl::gpu::flush();
     CHECK(same(ra, rb, 1e-4f));
     // Partial (a quarter of the row, as Qwen3.5), with the bias riding along
     // the pass-through dims too.
-    REQUIRE(gpu::rope(x.device_span(), ra.device_span(), H * T, T, D, 37, 1e6f,
-                      b.device_span(), D / 4));
-    REQUIRE(gen::rope(x.device_span(), rb.device_span(), H * T, T, D, 37, 1e6f,
-                      b.device_span(), D / 4));
+    REQUIRE(gpu::rope(x.device_span(), ra.device_span(), H * T, T, D, 37, {1e6f, D / 4},
+                      b.device_span()));
+    REQUIRE(gen::rope(x.device_span(), rb.device_span(), H * T, T, D, 37, {1e6f, D / 4},
+                      b.device_span()));
     tl::gpu::flush();
     CHECK(same(ra, rb, 1e-4f));
 

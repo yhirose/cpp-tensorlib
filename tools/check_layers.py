@@ -60,6 +60,8 @@ UP = {
     # The reference backend states every kernel id in one plain file.
     ("include/gpu_host.h", "include/gpu_abi_nn.h"),
     ("include/gpu_host.h", "include/gpu_abi_llm.h"),
+    # So does WebGPU's of its nn ops (softmax, layer_norm, rope: its rope takes rope_freq).
+    ("include/webgpu.h", "include/gpu_abi_nn.h"),
 }
 
 

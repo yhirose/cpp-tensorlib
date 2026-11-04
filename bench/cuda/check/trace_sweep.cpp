@@ -103,7 +103,7 @@ void capture(int64_t D) {
       partials(cu::attn_dpos_partials_bytes(hq, kv_max, D));
   cu::upload_u32(pos, 5);
   if (!cu::capture_begin()) return;
-  tl::gpu::rope_dpos({x, 0}, {xo, 0}, hq, 1, D, {pos, 0}, 10000.0f);
+  tl::gpu::rope_dpos({x, 0}, {xo, 0}, hq, 1, D, {pos, 0}, {10000.0f});
   tl::gpu::kv_append_dpos({K, 0}, {V, 0}, {knew, 0}, {vnew, 0}, {pos, 0}, kv_max, hkv, D);
   tl::gpu::attn_decode_dpos({xo, 0}, {K, 0}, {V, 0}, {o, 0}, hq, hkv, {pos, 0}, kv_max, D, 0.125f, {partials, 0});
   tl::gpu::incr_u32({pos, 0});
