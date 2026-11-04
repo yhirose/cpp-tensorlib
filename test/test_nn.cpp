@@ -6,6 +6,7 @@
 #include "test_quant.h"
 #include "test_util.h"
 
+#include <numbers>
 #include <tuple>
 
 TEST_CASE("softmax: own CPU rows across the pool match the ref oracle") {
@@ -1009,7 +1010,7 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     for (int64_t r = 0; r < rows; r++)
       for (int64_t f = 0; f < ff; f++) {
         const double x = in[r * 2 * ff + f], up = in[r * 2 * ff + ff + f];
-        const double t = std::tanh(std::sqrt(2.0 / M_PI) * (x + 0.044715 * x * x * x));
+        const double t = std::tanh(std::sqrt(2.0 / std::numbers::pi) * (x + 0.044715 * x * x * x));
         want[r * ff + f] = (float)(0.5 * x * (1.0 + t) * up);
       }
     CHECK(same(ga, array::from(want, {rows, ff}), 1e-5f));
