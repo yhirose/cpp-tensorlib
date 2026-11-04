@@ -1197,6 +1197,12 @@ TEST_CASE("tanh/sin/cos/clamp GPU dispatch matches the CPU oracle") {
   CHECK(c.at({0, 0}) == -1.0f);  // -2.0 clamped to lo
   CHECK(c.at({0, 1}) == -0.5f);  // within range, unchanged
   CHECK(c.at({1, 2}) == 1.0f);   // 5.0 clamped to hi
+
+  // tanh saturates, it does not overflow: a form built on exp(2x) gives 0 or NaN
+  // for x past ~44, as Metal's fast-math tanh did once GELU's gate reached there.
+  // The negative side is held to the same, for an implementation that differs there.
+  auto big = array::from({-1e4f, -100.0f, -45.0f, -44.0f, 44.0f, 45.0f, 100.0f, 1e4f}, {8});
+  CHECK(matches_gpu_oracle([&] { return big.tanh(); }));
 }
 
 TEST_CASE("concat GPU dispatch matches the CPU oracle") {

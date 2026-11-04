@@ -102,7 +102,9 @@ EW_UNARY(sqrt_, sqrt(a[i]))
 EW_UNARY(sigmoid_, 1.0f / (1.0f + exp(-a[i])))
 EW_UNARY(relu_, max(a[i], 0.0f))
 EW_UNARY(affine_, a[i])
-EW_UNARY(tanh_, tanh(a[i]))
+// The precise tanh: the fast-math one gives 0 at x ~ 44 and NaN past it, where
+// it should saturate to 1 (GELU's gate reaches there).
+EW_UNARY(tanh_, precise::tanh(a[i]))
 EW_UNARY(sin_, sin(a[i]))
 EW_UNARY(cos_, cos(a[i]))
 
