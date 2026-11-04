@@ -197,17 +197,15 @@ const OP_NE : u32 = 5u;
 // it. Threads whose row is shorter than the workgroup contribute this.
 const NEG_HUGE : f32 = -3.4e38;
 
-// Shared by the contiguous and the broadcast binaries: same five operations,
-// only the addressing differs.
-fn binary_op(op : u32, av : f32, bv : f32) -> f32 {
-  switch (op) {
-    case 1u: { return av - bv; }
-    case 2u: { return av * bv; }
-    case 3u: { return av / bv; }
-    case 4u: { return pow(av, bv); }
-    default: { return av + bv; }
-  }
-}
+// ---- The elementwise ops compute libm's functions, the CPU's, over the range
+// of normal floats (test_array holds every op to libm over the edges). WGSL
+// leaves some builtins' accuracy or domain to the platform, and those go
+// through a function here instead: tanh, pow and sin / cos.
+
+// IEEE infinity and NaN for a result libm gives as one, read from private
+// vars so the bitcast is a runtime value (a const-expression may be neither).
+var<private> F32_INF_BITS : u32 = 0x7f800000u;
+var<private> F32_NAN_BITS : u32 = 0x7fc00000u;
 
 // tanh out of exp(-2|x|) rather than the builtin: WGSL leaves tanh's accuracy
 // to the platform, and D3D12 on NVIDIA gives ~1e-5 relative (6e-6 absolute on
@@ -218,6 +216,133 @@ fn tanh_exp(x : f32) -> f32 {
   return sign(x) * (1.0 - e) / (1.0 + e);
 }
 
+// C's powf where WGSL's pow, exp2(y log2 x), is undefined: a negative or zero
+// base. |x|^y by the builtin, with C's rules (C11 F.10.4.4) for finite x and y:
+// x^0 is 1, a negative base keeps its sign under an odd integer y and is NaN
+// under a non-integer one, and 0^y is 0 for y > 0 and infinity for y < 0.
+fn pow_libm(x : f32, y : f32) -> f32 {
+  if (y == 0.0) { return 1.0; }
+  let ax = abs(x);
+  let neg = (bitcast<u32>(x) >> 31u) != 0u;
+  let integer = floor(y) == y;
+  if (neg && !integer && ax != 0.0) { return bitcast<f32>(F32_NAN_BITS); }
+  var r = pow(ax, y);
+  if (ax == 0.0) { r = select(0.0, bitcast<f32>(F32_INF_BITS), y < 0.0); }
+  let odd = integer && floor(y * 0.5) != y * 0.5;
+  return select(r, -r, neg && odd);
+}
+
+// sin and cos at libm's accuracy over the whole float range, where WGSL bounds
+// the builtins' error only on [-pi, pi]: x less k pi/2 (k the nearest integer),
+// then Cephes' sinf / cosf polynomials on what remains (|r| <= pi/4).
+//
+// The reduction is Payne and Hanek's, in integers, so it holds whatever the
+// compiler does to float arithmetic (a fast-math one reassociates a float
+// reduction's exact subtractions away); glibc's and Arm's sinf reduce the same
+// way. |x| = m 2^(e-23), and |x| 2/pi mod 4 is m times the bits of 2/pi from
+// the one where m's product stops being a multiple of 4: W8 holds 2/pi in
+// 32-bit windows 8 bits apart, the exponent's high bits pick the window and its
+// low three shift m, so the product's binary point always sits at bit 62 of a
+// 64-bit hi:lo, the 2 bits above it k mod 4. The fraction below, rounded to the
+// nearest k, is scaled by pi/2.
+const W8 = array<u32, 25>(  // W8[i] = floor(2/pi 2^(8 i)) mod 2^32
+    0x00000000u, 0x000000a2u, 0x0000a2f9u, 0x00a2f983u, 0xa2f9836eu, 0xf9836e4eu, 0x836e4e44u,
+    0x6e4e4415u, 0x4e441529u, 0x441529fcu, 0x1529fc27u, 0x29fc2757u, 0xfc2757d1u, 0x2757d1f5u,
+    0x57d1f534u, 0xd1f534ddu, 0xf534ddc0u, 0x34ddc0dbu, 0xddc0db62u, 0xc0db6295u, 0xdb629599u,
+    0x6295993cu, 0x95993c43u, 0x993c4390u, 0x3c439041u);
+const PIO2_F32 : f32 = 1.570796371;
+struct Reduced { r : f32, q : u32 };  // x = k pi/2 + r, q = k mod 4
+
+// a b as 64 bits (lo, hi): WGSL has no 64-bit integers.
+fn mul_wide(a : u32, b : u32) -> vec2<u32> {
+  let a0 = a & 0xffffu;
+  let a1 = a >> 16u;
+  let b0 = b & 0xffffu;
+  let b1 = b >> 16u;
+  let p00 = a0 * b0;
+  let p01 = a0 * b1;
+  let p10 = a1 * b0;
+  let mid = (p00 >> 16u) + (p01 & 0xffffu) + (p10 & 0xffffu);
+  return vec2<u32>((p00 & 0xffffu) | (mid << 16u),
+                   a1 * b1 + (p01 >> 16u) + (p10 >> 16u) + (mid >> 16u));
+}
+
+fn reduce_pio2(x : f32) -> Reduced {
+  let ux = bitcast<u32>(x);
+  if ((ux & 0x7f800000u) == 0x7f800000u) { return Reduced(bitcast<f32>(F32_NAN_BITS), 0u); }
+  if (abs(x) < 0.5 * PIO2_F32) { return Reduced(x, 0u); }  // the polynomials' own range
+  // |x| 2/pi 2^62 mod 2^64 as hi:lo: m (< 2^31 once shifted) times three windows
+  // 32 bits apart, the top one's product needed only mod 2^32.
+  let be = (ux >> 23u) & 0xffu;  // >= 126 here
+  let i = (be - 120u) >> 3u;
+  let m = ((ux & 0x7fffffu) | 0x800000u) << (be & 7u);
+  let p1 = mul_wide(m, W8[i + 4u]);
+  let p2 = mul_wide(m, W8[i + 8u]);
+  var lo = p1.x + p2.y;
+  var hi = m * W8[i] + p1.y + select(0u, 1u, lo < p1.x);
+  let k = (hi + 0x20000000u) >> 30u;  // the nearest quadrant, mod 4
+  hi -= k << 30u;                     // the fraction, signed, |.| <= 1/2
+  let neg = hi >= 0x80000000u;
+  if (neg) {
+    lo = ~lo + 1u;
+    hi = ~hi + select(0u, 1u, lo == 0u);
+  }
+  var frac = 0.0;
+  if (hi != 0u || lo != 0u) {
+    let lz = select(countLeadingZeros(hi), 32u + countLeadingZeros(lo), hi == 0u);
+    var top = hi;
+    if (lz >= 32u) { top = lo << (lz - 32u); }
+    else if (lz > 0u) { top = (hi << lz) | (lo >> (32u - lz)); }
+    frac = ldexp(f32(top), -30 - i32(lz));
+  }
+  let r = select(frac, -frac, neg) * PIO2_F32;
+  if (x < 0.0) { return Reduced(-r, (4u - k) & 3u); }
+  return Reduced(r, k & 3u);
+}
+
+fn sin_poly(r : f32) -> f32 {
+  let z = r * r;
+  return r + r * z * (-1.6666654611e-1 + z * (8.3321608736e-3 + z * -1.9515295891e-4));
+}
+
+fn cos_poly(r : f32) -> f32 {
+  let z = r * r;
+  return 1.0 - 0.5 * z + z * z * (4.166664568298827e-2 + z * (-1.388731625493765e-3 + z * 2.443315711809948e-5));
+}
+
+// sin(k pi/2 + r) for q = k mod 4. cos(x) is sin(x + pi/2): the same r a
+// quadrant on, so both read this one table.
+fn sin_quadrant(r : f32, q : u32) -> f32 {
+  switch (q & 3u) {
+    case 0u: { return sin_poly(r); }
+    case 1u: { return cos_poly(r); }
+    case 2u: { return -sin_poly(r); }
+    default: { return -cos_poly(r); }
+  }
+}
+
+fn sin_libm(x : f32) -> f32 {
+  let t = reduce_pio2(x);
+  return sin_quadrant(t.r, t.q);
+}
+
+fn cos_libm(x : f32) -> f32 {
+  let t = reduce_pio2(x);
+  return sin_quadrant(t.r, t.q + 1u);
+}
+
+// Shared by the contiguous and the broadcast binaries: same five operations,
+// only the addressing differs.
+fn binary_op(op : u32, av : f32, bv : f32) -> f32 {
+  switch (op) {
+    case 1u: { return av - bv; }
+    case 2u: { return av * bv; }
+    case 3u: { return av / bv; }
+    case 4u: { return pow_libm(av, bv); }
+    default: { return av + bv; }
+  }
+}
+
 fn unary_op(op : u32, v : f32) -> f32 {
   switch (op) {
     case 1u: { return log(v); }
@@ -226,8 +351,8 @@ fn unary_op(op : u32, v : f32) -> f32 {
     case 4u: { return max(v, 0.0); }
     case 5u: { return v; }
     case 6u: { return tanh_exp(v); }
-    case 7u: { return sin(v); }
-    case 8u: { return cos(v); }
+    case 7u: { return sin_libm(v); }
+    case 8u: { return cos_libm(v); }
     default: { return exp(v); }
   }
 }
@@ -299,7 +424,7 @@ fn clamp_(@builtin(global_invocation_id) gid : vec3<u32>) {
 // Views: a -> out. Params: scalar_params.
 fn scalar_op(op : u32, av : f32, s : f32) -> f32 {
   switch (op) {
-    case 0u: { return pow(av, s); }
+    case 0u: { return pow_libm(av, s); }
     default: { return cmp_op(op - 1u, av, s); }
   }
 }

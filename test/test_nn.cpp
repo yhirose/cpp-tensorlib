@@ -999,8 +999,9 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     tl::gpu::flush();
     CHECK(same(oa, ob, 1e-5f));
 
-    // GELU's, kernel and composition, against its tanh form in double.
-    array gw = dev(random_array({rows, 2 * ff}, 956) * 4.0f);
+    // GELU's, kernel and composition, against its tanh form in double; gates to
+    // 16, so tanh's argument reaches past 45, where a tanh built on exp(2x) fails.
+    array gw = dev(random_array({rows, 2 * ff}, 956) * 16.0f);
     array ga = array::empty({rows, ff}), gb = array::empty({rows, ff});
     REQUIRE(gpu::glu(gpu::glu_act::gelu_tanh, gw.device_span(), ga.device_span(), ff, rows));
     REQUIRE(gen::glu(gpu::glu_act::gelu_tanh, gw.device_span(), gb.device_span(), ff, rows));

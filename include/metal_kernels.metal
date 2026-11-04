@@ -40,6 +40,13 @@ static inline float4 load4_(device const half* p, uint i4) {
   return float4(((device const half4*)p)[i4]);
 }
 
+// The elementwise ops compute libm's functions, the CPU's, over the whole range
+// of normal floats, so each takes the precise:: form: the library compiles with
+// fast math (no MTLCompileOptions), whose forms give way at the edges (tanh 0 at
+// 44 and NaN past, sin and cos losing their range reduction past ~40). This
+// contract covers the elementwise ops; the fused kernels keep the fast forms (a
+// softmax's exp of x - max <= 0, SiLU's exp). test_array holds every op here to
+// libm over the edges.
 #define EW_BINARY(name, expr)                                  \
   kernel void name(device const float* a [[buffer(0)]],        \
                    device const float* b [[buffer(1)]],        \
@@ -54,7 +61,7 @@ EW_BINARY(add_, a[i] + b[i])
 EW_BINARY(sub_, a[i] - b[i])
 EW_BINARY(mul_, a[i] * b[i])
 EW_BINARY(div_, a[i] / b[i])
-EW_BINARY(pow_, pow(a[i], b[i]))
+EW_BINARY(pow_, precise::pow(a[i], b[i]))
 
 // Rank-2 broadcast binary: out[r,c] = f(a[r*ars + c*acs], b[r*brs + c*bcs]).
 // Per-operand strides express every rank-2 broadcast (row vector, column
@@ -85,7 +92,7 @@ EW_BCAST(badd_, av + bv)
 EW_BCAST(bsub_, av - bv)
 EW_BCAST(bmul_, av * bv)
 EW_BCAST(bdiv_, av / bv)
-EW_BCAST(bpow_, pow(av, bv))
+EW_BCAST(bpow_, precise::pow(av, bv))
 
 #define EW_UNARY(name, expr)                                   \
   kernel void name(device const float* a [[buffer(0)]],        \
@@ -96,15 +103,15 @@ EW_BCAST(bpow_, pow(av, bv))
     out[i] = fma(expr, p.scale, p.offset);                     \
   }
 
-EW_UNARY(exp_, exp(a[i]))
-EW_UNARY(log_, log(a[i]))
-EW_UNARY(sqrt_, sqrt(a[i]))
-EW_UNARY(sigmoid_, 1.0f / (1.0f + exp(-a[i])))
+EW_UNARY(exp_, precise::exp(a[i]))
+EW_UNARY(log_, precise::log(a[i]))
+EW_UNARY(sqrt_, precise::sqrt(a[i]))
+EW_UNARY(sigmoid_, 1.0f / (1.0f + precise::exp(-a[i])))
 EW_UNARY(relu_, max(a[i], 0.0f))
 EW_UNARY(affine_, a[i])
-EW_UNARY(tanh_, tanh(a[i]))
-EW_UNARY(sin_, sin(a[i]))
-EW_UNARY(cos_, cos(a[i]))
+EW_UNARY(tanh_, precise::tanh(a[i]))
+EW_UNARY(sin_, precise::sin(a[i]))
+EW_UNARY(cos_, precise::cos(a[i]))
 
 // Elementwise comparison: out = (a OP b) ? 1.0 : 0.0 (no scale/offset --
 // masks don't compose with the affine epilogue). `bstride` is 1 for a
@@ -165,7 +172,7 @@ struct scalar_params {
     out[i] = fma(expr, p.scale, p.offset);                     \
   }
 
-EW_SCALAR(pow_s_, pow(a[i], p.s))
+EW_SCALAR(pow_s_, precise::pow(a[i], p.s))
 EW_SCALAR(gt_s_, a[i] > p.s ? 1.0f : 0.0f)
 EW_SCALAR(lt_s_, a[i] < p.s ? 1.0f : 0.0f)
 EW_SCALAR(ge_s_, a[i] >= p.s ? 1.0f : 0.0f)
@@ -1243,7 +1250,7 @@ EW_BCAST_ND(badd_nd_, av + bv)
 EW_BCAST_ND(bsub_nd_, av - bv)
 EW_BCAST_ND(bmul_nd_, av * bv)
 EW_BCAST_ND(bdiv_nd_, av / bv)
-EW_BCAST_ND(bpow_nd_, pow(av, bv))
+EW_BCAST_ND(bpow_nd_, precise::pow(av, bv))
 #undef EW_BCAST_ND
 
 struct where_nd_params {

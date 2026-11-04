@@ -1199,6 +1199,96 @@ TEST_CASE("tanh/sin/cos/clamp GPU dispatch matches the CPU oracle") {
   CHECK(c.at({1, 2}) == 1.0f);   // 5.0 clamped to hi
 }
 
+TEST_CASE("the elementwise math ops give libm's results over the float range") {
+  // Each op's device kernel against libm (std::, in double, rounded to float), over
+  // normal floats from tiny to huge in both signs and the points where a narrower
+  // implementation gives way: tanh past 44 (Metal's fast-math tanh was 0 there, NaN
+  // past), exp past 88, pow's negative bases and zero (WGSL's pow is undefined there),
+  // sin and cos far from 0 (fast forms lose their range reduction past ~40). NaN where
+  // libm's is NaN, its infinity where it overflows, else within 1e-5 relative or 1e-6
+  // absolute.
+  namespace gpu = tl::gpu;
+  if (!tl::gpu_available()) return;
+  // (+-0.9, 1e20, 1e30 and 3e38 take each of WebGPU's sin / cos reduction's paths.)
+  const std::vector<float> wide = {-3e38f, -1e30f, -1e20f, -1e6f, -123456.79f, -1e4f, -1000,
+                                   -100, -89, -88, -45, -44, -20, -2, -1, -0.9f, -0.5f, -1e-3f,
+                                   -1e-30f, -0.0f, 0, 1e-30f, 1e-3f, 0.5f, 0.9f, 1, 2, 20, 44,
+                                   45, 88, 89, 100, 1000, 1e4f, 123456.79f, 1e6f, 1e20f, 1e30f,
+                                   3e38f};
+  std::vector<float> nonneg;
+  for (float x : wide)
+    if (x >= 0) nonneg.push_back(x);
+  const std::vector<float> exps = {2, 3, -1, 0.5f, 2.5f, 0};
+
+  const auto prev = tl::device_;
+  tl::use_gpu();
+  // f() against want, element i of f's inputs (a[i], and b[i] for a binary op),
+  // and run on the device, not a CPU fallback, where the backend has the kernel
+  // (`owned`: the shared ops always, an own form where it has one).
+  auto check = [](const char* name, const std::function<array()>& f,
+                  const std::vector<float>& a, const std::vector<float>& b,
+                  const std::vector<double>& want, bool owned = true) {
+    INFO(name);
+    gpu::census_reset();
+    const std::vector<float> got = host_values(f());
+    if (owned) CHECK(gpu::ops_run() >= 1);
+    REQUIRE(got.size() == want.size());
+    for (size_t i = 0; i < got.size(); i++) {
+      const float g = got[i], w = static_cast<float>(want[i]);
+      char at[96];
+      if (b.empty()) std::snprintf(at, sizeof at, "x %g: got %g, libm %g", a[i], g, w);
+      else std::snprintf(at, sizeof at, "x %g y %g: got %g, libm %g", a[i], b[i], g, w);
+      INFO(at);
+      if (std::isnan(w)) CHECK(std::isnan(g));
+      else if (std::isinf(w)) CHECK(g == w);
+      else CHECK(std::fabs(double(g) - w) <= 1e-6 + 1e-5 * std::fabs(double(w)));
+    }
+  };
+  auto unary = [&](const char* name, array (array::*op)() const,
+                   double (*ref)(double), const std::vector<float>& in) {
+    std::vector<double> want;
+    for (float x : in) want.push_back(ref(x));
+    const array a = array::from(in);
+    check(name, [&] { return (a.*op)(); }, in, {}, want);
+  };
+  unary("exp", &array::exp, [](double x) { return std::exp(x); }, wide);
+  unary("log", &array::log, [](double x) { return std::log(x); }, nonneg);
+  unary("sqrt", &array::sqrt, [](double x) { return std::sqrt(x); }, nonneg);
+  unary("sigmoid", &array::sigmoid,
+        [](double x) { return 1.0 / (1.0 + std::exp(-x)); }, wide);
+  unary("tanh", &array::tanh, [](double x) { return std::tanh(x); }, wide);
+  unary("sin", &array::sin, [](double x) { return std::sin(x); }, wide);
+  unary("cos", &array::cos, [](double x) { return std::cos(x); }, wide);
+
+  // pow in each of its kernels: by a scalar, by an array of the same shape, and
+  // broadcast at rank 2 (bpow) and above (bpow_nd), every base by every exponent.
+  std::vector<float> xs, ys;
+  std::vector<double> want;
+  for (float x : wide)
+    for (float y : exps) {
+      xs.push_back(x);
+      ys.push_back(y);
+      want.push_back(std::pow(double(x), double(y)));
+    }
+  const int64_t n = (int64_t)wide.size(), m = (int64_t)exps.size();
+  const array w = array::from(wide);
+  for (int64_t j = 0; j < m; j++) {
+    std::vector<double> wj;
+    for (int64_t i = 0; i < n; i++) wj.push_back(want[i * m + j]);
+    check("pow by a scalar", [&] { return tl::pow(w, exps[j]); }, wide,
+          std::vector<float>(n, exps[j]), wj);
+  }
+  const array A = array::from(xs), B = array::from(ys);
+  check("pow", [&] { return tl::pow(A, B); }, xs, ys, want);
+  const array base = array::from(std::vector<float>(wide), {n, 1}),
+              ex = array::from(std::vector<float>(exps), {1, m});
+  check("pow broadcast", [&] { return tl::pow(base, ex); }, xs, ys, want);
+  check("pow broadcast at rank 3",
+        [&] { return tl::pow(base.reshape({n, 1, 1}), ex.reshape({1, m, 1})); }, xs, ys, want,
+        gpu::has_binary_bcast_nd);
+  tl::device_ = prev;
+}
+
 TEST_CASE("concat GPU dispatch matches the CPU oracle") {
   auto a = array::from({1, 2, 3, 4}, {2, 2});
   auto b = array::from({5, 6, 7, 8}, {2, 2});
