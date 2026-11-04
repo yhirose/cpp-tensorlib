@@ -7,8 +7,9 @@
 // Usage: chat_qwen [model.gguf] ["your prompt"] [f32|bf16] [q4 spec] [nothink] [f32acc]
 //                  [temp=T] [top_k=K] [top_p=P] [seed=S]
 // Greedy decoding by default; temp=0.7 top_k=20 top_p=0.8 is Qwen's own
-// recommended sampling (the same seed draws the same text). Stops at
-// <|im_end|> or the token budget.
+// recommended sampling (the same seed draws the same text). Stops at the end of
+// the turn (tokenizer::is_eog: <|im_end|>, Gemma's <end_of_turn>) or the token
+// budget.
 
 #include "qwen.h"
 #include "tokenizer.h"
@@ -127,7 +128,7 @@ int main(int argc, char** argv) {
   std::vector<int> gen;
   auto t_dec = clk::now();
   for (int64_t i = 0; i < MAX_NEW && next >= 0; i++) {
-    if (next == tok.eos_id()) break;
+    if (tok.is_eog(next)) break;
     gen.push_back((int)next);
     next = dec.next(M);
   }

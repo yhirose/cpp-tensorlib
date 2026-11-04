@@ -26,6 +26,7 @@ int main(int argc, char** argv) {
       : "/home/yuji/models/qwen2.5-0.5b-instruct-fp16.gguf";
 
   tl::tokenizer tok(path);
+  const bool gemma = tl::gguf::model(path).kv("general.architecture").as_str() == "gemma3";
   std::printf("tokenizer loaded from %s (bos=%d eos=%d)\n", path.c_str(),
               tok.bos_id(), tok.eos_id());
 
@@ -35,7 +36,7 @@ int main(int argc, char** argv) {
     std::vector<int> ids;
   };
   std::vector<oracle_case> cases;
-  if (tl::gguf::model(path).kv("general.architecture").as_str() == "gemma3") {
+  if (gemma) {
     for (auto& c : tokoracle_gemma3::cases()) cases.push_back({c.text, c.ids});
   } else {
     for (auto& c : tokoracle::cases()) cases.push_back({c.text, c.ids});
@@ -69,6 +70,16 @@ int main(int argc, char** argv) {
                     rt.size(), cs.text.size());
     }
   }
+
+  // The generation ends at EOS and at the family's closing token of a turn (the
+  // chat template's), which is not EOS in Gemma's file; plain text ends nothing.
+  const std::vector<int> turn = tok.encode(gemma ? "<end_of_turn>" : "<|im_end|>"),
+                         text = tok.encode("Hello");
+  const bool eog_ok = turn.size() == 1 && tok.is_eog(turn[0]) && tok.is_eog(tok.eos_id()) &&
+                      !text.empty() && !tok.is_eog(text[0]);
+  std::printf("end of generation (EOS, the turn's closing token, not text): %s\n",
+              eog_ok ? "PASS" : "FAIL");
+  all_ok &= eog_ok;
 
   if (all_ok) {
     std::printf("ALL OK\n");

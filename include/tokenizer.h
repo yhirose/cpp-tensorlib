@@ -81,6 +81,18 @@ class tokenizer {
                        [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
 
     eos_id_ = static_cast<int>(m.kv("tokenizer.ggml.eos_token_id").as_u32());
+    // The tokens that end a generation, as llama.cpp's vocab gathers them: EOS,
+    // the file's EOT and EOM if it names them, and the tokens a chat template
+    // closes a turn with, found by their text whatever their type (Gemma's EOS
+    // is <eos>, but its turns end in <end_of_turn>; Qwen's in <|im_end|>).
+    eog_ids_.push_back(eos_id_);
+    for (const char* key : {"tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"})
+      if (m.has(key)) eog_ids_.push_back(static_cast<int>(m.kv(key).as_u32()));
+    for (size_t i = 0; i < tokens_.size(); i++)
+      for (const char* s : {"<|eot_id|>", "<|im_end|>", "<|end|>", "<end_of_turn>",
+                            "<|endoftext|>", "<|eom_id|>", "<|end_of_text|>", "<EOT>",
+                            "_<EOT>", "<end_of_utterance>"})
+        if (tokens_[i] == s) eog_ids_.push_back(static_cast<int>(i));
     // Qwen3.5 has no BOS (the template never adds one); -1 marks "none".
     bos_id_ = m.has("tokenizer.ggml.bos_token_id")
                   ? static_cast<int>(m.kv("tokenizer.ggml.bos_token_id").as_u32())
@@ -91,6 +103,10 @@ class tokenizer {
   }
 
   int eos_id() const { return eos_id_; }
+  // Whether `id` ends a generation (EOS, EOT, or a turn's closing token).
+  bool is_eog(int id) const {
+    return std::find(eog_ids_.begin(), eog_ids_.end(), id) != eog_ids_.end();
+  }
   int bos_id() const { return bos_id_; }
 
   // Encode raw UTF-8 text to token ids. Special-token strings embedded in the
@@ -446,6 +462,7 @@ class tokenizer {
   int byte_id_[256] = {};                              // <0xXX>'s id (spm)
   std::unordered_map<int, uint8_t> byte_of_;           // and back (spm)
   int eos_id_ = -1;
+  std::vector<int> eog_ids_;  // is_eog's ids
   int bos_id_ = -1;
 };
 
