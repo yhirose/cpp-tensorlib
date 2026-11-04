@@ -38,7 +38,7 @@ namespace {
 
 std::FILE* out = nullptr;
 
-void section(const std::string& name, const float* v, int64_t n) {
+void dump_section(const std::string& name, const float* v, int64_t n) {
   uint64_t h = 1469598103934665603ull;  // FNV-1a over the bytes
   const auto* b = reinterpret_cast<const unsigned char*>(v);
   for (int64_t i = 0; i < n * 4; i++) h = (h ^ b[i]) * 1099511628211ull;
@@ -64,10 +64,10 @@ void run(qm::Model& M, const std::string& tag) {
     int64_t pos = 0;
     const float* lg = nullptr;
     for (int id : ids) lg = qm::imperative_logits(M, id, pos++);
-    section(tag + "/imperative/prompt", lg, V);
+    dump_section(tag + "/imperative/prompt", lg, V);
     for (int64_t s = 0; s < kSteps; s++) {
       lg = qm::imperative_logits(M, all[(size_t)(kPrompt + s)], pos++);
-      section(tag + "/imperative/step" + std::to_string(s), lg, V);
+      dump_section(tag + "/imperative/step" + std::to_string(s), lg, V);
     }
   }
   // The chat's decoder: the prompt through begin(), batched where it can.
@@ -76,10 +76,10 @@ void run(qm::Model& M, const std::string& tag) {
     qm::captured_decoder dec;
     dec.begin(M, ids);
     std::printf("  (decoder prompt %s)\n", dec.batched ? "batched" : "token by token");
-    section(tag + "/decoder/prompt", logits(), V);
+    dump_section(tag + "/decoder/prompt", logits(), V);
     for (int64_t s = 0; s < kSteps; s++) {
       dec.step(M, all[(size_t)(kPrompt + s)]);
-      section(tag + "/decoder/step" + std::to_string(s), logits(), V);
+      dump_section(tag + "/decoder/step" + std::to_string(s), logits(), V);
     }
     dec.destroy();
   }
@@ -87,7 +87,7 @@ void run(qm::Model& M, const std::string& tag) {
   if (qm::can_prefill_batched(M, (int64_t)ids.size())) {
     qm::reset_cache(M);
     qm::prefill_batched(M, ids, qm::PREFILL_CHUNK, /*exact=*/true);
-    section(tag + "/prefill_exact/prompt", logits(), V);
+    dump_section(tag + "/prefill_exact/prompt", logits(), V);
   }
 }
 
@@ -116,8 +116,8 @@ int main(int argc, char** argv) {
   {
     const std::vector<int> all = tokens(qm::config_from_gguf(m).VOCAB);
     const std::vector<float> f(all.begin(), all.end());
-    section("tokens/prompt", f.data(), kPrompt);
-    section("tokens/steps", f.data() + kPrompt, kSteps);
+    dump_section("tokens/prompt", f.data(), kPrompt);
+    dump_section("tokens/steps", f.data() + kPrompt, kSteps);
   }
   {
     qm::Model M = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false,
