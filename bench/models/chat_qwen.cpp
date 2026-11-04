@@ -66,9 +66,12 @@ int main(int argc, char** argv) {
   // Qwen3 opens a <think> block itself, which "nothink" (argv[5]) closes up
   // front, exactly what the template's enable_thinking=false does.
   // Qwen3.5's template opens the <think> block itself. Gemma 3's opens with
-  // <bos> and has no system turn.
+  // <bos> and has no system turn. Llama 3's is llama.cpp's built-in one
+  // (LLM_CHAT_TEMPLATE_LLAMA_3), opening with <|begin_of_text|>: 3.1's and 3.2's
+  // own jinja adds a system turn with a knowledge cutoff and today's date, left
+  // out here.
   const bool qwen3 = M.c.arch == "qwen3", qwen35 = M.c.arch == "qwen35",
-             gemma3 = M.c.arch == "gemma3";
+             gemma3 = M.c.arch == "gemma3", llama = M.c.arch == "llama";
   bool nothink = false;
   tl::gpu::sampling sampler;
   for (int i = 5; i < argc; i++) {
@@ -91,6 +94,9 @@ int main(int argc, char** argv) {
   std::string templated;
   if (gemma3) {
     templated = "<bos><start_of_turn>user\n" + user + "<end_of_turn>\n<start_of_turn>model\n";
+  } else if (llama) {
+    templated = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n" + user +
+                "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
   } else {
     if (!qwen3 && !qwen35)
       templated = "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful "

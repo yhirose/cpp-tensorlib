@@ -41,12 +41,12 @@ namespace gg = tl::gguf;
 namespace gpu = tl::gpu;
 
 // The shape of one decoder, read from the GGUF metadata (config_from_gguf)
-// rather than compiled in, so Qwen2.5, Qwen3, Qwen3.5 and Gemma 3 — and every
-// size of each — share one forward. Everything that differs between those
+// rather than compiled in, so Qwen2.5, Qwen3, Qwen3.5, Gemma 3 and Llama 3.2 — and
+// every size of each — share one forward. Everything that differs between those
 // families is a field here: the dims, the norm eps / rope base, and the
 // structural switches.
 struct Config {
-  std::string arch;  // "qwen2" | "qwen3" | "qwen35" | "gemma3": the family, for drivers
+  std::string arch;  // "qwen2" | "qwen3" | "qwen35" | "gemma3" | "llama": the family, for drivers
   int64_t NL = 0, NE = 0, NH = 0, NKV = 0, HD = 0, FF = 0, VOCAB = 0;
   int64_t MAXC = 4096;  // KV capacity per layer (f32): NKV*MAXC*HD*8 B per layer
   float EPS = 1e-6f, ROPE_BASE = 1e6f;
@@ -82,21 +82,24 @@ struct Config {
   std::vector<bool> local;  // per layer; empty: every layer global
   float ROPE_BASE_LOCAL = 10000.0f, ROPE_SCALE = 1.0f;
   bool is_local(int64_t l) const { return l < (int64_t)local.size() && local[l]; }
-  // Layer l's RoPE frequencies: a local layer's base, unscaled, or a global one's.
-  gpu::rope_freq rope(int64_t l) const {
-    return is_local(l) ? gpu::rope_freq{ROPE_BASE_LOCAL, ROT}
-                       : gpu::rope_freq{ROPE_BASE, ROT, ROPE_SCALE};
-  }
+  // Llama: the GGUF converter permuted the q and k rows for llama.cpp's NORM rope,
+  // which pairs adjacent dims. The load reads them back in the model's order
+  // (wpart::norm_hd), so the kernels turn the halves, as for the other families.
+  bool rope_norm = false;
+  // Llama 3.1 and later: rope_freqs.weight, ROT/2 divisors of the pairs' angles on
+  // the global layers (Model::rope_freqs, rope_of).
+  bool rope_factors = false;
   // The attention's q scale: 1 / sqrt(HD), unless the family says otherwise
   // (QSCALE > 0: Gemma 3 27B's 1 / sqrt(NE / NH)).
   float QSCALE = 0.0f;
   float scale() const { return QSCALE > 0.0f ? QSCALE : 1.0f / std::sqrt((float)HD); }
   bool hybrid() const { return INTERVAL > 1; }
   // The array path (forward(), the per-op oracle) models the plain decoder:
-  // no DeltaNet layers, no Gemma post norms or GELU, every layer global.
+  // no DeltaNet layers, no Gemma post norms or GELU, every layer global, its RoPE
+  // neither scaled nor divided by per-pair factors (array::rope has neither).
   bool array_path() const {
     return !hybrid() && !post_norms && act == gpu::glu_act::silu && local.empty() &&
-           ROPE_SCALE == 1.0f;
+           ROPE_SCALE == 1.0f && !rope_factors;
   }
   bool is_delta(int64_t l) const { return hybrid() && (l + 1) % INTERVAL != 0; }
   // Output widths of the fused projections (and so of the scratch they land in).
@@ -122,7 +125,8 @@ struct Config {
 // architecture this forward does not implement.
 inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
   const std::string& arch = m.kv("general.architecture").as_str();
-  if (arch != "qwen2" && arch != "qwen3" && arch != "qwen35" && arch != "gemma3")
+  if (arch != "qwen2" && arch != "qwen3" && arch != "qwen35" && arch != "gemma3" &&
+      arch != "llama")
     throw std::runtime_error("qwen: unsupported architecture " + arch);
   auto u32 = [&](const char* k) { return (int64_t)m.kv(arch + "." + k).as_u32(); };
   Config c;
@@ -163,6 +167,19 @@ inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
   if (!wq) throw std::runtime_error("qwen: " + a0 + "attn_q.weight missing");
   c.attn_gate = (int64_t)wq->dims[1] == 2 * c.NH * c.HD;
   c.tied_output = m.tensor("output.weight") == nullptr;
+  // Llama, as llama.cpp's LLM_ARCH_LLAMA: rope type NORM, and the per-pair factors
+  // where the file has them. Only the q and k projections' rows are read back in
+  // the model's order (wpart::norm_hd): a q / k bias, which the converter permutes
+  // with them, or a q / k norm would stay in the file's, so such a file is refused.
+  c.rope_norm = arch == "llama";
+  if (c.rope_norm && (c.ROT != c.HD || c.attn_gate || c.qkv_bias || c.qk_norm))
+    throw std::runtime_error("qwen: a NORM rope over part of a head, or with a q gate, a q/k "
+                             "bias or a q/k norm");
+  if (const auto* rf = m.tensor("rope_freqs.weight")) {
+    if (rf->dims.size() != 1 || (int64_t)rf->dims[0] != c.ROT / 2)
+      throw std::runtime_error("qwen: rope_freqs.weight is not ROT/2 factors");
+    c.rope_factors = true;
+  }
   // Qwen3.5 names the MLP's input norm post_attention_norm; Gemma 3 has an
   // ffn_norm and a post_attention_norm both, and a post_ffw_norm: the norms of
   // the attention's and the MLP's outputs.
@@ -297,11 +314,23 @@ inline void widen_(const gg::tensor_info* t, size_t first, size_t n, float* dst)
 // head, splits into a contiguous q block and a contiguous gate block at load.
 // `wdt` is the storage dtype: f32 (exact, 4 B/weight) or bf16 (2 B/weight; the
 // decode GEMV consumes bf16 natively).
+//
+// With norm_hd set, the part is a q or k projection whose rows the GGUF converter
+// permuted for llama.cpp's NORM rope (convert_hf_to_gguf.py's permute: in a head of
+// norm_hd rows, row 2i + s holds the model's row s * norm_hd / 2 + i), and src()
+// reads them back in the model's order, the halves the RoPE kernels pair.
 struct wpart {
   std::string name;
   int64_t out;
   int64_t blk = 0, stride = 0, first = 0;
-  int64_t src(int64_t o) const { return blk ? (o / blk) * stride + first + o % blk : o; }
+  int64_t norm_hd = 0;
+  int64_t src(int64_t o) const {
+    if (norm_hd) {
+      const int64_t half = norm_hd / 2, r = o % norm_hd;
+      return o - r + 2 * (r % half) + r / half;
+    }
+    return blk ? (o / blk) * stride + first + o % blk : o;
+  }
 };
 inline array load_w_T_cat(const gg::model& m, const std::vector<wpart>& parts,
                           int64_t in, tl::dtype wdt) {
@@ -463,8 +492,9 @@ inline wmat load_wmat(const gg::model& m, const std::vector<wpart>& parts, int64
     while (pi + 1 < W.parts.size() && W.parts[pi + 1].row_off <= base) pi++;
     const wmat::part& run = W.parts[pi];
     const bool as_stored = run.type == static_cast<int>(t->type);
-    // Source rows are contiguous runs (the whole tensor, or the blk rows of one
-    // head of an interleaved projection): one upload a run, or a batch.
+    // Source rows are contiguous runs (the whole tensor, the blk rows of one head
+    // of an interleaved projection, or a single row of a NORM-permuted q / k):
+    // one upload a run, or a batch.
     int64_t o = 0;
     while (o < p.out) {
       const int64_t s0 = p.src(o);
@@ -667,6 +697,7 @@ struct Model {
   wmat outw_row;
   array outwT;
   array onorm;                // final norm [1, NE]
+  array rope_freqs;           // the per-pair RoPE divisors [1, ROT/2] (Config::rope_factors)
   array outwT_q4;             // q4 lm_head (imperative decode, when q4_lmhead)
   tl::dtype wdt = tl::dtype::f32;  // the float weights' dtype, as build() chose
                                    // (bf16 under quant, whose projections are blocks)
@@ -696,6 +727,14 @@ struct Model {
   // blocks takes an f32 cache, then the chat's again).
   bool kv_f16 = false;
 };
+
+// Layer l's RoPE frequencies: a local layer's base, unscaled, or a global one's,
+// its position scaled and its pairs divided by the file's factors where it has them.
+inline gpu::rope_freq rope_of(const Model& M, int64_t l) {
+  const Config& c = M.c;
+  if (c.is_local(l)) return {c.ROPE_BASE_LOCAL, c.ROT};
+  return {c.ROPE_BASE, c.ROT, c.ROPE_SCALE, sp(M.rope_freqs)};  // empty: no factors
+}
 
 // The KV cache's appends and attentions fail only on a caller's mistake (a position
 // past the capacity, an op the backend can neither run nor compose); the forward
@@ -935,7 +974,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       // Qwen3: every q / k head row (HD wide, one per h*T + t) is RMS-normalized
       // in place, before rope. v is untouched.
       // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
-      const gpu::rope_freq rf = c.rope(l);
+      const gpu::rope_freq rf = rope_of(M, l);
       if (c.qk_norm) {
         gpu::rmsnorm_rope(qh, sp(L.qn), c.NH * T, T, c.HD, pos0, rf, c.EPS);
         gpu::rmsnorm_rope(kh, sp(L.kn), c.NKV * T, T, c.HD, pos0, rf, c.EPS);
@@ -1158,6 +1197,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
       .outw_row = dev({{c.output_name(), c.VOCAB}}, c.NE),
       .outwT = (!row || oracle_w) ? load_w_T(m, c.output_name(), c.NE, c.VOCAB, wdt) : array{},
       .onorm = load_f32(m, "output_norm.weight", c.NE),
+      .rope_freqs = c.rope_factors ? load_f32(m, "rope_freqs.weight", c.ROT / 2) : array{},
       // q4 lm_head (imperative): quantize the f32 [K,VOCAB], keep only the q4.
       .outwT_q4 =
           q4lm ? load_w_T(m, c.output_name(), c.NE, c.VOCAB, f32).to_q4() : array{},
@@ -1179,15 +1219,15 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
         {p + "ffn_gate.weight", c.FF}, {p + "ffn_up.weight", c.FF}};
     // [K,N] weights: the array path's own (the oracle), and wo/wd, which the
     // imperative path reads too where it has no row copies.
-    auto W = [&](bool want, const char* n, int64_t in, int64_t out) {
-      return want ? load_w_T(m, p + n, in, out, wdt) : array{};
+    auto W = [&](bool want, const wpart& part, int64_t in) {
+      return want ? load_w_T_cat(m, {part}, in, wdt) : array{};
     };
     const std::vector<wpart> down = {{p + "ffn_down.weight", c.NE}};
     // Every layer: the norms and the MLP.
     Layer L{
-        .wg = W(oracle_w, "ffn_gate.weight", c.NE, c.FF),
-        .wu = W(oracle_w, "ffn_up.weight", c.NE, c.FF),
-        .wd = W(col_wo, "ffn_down.weight", c.FF, c.NE),
+        .wg = W(oracle_w, gu_parts[0], c.NE),
+        .wu = W(oracle_w, gu_parts[1], c.NE),
+        .wd = W(col_wo, down[0], c.FF),
         .an = load_f32(m, p + "attn_norm.weight", c.NE),
         .fn = load_f32(m, p + c.ffn_norm, c.NE),
         // gate|up and down: empty when q4m (replaced by wgu_q4 / wd_q4).
@@ -1232,11 +1272,14 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
       // head; the fused load takes q's rows first and the gate's last, so the
       // output is q | k | v | gate and every slice downstream is contiguous.
       const int64_t Q = c.NH * c.HD;
-      std::vector<wpart> qkv_parts = {
-          c.attn_gate ? wpart{p + "attn_q.weight", Q, c.HD, 2 * c.HD, 0}
-                      : wpart{p + "attn_q.weight", Q},
-          {p + "attn_k.weight", c.NKV * c.HD},
-          {p + "attn_v.weight", c.NKV * c.HD}};
+      // q and k in the halves order the kernels turn (a llama file's rows are in
+      // NORM order: wpart::norm_hd).
+      const int64_t nhd = c.rope_norm ? c.HD : 0;
+      const wpart wq_part = c.attn_gate ? wpart{p + "attn_q.weight", Q, c.HD, 2 * c.HD, 0}
+                                        : wpart{p + "attn_q.weight", Q, 0, 0, 0, nhd},
+                  wk_part{p + "attn_k.weight", c.NKV * c.HD, 0, 0, 0, nhd},
+                  wv_part{p + "attn_v.weight", c.NKV * c.HD};
+      std::vector<wpart> qkv_parts = {wq_part, wk_part, wv_part};
       if (c.attn_gate) qkv_parts.push_back({p + "attn_q.weight", Q, c.HD, 2 * c.HD, c.HD});
       auto bias = [&](const char* n, int64_t len) {
         return c.qkv_bias ? load_f32(m, p + n, len) : array{};
@@ -1244,13 +1287,14 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
       auto qk_norm = [&](const char* n) {
         return c.qk_norm ? load_f32(m, p + n, c.HD) : array{};
       };
-      L.wq = W(oracle_w, "attn_q.weight", c.NE, Q);
+      L.wq = W(oracle_w, wq_part, c.NE);
       L.bq = bias("attn_q.bias", Q);
-      L.wk = W(oracle_w, "attn_k.weight", c.NE, c.NKV * c.HD);
+      L.wk = W(oracle_w, wk_part, c.NE);
       L.bk = bias("attn_k.bias", c.NKV * c.HD);
-      L.wv = W(oracle_w, "attn_v.weight", c.NE, c.NKV * c.HD);
+      L.wv = W(oracle_w, wv_part, c.NE);
       L.bv = bias("attn_v.bias", c.NKV * c.HD);
-      L.wo = W(col_wo, "attn_output.weight", Q, c.NE);
+      const std::vector<wpart> wo_parts = {{p + "attn_output.weight", c.NE}};
+      L.wo = W(col_wo, wo_parts[0], Q);
       L.qn = qk_norm("attn_q_norm.weight");
       L.kn = qk_norm("attn_k_norm.weight");
       L.wqkv_row = dev(qkv_parts, c.NE);
@@ -1260,7 +1304,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
         L.bqkv = load_f32_cat(m, {{p + "attn_q.bias", Q},
                                   {p + "attn_k.bias", c.NKV * c.HD},
                                   {p + "attn_v.bias", c.NKV * c.HD}});
-      L.wo_row = dev({{p + "attn_output.weight", c.NE}}, Q);
+      L.wo_row = dev(wo_parts, Q);
     }
     M.layers.push_back(std::move(L));
   }
@@ -1529,7 +1573,7 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
         gpu::rmsnorm(qp, sp(L.qn), qp, c.HD, c.EPS, c.NH);
         gpu::rmsnorm(kp, sp(L.kn), kp, c.HD, c.EPS, c.NKV);
       }
-      const gpu::rope_freq rf = c.rope(l);
+      const gpu::rope_freq rf = rope_of(M, l);
       if (cap) {
         gpu::rope_dpos(qp, qp, c.NH, 1, c.HD, d_pos, rf, sp(L.bq));
         gpu::rope_dpos(kp, kp, c.NKV, 1, c.HD, d_pos, rf, sp(L.bk));

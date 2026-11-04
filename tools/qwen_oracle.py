@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tight numpy oracle for bench/models/check_qwen.cpp (Qwen2.5, Qwen3, Qwen3.5, Gemma 3).
+"""Tight numpy oracle for bench/models/check_qwen.cpp (Qwen2.5, Qwen3, Qwen3.5, Gemma 3, Llama 3.2).
 
 Reads a Qwen2.5 / Qwen3 / Qwen3.5 F16 (or BF16) GGUF with its own minimal parser and runs the decoder
 in float32 numpy on the SAME weights the C++ loads, so the two must agree to
@@ -13,6 +13,12 @@ read with the gguf package (llama.cpp's gguf-py) and dequantized to f32, all at
 once when that copy is under KEEP_ALL_BYTES (Gemma 3 1B's 4 GB), else when a step
 reads them, layer by layer, so no f32 copy of the whole model is held (the 4B's
 16 GB). Its local layers attend the last `sliding_window` positions.
+
+A Llama GGUF's q and k rows are as llama.cpp reads them: the converter permuted
+them for its NORM rope, which turns adjacent pairs. This forward turns them so,
+on the file's rows, where the C++ reads them back in the model's order and turns
+halves (qwen.h's wpart::norm_hd): two independent routes to the same numbers.
+Llama 3's rope_freqs.weight divides the pairs' angles, as llama.cpp's freq factors.
 
   python3 -I tools/qwen_oracle.py MODEL.gguf NAMESPACE [LLAMA_TOKENIZE] > bench/models/X_oracle_data.h
 
@@ -36,6 +42,7 @@ from tokenizer_oracle import tokenize  # noqa: E402
 
 USER35 = [33963, 728, 264, 2716, 16308, 310, 3349, 3992, 3983, 13]  # same sentence, Qwen3.5 vocab
 USER = [35127, 752, 264, 2805, 16800, 311, 3460, 4128, 4119, 13]  # "Give me a short introduction to large language models."
+LLAMA_USER = [36227, 757, 264, 2875, 17219, 311, 3544, 4221, 4211, 13]  # same sentence, Llama 3 vocab
 QWEN2_SYS = [151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465, 553, 54364,
              14817, 13, 1446, 525, 264, 10950, 17847, 13, 151645, 198]
 GEMMA_USER = [46762, 786, 496, 2822, 12650, 531, 2455, 5192, 4681, 236761]  # same sentence, Gemma 3 vocab
@@ -163,12 +170,18 @@ def rmsnorm(x, w, eps):
     return x / np.sqrt((x * x).mean(-1, keepdims=True) + eps) * w
 
 
-def rope(x, pos, base, rot=None):  # x [H, D]; rotates the first `rot` dims, half-split pairs
+def rope(x, pos, base, rot=None, factors=None, norm=False):
+    """x [H, D]: its first `rot` dims turn as pairs (j, j + rot/2), or with `norm`
+    (llama.cpp's NORM) (2j, 2j + 1), by pos * base^(-2j/rot) / factors[j]."""
     rot = rot or x.shape[-1]
     ang = pos * base ** (-np.arange(0, rot, 2, dtype=np.float64) / rot)
+    if factors is not None:
+        ang = ang / factors.astype(np.float64)
     c, s = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
-    a, b, rest = x[..., : rot // 2], x[..., rot // 2: rot], x[..., rot:]
-    return np.concatenate([a * c - b * s, a * s + b * c, rest], -1)
+    ia, ib = (slice(0, rot, 2), slice(1, rot, 2)) if norm else (slice(0, rot // 2), slice(rot // 2, rot))
+    a, b, out = x[..., ia], x[..., ib], x.copy()
+    out[..., ia], out[..., ib] = a * c - b * s, a * s + b * c
+    return out
 
 
 def gelu(x):  # tanh form: ggml's, and PyTorch's approximate='tanh'
@@ -224,6 +237,10 @@ class Model:
             self.local = ([bool(b) for b in pat] if isinstance(pat, list)
                           else [pat == 0 or l % pat < pat - 1 for l in range(self.nl)])
             self.base_local = kv.get(f"{arch}.rope.freq_base_swa", 10000.0)
+        # Llama: NORM rope on the file's q / k rows, and its per-pair factors on the
+        # global layers (llama.cpp's LLM_ARCH_LLAMA; qwen.h's rope_of).
+        self.norm = arch == "llama"
+        self.factors = self.t.get("rope_freqs.weight")
         self.k = [[] for _ in range(self.nl)]
         self.v = [[] for _ in range(self.nl)]
         self.lm = self.t.get("output.weight", self.t["token_embd.weight"])
@@ -274,8 +291,9 @@ class Model:
         if p + "attn_q_norm.weight" in t:  # Qwen3: per-head q/k RMSNorm before rope
             q = rmsnorm(q, t[p + "attn_q_norm.weight"], self.eps)
             k = rmsnorm(k, t[p + "attn_k_norm.weight"], self.eps)
-        base, p_ = (self.base_local, pos) if self.local[l] else (self.base, pos * self.scale)
-        q, k = rope(q, p_, base, self.rot), rope(k, p_, base, self.rot)
+        base, p_, f = ((self.base_local, pos, None) if self.local[l]
+                       else (self.base, pos * self.scale, self.factors))
+        q, k = (rope(y, p_, base, self.rot, f, self.norm) for y in (q, k))
         self.k[l].append(k)
         self.v[l].append(v)
         # A local layer reads the last `window` positions, this one the last of them
@@ -334,6 +352,8 @@ def main():
     long = tokenize(sys.argv[3], path, LONG_USER) if len(sys.argv) > 3 else None
     if m.arch == "gemma3":  # <bos><start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n
         prompt = [2, 105, 2364, 107] + (long or GEMMA_USER) + [106, 107, 105, 4368, 107]
+    elif m.arch == "llama":  # <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n...
+        prompt = [128000, 128006, 882, 128007, 271] + (long or LLAMA_USER) + [128009, 128006, 78191, 128007, 271]
     elif m.arch == "qwen35":  # thinking template: ends with "<think>\n"
         prompt = [248045, 846, 198] + (long or USER35) + [248046, 198, 248045, 74455, 198, 248068, 198]
     else:

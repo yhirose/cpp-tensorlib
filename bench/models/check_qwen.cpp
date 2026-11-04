@@ -1,22 +1,27 @@
 // M9 "actually chat" — numeric proof. Load a real Qwen2.5-0.5B-Instruct, Qwen3
-// or Qwen3.5 GGUF (F16 or BF16 weights), or Gemma 3 4B or 1B (Q4_K_M), and run the
-// decoder end to end, verified against a tight numpy reference that reads the
-// SAME weights (tools/qwen_oracle.py wrote qwen_oracle_data.h / qwen3_oracle_data.h
-// / qwen35_oracle_data.h / gemma3_oracle_data.h / gemma3_1b_oracle_data.h, the 1B's
-// over a prompt past its 512-position window; the model's arch and shape pick one). Identical
+// or Qwen3.5 GGUF (F16 or BF16 weights), Gemma 3 4B or 1B (Q4_K_M), or Llama 3.2
+// 1B (F16 or Q4_K_M) or 3B (Q4_K_M), and run the decoder end to end, verified
+// against a tight numpy reference that reads the SAME weights (tools/qwen_oracle.py
+// wrote the *_oracle_data.h headers: Gemma 3 1B's over a prompt past its
+// 512-position window, Llama 3.2 1B's over one long enough that its RoPE factors
+// turn the low-frequency pairs well apart; the model's arch and shape pick one,
+// and of two, the one that read the file's weights). Identical
 // weights => the C++ forward must match the reference to ~1e-4 at every checkpoint
 // (embedding, layer-0 residual, final norm, top-5 logits) AND reproduce the greedy
 // token sequence exactly. A file of other weights than its oracle's (another
 // quantization, or another quantizer's: held_to_oracle) skips those two, its paths
 // held to its own f32 greedy instead. A block-quantized file runs on its own
 // blocks, as a chat does, its f32 reference reading them with f32 activations and
-// an f32 KV cache (check_imperative), not widened to four bytes a weight. Proves weight loading +
-// GGML->our layout transpose + Qwen2 structure + the head_dim=64 attention
-// kernels, on whatever backend gpu:: resolves to. Tokenizer/sampling are
-// separate (see chat_qwen). Model path: argv[1] or ~/models/...fp16.gguf.
+// an f32 KV cache (check_imperative), not widened to four bytes a weight. Proves
+// weight loading + GGML->our layout transpose + each family's structure + the
+// attention kernels, on whatever backend gpu:: resolves to. Tokenizer/sampling
+// are separate (see chat_qwen). Model path: argv[1] or ~/models/...fp16.gguf.
 
 #include "gemma3_1b_oracle_data.h"
 #include "gemma3_oracle_data.h"
+#include "llama32_1b_oracle_data.h"
+#include "llama32_1b_q4_oracle_data.h"
+#include "llama32_3b_oracle_data.h"
 #include "qwen.h"
 #include "qwen35_oracle_data.h"
 #include "qwen3_oracle_data.h"
@@ -61,16 +66,18 @@ static uint64_t weights_fingerprint(const qm::gg::model& m) {
 
 // Whether the oracle read this file's weights, so its checkpoints and greedy are
 // this model's: a float oracle any float file's (no blocks), a block-quantized one
-// only the file whose fingerprint it names. Elsewhere it says which, and what the
-// paths are held to instead.
+// only the file whose fingerprint it names.
+static bool read_by(const qm::gg::model& m, const Oracle& O) {
+  return O.weights != 0 ? weights_fingerprint(m) == O.weights : !qm::quant_file(m);
+}
+
+// read_by, and where it is not, which weights each read and what the paths are
+// held to instead.
 static bool held_to_oracle(const qm::gg::model& m, const Oracle& O) {
-  bool same = !qm::quant_file(m);
-  if (O.weights != 0) {
-    const uint64_t fp = weights_fingerprint(m);
-    same = fp == O.weights;
-    std::printf("\nweights fingerprint %016llx, the oracle's %016llx\n", (unsigned long long)fp,
-                (unsigned long long)O.weights);
-  }
+  const bool same = read_by(m, O);
+  if (O.weights != 0)
+    std::printf("\nweights fingerprint %016llx, the oracle's %016llx\n",
+                (unsigned long long)weights_fingerprint(m), (unsigned long long)O.weights);
   if (!same)
     std::printf("the oracle read other weights: its checkpoints and greedy are skipped, and the "
                 "paths below are held to this model's own f32 greedy\n");
@@ -498,10 +505,17 @@ int main(int argc, char** argv) {
       {"qwen35", 24, 1024, TL_ORACLE(qwen35oracle, 0)},  // Qwen3.5-0.8B, F16
       // unsloth/gemma-3-{4b,1b}-it-GGUF's gemma-3-*-it-Q4_K_M.gguf
       {"gemma3", 34, 2560, TL_ORACLE(gemma3oracle, 0x0b1451ea793e00e9ull)},     // Gemma 3 4B
-      {"gemma3", 26, 1152, TL_ORACLE(gemma3_1boracle, 0x1f0d93832cf2bb46ull)}}; // Gemma 3 1B
+      {"gemma3", 26, 1152, TL_ORACLE(gemma3_1boracle, 0x1f0d93832cf2bb46ull)},  // Gemma 3 1B
+      // unsloth/Llama-3.2-{1B,3B}-Instruct-GGUF's F16 and Q4_K_M
+      {"llama", 16, 2048, TL_ORACLE(llama32_1boracle, 0)},                     // Llama 3.2 1B, F16
+      {"llama", 16, 2048, TL_ORACLE(llama32_1b_q4oracle, 0x00f056cb14a01068ull)},  // 1B Q4_K_M
+      {"llama", 28, 3072, TL_ORACLE(llama32_3boracle, 0x398103f1bd23c54bull)}};    // 3B Q4_K_M
+  // The oracle for the model's shape; of two (a float file's and a quantized one's),
+  // the one that read this file's weights, else the first.
   const Oracle* found = nullptr;
   for (const auto& r : oracles)
-    if (C.arch == r.arch && C.NL == r.nl && C.NE == r.ne) found = &r.o;
+    if (C.arch == r.arch && C.NL == r.nl && C.NE == r.ne && (!found || read_by(m, r.o)))
+      found = &r.o;
   if (!found) {
     std::printf("config mismatch — no oracle for this model\n");
     return 2;
