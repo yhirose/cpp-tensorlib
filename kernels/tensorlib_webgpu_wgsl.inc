@@ -331,6 +331,12 @@ fn cos_libm(x : f32) -> f32 {
   return sin_quadrant(t.r, t.q + 1u);
 }
 
+// (cos x, sin x) on one reduction, as sincosf.
+fn sincos_libm(x : f32) -> vec2<f32> {
+  let t = reduce_pio2(x);
+  return vec2<f32>(sin_quadrant(t.r, t.q + 1u), sin_quadrant(t.r, t.q));
+}
+
 // Shared by the contiguous and the broadcast binaries: same five operations,
 // only the addressing differs.
 fn binary_op(op : u32, av : f32, bv : f32) -> f32 {
@@ -896,10 +902,11 @@ fn rope(@builtin(global_invocation_id) gid : vec3<u32>) {
   var t : u32 = 0u;
   if (rp.t > 0u) { t = r % rp.t; }
   let position = f32(rp.pos + t);
-  let theta = pow(rp.base, -2.0 * f32(j) / f32(rp.d));
-  let ang = position * theta;
-  let c = cos(ang);
-  let s = sin(ang);
+  let theta = pow_libm(rp.base, -2.0 * f32(j) / f32(rp.d));  // C's powf: base^0 is 1 exactly
+  let ang = position * theta;  // grows with the position: libm's cos and sin, not the builtins
+  let cs = sincos_libm(ang);
+  let c = cs.x;
+  let s = cs.y;
   let bi = r * rp.d;
   let x0 = in0[rp.v.v0 + bi + j];
   let x1 = in0[rp.v.v0 + bi + j + half];

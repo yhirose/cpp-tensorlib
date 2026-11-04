@@ -54,7 +54,9 @@ static inline float4 load4_(device const half* p, uint i4) {
 // contract covers the elementwise ops; the fused kernels keep the fast forms
 // where their arguments stay inside those edges (a softmax's exp of x - max <=
 // 0, SiLU's exp) and take the precise ones where they do not (gelu_tanh_'s
-// tanh). test_array holds every op here to libm over the edges.
+// tanh, RoPE's angle, which grows with the position: rope_pair_ in
+// metal_kernels_nn.metal). test_array holds every op here to libm over the
+// edges.
 #define EW_BINARY(name, expr)                                  \
   kernel void name(device const float* a [[buffer(0)]],        \
                    device const float* b [[buffer(1)]],        \

@@ -241,11 +241,17 @@ struct rope_params {
 };
 
 // The turn of the pair (x0, x1) at dims (j, j + rot/2) of a row at `position`:
-// every rotation in this file goes through it (rope_, rmsnorm_rope_).
+// every rotation in this file goes through it (rope_, rmsnorm_rope_). The
+// angle is formed in f32, as the frameworks the models are trained in form it
+// (at position p it carries ~p 2^-24 rad of rounding against an exact angle);
+// its power, cos and sin are libm's, precise::, since the angle grows with the
+// position past where the fast forms keep their range reduction (~40) and
+// carries the power's relative error times the position.
 static inline void rope_pair_(float position, uint j, uint rot, float base,
                               thread float& x0, thread float& x1) {
-  const float ang = position * pow(base, -2.0f * float(j) / float(rot));
-  const float c = cos(ang), s = sin(ang);
+  const float ang = position * precise::pow(base, -2.0f * float(j) / float(rot));
+  float c;
+  const float s = precise::sincos(ang, c);  // one range reduction for both
   const float r0 = x0 * c - x1 * s;
   x1 = x0 * s + x1 * c;
   x0 = r0;

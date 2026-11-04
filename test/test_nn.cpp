@@ -189,6 +189,38 @@ TEST_CASE("rope GPU dispatch matches the CPU oracle") {
   for (int64_t i = 0; i < x.size(); i++) CHECK(pr[i] == px[i]);
 }
 
+TEST_CASE("rope turns by libm's cos and sin at large positions") {
+  // The angle grows with the position, past where a fast sin / cos holds its
+  // error (Metal's fast math past ~40, CUDA's __sinf / __cosf and WGSL's
+  // builtins past pi).
+  // Pair 0 turns by the position itself (base^0 = 1, exact in f32), so its cos
+  // and sin are held to libm's in double; the other pairs' angles carry their
+  // f32 base^(-2j/D)'s rounding, a few 2^-24 of the angle.
+  namespace gpu = tl::gpu;
+  if (!tl::gpu_available()) return;
+  const int64_t D = 64, half = D / 2;
+  std::vector<float> unit(D, 0.0f);
+  for (int64_t j = 0; j < half; j++) unit[j] = 1.0f;  // every pair (x0, x1) = (1, 0): (cos, sin)
+  const array x = dev(array::from(unit, {1, D}));
+  for (int64_t pos : {1000, 32767, 131071, 1000000}) {
+    INFO("position " << pos);
+    array o = array::empty({1, D});
+    gpu::census_reset();
+    REQUIRE(gpu::rope(x.device_span(), o.device_span(), 1, 1, D, pos, 10000.0f));
+    // The backend's own kernel where it has one: one op, not the composition's several.
+    if (gpu::has_rope) CHECK(gpu::ops_run() == 1);
+    tl::gpu::flush();
+    const std::vector<float> got = host_values(o);
+    for (int64_t j = 0; j < half; j++) {
+      INFO("pair " << j);
+      const double ang = double(pos) * std::pow(10000.0, -2.0 * double(j) / double(D));
+      const double tol = 1e-6 + (j == 0 ? 0.0 : ang * std::ldexp(1.0, -20));
+      CHECK(std::fabs(got[j] - std::cos(ang)) <= tol);
+      CHECK(std::fabs(got[j + half] - std::sin(ang)) <= tol);
+    }
+  }
+}
+
 TEST_CASE("layer_norm matches its composition, across the pool and on the GPU") {
   // The nine-op composition the fused node replaces.
   auto composed = [](const array& x, const array& g, const array& b) {

@@ -3699,10 +3699,15 @@ extern "C" __global__ void tl_attn_bwd_dkv_f32_64(const float* q, const float* K
 
 // RoPE's turn of the pair (x0, x1) at dims (j, j + rot/2) of a row at `position`
 // (rope_core below; every rotation here goes through it, so they agree bit for bit).
+// The angle is formed in f32, as the frameworks the models are trained in form it;
+// its base^(-2j/rot), sin and cos are libm's (powf, sincosf), not the intrinsics':
+// the angle grows with the position past where __sinf / __cosf stay accurate
+// (|x| <= pi), and carries the power's relative error times the position.
 __device__ __forceinline__ void rope_pair_(float position, unsigned j, unsigned rot, float base,
                                            float& x0, float& x1) {
-  const float ang = position * __powf(base, -2.0f * (float)j / (float)rot);
-  const float c = __cosf(ang), s = __sinf(ang);
+  const float ang = position * powf(base, -2.0f * (float)j / (float)rot);
+  float s, c;
+  sincosf(ang, &s, &c);
   // r1's fused multiply-add named (x0 s fused, x1 c rounded first, the form rope_core
   // had): left to contraction, the compiler fused whichever product suited the code
   // around each copy, and the copies stopped agreeing bit for bit. r0 stays as written,
