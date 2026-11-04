@@ -16,3 +16,6 @@ mnist-data/
 
 # GGUF weights (bench/models)
 /models/
+
+# Python's bytecode cache (tools/*.py)
+__pycache__/
