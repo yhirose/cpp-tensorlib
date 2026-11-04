@@ -790,6 +790,21 @@ inline void set_cache_pos(Model& M, int64_t p) {
   for (auto& L : M.layers) L.cache.pos = p;
 }
 
+// The batched prefill's f16 forms, in one place (prefill_chunk_ takes them, the
+// checks ask): its activations are f16 (a16) where f16_acc asks for f16 and the
+// backend has the producers that write them; its GEMMs sum in f16 under f16_acc,
+// a bf16 weight's on either activation (gemm_bf16_nt_f16acc reads f32 too), a
+// block-quantized one's only on f16 ones. The exact form takes neither.
+inline bool prefill_a16(const Model& M, bool exact) {
+  return M.f16_acc && !exact && gpu::f16_activations;
+}
+inline bool prefill_sums_f16(const Model& M, bool exact) {
+  return M.f16_acc && !exact && (!M.quant || gpu::f16_activations);
+}
+// MMQ (block-quantized weights' int8 GEMM) quantizes the f16 activation a16
+// makes, so it runs only where that is made.
+inline bool prefill_mmq(const Model& M, bool exact) { return M.mmq && prefill_a16(M, exact); }
+
 // ---- M9 batched prefill: run T prompt tokens through the layer stack at once.
 //
 // Decode is a GEMV regime (one token, weights read once per token, bandwidth-
@@ -819,9 +834,9 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
   // same source rather than taking it as a parameter that could disagree.
   const int64_t pos0 = seq_cache(M).pos;
   const int64_t AP = c.attn_proj(), Q = c.NH * c.HD;
-  // The f16-sum GEMMs read their activation as f16 when the backend has the
-  // producers that write it there (a16); `a16s` is that copy of `a`.
-  const bool a16 = M.f16_acc && !exact && gpu::f16_activations;
+  // The f16-sum GEMMs read their activation as f16 where prefill_a16 says; `a16s`
+  // is that copy of `a`.
+  const bool a16 = prefill_a16(M, exact), mmq = prefill_mmq(M, exact);
   // A GEMM a run of one format, each into its columns of y. The bf16 GEMMs
   // write y densely, so a bf16 run is the whole projection, as every bf16 build
   // loads it (load_wmat).
@@ -831,7 +846,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       const gpu::span w = W.at(p);
       if (p.type != bf16_type) {
         if (!gpu::gemm_quant(p.type, a16, a16 ? a16s : a, w, y.at(p.row_off * 4), T, p.rows,
-                             k, n, M.mmq && a16))
+                             k, n, mmq))
           throw std::logic_error("qwen: the block-quantized prefill GEMM refused its operands");
         continue;
       }
@@ -841,7 +856,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       if (a16) {
         if (!gpu::gemm_bf16_nt_f16acc_a16(a16s, w, y, T, n, k))
           throw std::logic_error("qwen: the f16 prefill GEMM refused its operands");
-      } else if (M.f16_acc && !exact) gpu::gemm_bf16_nt_f16acc(a, w, y, T, n, k);
+      } else if (prefill_sums_f16(M, exact)) gpu::gemm_bf16_nt_f16acc(a, w, y, T, n, k);
       else gpu::gemm_bf16_nt(a, w, y, T, n, k);
     }
   };
@@ -933,7 +948,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
     }
     norm_res(x, ro, sp(L.pa), sp(L.fn), ro, sp(P.h2), sp(P.h216), false);
     // With MMQ, gate|up of one format is one GEMM whose epilogue is the GLU.
-    const bool glu = M.mmq && a16 && L.wgu_row.parts.size() == 1 &&
+    const bool glu = mmq && L.wgu_row.parts.size() == 1 &&
                      gpu::gemm_quant_glu(L.wgu_row.parts[0].type, c.act, sp(P.h216),
                                          L.wgu_row.at(L.wgu_row.parts[0]),
                                          sp(P.mb16), T, c.FF, c.NE);

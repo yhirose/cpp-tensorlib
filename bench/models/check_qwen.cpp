@@ -6,7 +6,9 @@
 // over a prompt past its 512-position window; the model's arch and shape pick one). Identical
 // weights => the C++ forward must match the reference to ~1e-4 at every checkpoint
 // (embedding, layer-0 residual, final norm, top-5 logits) AND reproduce the greedy
-// token sequence exactly. Proves weight loading + GGML->our layout transpose +
+// token sequence exactly. A file of other weights than its oracle's (another
+// quantization: same_weights) skips those two, its paths held to its own f32
+// greedy instead. Proves weight loading + GGML->our layout transpose +
 // Qwen2 structure + the head_dim=64 attention kernels, on whatever backend
 // gpu:: resolves to. Tokenizer/sampling are
 // separate (see chat_qwen). Model path: argv[1] or ~/models/...fp16.gguf.
@@ -30,12 +32,36 @@ struct Oracle {
   const float *emb_last, *l0_last, *fnorm_last, *top5_vals;
   const int *top5_ids, *greedy30, *prompt_ids;
   size_t n_greedy, n_prompt;
+  // The weights its numpy forward read: a float file's (general.file_type 1, F16;
+  // the checks' bounds take F32's and BF16's too), or one quantization's blocks,
+  // dequantized exactly (15, Q4_K_M).
+  int file_type = 1;
 };
-#define TL_ORACLE(ns)                                                       \
+
+// Whether the oracle read this file's weights, so its checkpoints and greedy are
+// this model's: a float oracle any float file's (F32, F16, BF16: no blocks), a
+// block-quantized one only the same quantization's. Another quantization of the
+// same model is other weights. A block oracle is matched by the label alone: a
+// Q4_K_M from another quantizer (an imatrix, another llama.cpp's choice of Q6_K
+// tensors) carries the same 15 but other blocks, and fails the checkpoints; its
+// oracle is regenerated from it.
+static bool same_weights(const qm::gg::model& m, const Oracle& O) {
+  if (O.file_type == 1) return !qm::quant_file(m);
+  return m.has("general.file_type") && (int)m.kv("general.file_type").as_u32() == O.file_type;
+}
+// same_weights, and the line saying what holds the paths where the oracle cannot.
+static bool held_to_oracle(const qm::gg::model& m, const Oracle& O) {
+  const bool same = same_weights(m, O);
+  if (!same)
+    std::printf("\nthe oracle read other weights (another file type): its checkpoints and greedy "
+                "are skipped, and the paths below are held to this model's own f32 greedy\n");
+  return same;
+}
+#define TL_ORACLE(ns, file_type)                                            \
   Oracle {                                                                  \
     ns::emb_last, ns::l0_last, ns::fnorm_last, ns::top5_vals, ns::top5_ids, \
         ns::greedy30, ns::prompt_ids, sizeof(ns::greedy30) / sizeof(int),   \
-        sizeof(ns::prompt_ids) / sizeof(int)                                \
+        sizeof(ns::prompt_ids) / sizeof(int), file_type                     \
   }
 
 static double maxrel(const std::vector<float>& a, const float* b, int64_t n) {
@@ -61,6 +87,11 @@ static bool check_f16_sums(qm::Model& B, const std::vector<int>& ids,
   };
   const bool was = B.f16_acc;
   B.f16_acc = true;
+  if (!qm::prefill_sums_f16(B, false)) {  // nothing to hold: its prefill sums in f32 still
+    std::printf("\nf16 sums: none on this build (block-quantized weights, f32 activations) — skipped\n");
+    B.f16_acc = was;
+    return true;
+  }
   qm::reset_cache(B);
   const int64_t tok = qm::prefill_batched(B, ids);
   const double t5 = qm::top5_maxrel(logits().data(), ref.data(), B.c.VOCAB);
@@ -200,11 +231,14 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
           tl::max_err(logit_mr, std::fabs(logits[O.top5_ids[t]] - ref) / (1.0 + std::fabs(ref)));
     }
     const int64_t top1 = qm::argmax(logits);
-    std::printf("\ncheckpoints vs numpy-on-same-F16-weights (imperative path):\n");
-    std::printf("  final norm maxrel %.2e %s\n", fn_mr, fn_mr < 5e-3 ? "OK" : "FAIL");
-    std::printf("  top5 logit maxrel %.2e %s\n", logit_mr, logit_mr < 5e-3 ? "OK" : "FAIL");
-    std::printf("  argmax id  cpp=%lld ref=%d %s\n", (long long)top1, O.top5_ids[0],
-                top1 == O.top5_ids[0] ? "OK" : "FAIL");
+    const bool same = held_to_oracle(m, O);
+    if (same) {
+      std::printf("\ncheckpoints vs numpy-on-the-same-weights (imperative path):\n");
+      std::printf("  final norm maxrel %.2e %s\n", fn_mr, fn_mr < 5e-3 ? "OK" : "FAIL");
+      std::printf("  top5 logit maxrel %.2e %s\n", logit_mr, logit_mr < 5e-3 ? "OK" : "FAIL");
+      std::printf("  argmax id  cpp=%lld ref=%d %s\n", (long long)top1, O.top5_ids[0],
+                  top1 == O.top5_ids[0] ? "OK" : "FAIL");
+    }
     int64_t tok = top1, p = NP;
     bool greedy_ok = true;
     std::printf("\ngreedy %lld tokens:\n  cpp:", (long long)NG);
@@ -214,8 +248,9 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
       if (tok != O.greedy30[i]) greedy_ok = false;
       tok = qm::step_imperative(M, tok, p++);
     }
-    std::printf("\n  greedy %s\n", greedy_ok ? "MATCH" : "DIVERGE");
-    ok = fn_mr < 5e-3 && logit_mr < 5e-3 && top1 == O.top5_ids[0] && greedy_ok;
+    if (same) std::printf("\n  greedy %s\n", greedy_ok ? "MATCH" : "DIVERGE");
+    else std::printf("\n");
+    ok = !same || (fn_mr < 5e-3 && logit_mr < 5e-3 && top1 == O.top5_ids[0] && greedy_ok);
     if (qm::quant_file(m)) {
       qm::reset_cache(M);
       const float* sl = nullptr;
@@ -377,10 +412,13 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
   // 5e-4: docs/llama-cpp-comparison.md); the bound holds an int8 path that broke
   // (Gemma's GLU epilogue run as SiLU: 3.7).
   bool defaults_ok = true;
-  if (chat_form != tl::gpu::act_form::f32 || chat_mmq) {
+  B.mmq = chat_mmq;
+  B.f16_acc = true;
+  // A quantized file's (ref_spread is its f32 forward's), where its forms are not
+  // the f32 ones the checks above ran.
+  const bool mmq = qm::prefill_mmq(B, false), f16 = qm::prefill_sums_f16(B, false);
+  if (B.quant && (chat_form != tl::gpu::act_form::f32 || mmq || f16)) {
     B.gemv_form = chat_form;
-    B.mmq = chat_mmq;
-    B.f16_acc = true;
     qm::reset_cache(B);
     qm::captured_decoder d;
     d.begin(B, spread);
@@ -389,9 +427,9 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O) {
     const double kl = qm::kl_div(ref_spread, got);
     const bool top = qm::argmax(got) == qm::argmax(ref_spread);
     defaults_ok = top && kl < 0.3;
-    std::printf("\nthe chat's defaults (decode GEMV activations %s, prefill MMQ %s, f16 sums), a "
+    std::printf("\nthe chat's defaults (decode GEMV activations %s, prefill MMQ %s, sums in %s), a "
                 "spread-out prompt: KL %.2e from the f32 forward, top token %s %s\n",
-                qm::act_form_name(chat_form), chat_mmq ? "on" : "off", kl,
+                qm::act_form_name(chat_form), mmq ? "on" : "off", f16 ? "f16" : "f32", kl,
                 top ? "same" : "different", defaults_ok ? "OK" : "FAIL");
   }
   return ok && bf16_ok && logits_ok && cache_ok && dec_ok && turn2_ok && sample_ok && long_ok && f16_ok &&
@@ -413,11 +451,11 @@ int main(int argc, char** argv) {
     int64_t nl, ne;
     Oracle o;
   } oracles[] = {
-      {"qwen2", 24, 896, TL_ORACLE(qwenoracle)},         // Qwen2.5-0.5B
-      {"qwen3", 28, 1024, TL_ORACLE(qwen3oracle)},       // Qwen3-0.6B
-      {"qwen35", 24, 1024, TL_ORACLE(qwen35oracle)},     // Qwen3.5-0.8B
-      {"gemma3", 34, 2560, TL_ORACLE(gemma3oracle)},     // Gemma 3 4B
-      {"gemma3", 26, 1152, TL_ORACLE(gemma3_1boracle)}}; // Gemma 3 1B
+      {"qwen2", 24, 896, TL_ORACLE(qwenoracle, 1)},           // Qwen2.5-0.5B, F16
+      {"qwen3", 28, 1024, TL_ORACLE(qwen3oracle, 1)},         // Qwen3-0.6B, F16
+      {"qwen35", 24, 1024, TL_ORACLE(qwen35oracle, 1)},       // Qwen3.5-0.8B, F16
+      {"gemma3", 34, 2560, TL_ORACLE(gemma3oracle, 15)},      // Gemma 3 4B, Q4_K_M
+      {"gemma3", 26, 1152, TL_ORACLE(gemma3_1boracle, 15)}};  // Gemma 3 1B, Q4_K_M
   const Oracle* found = nullptr;
   for (const auto& r : oracles)
     if (C.arch == r.arch && C.NL == r.nl && C.NE == r.ne) found = &r.o;
@@ -466,13 +504,16 @@ int main(int argc, char** argv) {
                                          (1.0 + std::fabs((double)O.top5_vals[t])));
   }
 
-  std::printf("\ncheckpoints vs numpy-on-same-F16-weights (expect ~1e-4):\n");
-  std::printf("  embedding  maxrel %.2e %s\n", emb_mr, emb_mr < 1e-3 ? "OK" : "FAIL");
-  std::printf("  layer0 res maxrel %.2e %s\n", l0_mr, l0_mr < 5e-3 ? "OK" : "FAIL");
-  std::printf("  final norm maxrel %.2e %s\n", fn_mr, fn_mr < 5e-3 ? "OK" : "FAIL");
-  std::printf("  top5 logit maxrel %.2e %s\n", logit_mr, logit_mr < 5e-3 ? "OK" : "FAIL");
-  std::printf("  argmax id  cpp=%lld ref=%d %s\n", (long long)top5[0],
-              O.top5_ids[0], top1_ok ? "OK" : "FAIL");
+  const bool same = held_to_oracle(m, O);
+  if (same) {
+    std::printf("\ncheckpoints vs numpy-on-the-same-weights (expect ~1e-4):\n");
+    std::printf("  embedding  maxrel %.2e %s\n", emb_mr, emb_mr < 1e-3 ? "OK" : "FAIL");
+    std::printf("  layer0 res maxrel %.2e %s\n", l0_mr, l0_mr < 5e-3 ? "OK" : "FAIL");
+    std::printf("  final norm maxrel %.2e %s\n", fn_mr, fn_mr < 5e-3 ? "OK" : "FAIL");
+    std::printf("  top5 logit maxrel %.2e %s\n", logit_mr, logit_mr < 5e-3 ? "OK" : "FAIL");
+    std::printf("  argmax id  cpp=%lld ref=%d %s\n", (long long)top5[0],
+                O.top5_ids[0], top1_ok ? "OK" : "FAIL");
+  }
 
   const int64_t NG = (int64_t)O.n_greedy;
   std::vector<int64_t> gen;
@@ -487,17 +528,21 @@ int main(int argc, char** argv) {
   for (int64_t i = 0; i < NG; i++) if (gen[i] != O.greedy30[i]) greedy_ok = false;
   std::printf("\ngreedy %lld tokens:\n  cpp:", (long long)NG);
   for (auto t : gen) std::printf(" %lld", (long long)t);
-  std::printf("\n  ref:");
-  for (int64_t i = 0; i < NG; i++) std::printf(" %d", O.greedy30[i]);
-  std::printf("\n  greedy %s\n", greedy_ok ? "MATCH" : "DIVERGE");
+  if (same) {
+    std::printf("\n  ref:");
+    for (int64_t i = 0; i < NG; i++) std::printf(" %d", O.greedy30[i]);
+    std::printf("\n  greedy %s\n", greedy_ok ? "MATCH" : "DIVERGE");
+  } else {
+    std::printf("\n");
+  }
 
   // The same sequence again, on the imperative path: the fused model-path
   // kernels (rmsnorm/rmsnorm_res/swiglu, the decode GEMVs, kv_append,
   // attn_decode, argmax), or their generic compositions on a backend without
   // them, instead of the array compositions the checkpoints above validated.
   // They are meant to compute the same thing, so at F32 the greedy sequence
-  // must be identical — which makes every one of them gated against the numpy
-  // reference too, without a second oracle.
+  // must be the array path's — which, where that matched the numpy reference,
+  // gates every one of them against it too, without a second oracle.
   {
     qm::reset_cache(M);
     int64_t p = 0, tok = 0;
@@ -505,14 +550,15 @@ int main(int argc, char** argv) {
     std::printf("\nimperative path (same weights, fused kernels):\n  cpp:");
     for (int64_t i = 0; i < NG; i++) {
       std::printf(" %lld", (long long)tok);
-      if (tok != O.greedy30[i]) imp_ok = false;
+      if (tok != gen[i]) imp_ok = false;
       tok = qm::step_imperative(M, tok, p++);
     }
     std::printf("\n  greedy %s\n", imp_ok ? "MATCH" : "DIVERGE");
   }
 
-  ok_f32 = emb_mr < 1e-3 && l0_mr < 5e-3 && fn_mr < 5e-3 && logit_mr < 5e-3 &&
-           top1_ok && greedy_ok && imp_ok;
+  ok_f32 = (!same || (emb_mr < 1e-3 && l0_mr < 5e-3 && fn_mr < 5e-3 && logit_mr < 5e-3 &&
+                       top1_ok && greedy_ok)) &&
+           imp_ok;
   }
 
   // The bf16 weight path is the one a chat actually runs: [N,K] weights for
