@@ -291,7 +291,12 @@ kernel void rope_(device const float* x [[buffer(0)]],
 struct attn_params {
   uint T, kv_stride, group, pos0;
   float scale;
+  uint window;  // the prefill's sliding window; 0 none
 };
+
+// The first key a query attends among the n up to and including it, under a
+// window of w (0 none): gpu::attn_window_lo's twin.
+static inline uint attn_window_lo_(uint n, uint w) { return w > 0 && n > w ? n - w : 0; }
 
 // Across the four lanes that hold one fragment row (lane bits 0 and 3).
 static inline float frag_row_max_(float v) {
@@ -348,7 +353,8 @@ static inline void attn_store_row_(device float* row,
 }
 
 // q, out [H,T,D]; K/V a cache of kv_stride elements per kv head read over
-// [0, pos0+T); query p sits at pos0+p. BK keys per tile. KT is the cache's
+// [0, pos0+T); query p sits at pos0+p and attends the keys up to it, or with a
+// window its last p.window of them. BK keys per tile. KT is the cache's
 // element type: f32, or half for an f16 cache (caps::kv_f16). Width 256 is
 // instantiated for the f16 cache only, as cuda's (an f32 cache there takes
 // gpu::attn_prefill's GEMM form); its two 16-key tiles fill the whole 32 KB of
@@ -387,13 +393,21 @@ kernel void attn_prefill_(device const float* q   [[buffer(0)]],
   }
 
   const uint fm = frag_row_(lane), fn = frag_col_(lane);
-  const uint pabs = p.pos0 + qbase + sid * 8 + fm;
+  // The row's live keys [plo, pabs]: its causal end and its window's start.
+  const uint pabs = p.pos0 + qbase + sid * 8 + fm, plo = attn_window_lo_(pabs + 1, p.window),
+             width = pabs - plo;
   const uint last = qbase + BQ - 1 < T ? qbase + BQ - 1 : T - 1;
   const uint kmax = p.pos0 + last;
+  // The tile of the block's first key: its first row's window start (the later
+  // rows' windows start later).
+  const uint kt0 = attn_window_lo_(p.pos0 + qbase + 1, p.window) / BK * BK;
   const float sl2 = p.scale * M_LOG2E_F;
-  float m = -1e30f, l = 0.0f;
+  // The running max starts above the mask's -1e30, so a masked key weighs
+  // exp2(-1e30 - m) = 0 even in a tile with no live key (a row's leading tiles
+  // under a window), where m stays -1e20 and the tile adds nothing.
+  float m = -1e20f, l = 0.0f;
 
-  for (uint kt = 0; kt <= kmax; kt += BK) {
+  for (uint kt = kt0; kt <= kmax; kt += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     attn_stage_rows_<BK, AD>(Ks, Kh, Vs, Vh, kt, kmax + 1, tid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -417,7 +431,8 @@ kernel void attn_prefill_(device const float* q   [[buffer(0)]],
       _Pragma("clang loop unroll(full)")
       for (int k = 0; k < 2; k++) {
         const uint col = kt + j * 8 + fn + k;
-        e[k] = col <= pabs ? e[k] * sl2 : -1e30f;  // causal mask
+        // Causal and window mask in one compare: a col below plo wraps past width.
+        e[k] = col - plo <= width ? e[k] * sl2 : -1e30f;
         mt = max(mt, e[k]);
       }
     }

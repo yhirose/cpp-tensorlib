@@ -287,6 +287,7 @@ namespace detail_ {
 struct attn_params {
   uint32_t T, kv_stride, group, pos0;
   float scale;
+  uint32_t window;  // the prefill's sliding window (gpu::attn_window_lo); 0 none
 };
 
 struct gemv_params {
@@ -356,7 +357,8 @@ inline void attn_dispatch_(objc::id enc, const attn_params& p,
 }  // namespace detail_
 
 // q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D] cache read over
-// [0,pos0+T), query p at absolute position pos0+p. GQA via the head ratio.
+// [0,pos0+T), query p at absolute position pos0+p (with a window, attending
+// only its last `window` keys). GQA via the head ratio.
 // The head widths and caches attn_kernel_ names (cuda's: 64 and 128 over
 // either cache, 256 over an f16 one). An f16 cache is staged four halves at a
 // time (load4_'s half4) without a word_aligned_ check: no composition takes an
@@ -369,7 +371,7 @@ inline bool own_nn::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
                               int64_t pos0, int64_t window) {
   auto& c = context::get();
   const attn_kernel k = attn_kernel_(attn_op::prefill, D, kv_f16);
-  if (!c.device || !k || window > 0) return false;  // no window in the kernel
+  if (!c.device || !k) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || T <= 0) return false;
   c.bind_(k);
   detail_::set_buf_(c.enc, q, 0ul);
@@ -379,7 +381,8 @@ inline bool own_nn::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
   detail_::attn_params p{static_cast<uint32_t>(T),
                          static_cast<uint32_t>(kv_max * D),
                          static_cast<uint32_t>(n_q_heads / n_kv_heads),
-                         static_cast<uint32_t>(pos0), scale};
+                         static_cast<uint32_t>(pos0), scale,
+                         static_cast<uint32_t>(window)};
   detail_::attn_dispatch_(c.enc, p, 4ul, n_q_heads, T);
   return true;
 }

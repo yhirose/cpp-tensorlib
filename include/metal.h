@@ -1204,9 +1204,7 @@ struct caps {
   static constexpr bool row_gemv = true;   // gemv_bf16_row: weights as [N,K]
   static constexpr bool bf16_gemm = true;  // gemm_bf16_nt: a bf16-weight GEMM
   static constexpr bool kv_f16 = true;     // an f16 KV cache, every head width and path
-  // No sliding window: the prefill kernel refuses one and an f16 cache has no
-  // composition to take it instead (the decode's is a view, which it reads).
-  static constexpr bool attn_window = false;
+  static constexpr bool attn_window = true;  // a sliding window, every attention form
 };
 
 // The capture group, cuda.h's contracts: absent here, so each answers false
