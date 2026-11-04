@@ -275,6 +275,10 @@ inline bool own_nn::gated_rmsnorm(gpu::span o, gpu::span z, int64_t ldz,
   return true;
 }
 
+inline bool own_nn::quant_reads(int type, int64_t k) {
+  return (type == 12 || type == 14 || type == 8) && k > 0 && k % (type == 8 ? 32 : 256) == 0;
+}
+
 // ---- causal prefill attention and its pullback ------------------------------
 // cuda.h's contracts. 128 threads per threadgroup, owning 32 rows (queries,
 // or keys for the key/value half): the MSL kernels' 4 simdgroups × 8.
@@ -308,9 +312,6 @@ inline constexpr unsigned long gemv_quant_qrows_ = 2, gemv_quant_sg_ = 2,
 // others).
 inline bool quant_ok_(int type, int64_t k, gpu::span W) {
   return own_nn::quant_reads(type, k) && (type == 12 ? word_aligned_(W) : W.off % 2 == 0);
-}
-inline bool own_nn::quant_reads(int type, int64_t k) {
-  return (type == 12 || type == 14 || type == 8) && k > 0 && k % (type == 8 ? 32 : 256) == 0;
 }
 
 // An NT GEMM's launch on STEEL's body (C[M,N] rows ldc apart, W [N,K] the
