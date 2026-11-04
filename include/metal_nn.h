@@ -6,6 +6,7 @@
 //
 // Included by metal.h, after the device core.
 
+#include "ggml_quant.h"
 #include "gpu_abi_nn.h"
 
 namespace tl {
@@ -15,11 +16,11 @@ namespace metal {
 // (gtile, attn_kernel_): keyed below attn's range in the one pipeline cache, so
 // a new nn kernel joins this list rather than starting another family.
 enum class nn_kernel {
-  gemv_q4k, gemv_q6k, gemv_q80,
-  gemm_q4k, gemm_q4k_32, gemm_q6k, gemm_q6k_32, gemm_q80, gemm_q80_32,
+  gemv_q4k, gemv_q6k, gemv_q80, gemv_q50,
+  gemm_q4k, gemm_q4k_32, gemm_q6k, gemm_q6k_32, gemm_q80, gemm_q80_32, gemm_q50, gemm_q50_32,
   rmsnorm_rope_64, rmsnorm_rope_128, rmsnorm_rope_256, gated_rmsnorm,
   gemm_bf16_steel, gemm_bf16_steel_32, gemm_bf16_f16acc, gemm_bf16_f16acc_32,
-  embed_row_f32, embed_row_bf16, embed_row_q4k, embed_row_q6k, embed_row_q80,
+  embed_row_f32, embed_row_bf16, embed_row_q4k, embed_row_q6k, embed_row_q80, embed_row_q50,
 };
 constexpr int nn_kernel_key_(nn_kernel t) { return -201 - static_cast<int>(t); }
 inline const char* nn_kernel_name_(nn_kernel t) {
@@ -27,12 +28,15 @@ inline const char* nn_kernel_name_(nn_kernel t) {
     case nn_kernel::gemv_q4k: return "gemv_q4k_";
     case nn_kernel::gemv_q6k: return "gemv_q6k_";
     case nn_kernel::gemv_q80: return "gemv_q80_";
+    case nn_kernel::gemv_q50: return "gemv_q50_";
     case nn_kernel::gemm_q4k: return "gemm_q4k_nt_";
     case nn_kernel::gemm_q4k_32: return "gemm_q4k_nt32_";
     case nn_kernel::gemm_q6k: return "gemm_q6k_nt_";
     case nn_kernel::gemm_q6k_32: return "gemm_q6k_nt32_";
     case nn_kernel::gemm_q80: return "gemm_q80_nt_";
     case nn_kernel::gemm_q80_32: return "gemm_q80_nt32_";
+    case nn_kernel::gemm_q50: return "gemm_q50_nt_";
+    case nn_kernel::gemm_q50_32: return "gemm_q50_nt32_";
     case nn_kernel::rmsnorm_rope_64: return "rmsnorm_rope_64_";
     case nn_kernel::rmsnorm_rope_128: return "rmsnorm_rope_128_";
     case nn_kernel::rmsnorm_rope_256: return "rmsnorm_rope_256_";
@@ -46,6 +50,7 @@ inline const char* nn_kernel_name_(nn_kernel t) {
     case nn_kernel::embed_row_q4k: return "embed_row_q4k_";
     case nn_kernel::embed_row_q6k: return "embed_row_q6k_";
     case nn_kernel::embed_row_q80: return "embed_row_q80_";
+    case nn_kernel::embed_row_q50: return "embed_row_q50_";
   }
   return "";
 }
@@ -89,7 +94,7 @@ struct own_nn {
   // A scale other than 1 is not in its kernels: false (the caller stages the row).
   static bool embed_row(int type, gpu::span W, gpu::span idx, gpu::span out, int64_t k,
                         int64_t rows, int64_t row_stride, int64_t col_stride, float scale);
-  static bool quant_reads(int type, int64_t k);  // Q4_K, Q6_K and Q8_0
+  static bool quant_reads(int type, int64_t k);  // Q4_K, Q6_K, Q8_0 and Q5_0
   static bool gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y,
                          int64_t n, int64_t k);
   static bool gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
@@ -275,10 +280,6 @@ inline bool own_nn::gated_rmsnorm(gpu::span o, gpu::span z, int64_t ldz,
   return true;
 }
 
-inline bool own_nn::quant_reads(int type, int64_t k) {
-  return (type == 12 || type == 14 || type == 8) && k > 0 && k % (type == 8 ? 32 : 256) == 0;
-}
-
 // ---- causal prefill attention and its pullback ------------------------------
 // cuda.h's contracts. 128 threads per threadgroup, owning 32 rows (queries,
 // or keys for the key/value half): the MSL kernels' 4 simdgroups × 8.
@@ -307,12 +308,35 @@ inline bool bf16_rows_vec_(int64_t K, gpu::span W) { return K % 8 == 0 && word_a
 inline constexpr unsigned long gemv_quant_qrows_ = 2, gemv_quant_sg_ = 2,
                                gemv_quant_rows_ = gemv_quant_sg_ * gemv_quant_qrows_;
 
-// The quantized weights this backend reads natively: ggml type codes 12 Q4_K,
-// 14 Q6_K and 8 Q8_0, K a whole number of their blocks, and W aligned for the
-// kernels' loads (32-bit into a Q4_K block, so word_aligned_; 16-bit into the
-// others).
-inline bool quant_ok_(int type, int64_t k, gpu::span W) {
-  return own_nn::quant_reads(type, k) && (type == 12 ? word_aligned_(W) : W.off % 2 == 0);
+// The GGUF block formats the kernels read, a row each (cuda_nn.h's quant_fmts_):
+// the ggml type, its GEMV, GEMM (64- and 32-row bands) and row-lookup kernels, and
+// whether its reader takes 32-bit loads into a block (W word_aligned_) or 16-bit
+// ones (W 2-byte aligned). A block's geometry is ggml's (gguf::ggml_block).
+struct quant_fmt {
+  int type;
+  nn_kernel gemv, gemm, gemm32, embed;
+  bool word;
+};
+inline constexpr quant_fmt quant_fmts_[] = {
+    {12, nn_kernel::gemv_q4k, nn_kernel::gemm_q4k, nn_kernel::gemm_q4k_32, nn_kernel::embed_row_q4k, true},
+    {14, nn_kernel::gemv_q6k, nn_kernel::gemm_q6k, nn_kernel::gemm_q6k_32, nn_kernel::embed_row_q6k, false},
+    {8, nn_kernel::gemv_q80, nn_kernel::gemm_q80, nn_kernel::gemm_q80_32, nn_kernel::embed_row_q80, false},
+    {6, nn_kernel::gemv_q50, nn_kernel::gemm_q50, nn_kernel::gemm_q50_32, nn_kernel::embed_row_q50, false},
+};
+// The row of `type` where rows of k weights are a whole number of its blocks, else null.
+inline const quant_fmt* quant_fmt_(int type, int64_t k) {
+  for (const auto& f : quant_fmts_) {
+    if (f.type != type) continue;
+    uint64_t elems = 0, bytes = 0;
+    gguf::ggml_block(static_cast<gguf::ggml_type>(type), elems, bytes);
+    return k > 0 && k % (int64_t)elems == 0 ? &f : nullptr;
+  }
+  return nullptr;
+}
+// The row of a weight W the kernels can read where it lies, else null.
+inline const quant_fmt* quant_ok_(int type, int64_t k, gpu::span W) {
+  const quant_fmt* f = quant_fmt_(type, k);
+  return f && (f->word ? word_aligned_(W) : W.off % 2 == 0) ? f : nullptr;
 }
 
 // An NT GEMM's launch on STEEL's body (C[M,N] rows ldc apart, W [N,K] the
@@ -355,6 +379,8 @@ inline void attn_dispatch_(objc::id enc, const attn_params& p,
                  {128, 1, 1});
 }
 }  // namespace detail_
+
+inline bool own_nn::quant_reads(int type, int64_t k) { return detail_::quant_fmt_(type, k); }
 
 // q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D] cache read over
 // [0,pos0+T), query p at absolute position pos0+p (with a window, attending
@@ -473,10 +499,9 @@ inline bool own_nn::gemm_bf16_nt_f16acc(gpu::span A, gpu::span B, gpu::span C,
 inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y,
                                int64_t n, int64_t k) {
   auto& c = context::get();
-  if (!c.device || n <= 0 || a.off % 16 || !detail_::quant_ok_(type, k, W)) return false;
-  detail_::bind_(c, type == 12   ? nn_kernel::gemv_q4k
-                    : type == 14 ? nn_kernel::gemv_q6k
-                                 : nn_kernel::gemv_q80);
+  const detail_::quant_fmt* f = detail_::quant_ok_(type, k, W);
+  if (!c.device || n <= 0 || a.off % 16 || !f) return false;
+  detail_::bind_(c, f->gemv);
   detail_::set_buf_(c.enc, a, 0ul);
   detail_::set_buf_(c.enc, W, 1ul);
   detail_::set_buf_(c.enc, y, 2ul);
@@ -495,15 +520,12 @@ inline bool own_nn::embed_row(int type, gpu::span W, gpu::span idx, gpu::span ou
                               int64_t k, int64_t rows, int64_t row_stride,
                               int64_t col_stride, float scale) {
   auto& c = context::get();
-  const bool q = type == 12 || type == 14 || type == 8;
-  if (!c.device || scale != 1.0f ||
-      (q ? !detail_::quant_ok_(type, k, W) : type != 0 && type != 30))
-    return false;
+  const bool plain = type == 0 || type == 30;
+  const detail_::quant_fmt* f = plain ? nullptr : detail_::quant_ok_(type, k, W);
+  if (!c.device || scale != 1.0f || (!plain && !f)) return false;
   detail_::bind_(c, type == 0    ? nn_kernel::embed_row_f32
                     : type == 30 ? nn_kernel::embed_row_bf16
-                    : type == 12 ? nn_kernel::embed_row_q4k
-                    : type == 14 ? nn_kernel::embed_row_q6k
-                                 : nn_kernel::embed_row_q80);
+                                 : f->embed);
   detail_::set_buf_(c.enc, W, 0ul);
   detail_::set_buf_(c.enc, idx, 1ul);
   detail_::set_buf_(c.enc, out, 2ul);
@@ -525,14 +547,10 @@ inline bool own_nn::gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
                                int64_t ldc, bool mmq) {
   (void)mmq;
   auto& c = context::get();
-  if (!c.device || a16 || m <= 0 || n <= 0 || ldc < n ||
-      !detail_::quant_ok_(type, k, W))
-    return false;
+  const detail_::quant_fmt* f = detail_::quant_ok_(type, k, W);
+  if (!c.device || a16 || m <= 0 || n <= 0 || ldc < n || !f) return false;
   const detail_::steel_grid g = detail_::steel_grid_(m, n);
-  const bool s = g.band32;
-  detail_::bind_(c, type == 12   ? (s ? nn_kernel::gemm_q4k_32 : nn_kernel::gemm_q4k)
-                    : type == 14 ? (s ? nn_kernel::gemm_q6k_32 : nn_kernel::gemm_q6k)
-                                 : (s ? nn_kernel::gemm_q80_32 : nn_kernel::gemm_q80));
+  detail_::bind_(c, g.band32 ? f->gemm32 : f->gemm);
   detail_::gemm_nt_launch_(c, g, A, W, C, m, n, k, ldc);
   return true;
 }

@@ -942,8 +942,8 @@ struct read_bf16_ {
 // they lie; include/ggml_quant.h has the formats in words and the CPU
 // reference). A Q4_K row is whole 144-byte blocks, so from a 4-byte aligned
 // weight (the host checks) its reader takes 32-bit loads (the decode GEMV,
-// llama.cpp's, 16-bit ones); Q6_K's (210) and Q8_0's (34) are only 2-byte
-// aligned, hence their 16-bit loads.
+// llama.cpp's, 16-bit ones); Q6_K's (210), Q8_0's (34) and Q5_0's (22) are
+// only 2-byte aligned, hence their 16-bit loads.
 
 // Scale and min of a Q4_K group j (0..7) from the block's 12 scale bytes held
 // as three words: ggml's get_scale_min_k4, cuda's q4k_scale_min_.
@@ -959,6 +959,11 @@ static inline uint3 q4k_scale_words_(device const uchar* b) {
 }
 static inline float half_at_(device const uchar* b) {
   return float(*reinterpret_cast<device const half*>(b));
+}
+// A 32-bit word from two 16-bit loads (a 2-byte aligned block).
+static inline uint ld32_h_(device const uchar* b) {
+  device const ushort* s = reinterpret_cast<device const ushort*>(b);
+  return uint(s[0]) | (uint(s[1]) << 16);
 }
 
 // One weight, k of its row: the dequantization the CPU reference does, op for
@@ -1052,6 +1057,40 @@ struct read_q80_ {
   }
 };
 
+// Q5_0, 22 bytes a block of 32: d, the fifth bits qh (bit e of the 32-bit word
+// element e's), then qs, whose byte j holds element j's low four bits in its low
+// nibble and element j + 16's in its high one; weight d * (q - 16), as ggml's
+// dequantize_row_q5_0 (cuda's q50_vals_).
+// The eight q - 16 of the elements o.. of block b (o % 8 == 0), by 16-bit loads
+// (two for qh, four for qs): the one reading of a Q5_0 block, which the reader
+// and the GEMV share.
+static inline void q50_vals8_(device const uchar* b, uint o, thread float* q) {
+  const uint qh = ld32_h_(b + 2), sh = (o & 16u) ? 4u : 0u;  // elements 16.. high nibbles
+  device const ushort* q16 = reinterpret_cast<device const ushort*>(b + 6 + (o & 15u));
+  for (uint i = 0; i < 4; i++) {
+    const uint w = q16[i], e = o + 2 * i;
+    q[2 * i] = float(int(((w >> sh) & 0xFu) | (((qh >> e) & 1u) << 4)) - 16);
+    q[2 * i + 1] = float(int(((w >> (8u + sh)) & 0xFu) | (((qh >> (e + 1u)) & 1u) << 4)) - 16);
+  }
+}
+struct read_q50_ {
+  static constexpr constant uint ELEMS = 32, BYTES = 22;
+  device const uchar* W;
+  uint row_bytes;
+  float operator()(uint n, uint k) const {
+    device const uchar* b = W + (ulong)n * row_bytes + (k >> 5) * BYTES;
+    float q[8];
+    q50_vals8_(b, k & 24u, q);
+    return half_at_(b) * q[k & 7u];
+  }
+  void vec(uint n, uint k, thread float* v) const {
+    device const uchar* b = W + (ulong)n * row_bytes + (k >> 5) * BYTES;
+    q50_vals8_(b, k & 31u, v);
+    const float d = half_at_(b);
+    for (uint i = 0; i < 8; i++) v[i] *= d;
+  }
+};
+
 #define TL_READ_BF16 (read_bf16_{B, p.K})
 #define TL_READ_Q(L) (L{B, p.K / L::ELEMS * L::BYTES})
 
@@ -1072,6 +1111,8 @@ TL_STEEL_KERNEL_SRC(gemm_q6k_nt_, 64, false, true, uchar, TL_READ_Q(read_q6k_))
 TL_STEEL_KERNEL_SRC(gemm_q6k_nt32_, 32, false, true, uchar, TL_READ_Q(read_q6k_))
 TL_STEEL_KERNEL_SRC(gemm_q80_nt_, 64, false, true, uchar, TL_READ_Q(read_q80_))
 TL_STEEL_KERNEL_SRC(gemm_q80_nt32_, 32, false, true, uchar, TL_READ_Q(read_q80_))
+TL_STEEL_KERNEL_SRC(gemm_q50_nt_, 64, false, true, uchar, TL_READ_Q(read_q50_))
+TL_STEEL_KERNEL_SRC(gemm_q50_nt32_, 32, false, true, uchar, TL_READ_Q(read_q50_))
 
 // ---- one row of a table into f32, the row the f32 index idx[0] names (a
 // decode step's input, from the token the last step's argmax_to left; an
@@ -1105,6 +1146,7 @@ TL_EMBED_ROW(embed_row_bf16_, ushort, (read_bf16_s_{B, p.rs, p.cs}))
 TL_EMBED_ROW(embed_row_q4k_, uchar, TL_READ_Q(read_q4k_))
 TL_EMBED_ROW(embed_row_q6k_, uchar, TL_READ_Q(read_q6k_))
 TL_EMBED_ROW(embed_row_q80_, uchar, TL_READ_Q(read_q80_))
+TL_EMBED_ROW(embed_row_q50_, uchar, TL_READ_Q(read_q50_))
 #undef TL_EMBED_ROW
 #undef TL_READ_Q
 #undef TL_READ_BF16
@@ -1217,10 +1259,6 @@ struct gemv_q4k_dot_ {
 // Q6_K, two blocks at a time: lane = 16 * which + 8 * half + j reads the 4
 // consecutive positions 4j.. of its 128-weight half in each of the four
 // 32-weight quarters (4 + 4 bytes of ql, 4 of qh, 16 activations).
-static inline uint ld32_h_(device const uchar* b) {
-  device const ushort* s = reinterpret_cast<device const ushort*>(b);
-  return uint(s[0]) | (uint(s[1]) << 16);
-}
 struct gemv_q6k_dot_ {
   using L = read_q6k_;
   static void accumulate(thread float* acc, device const float* a, gemv_q_rows_<L> w,
@@ -1285,6 +1323,30 @@ struct gemv_q80_dot_ {
   }
 };
 
+// Q5_0, as Q8_0's: eight blocks at a time, lane = 4 * which + j taking the
+// elements 8j.. of its block (q50_vals8_) and the 8 activations they
+// multiply. y_n = sum d*(q - 16)*a.
+struct gemv_q50_dot_ {
+  using L = read_q50_;
+  static void accumulate(thread float* acc, device const float* a, gemv_q_rows_<L> w,
+                         uint nb, uint lane) {
+    const uint j = lane & 3u;
+    for (uint ib = lane >> 2; ib < nb; ib += 8) {
+      device const float4* ap =
+          reinterpret_cast<device const float4*>(a + (ulong)ib * 32u + 8u * j);
+      const float4 a0 = ap[0], a1 = ap[1];
+      _Pragma("clang loop unroll(full)")
+      for (uint r = 0; r < QROWS; r++) {
+        device const uchar* b = w.block(r, ib);
+        float q[8];
+        q50_vals8_(b, 8u * j, q);
+        acc[r] += half_at_(b) * (dot(float4(q[0], q[1], q[2], q[3]), a0) +
+                                 dot(float4(q[4], q[5], q[6], q[7]), a1));
+      }
+    }
+  }
+};
+
 #define TL_GEMV_Q(name, F)                                                   \
   template [[host_name(name)]] kernel void gemv_q_<F>(                       \
       device const float*, device const uchar*, device float*,               \
@@ -1292,6 +1354,7 @@ struct gemv_q80_dot_ {
 TL_GEMV_Q("gemv_q4k_", gemv_q4k_dot_)
 TL_GEMV_Q("gemv_q6k_", gemv_q6k_dot_)
 TL_GEMV_Q("gemv_q80_", gemv_q80_dot_)
+TL_GEMV_Q("gemv_q50_", gemv_q50_dot_)
 #undef TL_GEMV_Q
 
 // ---------------------------------------------------------------------------

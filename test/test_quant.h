@@ -48,15 +48,11 @@ quant_rows random_quant_rows(int type, int64_t N, int64_t K, unsigned seed) {
 }
 
 // Whether the backend reads `type`'s blocks in rows of k (gpu::quant_reads), held to
-// what it must: a backend with the block kernels reads Q4_K, Q6_K and Q8_0, and
-// CUDA Q5_0 too, so a test skipping a format it does not read skips none it must.
+// what it must: a backend with the block kernels reads all four (Q4_K, Q6_K, Q8_0
+// and Q5_0), so a test skipping a format it does not read skips none it must.
 inline bool reads_quant(int type, int64_t k) {
   const bool reads = tl::gpu::quant_reads(type, k);
-#if defined(TENSORLIB_CUDA)
   CHECK(reads);
-#else
-  if (type != 6) CHECK(reads);
-#endif
   return reads;
 }
 
