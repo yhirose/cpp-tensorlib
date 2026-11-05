@@ -3842,12 +3842,73 @@ extern "C" __global__ void tl_attn_bwd_dkv_f32_64(const float* q, const float* K
   attn_bwd_dkv_core<64, 2>(q, K, V, dO, stats, dK, dV, T, scale);
 }
 
+// sin and cos of x at libm's accuracy over the float range, in registers: the WGSL kernels'
+// sincos_libm, Payne and Hanek's reduction in integers (x less k pi/2, k the nearest
+// integer) and Cephes' sinf / cosf polynomials on what remains (|r| <= pi/4). CUDA's own
+// sincosf reduces |x| > 105615 through an array in local memory, which gave every kernel
+// that turned a RoPE pair a frame, rmsnorm_rope's also its row's values (check_cuda,
+// tools/check_cuda_frames.py). Within 2.75 ulp of sin and cos over every finite float, as
+// the WGSL's (CUDA's sincosf: 2).
+//
+// 2/pi in 32-bit windows 8 bits apart, W8[i] = floor(2/pi 2^(8 i)) mod 2^32.
+static __device__ const unsigned two_over_pi_w8_[25] = {
+    0x00000000u, 0x000000a2u, 0x0000a2f9u, 0x00a2f983u, 0xa2f9836eu, 0xf9836e4eu, 0x836e4e44u,
+    0x6e4e4415u, 0x4e441529u, 0x441529fcu, 0x1529fc27u, 0x29fc2757u, 0xfc2757d1u, 0x2757d1f5u,
+    0x57d1f534u, 0xd1f534ddu, 0xf534ddc0u, 0x34ddc0dbu, 0xddc0db62u, 0xc0db6295u, 0xdb629599u,
+    0x6295993cu, 0x95993c43u, 0x993c4390u, 0x3c439041u};
+__device__ __forceinline__ void sincos_libm_(float x, float& s, float& c) {
+  const unsigned ux = __float_as_uint(x);
+  float r = x;
+  unsigned q = 0;
+  if ((ux & 0x7f800000u) == 0x7f800000u) {  // inf or NaN
+    s = c = __uint_as_float(0x7fc00000u);
+    return;
+  }
+  if (fabsf(x) >= 0.785398185f) {  // past pi/4, the polynomials' range
+    // |x| = m 2^(e-23); |x| 2/pi mod 4 is m times the bits of 2/pi from the one where
+    // m's product stops being a multiple of 4. The exponent's high bits pick the window
+    // and its low three shift m, so the product's binary point sits at bit 62 of v.
+    const unsigned be = (ux >> 23) & 0xffu, i = (be - 120u) >> 3;
+    const unsigned m = ((ux & 0x7fffffu) | 0x800000u) << (be & 7u);
+    unsigned long long v = ((unsigned long long)(m * two_over_pi_w8_[i]) << 32) +
+                           (unsigned long long)m * two_over_pi_w8_[i + 4] +
+                           (((unsigned long long)m * two_over_pi_w8_[i + 8]) >> 32);
+    const unsigned k = (unsigned)((v + (1ull << 61)) >> 62);  // the nearest quadrant, mod 4
+    v -= (unsigned long long)k << 62;                          // the fraction, |.| <= 1/2
+    const bool neg = (long long)v < 0;
+    if (neg) v = 0ull - v;
+    float frac = 0.0f;
+    if (v) {
+      const int lz = __clzll(v);
+      // times 2^(-30 - lz), built from its bits: lz is 2..63 (|v| <= 2^61), so the scale
+      // is a normal power of two and the product exact, as ldexpf's.
+      frac = (float)(unsigned)((v << lz) >> 32) * __uint_as_float((97u - (unsigned)lz) << 23);
+    }
+    r = (neg ? -frac : frac) * 1.57079637f;
+    q = k & 3u;
+    if (x < 0.0f) {
+      r = -r;
+      q = (4u - q) & 3u;
+    }
+  }
+  // Cephes' sinf and cosf polynomials, each fused multiply-add named.
+  const float z = r * r;
+  const float sp = __fmaf_rn(r * z, __fmaf_rn(z, __fmaf_rn(z, -1.9515295891e-4f, 8.3321608736e-3f),
+                                              -1.6666654611e-1f), r);
+  const float cp = __fmaf_rn(z * z, __fmaf_rn(z, __fmaf_rn(z, 2.443315711809948e-5f,
+                                                           -1.388731625493765e-3f),
+                                              4.166664568298827e-2f),
+                             __fmaf_rn(-0.5f, z, 1.0f));
+  // sin(k pi/2 + r) by k mod 4; cos(x) is sin(x + pi/2), a quadrant on.
+  s = q == 0 ? sp : q == 1 ? cp : q == 2 ? -sp : -cp;
+  c = q == 0 ? cp : q == 1 ? -sp : q == 2 ? -cp : sp;
+}
 // RoPE's turn of the pair (x0, x1) at dims (j, j + rot/2) of a row at `position`
 // (rope_core below; every rotation here goes through it, so they agree bit for bit).
 // The angle is formed in f32, as the frameworks the models are trained in form it;
-// its base^(-2j/rot), sin and cos are libm's (powf, sincosf), not the intrinsics':
-// the angle grows with the position past where __sinf / __cosf stay accurate
-// (|x| <= pi), and carries the power's relative error times the position. factors
+// its base^(-2j/rot) is libm's powf and its sin and cos sincos_libm_'s, not the
+// intrinsics': the angle grows with the position past where __sinf / __cosf stay
+// accurate (|x| <= pi), and carries the power's relative error times the position. factors
 // are the pairs' (gpu::rope_freq's), each dividing its angle as llama.cpp's freq
 // factors do; none (null) is 1, which leaves the angle as it was.
 __device__ __forceinline__ void rope_pair_(float position, unsigned j, unsigned rot, float base,
@@ -3856,7 +3917,7 @@ __device__ __forceinline__ void rope_pair_(float position, unsigned j, unsigned 
   const float ff = factors ? factors[j] : 1.0f;
   const float ang = position * powf(base, -2.0f * (float)j / (float)rot) / ff;
   float s, c;
-  sincosf(ang, &s, &c);
+  sincos_libm_(ang, s, c);
   // r1's fused multiply-add named (x0 s fused, x1 c rounded first, the form rope_core
   // had): left to contraction, the compiler fused whichever product suited the code
   // around each copy, and the copies stopped agreeing bit for bit. r0 stays as written,
@@ -3899,7 +3960,9 @@ __device__ __forceinline__ void rmsnorm_rope_core_(float* __restrict__ x, const 
   for (int k = 0; k < E / 2; k++) {
     if ((unsigned)k >= P) break;
     const unsigned t = lane + 32 * k;
-    float x0 = v[k] * inv * w[t], x1 = v[k + P] * inv * w[t + half];
+    // The pair's second value read back from the row, which holds it until this turn
+    // writes it: v[k + P], P the runtime rot's, put v in local memory.
+    float x0 = v[k] * inv * w[t], x1 = xr[t + half] * inv * w[t + half];
     rope_pair_(position, t, rot, base, factors, x0, x1);
     xr[t] = x0;
     xr[t + half] = x1;

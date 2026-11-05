@@ -97,6 +97,11 @@ jobs:
       - name: Layers (CUDA kernels)
         if: runner.os == 'Linux'
         run: python3 tools/check_layers.py --nvcc
+      # No kernel keeps an array in local memory: ptxas's report of each kernel's
+      # frame for the RTX 3090's arch, as check_cuda holds on a GPU.
+      - name: Frames (CUDA kernels)
+        if: runner.os == 'Linux'
+        run: python3 tools/check_cuda_frames.py build/tensorlib_cuda.ptx
 
   # WebGPU (wasm) backend. Unlike cuda-build this does not stop at building —
   # it runs the suite.
