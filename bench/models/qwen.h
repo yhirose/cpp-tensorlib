@@ -424,11 +424,11 @@ struct wmat {
 constexpr int bf16_type = static_cast<int>(gg::ggml_type::bf16);
 
 // y = W . a, a GEMV a run. In a prepared form f (gpu::act_form, into `pa`, room for
-// gpu::act_bytes_max) the Q4_K runs read the activation as that form makes it,
-// prepared once for the call: int8 (q8) or f16 on the tensor cores (h16) is what
-// makes them run at the weights' bandwidth rather than at the float kernel's
-// instruction rate. The other formats, f32, and a form the backend has not got read
-// it as float.
+// gpu::act_bytes_max) the runs whose format has a GEMV for that form
+// (gpu::quant_act_reads) read the activation as the form makes it, prepared once for
+// the call: int8 (q8) or f16 on the tensor cores (h16) is what makes them run at the
+// weights' bandwidth rather than at the float kernel's instruction rate. The other
+// runs, f32, and a form the backend has not got read it as float.
 inline void gemv_m(const wmat& W, gpu::span a, gpu::span y,
                    gpu::act_form f = gpu::act_form::f32, gpu::span pa = {}) {
   bool prepared = false;
@@ -438,10 +438,10 @@ inline void gemv_m(const wmat& W, gpu::span a, gpu::span y,
       gpu::gemv_bf16_row(a, w, out, p.rows, W.K);
       continue;
     }
-    if (p.type == 12 && (prepared || gpu::prepare_act(f, a, pa, W.K))) {
-      prepared = true;
-      if (gpu::gemv_q4k_act(f, pa, w, out, p.rows, W.K)) continue;
-    }
+    if (gpu::quant_act_reads(p.type, f, W.K) &&
+        (prepared || (prepared = gpu::prepare_act(f, a, pa, W.K))) &&
+        gpu::gemv_quant_act(p.type, f, pa, w, out, p.rows, W.K))
+      continue;
     gpu::gemv_quant(p.type, a, w, out, p.rows, W.K);
   }
 }
@@ -582,7 +582,7 @@ struct Layer {
 // (qkvb, gub).
 struct Scratch {
   storage res[2];       // residual ping-pong [NE]
-  storage act;          // a Q4_K GEMV's activation prepared in Model::gemv_form
+  storage act;          // a block-quantized GEMV's activation prepared in Model::gemv_form
   storage hb;           // input-norm out [NE]
   storage h2b;          // post-attn norm out [NE]
   storage qb;           // [NH*HD] query fixture (bench_qwen_ctx's isolated-
@@ -713,7 +713,8 @@ struct Model {
   array outwT_q4;             // q4 lm_head (imperative decode, when q4_lmhead)
   tl::dtype wdt = tl::dtype::f32;  // the float weights' dtype, as build() chose
                                    // (bf16 under quant, whose projections are blocks)
-  // The form the decode's Q4_K GEMVs read their activation in (TL_GEMV_ACT).
+  // The form the decode's block-quantized GEMVs read their activation in, where their
+  // format has a GEMV for it (TL_GEMV_ACT; gpu::quant_act_reads).
   gpu::act_form gemv_form = gpu::act_form::f32;
   bool mmq = false;           // prefill Q4_K / Q8_0 GEMMs on the int8 tensor cores (TL_NO_MMQ: f16)
   bool quant = false;         // the projections are block-quantized blocks, read as such

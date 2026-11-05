@@ -1350,7 +1350,8 @@ __device__ __forceinline__ void dq8_q80_(const unsigned char* row, unsigned gk, 
 // The 32-weight formats Q5_0, Q4_0 and Q4_1 hold their four low bits alike: 16 bytes,
 // byte j element j's in its low nibble and element j + 16's in its high one. The
 // nibbles of elements o .. o + 7 (o % 8 == 0) from those bytes at qs, by 16-bit loads
-// (the blocks are 2-byte aligned only): the one reading of them.
+// (the blocks are 2-byte aligned only), for the float GEMVs, the dequantization and the
+// row lookup (the int8 GEMVs read them in place).
 __device__ __forceinline__ void nib32_(const unsigned char* qs, unsigned o, unsigned (&n)[8]) {
   const unsigned short* q16 = reinterpret_cast<const unsigned short*>(qs + (o & 15u));
   const unsigned sh = o & 16u ? 4u : 0u;  // elements 16.. are the high nibbles
@@ -2265,7 +2266,8 @@ __global__ void tl_gemv_q5k_row(const float* __restrict__ a, const unsigned char
   gemv_row_block_store(acc, lane, warp, nwarps, y + n);
 }
 
-// ---- Q4_K . int8 activations (llama.cpp's q8_1 scheme, and what its Q4_K GEMV does).
+// ---- Block-quantized rows . int8 activations (form q8: llama.cpp's q8_1 scheme, and what
+// its GEMVs do), Q4_K's first.
 // The float kernel above is bound by its instructions, not by bytes: every weight
 // is a nibble shifted out, converted and multiplied on its own, ~12 instructions a
 // weight, and it runs as slowly with its weights held in the cache (a Q4_K GEMV at
@@ -2298,32 +2300,50 @@ __global__ void tl_quant_act_q8(const float* __restrict__ a, signed char* __rest
 // bytes of its superblock (16 low-nibble weights of group 2*pair and 16 high of
 // group 2*pair+1, positions 16*half..) and the 16 + 16 int8 activations they meet.
 // The group's min term (dmin * m * sum of the group) is taken by the half-0 lane.
-TL_ALIGN(tl_gemv_q4k_q8_row, 16, 8, 16)
-__global__ void tl_gemv_q4k_q8_row(const signed char* __restrict__ qa, const float2* __restrict__ ds,
-                                   const unsigned char* __restrict__ W, float* __restrict__ y,
-                                   unsigned N, unsigned K) {
+// Q5_K the same, its quants at byte 48 and the fifth bits beside: the lane's 16 bytes
+// of qh at 16 * half, bit 2*pair of byte i weight i's in group 2*pair, bit 2*pair+1
+// in group 2*pair+1, put at bit 4 of each byte (q up to 31, still an int8).
+}  // extern "C"
+template <bool Q5>
+static __device__ __forceinline__ void kq8_row_(const signed char* __restrict__ qa,
+                                                const float2* __restrict__ ds,
+                                                const unsigned char* __restrict__ W,
+                                                float* __restrict__ y, unsigned N, unsigned K) {
+  constexpr unsigned bb = Q5 ? 176u : 144u, qs = Q5 ? 48u : 16u;
   const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
   const unsigned n = blockIdx.x * (blockDim.x >> 5) + warp;
   if (n >= N) return;
   const unsigned nb = K / 256u, sbl = lane >> 3, p = (lane & 7u) >> 1, hf = lane & 1u;
-  const unsigned char* row = W + (size_t)n * nb * 144u;
+  const unsigned char* row = W + (size_t)n * nb * bb;
   float acc = 0.0f;
   for (unsigned ib = sbl; ib < nb; ib += 4) {
-    const unsigned char* b = row + (size_t)ib * 144u;
+    const unsigned char* b = row + (size_t)ib * bb;
     const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(b));  // d, dmin
     const uint3 sw = *reinterpret_cast<const uint3*>(b + 4);
-    const uint4 q = *reinterpret_cast<const uint4*>(b + 16 + 32 * p + 16 * hf);
+    const uint4 q = *reinterpret_cast<const uint4*>(b + qs + 32 * p + 16 * hf);
     const signed char* ap = qa + (size_t)ib * 256u + 64u * p + 16u * hf;
     const uint4 al = *reinterpret_cast<const uint4*>(ap), ah = *reinterpret_cast<const uint4*>(ap + 32);
+    unsigned lo[4] = {q.x & 0x0F0F0F0Fu, q.y & 0x0F0F0F0Fu, q.z & 0x0F0F0F0Fu, q.w & 0x0F0F0F0Fu};
+    unsigned hi[4] = {(q.x >> 4) & 0x0F0F0F0Fu, (q.y >> 4) & 0x0F0F0F0Fu, (q.z >> 4) & 0x0F0F0F0Fu,
+                      (q.w >> 4) & 0x0F0F0F0Fu};
+    if constexpr (Q5) {
+      const uint4 h = *reinterpret_cast<const uint4*>(b + 16 + 16 * hf);
+      const unsigned hw[4] = {h.x >> (2 * p), h.y >> (2 * p), h.z >> (2 * p), h.w >> (2 * p)};
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        lo[i] |= (hw[i] & 0x01010101u) << 4;
+        hi[i] |= (hw[i] & 0x02020202u) << 3;
+      }
+    }
     int sl = 0, sh = 0;
-    sl = __dp4a((int)(q.x & 0x0F0F0F0Fu), (int)al.x, sl);
-    sl = __dp4a((int)(q.y & 0x0F0F0F0Fu), (int)al.y, sl);
-    sl = __dp4a((int)(q.z & 0x0F0F0F0Fu), (int)al.z, sl);
-    sl = __dp4a((int)(q.w & 0x0F0F0F0Fu), (int)al.w, sl);
-    sh = __dp4a((int)((q.x >> 4) & 0x0F0F0F0Fu), (int)ah.x, sh);
-    sh = __dp4a((int)((q.y >> 4) & 0x0F0F0F0Fu), (int)ah.y, sh);
-    sh = __dp4a((int)((q.z >> 4) & 0x0F0F0F0Fu), (int)ah.z, sh);
-    sh = __dp4a((int)((q.w >> 4) & 0x0F0F0F0Fu), (int)ah.w, sh);
+    sl = __dp4a((int)lo[0], (int)al.x, sl);
+    sl = __dp4a((int)lo[1], (int)al.y, sl);
+    sl = __dp4a((int)lo[2], (int)al.z, sl);
+    sl = __dp4a((int)lo[3], (int)al.w, sl);
+    sh = __dp4a((int)hi[0], (int)ah.x, sh);
+    sh = __dp4a((int)hi[1], (int)ah.y, sh);
+    sh = __dp4a((int)hi[2], (int)ah.z, sh);
+    sh = __dp4a((int)hi[3], (int)ah.w, sh);
     const int g0 = 2 * (int)p, g1 = g0 + 1;  // scale / min of groups 2p, 2p+1
     int s0, m0, s1, m1;
     q4k_scale_min_(sw, g0, s0, m0);
@@ -2337,8 +2357,23 @@ __global__ void tl_gemv_q4k_q8_row(const signed char* __restrict__ qa, const flo
   for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
   if (lane == 0) y[n] = acc;
 }
+TL_ALIGN(tl_gemv_q4k_q8_row, 16, 8, 16)
+extern "C" __global__ void tl_gemv_q4k_q8_row(const signed char* __restrict__ qa,
+                                              const float2* __restrict__ ds,
+                                              const unsigned char* __restrict__ W,
+                                              float* __restrict__ y, unsigned N, unsigned K) {
+  kq8_row_<false>(qa, ds, W, y, N, K);
+}
+TL_ALIGN(tl_gemv_q5k_q8_row, 16, 8, 16)
+extern "C" __global__ void tl_gemv_q5k_q8_row(const signed char* __restrict__ qa,
+                                              const float2* __restrict__ ds,
+                                              const unsigned char* __restrict__ W,
+                                              float* __restrict__ y, unsigned N, unsigned K) {
+  kq8_row_<true>(qa, ds, W, y, N, K);
+}
+extern "C" {
 
-// ---- Q4_K . f16 activations on the tensor cores (form h16): exact products and f32
+// ---- Q4_K and Q5_K . f16 activations on the tensor cores (form h16): exact products and f32
 // sums, so the result is the float kernel's on the activation rounded to f16 (to f32
 // summation), near the int8 kernel's speed. The float kernel pays ~12 instructions
 // a weight (above); here a pair of nibbles becomes f16 in two instructions and the
@@ -2390,13 +2425,13 @@ static __device__ __forceinline__ unsigned q4k_h16_pair_(int v) {
   const __half2 p = __half2half2(__int2half_rn(v));
   return *reinterpret_cast<const unsigned*>(&p);
 }
-// q * sc for the two nibbles a masked word holds in bits 0-3 and 16-19, as an f16 pair,
-// exactly: OR-ing 0x6400 makes each half 1024 + q, and fma(1024 + q, sc, -1024 sc) = q sc,
-// an integer <= 15 * 63 = 945 that f16 holds (as it does -1024 * 63 = -64512), rounded
-// once. sc2 / nsc2: q4k_h16_pair_(sc) and q4k_h16_pair_(-1024 * sc).
-static __device__ __forceinline__ unsigned q4k_h16_qsc_(unsigned nib2, unsigned sc2,
-                                                        unsigned nsc2) {
-  const unsigned w = (nib2 & 0x000F000Fu) | 0x64006400u;
+// q * sc for the two q a word holds in bits 0-4 and 16-20 (q < 32, the rest of the
+// word clear), as an f16 pair, exactly: OR-ing 0x6400 makes each half 1024 + q, and
+// fma(1024 + q, sc, -1024 sc) = q sc, an integer <= 31 * 63 = 1953 that f16 holds (as it
+// does -1024 * 63 = -64512), rounded once. sc2 / nsc2: q4k_h16_pair_(sc) and
+// q4k_h16_pair_(-1024 * sc).
+static __device__ __forceinline__ unsigned h16_qsc_(unsigned q2, unsigned sc2, unsigned nsc2) {
+  const unsigned w = q2 | 0x64006400u;
   const __half2 r = __hfma2(*reinterpret_cast<const __half2*>(&w),
                             *reinterpret_cast<const __half2*>(&sc2),
                             *reinterpret_cast<const __half2*>(&nsc2));
@@ -2407,28 +2442,42 @@ static __device__ __forceinline__ unsigned q4k_h16_qsc_(unsigned nib2, unsigned 
 // bytes 0, 1 go to the mma k slots 2t, 2t+1 and bytes 2, 3 to 2t+8, 2t+9 (__byte_perm
 // spreads them to the halves); B, the activation's same four values (16 of group lo at
 // a, of group hi at a + 32), is the same in every column, so each column of the
-// accumulator is the row's sum: c[0] row g, c[2] row g + 8. 8 mma.
-static __device__ __forceinline__ void q4k_h16_chunk_(float* c, uint4 x, uint4 y,
-                                                      const unsigned* sx, const unsigned* sy,
-                                                      const __half* a) {
+// accumulator is the row's sum: c[0] row g, c[2] row g + 8. 8 mma. Q5_K: hx / hy are
+// the rows' fifth bits of the same elements, a byte each, bit 0 group lo's and bit 1
+// group hi's.
+}  // extern "C"
+template <bool Q5>
+static __device__ __forceinline__ void kh16_chunk_(float* c, uint4 x, uint4 y, uint4 hx, uint4 hy,
+                                                   const unsigned* sx, const unsigned* sy,
+                                                   const __half* a) {
   const uint4 l0 = *reinterpret_cast<const uint4*>(a), l1 = *reinterpret_cast<const uint4*>(a + 8);
   const uint4 h0 = *reinterpret_cast<const uint4*>(a + 32),
               h1 = *reinterpret_cast<const uint4*>(a + 40);
   const unsigned la[8] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w};
   const unsigned ha[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
   const unsigned wx[4] = {x.x, x.y, x.z, x.w}, wy[4] = {y.x, y.y, y.z, y.w};
+  const unsigned bx[4] = {hx.x, hx.y, hx.z, hx.w}, by[4] = {hy.x, hy.y, hy.z, hy.w};
 #pragma unroll
   for (int j = 0; j < 4; j++) {
     const unsigned x01 = __byte_perm(wx[j], 0u, 0x4140u), x23 = __byte_perm(wx[j], 0u, 0x4342u);
     const unsigned y01 = __byte_perm(wy[j], 0u, 0x4140u), y23 = __byte_perm(wy[j], 0u, 0x4342u);
+    // The fifth bits of the same four elements (Q5_K; Q4_K's are 0), spread the same way.
+    const unsigned u01 = __byte_perm(bx[j], 0u, 0x4140u), u23 = __byte_perm(bx[j], 0u, 0x4342u);
+    const unsigned v01 = __byte_perm(by[j], 0u, 0x4140u), v23 = __byte_perm(by[j], 0u, 0x4342u);
+    const auto lo = [](unsigned n, unsigned h) {
+      return Q5 ? (n & 0x000F000Fu) | ((h & 0x00010001u) << 4) : n & 0x000F000Fu;
+    };
+    const auto hi = [](unsigned n, unsigned h) {
+      return Q5 ? ((n >> 4) & 0x000F000Fu) | ((h & 0x00020002u) << 3) : (n >> 4) & 0x000F000Fu;
+    };
     // sx / sy: (sc, -1024 sc) pairs of group lo, then of group hi, for rows g / g + 8.
-    unsigned A[4] = {q4k_h16_qsc_(x01, sx[0], sx[1]), q4k_h16_qsc_(y01, sy[0], sy[1]),
-                     q4k_h16_qsc_(x23, sx[0], sx[1]), q4k_h16_qsc_(y23, sy[0], sy[1])};
+    unsigned A[4] = {h16_qsc_(lo(x01, u01), sx[0], sx[1]), h16_qsc_(lo(y01, v01), sy[0], sy[1]),
+                     h16_qsc_(lo(x23, u23), sx[0], sx[1]), h16_qsc_(lo(y23, v23), sy[0], sy[1])};
     tc_mma_(c, A, la[2 * j], la[2 * j + 1], __half());
-    A[0] = q4k_h16_qsc_(x01 >> 4, sx[2], sx[3]);
-    A[1] = q4k_h16_qsc_(y01 >> 4, sy[2], sy[3]);
-    A[2] = q4k_h16_qsc_(x23 >> 4, sx[2], sx[3]);
-    A[3] = q4k_h16_qsc_(y23 >> 4, sy[2], sy[3]);
+    A[0] = h16_qsc_(hi(x01, u01), sx[2], sx[3]);
+    A[1] = h16_qsc_(hi(y01, v01), sy[2], sy[3]);
+    A[2] = h16_qsc_(hi(x23, u23), sx[2], sx[3]);
+    A[3] = h16_qsc_(hi(y23, v23), sy[2], sy[3]);
     tc_mma_(c, A, ha[2 * j], ha[2 * j + 1], __half());
   }
 }
@@ -2438,32 +2487,47 @@ static __device__ __forceinline__ void q4k_h16_chunk_(float* c, uint4 x, uint4 y
 // groups). A superblock's 16 mma sum into a fresh accumulator, which d and the
 // superblock's activation scale then multiply; the min term (dmin m times the group's
 // sum) is f32, its 8 groups split over the quad. ~110 registers; capping them for more
-// blocks a multiprocessor spills, at half the speed.
-TL_ALIGN(tl_gemv_q4k_h16_row, 16, 4, 4, 16)
-__global__ void __launch_bounds__(128, 1)
-    tl_gemv_q4k_h16_row(const __half* __restrict__ ah, const float* __restrict__ sums,
-                        const float* __restrict__ scales, const unsigned char* __restrict__ W,
-                        float* __restrict__ y, unsigned N, unsigned K) {
+// blocks a multiprocessor spills, at half the speed. Q5_K as Q4_K, its quants at byte 48
+// and its fifth bits (qh, 32 bytes at 16: bit 2 * pair of byte l element l's of the
+// pair's low group, bit 2 * pair + 1 of its high one) beside them: chunks t and t + 4
+// share elements, so one 16-byte read of qh a row serves both.
+template <bool Q5>
+static __device__ __forceinline__ void kh16_row_(const __half* __restrict__ ah,
+                                                 const float* __restrict__ sums,
+                                                 const float* __restrict__ scales,
+                                                 const unsigned char* __restrict__ W,
+                                                 float* __restrict__ y, unsigned N, unsigned K) {
+  constexpr unsigned bb = Q5 ? 176u : 144u, qs = Q5 ? 48u : 16u;
   const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3u;
   const unsigned nb = K / 256u, r0 = blockIdx.x * 16u + g;
   // The last block's rows past N read row N - 1 and store nothing.
-  const unsigned char* row0 = W + (size_t)min(r0, N - 1u) * nb * 144u;
-  const unsigned char* row1 = W + (size_t)min(r0 + 8u, N - 1u) * nb * 144u;
+  const unsigned char* row0 = W + (size_t)min(r0, N - 1u) * nb * bb;
+  const unsigned char* row1 = W + (size_t)min(r0 + 8u, N - 1u) * nb * bb;
   const unsigned p0 = t >> 1, p1 = p0 + 2u, l0 = 16u * (t & 1u);
   const bool odd = t & 1u;  // the min term's two groups: chunk t's (t even), chunk t + 4's
   const unsigned gm = 2u * (odd ? p1 : p0);
   float acc0 = 0.0f, acc1 = 0.0f, mn0 = 0.0f, mn1 = 0.0f;
   for (unsigned ib = warp; ib < nb; ib += 4u) {
-    const unsigned char* b0 = row0 + (size_t)ib * 144u;
-    const unsigned char* b1 = row1 + (size_t)ib * 144u;
+    const unsigned char* b0 = row0 + (size_t)ib * bb;
+    const unsigned char* b1 = row1 + (size_t)ib * bb;
     const float2 dd0 = __half22float2(*reinterpret_cast<const __half2*>(b0));  // d, dmin
     const float2 dd1 = __half22float2(*reinterpret_cast<const __half2*>(b1));
     const uint3 sw0 = *reinterpret_cast<const uint3*>(b0 + 4);
     const uint3 sw1 = *reinterpret_cast<const uint3*>(b1 + 4);
-    const uint4 x0 = *reinterpret_cast<const uint4*>(b0 + 16 + 16 * t);
-    const uint4 x1 = *reinterpret_cast<const uint4*>(b0 + 16 + 16 * (t + 4));
-    const uint4 y0 = *reinterpret_cast<const uint4*>(b1 + 16 + 16 * t);
-    const uint4 y1 = *reinterpret_cast<const uint4*>(b1 + 16 + 16 * (t + 4));
+    const uint4 x0 = *reinterpret_cast<const uint4*>(b0 + qs + 16 * t);
+    const uint4 x1 = *reinterpret_cast<const uint4*>(b0 + qs + 16 * (t + 4));
+    const uint4 y0 = *reinterpret_cast<const uint4*>(b1 + qs + 16 * t);
+    const uint4 y1 = *reinterpret_cast<const uint4*>(b1 + qs + 16 * (t + 4));
+    // The fifth bits of chunks t and t + 4, each pair's at bits 0 and 1 of a byte.
+    uint4 hx0{}, hx1{}, hy0{}, hy1{};
+    if constexpr (Q5) {
+      const uint4 u = *reinterpret_cast<const uint4*>(b0 + 16 + l0);
+      const uint4 v = *reinterpret_cast<const uint4*>(b1 + 16 + l0);
+      hx0 = make_uint4(u.x >> 2 * p0, u.y >> 2 * p0, u.z >> 2 * p0, u.w >> 2 * p0);
+      hx1 = make_uint4(u.x >> 2 * p1, u.y >> 2 * p1, u.z >> 2 * p1, u.w >> 2 * p1);
+      hy0 = make_uint4(v.x >> 2 * p0, v.y >> 2 * p0, v.z >> 2 * p0, v.w >> 2 * p0);
+      hy1 = make_uint4(v.x >> 2 * p1, v.y >> 2 * p1, v.z >> 2 * p1, v.w >> 2 * p1);
+    }
     // Scales and mins of groups 2p0, 2p0 + 1, 2p1, 2p1 + 1, rows g and g + 8.
     int sc0[4], mn0g[4], sc1[4], mn1g[4];
 #pragma unroll
@@ -2482,8 +2546,8 @@ __global__ void __launch_bounds__(128, 1)
     }
     const __half* ab = ah + (size_t)ib * 256u;
     float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    q4k_h16_chunk_(c, x0, y0, sx, sy, ab + 64u * p0 + l0);
-    q4k_h16_chunk_(c, x1, y1, sx + 4, sy + 4, ab + 64u * p1 + l0);
+    kh16_chunk_<Q5>(c, x0, y0, hx0, hy0, sx, sy, ab + 64u * p0 + l0);
+    kh16_chunk_<Q5>(c, x1, y1, hx1, hy1, sx + 4, sy + 4, ab + 64u * p1 + l0);
     const float s = scales[ib];
     acc0 += (s * dd0.x) * c[0];
     acc1 += (s * dd1.x) * c[2];
@@ -2508,6 +2572,21 @@ __global__ void __launch_bounds__(128, 1)
     if (r < N) y[r] = part[0][lane] + part[1][lane] + part[2][lane] + part[3][lane];
   }
 }
+TL_ALIGN(tl_gemv_q4k_h16_row, 16, 4, 4, 16)
+extern "C" __global__ void __launch_bounds__(128, 1)
+    tl_gemv_q4k_h16_row(const __half* __restrict__ ah, const float* __restrict__ sums,
+                        const float* __restrict__ scales, const unsigned char* __restrict__ W,
+                        float* __restrict__ y, unsigned N, unsigned K) {
+  kh16_row_<false>(ah, sums, scales, W, y, N, K);
+}
+TL_ALIGN(tl_gemv_q5k_h16_row, 16, 4, 4, 16)
+extern "C" __global__ void __launch_bounds__(128, 1)
+    tl_gemv_q5k_h16_row(const __half* __restrict__ ah, const float* __restrict__ sums,
+                        const float* __restrict__ scales, const unsigned char* __restrict__ W,
+                        float* __restrict__ y, unsigned N, unsigned K) {
+  kh16_row_<true>(ah, sums, scales, W, y, N, K);
+}
+extern "C" {
 
 // Q8_0, 34 bytes a block of 32 (2-byte aligned only): a warp takes eight blocks
 // at a time, lane = 4 * which + j reading the 8 bytes 8j.. of its block and the
@@ -2609,14 +2688,74 @@ __global__ void tl_gemv_q41_row(const float* __restrict__ a, const unsigned char
   gemv_row_block_store(acc, lane, warp, nwarps, y + n);
 }
 
-// Q6_K, 210 bytes a block (2-byte aligned only, hence the 16-bit loads): a warp
-// takes two blocks at a time, lane = 16 * which + 8 * half + j reading the 4
-// consecutive positions 4j.. of its 128-weight half, in each of the four
-// 32-weight quarters (4 + 4 bytes of ql, 4 of qh, 16 activations).
+// A word read as two halves, for blocks aligned to 2 bytes only.
 __device__ __forceinline__ unsigned ld32_h(const unsigned char* p) {
   return (unsigned)*reinterpret_cast<const unsigned short*>(p) |
          ((unsigned)*reinterpret_cast<const unsigned short*>(p + 2) << 16);
 }
+// Q4_0 and Q4_1 . int8 activations (form q8; llama.cpp's vec_dot_q4_0_q8_1 and
+// _q4_1_): a warp a row, four rows a block, as the Q4_K one; lane = 2 * which + h
+// takes 8 bytes of qs (h * 8.., the elements' low nibbles, and the same bytes' high
+// nibbles, elements 16 + h * 8..), two words of two halves each (the block is 2-byte
+// aligned only), and the int8 activations they meet. Q4_0: y_n = sum d (q - 8) a, the
+// -8 d sum(a) taken from the block's activation sum by the h = 0 lane; Q4_1: y_n = sum
+// d q a + m sum(a), the same way.
+}  // extern "C"
+template <bool M1>
+static __device__ __forceinline__ void q4_q8_row_(const signed char* __restrict__ qa,
+                                                  const float2* __restrict__ ds,
+                                                  const unsigned char* __restrict__ W,
+                                                  float* __restrict__ y, unsigned N, unsigned K) {
+  constexpr unsigned bb = M1 ? 20u : 18u, qs = M1 ? 4u : 2u;
+  const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+  const unsigned n = blockIdx.x * (blockDim.x >> 5) + warp;
+  if (n >= N) return;
+  const unsigned nb = K / 32u, h = lane & 1u;
+  const unsigned char* row = W + (size_t)n * nb * bb;
+  float acc = 0.0f;
+  for (unsigned ib = lane >> 1; ib < nb; ib += 16u) {
+    const unsigned char* b = row + (size_t)ib * bb;
+    const unsigned w0 = ld32_h(b + qs + 8 * h), w1 = ld32_h(b + qs + 8 * h + 4);
+    const signed char* ap = qa + (size_t)ib * 32u + 8u * h;
+    const uint2 al = *reinterpret_cast<const uint2*>(ap), ah = *reinterpret_cast<const uint2*>(ap + 16);
+    int si = 0;
+    si = __dp4a((int)(w0 & 0x0F0F0F0Fu), (int)al.x, si);
+    si = __dp4a((int)(w1 & 0x0F0F0F0Fu), (int)al.y, si);
+    si = __dp4a((int)((w0 >> 4) & 0x0F0F0F0Fu), (int)ah.x, si);
+    si = __dp4a((int)((w1 >> 4) & 0x0F0F0F0Fu), (int)ah.y, si);
+    const float2 da = ds[ib];
+    const float d = __half2float(*reinterpret_cast<const __half*>(b));
+    float t = d * (da.x * (float)si);
+    if (h == 0) {
+      if constexpr (M1) t += __half2float(*reinterpret_cast<const __half*>(b + 2)) * da.y;
+      else t -= 8.0f * d * da.y;
+    }
+    acc += t;
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+  if (lane == 0) y[n] = acc;
+}
+TL_ALIGN(tl_gemv_q40_q8_row, 8, 8, 2)
+extern "C" __global__ void tl_gemv_q40_q8_row(const signed char* __restrict__ qa,
+                                              const float2* __restrict__ ds,
+                                              const unsigned char* __restrict__ W,
+                                              float* __restrict__ y, unsigned N, unsigned K) {
+  q4_q8_row_<false>(qa, ds, W, y, N, K);
+}
+TL_ALIGN(tl_gemv_q41_q8_row, 8, 8, 2)
+extern "C" __global__ void tl_gemv_q41_q8_row(const signed char* __restrict__ qa,
+                                              const float2* __restrict__ ds,
+                                              const unsigned char* __restrict__ W,
+                                              float* __restrict__ y, unsigned N, unsigned K) {
+  q4_q8_row_<true>(qa, ds, W, y, N, K);
+}
+extern "C" {
+
+// Q6_K, 210 bytes a block (2-byte aligned only, hence the 16-bit loads): a warp
+// takes two blocks at a time, lane = 16 * which + 8 * half + j reading the 4
+// consecutive positions 4j.. of its 128-weight half, in each of the four
+// 32-weight quarters (4 + 4 bytes of ql, 4 of qh, 16 activations).
 TL_ALIGN(tl_gemv_q6k_row, 16, 2)  // a by float4; Q6_K by halves
 __global__ void tl_gemv_q6k_row(const float* __restrict__ a, const unsigned char* __restrict__ W,
                                 float* __restrict__ y, unsigned N, unsigned K) {

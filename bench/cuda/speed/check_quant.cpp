@@ -6,8 +6,9 @@
 // bound per form, and the top token agrees except where the oracle's top two are
 // closer than that bound (a near tie).
 //
-// The native run is made once per form the Q4_K GEMVs read their activation in
-// (Model::gemv_form, every one the backend has): f32 (the order of the sums alone),
+// The native run is made once per form the block-quantized GEMVs read their activation
+// in (Model::gemv_form, every one the backend has; a format without a GEMV for the form
+// reads it as f32): f32 (the order of the sums alone),
 // h16 (the activation rounded to f16 too) and q8 (the dp4a form: the activation
 // rounded to 8 bits per 32 values, as llama.cpp does), held to a looser bound.
 //

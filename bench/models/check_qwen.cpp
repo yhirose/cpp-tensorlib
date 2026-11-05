@@ -301,7 +301,7 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   }
   // The chat's weights: a quantized file's blocks as they lie, else bf16 (a
   // backend without the bf16 GEMV builds f32 instead, and says so). Its default
-  // activation forms (the decode's Q4_K GEMVs read f16, the prefill's MMQ int8)
+  // activation forms (the decode's Q4_K and Q5_K GEMVs read f16, the prefill's MMQ int8)
   // round each GEMV input, the MMQ to 8 bits, which moves the logits by an amount
   // that is the model's (Gemma 3 ~70x Qwen's: docs/llama-cpp-comparison.md,
   // "Accuracy"), so the structural checks below read the blocks with float

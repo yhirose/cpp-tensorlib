@@ -121,6 +121,18 @@ std::vector<float> after_lead(const array& buf, int64_t lead, int64_t n) {
   return std::vector<float>(h.begin() + lead, h.begin() + lead + n);
 }
 
+// An output of n values between sentinels: `pad` sevens on each side, the output
+// itself viewed at .at(4 * pad) and read back with after_lead(buf, pad, n);
+// sentinels_kept says whether the kernel stored nothing outside it.
+array with_sentinels(int64_t n, int64_t pad) {
+  return array::from(std::vector<float>((size_t)(n + 2 * pad), 7.0f), {n + 2 * pad});
+}
+bool sentinels_kept(const std::vector<float>& buf, int64_t n, int64_t pad) {
+  for (int64_t i = 0; i < n + 2 * pad; i++)
+    if ((i < pad || i >= pad + n) && buf[(size_t)i] != 7.0f) return false;
+  return true;
+}
+
 // Whether `got` is within tol (absolute and relative) of `want`, compared on
 // the host: a launch that faulted poisons the device, after which a GPU-side
 // comparison proves nothing, so the expected values are read back first.

@@ -8,30 +8,33 @@
 #include <ggml_quant.h>
 
 #include <cstddef>
+#include <iterator>
 
 namespace {
 
 // The GGUF block formats the kernels read, a row each: the ggml type, its name, the
 // byte alignment its GEMVs need of a weight (4 for the word loads into a Q4_K or Q5_K
-// block, 2 for the others' halves), and the byte offsets of a block's half scales (its
-// d, and its dmin or m where it has one). Every test over the formats takes them from
-// here.
+// block, 2 for the others' halves), the byte offsets of a block's half scales (its
+// d, and its dmin or m where it has one), and the prepared activations a backend with
+// them reads the format in (bit i: gpu::prepared_act_forms[i], so 1 q8, 2 h16; see
+// reads_form). Every test over the formats takes them from here.
 struct block_format {
   int type;
   const char* name;
   int align;
   size_t halves[2];
   int nhalves;
+  unsigned act_forms;
 };
 namespace gq = tl::gguf;
 inline constexpr block_format block_formats[] = {
-    {12, "Q4_K", 4, {offsetof(gq::block_q4_k, d), offsetof(gq::block_q4_k, dmin)}, 2},
-    {14, "Q6_K", 2, {offsetof(gq::block_q6_k, d)}, 1},
-    {8, "Q8_0", 2, {offsetof(gq::block_q8_0, d)}, 1},
-    {6, "Q5_0", 2, {offsetof(gq::block_q5_0, d)}, 1},
-    {13, "Q5_K", 4, {offsetof(gq::block_q5_k, d), offsetof(gq::block_q5_k, dmin)}, 2},
-    {2, "Q4_0", 2, {offsetof(gq::block_q4_0, d)}, 1},
-    {3, "Q4_1", 2, {offsetof(gq::block_q4_1, d), offsetof(gq::block_q4_1, m)}, 2},
+    {12, "Q4_K", 4, {offsetof(gq::block_q4_k, d), offsetof(gq::block_q4_k, dmin)}, 2, 3},
+    {14, "Q6_K", 2, {offsetof(gq::block_q6_k, d)}, 1, 0},
+    {8, "Q8_0", 2, {offsetof(gq::block_q8_0, d)}, 1, 0},
+    {6, "Q5_0", 2, {offsetof(gq::block_q5_0, d)}, 1, 0},
+    {13, "Q5_K", 4, {offsetof(gq::block_q5_k, d), offsetof(gq::block_q5_k, dmin)}, 2, 3},
+    {2, "Q4_0", 2, {offsetof(gq::block_q4_0, d)}, 1, 1},
+    {3, "Q4_1", 2, {offsetof(gq::block_q4_1, d), offsetof(gq::block_q4_1, m)}, 2, 1},
 };
 // A row of K weights for a test over `type`: K itself for a 256-weight format, 35
 // blocks for a 32-weight one (an odd count: a row of 18-, 22- or 34-byte blocks puts
@@ -77,6 +80,20 @@ quant_rows random_quant_rows(int type, int64_t N, int64_t K, unsigned seed) {
   std::memcpy(packed.data(), bytes.data(), bytes.size());
   r.W = array::from(std::move(packed), {(int64_t)((bytes.size() + 3) / 4)});
   return r;
+}
+
+// Whether the backend reads a format's rows of k against a prepared activation of
+// form f (gpu::quant_act_reads), held to block_format::act_forms where it has the form
+// at all (gpu::act_bytes), so a test skipping a format skips none it must cover.
+inline bool reads_form(const block_format& f, tl::gpu::act_form form, int64_t k) {
+  const bool reads = tl::gpu::quant_act_reads(f.type, form, k);
+  if (tl::gpu::act_bytes(form, k) > 0) {
+    unsigned bit = 0;
+    for (size_t i = 0; i < std::size(tl::gpu::prepared_act_forms); i++)
+      if (tl::gpu::prepared_act_forms[i] == form) bit = 1u << i;
+    CHECK(reads == ((f.act_forms & bit) != 0));
+  }
+  return reads;
 }
 
 // Whether the backend reads `type`'s blocks in rows of k (gpu::quant_reads), held to

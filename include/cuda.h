@@ -654,12 +654,13 @@ struct context {
     return cached_(gemm_bf16_nt_sk_fn, "tl_gemm_bf16_nt_sk");
   }
   // The block formats' kernels, by their row of cuda_nn.h's quant_fmts_ (at most
-  // quant_fmts_max rows): the GEMV, the f16 dequantization and the row lookup.
-  static constexpr int quant_fmts_max = 8;
+  // quant_fmts_max rows): the GEMV, the f16 dequantization, the row lookup, and the
+  // GEMVs reading a prepared activation (by own_nn::act_slot_ of its form).
+  static constexpr int quant_fmts_max = 8, act_forms_max = 2;
   CUfunction gemv_quant_fn[quant_fmts_max] = {}, dequant_fn[quant_fmts_max] = {},
              embed_quant_fn[quant_fmts_max] = {};
-  CUfunction quant_act_fn = nullptr, gemv_q4k_q8_fn = nullptr, act_h16_fn = nullptr,
-             gemv_q4k_h16_fn = nullptr;
+  CUfunction gemv_act_fn[quant_fmts_max][act_forms_max] = {};
+  CUfunction quant_act_fn = nullptr, act_h16_fn = nullptr;
   CUfunction rmsnorm_rope_fn[3] = {};  // D 64, 128, 256
   CUfunction gated_rmsnorm_fn[2] = {};
   CUfunction rmsnorm_h16_fn = nullptr, add_rmsnorm_h16_fn = nullptr, glu_h16_fn[2] = {},

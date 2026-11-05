@@ -702,14 +702,17 @@ inline bool gated_rmsnorm(span o, span z, int64_t ldz, span w, span out, bool h1
   }
 }
 
-// A Q4_K GEMV reading its activation in a prepared form (act_form, gpu_abi_nn.h):
-// act_bytes is the prepared activation's size for k values in form f, 0 where the
-// backend has not got the form (f32 is never prepared); prepare_act writes it from the
-// f32 activation, gemv_q4k_act reads it. Both false where act_bytes is 0: the caller
-// then runs gemv_quant on the f32 activation.
+// A block-quantized GEMV reading its activation in a prepared form (act_form,
+// gpu_abi_nn.h): act_bytes is the prepared activation's size for k values in form f, 0
+// where the backend has not got the form (f32 is never prepared); prepare_act writes it
+// from the f32 activation; quant_act_reads says whether the backend has a GEMV of
+// format `type` (a ggml_type code, as gemv_quant's) for the form, and gemv_quant_act
+// runs it. False where they do not apply: the caller then runs gemv_quant on the f32
+// activation.
 TL_GPU_DETECT_OWN(act_bytes)
 TL_GPU_DETECT_OWN(prepare_act)
-TL_GPU_DETECT_OWN(gemv_q4k_act)
+TL_GPU_DETECT_OWN(quant_act_reads)
+TL_GPU_DETECT_OWN(gemv_quant_act)
 template <class Own = own>
 inline int64_t act_bytes(act_form f, int64_t k) {
   if constexpr (detail::owns_act_bytes<Own>::value) {
@@ -733,9 +736,17 @@ inline bool prepare_act(act_form f, span a, span pa, int64_t k) {
   }
 }
 template <class Own = own>
-inline bool gemv_q4k_act(act_form f, span pa, span W, span y, int64_t n, int64_t k) {
-  if constexpr (detail::owns_gemv_q4k_act<Own>::value) {
-    return detail::ran(Own::gemv_q4k_act(f, pa, W, y, n, k));
+inline bool quant_act_reads(int type, act_form f, int64_t k) {
+  if constexpr (detail::owns_quant_act_reads<Own>::value) {
+    return Own::quant_act_reads(type, f, k);
+  } else {
+    return false;
+  }
+}
+template <class Own = own>
+inline bool gemv_quant_act(int type, act_form f, span pa, span W, span y, int64_t n, int64_t k) {
+  if constexpr (detail::owns_gemv_quant_act<Own>::value) {
+    return detail::ran(Own::gemv_quant_act(type, f, pa, W, y, n, k));
   } else {
     return false;
   }

@@ -10,6 +10,8 @@
 #include "ggml_quant.h"
 #include "gpu_abi_nn.h"
 
+#include <iterator>  // std::size
+
 namespace tl {
 namespace cuda {
 
@@ -21,21 +23,25 @@ struct own_nn {
   // 128 or 256 and f.rot a multiple of 64, else false.
   static bool rmsnorm_rope(gpu::span x, gpu::span w, int64_t rows, int64_t T, int64_t D,
                            int64_t pos, const gpu::rope_freq& f, float eps);
-  // The activation a[K] prepared in form f into pa, and Q4_K rows dotted with it
-  // (K % 256 == 0). q8: int8 blocks of 32 (K int8, then K/32 float2 of scale and sum),
-  // read with dp4a. h16: K f16, K/32 f32 sums and K/256 f32 scales, read by the tensor
-  // cores (tl_gemv_q4k_h16_row). act_layout_ is where a form keeps its parts, the one
-  // place the launchers and act_bytes read it.
+  // The activation a[K] prepared in form f into pa, and block-quantized rows dotted with
+  // it. q8 (K % 32 == 0): int8 blocks of 32 (K int8, then K/32 float2 of scale and sum),
+  // read with dp4a. h16 (K % 256 == 0): K f16, K/32 f32 sums and K/256 f32 scales, read
+  // by the tensor cores. act_layout_ is where a form keeps its parts, the one place the launchers and
+  // act_bytes read it; quant_fmts_ says which format has a kernel for which form
+  // (quant_act_reads), and act_slot_ is a form's column there.
   struct act_layout {  // byte offsets from the start; bytes 0: no such form
     int64_t meta = 0;   // q8: the float2 (scale, sum) of each 32; h16: the f32 sum of each 32
     int64_t scale = 0;  // h16: the f32 scale of each 256
     int64_t bytes = 0;
   };
   static act_layout act_layout_(gpu::act_form f, int64_t k);
+  static int act_slot_(gpu::act_form f);
+  static const char* act_kernel_(int type, gpu::act_form f, int64_t k, int& fi, int& slot);
   static int64_t act_bytes(gpu::act_form f, int64_t k) { return act_layout_(f, k).bytes; }
   static bool prepare_act(gpu::act_form f, gpu::span a, gpu::span pa, int64_t k);
-  static bool gemv_q4k_act(gpu::act_form f, gpu::span pa, gpu::span W, gpu::span y, int64_t n,
-                           int64_t k);
+  static bool quant_act_reads(int type, gpu::act_form f, int64_t k);
+  static bool gemv_quant_act(int type, gpu::act_form f, gpu::span pa, gpu::span W, gpu::span y,
+                             int64_t n, int64_t k);
   // C[m, ldc-strided n columns] = A[m,K] . W[n,K]^T over GGUF block-quantized rows (type: a
   // format of quant_fmts_, K a whole number of its blocks). a16: A is f16 and the sums f16,
   // else A f32, the operands rounded to bf16 and the sums f32 (the exact form: no f16 range
@@ -347,23 +353,29 @@ inline bool own_nn::gemm_bf16_nt_f16acc_a16(gpu::span a, gpu::span B, gpu::span 
 
 // The GGUF block formats the kernels read, a row each: the ggml type; the format's
 // index in the GEMM's staging and the device code (context::tc_weight, cuda_nn.cuh's
-// WF); its GEMV, f16 dequantization and row-lookup kernels; and its MMQ kernels'
-// index (context::mmq_), -1 where it has none. A block's geometry is ggml's
-// (gguf::ggml_block). Every reader of a format takes it from here.
+// WF); its GEMV, f16 dequantization and row-lookup kernels; its MMQ kernels' index
+// (context::mmq_), -1 where it has none; its GEMVs reading a prepared activation, by
+// form (act_slot_: q8, h16), null where it reads none. A block's
+// geometry is ggml's (gguf::ggml_block). Every reader of a format takes it from here.
 struct quant_fmt {
   int type;
   context::tc_weight wf;
   const char *gemv, *dequant, *embed;
   int mmq;
+  const char* gemv_act[context::act_forms_max];
 };
 inline constexpr quant_fmt quant_fmts_[] = {
-    {12, context::tc_weight::q4k, "tl_gemv_q4k_row", "tl_dequant_f16_q4k", "tl_embed_row_q4k", 0},
-    {14, context::tc_weight::q6k, "tl_gemv_q6k_row", "tl_dequant_f16_q6k", "tl_embed_row_q6k", -1},
-    {8, context::tc_weight::q80, "tl_gemv_q80_row", "tl_dequant_f16_q80", "tl_embed_row_q80", 1},
-    {6, context::tc_weight::q50, "tl_gemv_q50_row", "tl_dequant_f16_q50", "tl_embed_row_q50", -1},
-    {13, context::tc_weight::q5k, "tl_gemv_q5k_row", "tl_dequant_f16_q5k", "tl_embed_row_q5k", -1},
-    {2, context::tc_weight::q40, "tl_gemv_q40_row", "tl_dequant_f16_q40", "tl_embed_row_q40", -1},
-    {3, context::tc_weight::q41, "tl_gemv_q41_row", "tl_dequant_f16_q41", "tl_embed_row_q41", -1},
+    {12, context::tc_weight::q4k, "tl_gemv_q4k_row", "tl_dequant_f16_q4k", "tl_embed_row_q4k", 0,
+     {"tl_gemv_q4k_q8_row", "tl_gemv_q4k_h16_row"}},
+    {14, context::tc_weight::q6k, "tl_gemv_q6k_row", "tl_dequant_f16_q6k", "tl_embed_row_q6k", -1, {}},
+    {8, context::tc_weight::q80, "tl_gemv_q80_row", "tl_dequant_f16_q80", "tl_embed_row_q80", 1, {}},
+    {6, context::tc_weight::q50, "tl_gemv_q50_row", "tl_dequant_f16_q50", "tl_embed_row_q50", -1, {}},
+    {13, context::tc_weight::q5k, "tl_gemv_q5k_row", "tl_dequant_f16_q5k", "tl_embed_row_q5k", -1,
+     {"tl_gemv_q5k_q8_row", "tl_gemv_q5k_h16_row"}},
+    {2, context::tc_weight::q40, "tl_gemv_q40_row", "tl_dequant_f16_q40", "tl_embed_row_q40", -1,
+     {"tl_gemv_q40_q8_row", nullptr}},
+    {3, context::tc_weight::q41, "tl_gemv_q41_row", "tl_dequant_f16_q41", "tl_embed_row_q41", -1,
+     {"tl_gemv_q41_q8_row", nullptr}},
 };
 static_assert(sizeof(quant_fmts_) / sizeof(quant_fmts_[0]) <= context::quant_fmts_max, "slots");
 // The row of `type` where rows of k weights are a whole number of its blocks, else -1.
@@ -488,10 +500,14 @@ inline bool own_nn::gemm_quant_glu(int type, gpu::glu_act act, gpu::span A16, gp
 }
 
 inline own_nn::act_layout own_nn::act_layout_(gpu::act_form f, int64_t k) {
-  if (k <= 0 || k % 256) return {};
+  if (k <= 0) return {};
   switch (f) {
-    case gpu::act_form::q8: return {k, 0, k + k / 32 * 8};
-    case gpu::act_form::h16: return {2 * k, 2 * k + k / 8, 2 * k + k / 8 + k / 64};
+    case gpu::act_form::q8:  // a scale and a sum each 32
+      if (k % 32 == 0) return {k, 0, k + k / 32 * 8};
+      break;
+    case gpu::act_form::h16:  // a sum each 32, a scale each 256
+      if (k % 256 == 0) return {2 * k, 2 * k + k / 8, 2 * k + k / 8 + k / 64};
+      break;
     case gpu::act_form::f32: break;
   }
   return {};
@@ -521,25 +537,50 @@ inline bool own_nn::prepare_act(gpu::act_form f, gpu::span a, gpu::span pa, int6
   return false;
 }
 
-inline bool own_nn::gemv_q4k_act(gpu::act_form f, gpu::span pa, gpu::span W, gpu::span y,
-                                 int64_t n, int64_t k) {
+// A form's column of quant_fmts_' gemv_act: its place in gpu::prepared_act_forms.
+static_assert(std::size(gpu::prepared_act_forms) == context::act_forms_max, "a column a form");
+inline int own_nn::act_slot_(gpu::act_form f) {
+  for (int i = 0; i < context::act_forms_max; i++)
+    if (gpu::prepared_act_forms[i] == f) return i;
+  return -1;
+}
+
+// The format's GEMV for form f over rows of k weights (its row fi and the form's column
+// slot of quant_fmts_), null where it has none or the form does not take k.
+inline const char* own_nn::act_kernel_(int type, gpu::act_form f, int64_t k, int& fi,
+                                       int& slot) {
+  fi = quant_fmt_(type, k);
+  slot = act_slot_(f);
+  if (fi < 0 || slot < 0 || !act_layout_(f, k).bytes) return nullptr;
+  return quant_fmts_[fi].gemv_act[slot];
+}
+inline bool own_nn::quant_act_reads(int type, gpu::act_form f, int64_t k) {
+  int fi, slot;
+  return act_kernel_(type, f, k, fi, slot) != nullptr;
+}
+
+// Every format's kernel for a form launches the same way: q8, a warp a row and four
+// rows a block; h16, 16 rows a block of 4 warps.
+inline bool own_nn::gemv_quant_act(int type, gpu::act_form f, gpu::span pa, gpu::span W,
+                                   gpu::span y, int64_t n, int64_t k) {
   auto& c = context::get();
+  int fi, slot;
+  const char* name = act_kernel_(type, f, k, fi, slot);
+  if (!c.ready || !pa.buf || n <= 0 || !name) return false;
   const act_layout L = act_layout_(f, k);
-  if (!c.ready || !pa.buf || !L.bytes || n <= 0) return false;
   char* pp = reinterpret_cast<char*>(context::off_(pa.buf, pa.off));
   float* pw = context::off_(W.buf, W.off);
   c.device_read_(pa.buf);
   c.device_read_(W.buf);
   c.device_write_(y.buf);
+  CUfunction fn = c.cached_(c.gemv_act_fn[fi][slot], name);
   switch (f) {
-    case gpu::act_form::q8:  // a warp a row, 4 rows a block
-      return c.launch_(c.cached_(c.gemv_q4k_q8_fn, "tl_gemv_q4k_q8_row"),
-                       {((unsigned)n + 3) / 4}, {128}, 0, reinterpret_cast<signed char*>(pp),
+    case gpu::act_form::q8:
+      return c.launch_(fn, {((unsigned)n + 3) / 4}, {128}, 0, reinterpret_cast<signed char*>(pp),
                        reinterpret_cast<void*>(pp + L.meta), reinterpret_cast<unsigned char*>(pw),
                        context::off_(y.buf, y.off), (unsigned)n, (unsigned)k);
-    case gpu::act_form::h16:  // 16 rows a block of 4 warps
-      return c.launch_(c.cached_(c.gemv_q4k_h16_fn, "tl_gemv_q4k_h16_row"),
-                       {((unsigned)n + 15) / 16}, {128}, 0, reinterpret_cast<void*>(pp),
+    case gpu::act_form::h16:
+      return c.launch_(fn, {((unsigned)n + 15) / 16}, {128}, 0, reinterpret_cast<void*>(pp),
                        reinterpret_cast<void*>(pp + L.meta), reinterpret_cast<void*>(pp + L.scale),
                        reinterpret_cast<unsigned char*>(pw), context::off_(y.buf, y.off),
                        (unsigned)n, (unsigned)k);

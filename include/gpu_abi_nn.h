@@ -11,7 +11,7 @@ namespace tl {
 namespace gpu {
 
 // The form a block-quantized GEMV reads its activation in (gpu_ops_nn.h's prepare_act
-// and gemv_q4k_act): f32, the activation as it is; q8, int8 blocks of 32 with an f32
+// and gemv_quant_act): f32, the activation as it is; q8, int8 blocks of 32 with an f32
 // scale and sum each (llama.cpp's q8_1), read with dp4a; h16, f16 (each 256 values
 // scaled by a power of two where they would pass f16's range), read by the tensor
 // cores with f32 sums: the f32 result on the activation rounded to f16. Every form
