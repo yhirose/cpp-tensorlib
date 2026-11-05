@@ -1,6 +1,7 @@
 // M9 "actually chat" — numeric proof. Load a real Qwen2.5-0.5B-Instruct, Qwen3
-// or Qwen3.5 GGUF (F16 or BF16 weights), Gemma 3 4B or 1B (Q4_K_M), or Llama 3.2
-// 1B (F16 or Q4_K_M) or 3B (Q4_K_M), and run the decoder end to end, verified
+// or Qwen3.5 GGUF (F16 or BF16 weights, or Qwen3.5 0.8B's Q4_K_M, a fifth of it
+// Q5_K), Gemma 3 4B or 1B (Q4_K_M), or Llama 3.2 1B (F16 or Q4_K_M) or 3B
+// (Q4_K_M), and run the decoder end to end, verified
 // against a tight numpy reference that reads the SAME weights (tools/qwen_oracle.py
 // wrote the *_oracle_data.h headers: Gemma 3 1B's over a prompt past its
 // 512-position window, Llama 3.2 1B's over one long enough that its RoPE factors
@@ -24,6 +25,7 @@
 #include "llama32_3b_oracle_data.h"
 #include "qwen.h"
 #include "qwen35_oracle_data.h"
+#include "qwen35_q4_oracle_data.h"
 #include "qwen3_oracle_data.h"
 #include "qwen_oracle_data.h"
 
@@ -503,6 +505,8 @@ int main(int argc, char** argv) {
       {"qwen2", 24, 896, TL_ORACLE(qwenoracle, 0)},      // Qwen2.5-0.5B, F16
       {"qwen3", 28, 1024, TL_ORACLE(qwen3oracle, 0)},    // Qwen3-0.6B, F16
       {"qwen35", 24, 1024, TL_ORACLE(qwen35oracle, 0)},  // Qwen3.5-0.8B, F16
+      // unsloth/Qwen3.5-0.8B-GGUF's Qwen3.5-0.8B-Q4_K_M.gguf (its attn_qkv and more Q5_K)
+      {"qwen35", 24, 1024, TL_ORACLE(qwen35_q4oracle, 0xea8ff0e6652acd3dull)},
       // unsloth/gemma-3-{4b,1b}-it-GGUF's gemma-3-*-it-Q4_K_M.gguf
       {"gemma3", 34, 2560, TL_ORACLE(gemma3oracle, 0x0b1451ea793e00e9ull)},     // Gemma 3 4B
       {"gemma3", 26, 1152, TL_ORACLE(gemma3_1boracle, 0x1f0d93832cf2bb46ull)},  // Gemma 3 1B

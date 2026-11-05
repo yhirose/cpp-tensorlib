@@ -1510,10 +1510,13 @@ TEST_CASE("generic compositions agree with the fused kernels") {
 
   SUBCASE("GGML block-quantized dequantization is bit for bit ggml's") {
     // One block of each format, the 8th of a Qwen3-0.6B Q4_K_M tensor (Q5_0's of
-    // Gemma 3 1B's blk.0.attn_q); the hash is over the float bit patterns ggml's
-    // dequantize_row_q4_K / _q6_K / _q8_0 give (checked against libggml over every
-    // block-quantized value of two models, 7.5e8 of them, none differing), and for
-    // Q5_0 gguf-py's dequantization (both halves' fifth bits set in it).
+    // Gemma 3 1B's blk.0.attn_q, Q5_K's the first of Qwen3.5-0.8B's blk.0.attn_qkv);
+    // the hash is over the float bit patterns ggml's dequantize_row_q4_K / _q6_K /
+    // _q8_0 give (checked against libggml over every block-quantized value of two
+    // models, 7.5e8 of them, none differing), and for Q5_0 and Q5_K gguf-py's
+    // dequantization (Q5_0's with both halves' fifth bits set; Q5_K's with each of
+    // its eight fifth-bit positions both set and clear, and groups 4..7's scales and
+    // mins past their low four bits).
     static const unsigned char q4k_block[144] = {
       198, 8, 211, 20, 238, 244, 255, 240, 171, 236, 255, 233, 134, 147, 7, 221,
       35, 180, 91, 134, 100, 200, 9, 51, 195, 5, 202, 146, 98, 27, 179, 39,
@@ -1546,6 +1549,18 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     static const unsigned char q50_block[22] = {181, 26,  177, 3,   9,   5,   132, 239,
                                                 223, 48,  160, 201, 187, 169, 6,   244,
                                                 123, 79,  137, 201, 185, 237};
+    static const unsigned char q5k_block[176] = {
+      101, 3, 117, 17, 229, 156, 163, 170, 108, 222, 105, 255, 223, 133, 162, 203,
+      140, 203, 9, 105, 41, 75, 141, 168, 130, 32, 9, 141, 224, 34, 46, 41,
+      167, 108, 38, 191, 44, 8, 44, 74, 100, 202, 233, 43, 169, 175, 236, 140,
+      121, 66, 116, 48, 154, 144, 55, 64, 107, 7, 80, 161, 231, 70, 93, 167,
+      55, 110, 88, 54, 237, 156, 150, 253, 140, 125, 239, 44, 100, 215, 215, 205,
+      49, 119, 123, 90, 75, 161, 147, 93, 184, 218, 91, 48, 174, 11, 33, 88,
+      248, 32, 140, 112, 75, 12, 53, 22, 83, 96, 237, 154, 158, 54, 30, 130,
+      178, 246, 70, 118, 35, 170, 248, 212, 80, 216, 217, 57, 128, 71, 105, 151,
+      71, 26, 227, 79, 75, 118, 197, 183, 54, 4, 246, 8, 121, 79, 117, 213,
+      135, 47, 199, 176, 138, 195, 10, 92, 14, 2, 225, 115, 180, 255, 240, 107,
+      5, 160, 154, 237, 205, 152, 214, 245, 241, 33, 21, 229, 174, 151, 4, 176};
     auto fnv = [](const float* y, int n = 256) {
       uint64_t h = 1469598103934665603ull;
       for (int i = 0; i < n; i++) {
@@ -1565,13 +1580,16 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     CHECK(fnv(y, 32) == 0xa0de60ff7c89bf3dull);
     tl::gguf::dequant_range(tl::gguf::ggml_type::q6_k, q6k_block, 0, 256, y);
     CHECK(fnv(y) == 0x1da2050114e9c32bull);
+    tl::gguf::dequant_range(tl::gguf::ggml_type::q5_k, q5k_block, 0, 256, y);
+    CHECK(fnv(y) == 0x55b5242bae67f8e3ull);
   }
 
   SUBCASE("GEMV over block-quantized rows against the dequantized weights") {
     // Only a backend that reads block-quantized rows natively runs this; no
     // composition stands in for it, and a model refuses such weights without it.
     if (gpu::has_gemv_quant) {
-      for (int type : {12, 14, 8, 6}) {
+      for (const block_format& f : block_formats) {
+        const int type = f.type;
         // Q5_0 at 35 blocks of 32: a row's 770 bytes put every other row 2 bytes off 4.
         const int64_t N = 37, K = type == 6 ? 1120 : 1024;
         if (!reads_quant(type, K)) continue;
@@ -1583,8 +1601,8 @@ TEST_CASE("generic compositions agree with the fused kernels") {
           for (int64_t k = 0; k < K; k++) ref[n] += (double)q.w[(size_t)n * K + k] * a.raw()[k];
         array W = dev(q.W), ad = dev(a), y = array::empty({N});
         REQUIRE(gpu::gemv_quant(type, ad.device_span(), W.device_span(), y.device_span(), N, K));
-        // A Q4_K weight off its 4-byte alignment is refused, not misread.
-        if (type == 12)
+        // A Q4_K or Q5_K weight off its 4-byte alignment is refused, not misread.
+        if (type == 12 || type == 13)
           CHECK_FALSE(gpu::gemv_quant(type, ad.device_span(), W.device_span().at(2),
                                       y.device_span(), N, K));
         // So is an activation off 16 bytes (the kernels' vector loads).
@@ -1627,7 +1645,8 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     // columns around them left as they were. M on both sides of the
     // backend's tile choice.
     if (gpu::has_gemm_quant) {
-      for (int type : {12, 14, 8, 6}) {
+      for (const block_format& f : block_formats) {
+        const int type = f.type;
         // Q5_0 at 35 blocks: rows 2 bytes off 4, and a last key tile half full.
         const int64_t K = type == 6 ? 1120 : 512;
         if (!reads_quant(type, K)) continue;
@@ -1674,8 +1693,8 @@ TEST_CASE("generic compositions agree with the fused kernels") {
           CHECK(worst_rel(got, off) < bound);
           CHECK(kept);
           // C one column off its float2 stores, and the weight 4 bytes off its
-          // base (a Q6_K or Q8_0 row's halves still fit; Q4_K's vectors do
-          // not): each refused or computed as above, never misplaced.
+          // base (a Q6_K, Q8_0 or Q5_0 row's halves still fit; Q4_K's and Q5_K's
+          // vectors do not): each refused or computed as above, never misplaced.
           array Wl = dev(with_lead(q.W, 1));
           for (const bool shift_w : {false, true}) {
             array C1 = dev(array::zeros({M * ldc + 1}));

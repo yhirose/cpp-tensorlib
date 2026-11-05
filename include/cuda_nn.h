@@ -36,10 +36,10 @@ struct own_nn {
   static bool prepare_act(gpu::act_form f, gpu::span a, gpu::span pa, int64_t k);
   static bool gemv_q4k_act(gpu::act_form f, gpu::span pa, gpu::span W, gpu::span y, int64_t n,
                            int64_t k);
-  // C[m, ldc-strided n columns] = A[m,K] . W[n,K]^T over GGUF block-quantized rows (type 12
-  // Q4_K, 14 Q6_K, 8 Q8_0). a16: A is f16 and the sums f16, else A f32, the operands
-  // rounded to bf16 and the sums f32 (the exact form: no f16 range to overflow). K % 256 == 0
-  // (Q8_0: % 32), n even. mmq (with a16, Q4_K, or Q8_0 with
+  // C[m, ldc-strided n columns] = A[m,K] . W[n,K]^T over GGUF block-quantized rows (type: a
+  // format of quant_fmts_, K a whole number of its blocks). a16: A is f16 and the sums f16,
+  // else A f32, the operands rounded to bf16 and the sums f32 (the exact form: no f16 range
+  // to overflow). n even. mmq (with a16, Q4_K, or Q8_0 with
   // K % 256 == 0):
   // A is quantized to int8 and the product runs on the int8 tensor cores, nothing
   // dequantized (tl_gemm_mmq_q4k, _q80): faster, and the activation rounded to 8 bits.
@@ -361,6 +361,7 @@ inline constexpr quant_fmt quant_fmts_[] = {
     {14, context::tc_weight::q6k, "tl_gemv_q6k_row", "tl_dequant_f16_q6k", "tl_embed_row_q6k", -1},
     {8, context::tc_weight::q80, "tl_gemv_q80_row", "tl_dequant_f16_q80", "tl_embed_row_q80", 1},
     {6, context::tc_weight::q50, "tl_gemv_q50_row", "tl_dequant_f16_q50", "tl_embed_row_q50", -1},
+    {13, context::tc_weight::q5k, "tl_gemv_q5k_row", "tl_dequant_f16_q5k", "tl_embed_row_q5k", -1},
 };
 static_assert(sizeof(quant_fmts_) / sizeof(quant_fmts_[0]) <= context::quant_fmts_max, "slots");
 // The row of `type` where rows of k weights are a whole number of its blocks, else -1.

@@ -8,11 +8,11 @@ is F16, and the two drift apart within a few tokens.) Writes a C++ header with
 the checkpoints the check compares: last-token embedding, layer-0 residual, final
 norm, top-5 logits, and the greedy continuation.
 
-A Gemma 3 GGUF is block-quantized (Q4_K / Q6_K / Q5_0 / Q8_0): its weights are
+A block-quantized GGUF (Gemma 3's, or a Q4_K_M of the others) has its weights
 read with the gguf package (llama.cpp's gguf-py) and dequantized to f32, all at
 once when that copy is under KEEP_ALL_BYTES (Gemma 3 1B's 4 GB), else when a step
 reads them, layer by layer, so no f32 copy of the whole model is held (the 4B's
-16 GB). Its local layers attend the last `sliding_window` positions.
+16 GB). Gemma 3's local layers attend the last `sliding_window` positions.
 
 A Llama GGUF's q and k rows are as llama.cpp reads them: the converter permuted
 them for its NORM rope, which turns adjacent pairs. This forward turns them so,

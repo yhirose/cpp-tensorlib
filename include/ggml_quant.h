@@ -1,9 +1,9 @@
 // Dequantization of the GGML block formats a GGUF stores its weights in, on the
 // host: the reference the GPU kernels are checked against, and what a row
 // gather (the embedding table) reads. Bit for bit what ggml's
-// dequantize_row_q4_K / _q6_K / _q8_0 / _q5_0 produce. A format is a run of blocks
-// along a row of K weights (K a multiple of the block's 256, or 32 for Q8_0 and
-// Q5_0), each block self-contained.
+// dequantize_row_q4_K / _q5_K / _q6_K / _q8_0 / _q5_0 produce. A format is a run of
+// blocks along a row of K weights (K a multiple of the block's 256, or 32 for Q8_0
+// and Q5_0), each block self-contained.
 #pragma once
 
 #include <cmath>
@@ -111,6 +111,38 @@ inline void dequant_q4_k(const block_q4_k* x, float* y, size_t nblocks) {
   }
 }
 
+// Q5_K: Q4_K with a fifth bit a weight. d, dmin and the 12 scale bytes as Q4_K's;
+// qh: bit g of byte l is the fifth bit of weight l of group g; qs: the low four
+// bits, as Q4_K's.
+// Weight = d * scale_g * q - dmin * min_g.
+struct block_q5_k {
+  uint16_t d, dmin;
+  uint8_t scales[12];
+  uint8_t qh[32];
+  uint8_t qs[128];
+};
+static_assert(sizeof(block_q5_k) == 176, "block_q5_k");
+
+inline void dequant_q5_k(const block_q5_k* x, float* y, size_t nblocks) {
+  for (size_t i = 0; i < nblocks; i++) {
+    const float d = half_to_float(x[i].d), mn = half_to_float(x[i].dmin);
+    const uint8_t* q = x[i].qs;
+    const uint8_t* qh = x[i].qh;
+    int is = 0;
+    for (int j = 0; j < 256; j += 64) {
+      uint8_t sc, m;
+      q4k_scale_min(is + 0, x[i].scales, sc, m);
+      const float d1 = d * sc, m1 = mn * m;
+      q4k_scale_min(is + 1, x[i].scales, sc, m);
+      const float d2 = d * sc, m2 = mn * m;
+      for (int l = 0; l < 32; l++) *y++ = d1 * ((q[l] & 0xF) | (((qh[l] >> is) & 1) << 4)) - m1;
+      for (int l = 0; l < 32; l++) *y++ = d2 * ((q[l] >> 4) | (((qh[l] >> (is + 1)) & 1) << 4)) - m2;
+      q += 32;
+      is += 2;
+    }
+  }
+}
+
 // Q6_K: 256 weights in 16 groups of 16. ql: the low 4 bits, qh: the high 2,
 // scales: a signed byte a group; weight = d * scale_g * (q - 32).
 struct block_q6_k {
@@ -189,6 +221,7 @@ inline void dequant_q5_0(const block_q5_0* x, float* y, size_t nblocks) {
 inline bool is_quant(ggml_type t) {
   switch (t) {
     case ggml_type::q4_k:
+    case ggml_type::q5_k:
     case ggml_type::q6_k:
     case ggml_type::q8_0:
     case ggml_type::q5_0: return true;
@@ -204,6 +237,7 @@ inline void dequant_range(ggml_type t, const void* data, size_t first, size_t n,
   const char* base = static_cast<const char*>(data) + (first / elems) * bytes;
   switch (t) {
     case ggml_type::q4_k: return dequant_q4_k(reinterpret_cast<const block_q4_k*>(base), dst, n / elems);
+    case ggml_type::q5_k: return dequant_q5_k(reinterpret_cast<const block_q5_k*>(base), dst, n / elems);
     case ggml_type::q6_k: return dequant_q6_k(reinterpret_cast<const block_q6_k*>(base), dst, n / elems);
     case ggml_type::q8_0: return dequant_q8_0(reinterpret_cast<const block_q8_0*>(base), dst, n / elems);
     case ggml_type::q5_0: return dequant_q5_0(reinterpret_cast<const block_q5_0*>(base), dst, n / elems);

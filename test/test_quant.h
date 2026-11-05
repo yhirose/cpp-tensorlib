@@ -7,23 +7,41 @@
 
 #include <ggml_quant.h>
 
+#include <cstddef>
+
 namespace {
 
-// N rows of K weights in a GGUF block format (ggml type 12 Q4_K, 14 Q6_K, 8
-// Q8_0, 6 Q5_0) as one buffer (for the caller to move to the device), and the
-// same rows dequantized by the CPU reference. Random bytes are valid blocks; only
-// the half scales are set (a random one could be inf or NaN): Q4_K d, dmin at
-// the start, Q6_K d at byte 208, Q8_0's and Q5_0's d at the start, each a small
-// positive half ~ 2^-5 .. 2^-4.
+// The GGUF block formats the kernels read, a row each: the ggml type, and the byte
+// offsets of a block's half scales (its d, and dmin where it has one). Every test over
+// the formats takes them from here.
+struct block_format {
+  int type;
+  size_t halves[2];
+  int nhalves;
+};
+namespace gq = tl::gguf;
+inline constexpr block_format block_formats[] = {
+    {12, {offsetof(gq::block_q4_k, d), offsetof(gq::block_q4_k, dmin)}, 2},  // Q4_K
+    {14, {offsetof(gq::block_q6_k, d)}, 1},                                 // Q6_K
+    {8, {offsetof(gq::block_q8_0, d)}, 1},                                  // Q8_0
+    {6, {offsetof(gq::block_q5_0, d)}, 1},                                  // Q5_0
+    {13, {offsetof(gq::block_q5_k, d), offsetof(gq::block_q5_k, dmin)}, 2},  // Q5_K
+};
+
+// N rows of K weights in a GGUF block format (a row of block_formats) as one buffer
+// (for the caller to move to the device), and the same rows dequantized by the CPU
+// reference. Random bytes are valid blocks; only the half scales are set (a random
+// one could be inf or NaN), each a small positive half ~ 2^-5 .. 2^-4.
 struct quant_rows {
   array W;               // the blocks, packed into floats
   std::vector<float> w;  // [N,K], dequantized
 };
 quant_rows random_quant_rows(int type, int64_t N, int64_t K, unsigned seed) {
   const auto t = static_cast<tl::gguf::ggml_type>(type);
-  const std::vector<size_t> halves = t == tl::gguf::ggml_type::q4_k   ? std::vector<size_t>{0, 2}
-                                     : t == tl::gguf::ggml_type::q6_k ? std::vector<size_t>{208}
-                                                                       : std::vector<size_t>{0};
+  const block_format* f = nullptr;
+  for (const auto& b : block_formats)
+    if (b.type == type) f = &b;
+  REQUIRE(f);
   uint64_t elems, block_bytes;
   tl::gguf::ggml_block(t, elems, block_bytes);
   const int64_t nb = K / (int64_t)elems, bb = (int64_t)block_bytes;
@@ -35,7 +53,7 @@ quant_rows random_quant_rows(int type, int64_t N, int64_t K, unsigned seed) {
     std::memcpy(&bytes[at], &h, 2);
   };
   for (int64_t i = 0; i < N * nb; i++)
-    for (size_t at : halves) set_half((size_t)i * bb + at);
+    for (int h = 0; h < f->nhalves; h++) set_half((size_t)i * bb + f->halves[h]);
   quant_rows r;
   r.w.resize((size_t)N * K);
   for (int64_t n = 0; n < N; n++)
@@ -48,8 +66,8 @@ quant_rows random_quant_rows(int type, int64_t N, int64_t K, unsigned seed) {
 }
 
 // Whether the backend reads `type`'s blocks in rows of k (gpu::quant_reads), held to
-// what it must: a backend with the block kernels reads all four (Q4_K, Q6_K, Q8_0
-// and Q5_0), so a test skipping a format it does not read skips none it must.
+// what it must: a backend with the block kernels reads every format of
+// block_formats, so a test skipping a format it does not read skips none it must.
 inline bool reads_quant(int type, int64_t k) {
   const bool reads = tl::gpu::quant_reads(type, k);
   CHECK(reads);

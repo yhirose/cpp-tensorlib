@@ -677,8 +677,9 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
       };
       std::vector<std::pair<int, quant_rows>> qs;
       if (gpu::has_gemv_quant)
-        for (int type : {12, 14, 8, 6})
-          if (reads_quant(type, K)) qs.push_back({type, random_quant_rows(type, V, K, 990 + type)});
+        for (const block_format& f : block_formats)
+          if (reads_quant(f.type, K))
+            qs.push_back({f.type, random_quant_rows(f.type, V, K, 990 + f.type)});
       // Scaled (Gemma's embedding): each value times the scale, an f32 product,
       // required of every backend.
       auto scaled = [&](int type, const array& W, int64_t rs, int64_t cs, int64_t n,

@@ -954,10 +954,10 @@ struct read_bf16_ {
 
 // ---- GGUF block-quantized weights ([N,K] rows of whole blocks, read where
 // they lie; include/ggml_quant.h has the formats in words and the CPU
-// reference). A Q4_K row is whole 144-byte blocks, so from a 4-byte aligned
-// weight (the host checks) its reader takes 32-bit loads (the decode GEMV,
-// llama.cpp's, 16-bit ones); Q6_K's (210), Q8_0's (34) and Q5_0's (22) are
-// only 2-byte aligned, hence their 16-bit loads.
+// reference). A Q4_K row is whole 144-byte blocks and a Q5_K row 176-byte ones,
+// so from a 4-byte aligned weight (the host checks) their readers take 32-bit
+// loads (the decode GEMVs, llama.cpp's, 16-bit ones); Q6_K's (210), Q8_0's (34)
+// and Q5_0's (22) are only 2-byte aligned, hence their 16-bit loads.
 
 // Scale and min of a Q4_K group j (0..7) from the block's 12 scale bytes held
 // as three words: ggml's get_scale_min_k4, cuda's q4k_scale_min_.
@@ -1009,6 +1009,38 @@ struct read_q4k_ {
     for (uint j = 0; j < 4; j++) {
       v[j] = d1 * float((w0 >> (8 * j)) & 0xFu) - m1;
       v[4 + j] = d1 * float((w1 >> (8 * j)) & 0xFu) - m1;
+    }
+  }
+};
+// Q5_K, 176 bytes a block: Q4_K's d, dmin and scale bytes, then qh (bit g of
+// byte l the fifth bit of weight l of group g), then Q4_K's quants at byte 48.
+struct read_q5k_ {
+  static constexpr constant uint ELEMS = 256, BYTES = 176;
+  device const uchar* W;
+  uint row_bytes;
+  float operator()(uint n, uint k) const {
+    device const uchar* b = W + (ulong)n * row_bytes + (k >> 8) * BYTES;
+    const uint o = k & 255u, g = o >> 5, l = o & 31u;
+    float sc, mn;
+    q4k_scale_min_(q4k_scale_words_(b), g, sc, mn);
+    const uint q = b[48 + 32 * (g >> 1) + l], h = (b[16 + l] >> g) & 1u;
+    const float d1 = half_at_(b) * sc, m1 = half_at_(b + 2) * mn;
+    return d1 * float(((g & 1u) ? q >> 4 : q & 0xFu) | (h << 4)) - m1;
+  }
+  // Four 32-bit loads (the block 4-byte aligned: quant_ok_).
+  void vec(uint n, uint k, thread float* v) const {
+    device const uchar* b = W + (ulong)n * row_bytes + (k >> 8) * BYTES;
+    const uint o = k & 255u, g = o >> 5, l = o & 31u;
+    float sc, mn;
+    q4k_scale_min_(q4k_scale_words_(b), g, sc, mn);
+    device const uint* q = reinterpret_cast<device const uint*>(b + 48 + 32 * (g >> 1) + l);
+    device const uint* qh = reinterpret_cast<device const uint*>(b + 16 + l);
+    const uint sh = (g & 1u) ? 4u : 0u;
+    const uint w0 = q[0] >> sh, w1 = q[1] >> sh, h0 = qh[0] >> g, h1 = qh[1] >> g;
+    const float d1 = half_at_(b) * sc, m1 = half_at_(b + 2) * mn;
+    for (uint j = 0; j < 4; j++) {
+      v[j] = d1 * float(((w0 >> (8 * j)) & 0xFu) | (((h0 >> (8 * j)) & 1u) << 4)) - m1;
+      v[4 + j] = d1 * float(((w1 >> (8 * j)) & 0xFu) | (((h1 >> (8 * j)) & 1u) << 4)) - m1;
     }
   }
 };
@@ -1121,6 +1153,8 @@ TL_STEEL_KERNEL_SRC(gemm_bf16_nt_, 64, false, true, ushort, TL_READ_BF16)
 TL_STEEL_KERNEL_SRC(gemm_bf16_nt32_, 32, false, true, ushort, TL_READ_BF16)
 TL_STEEL_KERNEL_SRC(gemm_q4k_nt_, 64, false, true, uchar, TL_READ_Q(read_q4k_))
 TL_STEEL_KERNEL_SRC(gemm_q4k_nt32_, 32, false, true, uchar, TL_READ_Q(read_q4k_))
+TL_STEEL_KERNEL_SRC(gemm_q5k_nt_, 64, false, true, uchar, TL_READ_Q(read_q5k_))
+TL_STEEL_KERNEL_SRC(gemm_q5k_nt32_, 32, false, true, uchar, TL_READ_Q(read_q5k_))
 TL_STEEL_KERNEL_SRC(gemm_q6k_nt_, 64, false, true, uchar, TL_READ_Q(read_q6k_))
 TL_STEEL_KERNEL_SRC(gemm_q6k_nt32_, 32, false, true, uchar, TL_READ_Q(read_q6k_))
 TL_STEEL_KERNEL_SRC(gemm_q80_nt_, 64, false, true, uchar, TL_READ_Q(read_q80_))
@@ -1159,6 +1193,7 @@ struct embed_row_params {
 TL_EMBED_ROW(embed_row_f32_, float, (read_f32_s_{B, p.rs, p.cs}))
 TL_EMBED_ROW(embed_row_bf16_, ushort, (read_bf16_s_{B, p.rs, p.cs}))
 TL_EMBED_ROW(embed_row_q4k_, uchar, TL_READ_Q(read_q4k_))
+TL_EMBED_ROW(embed_row_q5k_, uchar, TL_READ_Q(read_q5k_))
 TL_EMBED_ROW(embed_row_q6k_, uchar, TL_READ_Q(read_q6k_))
 TL_EMBED_ROW(embed_row_q80_, uchar, TL_READ_Q(read_q80_))
 TL_EMBED_ROW(embed_row_q50_, uchar, TL_READ_Q(read_q50_))
@@ -1166,8 +1201,9 @@ TL_EMBED_ROW(embed_row_q50_, uchar, TL_READ_Q(read_q50_))
 #undef TL_READ_Q
 #undef TL_READ_BF16
 
-// The decode GEMVs over the same rows: cuda's tl_gemv_q4k_row / _q6k_row /
-// _q80_row in what they compute, llama.cpp's Metal mul_mv in shape: a
+// The decode GEMVs over the same rows: cuda's tl_gemv_q4k_row / _q5k_row /
+// _q6k_row / _q80_row / _q50_row in what they compute, llama.cpp's Metal mul_mv
+// in shape: a
 // simdgroup takes QROWS rows (threadgroups of any number of simdgroups, the
 // host's gemv_quant_rows_ in all), holds the activations a lane multiplies
 // once for all of them, and folds the weights it dequantizes straight into
@@ -1219,7 +1255,55 @@ kernel void gemv_q_(device const float* a       [[buffer(0)]],
 // 8 bytes at 8 * ir: their low nibbles are weights 8 * ir.. of the pair's
 // first group, the high ones of its second. A nibble is masked in place, not
 // shifted down (u & 0x0F00 is 256 q), and the powers of 16 come off with the
-// scales. y_n = sum d*sc*q*a - dmin*m*a.
+// scales. y_n = sum d*sc*q*a - dmin*m*a. Q5_K reads its blocks the same way.
+//
+// The 32 activations the lane multiplies in block ib: al the weights 8 * ir..
+// of groups 2iq and 2iq + 1 (0..7, 8..15), ah those of groups 2iq + 4 and
+// 2iq + 5; and their four sums, a group each.
+static inline float4 k4_acts_(device const float* a, uint ib, uint iq, uint ir,
+                              thread float* al, thread float* ah) {
+  device const float* ap = a + (ulong)ib * 256u + 64u * iq + 8u * ir;
+  float4 suma = 0.0f;
+  _Pragma("clang loop unroll(full)")
+  for (uint i = 0; i < 8; i++) {
+    al[i] = ap[i];
+    al[i + 8] = ap[i + 32];
+    ah[i] = ap[i + 128];
+    ah[i + 8] = ap[i + 160];
+    suma += float4(al[i], al[i + 8], ah[i], ah[i + 8]);
+  }
+  return suma;
+}
+// The 6-bit scales and mins of those four groups from the 12 scale bytes at
+// b + 4, a byte each as sc16 holds them: the scales of groups 2iq, 2iq + 1 at
+// 0, 1 and their mins at 2, 3; groups 2iq + 4, 2iq + 5's at 4, 5 and 6, 7.
+// ggml's get_scale_min_k4, two groups a ushort.
+static inline void k4_scales_(device const uchar* b, uint iq, thread ushort* sc16) {
+  device const ushort* sc = reinterpret_cast<device const ushort*>(b + 4) + iq;
+  sc16[0] = sc[0] & 0x3f3f;
+  sc16[1] = sc[2] & 0x3f3f;
+  sc16[2] = (sc[4] & 0x0f0f) | ((sc[0] & 0xc0c0) >> 2);
+  sc16[3] = ((sc[4] >> 4) & 0x0f0f) | ((sc[2] & 0xc0c0) >> 2);
+}
+// The lane's quants (Q4_K's at b + 16, Q5_K's at b + 48) times those
+// activations, a nibble masked in place: acc1 over groups 2iq and 2iq + 1,
+// acc2 over 2iq + 4 and 2iq + 5, their components 1, 256, 16 and 4096 times
+// the sums of q a.
+static inline void k4_nibbles_(device const uchar* qs, uint iq, uint ir, thread const float* al,
+                               thread const float* ah, thread float4& acc1, thread float4& acc2) {
+  device const ushort* q1 = reinterpret_cast<device const ushort*>(qs) + 16 * iq + 4 * ir;
+  device const ushort* q2 = q1 + 32;
+  acc1 = 0.0f;
+  acc2 = 0.0f;
+  _Pragma("clang loop unroll(full)")
+  for (uint i = 0; i < 4; i++) {
+    const ushort u = q1[i], v = q2[i];
+    acc1 += float4(al[2 * i], al[2 * i + 1], al[2 * i + 8], al[2 * i + 9]) *
+            float4(u & 0x000F, u & 0x0F00, u & 0x00F0, u & 0xF000);
+    acc2 += float4(ah[2 * i], ah[2 * i + 1], ah[2 * i + 8], ah[2 * i + 9]) *
+            float4(v & 0x000F, v & 0x0F00, v & 0x00F0, v & 0xF000);
+  }
+}
 struct gemv_q4k_dot_ {
   using L = read_q4k_;
   static void accumulate(thread float* acc, device const float* a, gemv_q_rows_<L> w,
@@ -1227,44 +1311,60 @@ struct gemv_q4k_dot_ {
     const uint it = lane & 7u, iq = it >> 2, ir = it & 3u;
     float al[16], ah[16];
     for (uint ib = lane >> 3; ib < nb; ib += 4) {
-      device const float* ap = a + (ulong)ib * 256u + 64u * iq + 8u * ir;
-      float4 suma = 0.0f;
-      _Pragma("clang loop unroll(full)")
-      for (uint i = 0; i < 8; i++) {
-        al[i] = ap[i];
-        al[i + 8] = ap[i + 32];
-        ah[i] = ap[i + 128];
-        ah[i + 8] = ap[i + 160];
-        suma += float4(al[i], al[i + 8], ah[i], ah[i + 8]);
-      }
+      const float4 suma = k4_acts_(a, ib, iq, ir, al, ah);
       _Pragma("clang loop unroll(full)")
       for (uint r = 0; r < QROWS; r++) {
         device const uchar* b = w.block(r, ib);
-        // Groups 2iq, 2iq + 1 (scales 0, 1, mins 2, 3) and 2iq + 4, 2iq + 5
-        // (4, 5 and 6, 7): ggml's get_scale_min_k4, two groups a ushort.
-        device const ushort* sc = reinterpret_cast<device const ushort*>(b + 4) + iq;
         ushort sc16[4];
-        sc16[0] = sc[0] & 0x3f3f;
-        sc16[1] = sc[2] & 0x3f3f;
-        sc16[2] = (sc[4] & 0x0f0f) | ((sc[0] & 0xc0c0) >> 2);
-        sc16[3] = ((sc[4] >> 4) & 0x0f0f) | ((sc[2] & 0xc0c0) >> 2);
+        k4_scales_(b, iq, sc16);
         thread const uchar* sc8 = reinterpret_cast<thread const uchar*>(sc16);
-        device const ushort* q1 =
-            reinterpret_cast<device const ushort*>(b + 16) + 16 * iq + 4 * ir;
-        device const ushort* q2 = q1 + 32;
-        float4 acc1 = 0.0f, acc2 = 0.0f;
-        _Pragma("clang loop unroll(full)")
-        for (uint i = 0; i < 4; i++) {
-          const ushort u = q1[i], v = q2[i];
-          acc1 += float4(al[2 * i], al[2 * i + 1], al[2 * i + 8], al[2 * i + 9]) *
-                  float4(u & 0x000F, u & 0x0F00, u & 0x00F0, u & 0xF000);
-          acc2 += float4(ah[2 * i], ah[2 * i + 1], ah[2 * i + 8], ah[2 * i + 9]) *
-                  float4(v & 0x000F, v & 0x0F00, v & 0x00F0, v & 0xF000);
-        }
+        float4 acc1, acc2;
+        k4_nibbles_(b + 16, iq, ir, al, ah, acc1, acc2);
         acc[r] += half_at_(b) * ((acc1[0] + acc1[1] / 256.0f) * sc8[0] +
                                  (acc1[2] + acc1[3] / 256.0f) * sc8[1] / 16.0f +
                                  (acc2[0] + acc2[1] / 256.0f) * sc8[4] +
                                  (acc2[2] + acc2[3] / 256.0f) * sc8[5] / 16.0f) -
+                  half_at_(b + 2) * dot(suma, float4(sc8[2], sc8[3], sc8[6], sc8[7]));
+      }
+    }
+  }
+};
+
+// Q5_K, as Q4_K's (its quants at byte 48), and the fifth bits, llama.cpp's
+// kernel_mul_mv_q5_K_f32: bits 2iq, 2iq + 1, 2iq + 4 and 2iq + 5 of qh byte
+// 8 * ir + i are weight 8 * ir + i's in the four groups. A set bit is 16 more
+// q, so a group adds 16 times the activations its set bits meet.
+struct gemv_q5k_dot_ {
+  using L = read_q5k_;
+  static void accumulate(thread float* acc, device const float* a, gemv_q_rows_<L> w,
+                         uint nb, uint lane) {
+    const uint it = lane & 7u, iq = it >> 2, ir = it & 3u;
+    float al[16], ah[16];
+    for (uint ib = lane >> 3; ib < nb; ib += 4) {
+      const float4 suma = k4_acts_(a, ib, iq, ir, al, ah);
+      _Pragma("clang loop unroll(full)")
+      for (uint r = 0; r < QROWS; r++) {
+        device const uchar* b = w.block(r, ib);
+        ushort sc16[4];
+        k4_scales_(b, iq, sc16);
+        thread const uchar* sc8 = reinterpret_cast<thread const uchar*>(sc16);
+        float4 acc1, acc2, hi = 0.0f;
+        k4_nibbles_(b + 48, iq, ir, al, ah, acc1, acc2);
+        // The qh bytes 8 * ir.. as two words (the block 4-byte aligned:
+        // quant_ok_), shifted so bits 0, 1, 4 and 5 of each byte are its
+        // four groups'.
+        device const uint* qh = reinterpret_cast<device const uint*>(b + 16 + 8 * ir);
+        const uint h0 = qh[0] >> (2u * iq), h1 = qh[1] >> (2u * iq);
+        _Pragma("clang loop unroll(full)")
+        for (uint i = 0; i < 8; i++) {
+          const uint h = (i < 4 ? h0 : h1) >> (8u * (i & 3u));
+          hi += float4((h & 1u) ? al[i] : 0.0f, (h & 2u) ? al[i + 8] : 0.0f,
+                       (h & 16u) ? ah[i] : 0.0f, (h & 32u) ? ah[i + 8] : 0.0f);
+        }
+        acc[r] += half_at_(b) * ((acc1[0] + acc1[1] / 256.0f + 16.0f * hi[0]) * sc8[0] +
+                                 ((acc1[2] + acc1[3] / 256.0f) / 16.0f + 16.0f * hi[1]) * sc8[1] +
+                                 (acc2[0] + acc2[1] / 256.0f + 16.0f * hi[2]) * sc8[4] +
+                                 ((acc2[2] + acc2[3] / 256.0f) / 16.0f + 16.0f * hi[3]) * sc8[5]) -
                   half_at_(b + 2) * dot(suma, float4(sc8[2], sc8[3], sc8[6], sc8[7]));
       }
     }
@@ -1367,6 +1467,7 @@ struct gemv_q50_dot_ {
       device const float*, device const uchar*, device float*,               \
       constant gemv_row_params&, uint, uint, uint, uint);
 TL_GEMV_Q("gemv_q4k_", gemv_q4k_dot_)
+TL_GEMV_Q("gemv_q5k_", gemv_q5k_dot_)
 TL_GEMV_Q("gemv_q6k_", gemv_q6k_dot_)
 TL_GEMV_Q("gemv_q80_", gemv_q80_dot_)
 TL_GEMV_Q("gemv_q50_", gemv_q50_dot_)

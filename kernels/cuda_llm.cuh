@@ -178,6 +178,7 @@ TL_ALIGN(tl_embed_row_q4k, 8)
 TL_ALIGN(tl_embed_row_q6k, 2)
 TL_ALIGN(tl_embed_row_q80, 2)
 TL_ALIGN(tl_embed_row_q50, 2)
+TL_ALIGN(tl_embed_row_q5k, 8)
 extern "C" __global__ void tl_embed_row_f32(const float* W, const float* idx, float* out, unsigned K,
                                             unsigned rows, unsigned rs, unsigned cs, float scale) {
   embed_row_strided_core(W, idx, out, K, rows, rs, cs, scale);
@@ -202,6 +203,10 @@ extern "C" __global__ void tl_embed_row_q80(const unsigned char* W, const float*
 extern "C" __global__ void tl_embed_row_q50(const unsigned char* W, const float* idx, float* out,
                                             unsigned K, unsigned rows, float scale) {
   embed_row_quant_core<5>(W, idx, out, K, rows, scale);
+}
+extern "C" __global__ void tl_embed_row_q5k(const unsigned char* W, const float* idx, float* out,
+                                            unsigned K, unsigned rows, float scale) {
+  embed_row_quant_core<6>(W, idx, out, K, rows, scale);
 }
 
 // ---- gpu_abi_llm.h's sample_ref on the device: metal_kernels_llm.metal's

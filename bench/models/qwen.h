@@ -256,8 +256,8 @@ inline const gg::tensor_info* need(const gg::model& m, const std::string& n) {
 
 // Elements [first, first + n) of a tensor, widened to f32 into dst: the one
 // place that reads a weight's bytes, whatever 16- or 32-bit float the file
-// stored it as (an F16 GGUF, or a BF16 one) or block-quantized (Q4_K / Q6_K / Q8_0, dequantized
-// here: a quantized file runs as bf16 weights, which a model that fits in memory
+// stored it as (an F16 GGUF, or a BF16 one) or block-quantized (a format gg::is_quant takes,
+// dequantized here: a quantized file runs as bf16 weights, which a model that fits in memory
 // as bf16 can do). The type is dispatched once per call, outside the element loop.
 inline void widen_(const gg::tensor_info* t, size_t first, size_t n, float* dst) {
   switch (t->type) {

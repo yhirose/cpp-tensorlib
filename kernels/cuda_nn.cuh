@@ -1303,6 +1303,24 @@ __device__ __forceinline__ void dq8_q4k_(const unsigned char* row, unsigned gk, 
     v[4 + i] = d1 * (float)((w.y >> (8 * i + sh)) & 0xFu) - m1;
   }
 }
+// Q5_K, 176 bytes a block: Q4_K's d, dmin and scale bytes, then qh (bit g of byte l
+// the fifth bit of weight l of group g), then Q4_K's quants at byte 48.
+__device__ __forceinline__ void dq8_q5k_(const unsigned char* row, unsigned gk, float (&v)[8]) {
+  const unsigned char* b = row + (size_t)(gk >> 8) * 176u;
+  const unsigned o = gk & 255u, g = o >> 5, p = g >> 1, l0 = o & 31u;
+  const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(b));  // d, dmin
+  int sc, mn;
+  q4k_scale_min_(*reinterpret_cast<const uint3*>(b + 4), (int)g, sc, mn);
+  const float d1 = dd.x * (float)sc, m1 = dd.y * (float)mn;
+  const uint2 w = *reinterpret_cast<const uint2*>(b + 48 + 32 * p + l0);
+  const uint2 h = *reinterpret_cast<const uint2*>(b + 16 + l0);
+  const unsigned sh = (g & 1u) ? 4u : 0u;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    v[i] = d1 * (float)(((w.x >> (8 * i + sh)) & 0xFu) | (((h.x >> (8 * i + g)) & 1u) << 4)) - m1;
+    v[4 + i] = d1 * (float)(((w.y >> (8 * i + sh)) & 0xFu) | (((h.y >> (8 * i + g)) & 1u) << 4)) - m1;
+  }
+}
 __device__ __forceinline__ void dq8_q6k_(const unsigned char* row, unsigned gk, float (&v)[8]) {
   const unsigned char* b = row + (size_t)(gk >> 8) * 210u;
   const unsigned o = gk & 255u, h = o >> 7, qd = (o >> 5) & 3u, l0 = o & 31u;
@@ -1353,15 +1371,16 @@ __device__ __forceinline__ void dq8_q50_(const unsigned char* row, unsigned gk, 
 #pragma unroll
   for (int i = 0; i < 8; i++) v[i] = (float)q[i] * d;
 }
-// WF 1 Q4_K, 2 Q6_K, 3 Q8_0, 5 Q5_0 (the GEMMs' weight formats below; 4 is f16 weights,
-// which nothing dequantizes).
+// WF 1 Q4_K, 2 Q6_K, 3 Q8_0, 5 Q5_0, 6 Q5_K (the GEMMs' weight formats below; 4 is f16
+// weights, which nothing dequantizes).
 template <int WF>
 __device__ __forceinline__ void dq8_(const unsigned char* row, unsigned gk, float (&v)[8]) {
-  static_assert(WF >= 1 && WF <= 5 && WF != 4, "a block format");
+  static_assert(WF >= 1 && WF <= 6 && WF != 4, "a block format");
   if constexpr (WF == 1) dq8_q4k_(row, gk, v);
   else if constexpr (WF == 2) dq8_q6k_(row, gk, v);
   else if constexpr (WF == 3) dq8_q80_(row, gk, v);
-  else dq8_q50_(row, gk, v);
+  else if constexpr (WF == 5) dq8_q50_(row, gk, v);
+  else dq8_q5k_(row, gk, v);
 }
 // A row's bytes in format WF, K weights long (K % 256 == 0 for the K-quants).
 template <int WF>
@@ -1369,7 +1388,8 @@ __device__ __forceinline__ size_t quant_row_bytes_(unsigned K) {
   return WF == 1   ? (size_t)(K >> 8) * 144u
          : WF == 2 ? (size_t)(K >> 8) * 210u
          : WF == 3 ? (size_t)(K >> 5) * 34u
-                   : (size_t)(K >> 5) * 22u;
+         : WF == 5 ? (size_t)(K >> 5) * 22u
+                   : (size_t)(K >> 8) * 176u;
 }
 template <bool F16>
 __device__ __forceinline__ uint4 tc_pack8_(const float (&v)[8]) {
@@ -1383,8 +1403,8 @@ __device__ __forceinline__ uint4 tc_dq8_(const unsigned char* row, unsigned gk) 
   return tc_pack8_<F16>(v);
 }
 
-// WF: the weight format B holds: 0 bf16 [N][K], 1 Q4_K, 2 Q6_K blocks (rows of
-// K/256 blocks, K % 256 == 0), 3 Q8_0 (rows of K/32 blocks), 4 f16 [N][K] (a
+// WF: the weight format B holds: 0 bf16 [N][K], 1 Q4_K, 2 Q6_K, 6 Q5_K blocks (rows of
+// K/256 blocks, K % 256 == 0), 3 Q8_0, 5 Q5_0 (rows of K/32 blocks), 4 f16 [N][K] (a
 // block-quantized weight dequantized once ahead, tl_dequant_f16). C rows are `ldc` apart, so a part of a fused
 // projection writes its own columns of the shared output.
 template <int BM, int BN, int BK, int WM, int WN, bool F16, bool AH = false, int WF = 0>
@@ -1528,16 +1548,16 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
 // Three tiles, picked by how well the grid fills the GPU (gemm_tc_run_ in cuda.h):
 // L 128x128 for wide outputs, M 64x128 and S 64x64 for narrow ones. Dynamic
 // shared memory, (BM+BN)*(BK+8)*2 stages*2 bytes: 40/55/37 KB.
-// A and a bf16 / f16 B by 16-byte vectors, Q4_K's nibbles by 8, Q6_K's, Q8_0's and
-// Q5_0's halves by 2; C by float2 stores.
-#define TL_GEMM_TC(NAME, BM, BN, BK, WM, WN, F16, AH, WF)                            \
-  TL_ALIGN(NAME, 16, (WF) == 1 ? 8 : (WF) == 2 || (WF) == 3 || (WF) == 5 ? 2 : 16, 8) \
-  extern "C" __global__ void NAME(const void* __restrict__ A,                        \
-      const void* __restrict__ B, float* __restrict__ C, unsigned M, unsigned N,     \
-      unsigned K, unsigned ldc) {                                                    \
-    gemm_nt_tc_core<BM, BN, BK, WM, WN, F16, AH, WF>(A, B, C, M, N, K, ldc);         \
+// A and a bf16 / f16 B by 16-byte vectors, Q4_K's and Q5_K's nibbles by 8, Q6_K's,
+// Q8_0's and Q5_0's halves by 2; C by float2 stores.
+#define TL_GEMM_TC(NAME, BM, BN, BK, WM, WN, F16, AH, WF)                                          \
+  TL_ALIGN(NAME, 16, (WF) == 1 || (WF) == 6 ? 8 : (WF) == 2 || (WF) == 3 || (WF) == 5 ? 2 : 16, 8) \
+  extern "C" __global__ void NAME(const void* __restrict__ A,                                      \
+      const void* __restrict__ B, float* __restrict__ C, unsigned M, unsigned N,                   \
+      unsigned K, unsigned ldc) {                                                                  \
+    gemm_nt_tc_core<BM, BN, BK, WM, WN, F16, AH, WF>(A, B, C, M, N, K, ldc);                       \
   }
-// Per weight format: bf16 and the block-quantized ones (q4k, q6k, q80, q50); per tile (l, m, s);
+// Per weight format: bf16 and the block-quantized ones (q4k, q6k, q80, q50, q5k); per tile (l, m, s);
 // per form: f32 (bf16 operands, f32 sums), f16 (f16 operands and sums, A f32), f16h
 // (as f16 with A already f16). The quantized weights have the exact form (f32) and
 // the f16h one: the prefill's two, as a backend that rounds activations where they
@@ -1558,6 +1578,8 @@ TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q80, true, true, 3)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_f16w, true, true, 4)
 TL_GEMM_TC_TILES(tl_gemm_tc_f32_q50, false, false, 5)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q50, true, true, 5)
+TL_GEMM_TC_TILES(tl_gemm_tc_f32_q5k, false, false, 6)
+TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q5k, true, true, 6)
 #undef TL_GEMM_TC_TILES
 
 // The f16 weight's fourth tile, for the long-K GEMMs of a big model (a 27B's
@@ -1679,6 +1701,7 @@ TL_ALIGN(tl_dequant_f16_q4k, 8, 16)
 TL_ALIGN(tl_dequant_f16_q6k, 2, 16)
 TL_ALIGN(tl_dequant_f16_q80, 2, 16)
 TL_ALIGN(tl_dequant_f16_q50, 2, 16)
+TL_ALIGN(tl_dequant_f16_q5k, 8, 16)
 extern "C" __global__ void tl_dequant_f16_q4k(const unsigned char* W, __half* out, unsigned rows, unsigned K) {
   dequant_f16_core<1>(W, out, rows, K);
 }
@@ -1690,6 +1713,9 @@ extern "C" __global__ void tl_dequant_f16_q80(const unsigned char* W, __half* ou
 }
 extern "C" __global__ void tl_dequant_f16_q50(const unsigned char* W, __half* out, unsigned rows, unsigned K) {
   dequant_f16_core<5>(W, out, rows, K);
+}
+extern "C" __global__ void tl_dequant_f16_q5k(const unsigned char* W, __half* out, unsigned rows, unsigned K) {
+  dequant_f16_core<6>(W, out, rows, K);
 }
 
 // ---- The prefill GEMM over block-quantized weights on the int8 tensor cores (llama.cpp's MMQ).
@@ -2133,6 +2159,23 @@ static __device__ __forceinline__ void gemv_row_block_store(
 // the pair's 32 (8 weights: 4 low nibbles of group 2*pair, 4 high of 2*pair+1)
 // and the 4 + 4 activations they multiply.
 // y_n = sum d*sc*q*a - dmin*m*a.
+//
+// A lane's term of a Q4_K or Q5_K block b (d, dmin and the scale words at its
+// start): lo and hi the q of its 4 weights of groups 2p and 2p+1, times the
+// activations at ap and ap + 32.
+__device__ __forceinline__ float k4_lane_(const unsigned char* b, const float* ap, unsigned p,
+                                          const float (&lo)[4], const float (&hi)[4]) {
+  const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(b));  // d, dmin
+  const uint3 sw = *reinterpret_cast<const uint3*>(b + 4);
+  const float4 alo = *reinterpret_cast<const float4*>(ap), ahi = *reinterpret_cast<const float4*>(ap + 32);
+  const float sql = lo[0] * alo.x + lo[1] * alo.y + lo[2] * alo.z + lo[3] * alo.w;
+  const float sqh = hi[0] * ahi.x + hi[1] * ahi.y + hi[2] * ahi.z + hi[3] * ahi.w;
+  int s0, m0, s1, m1;  // scale / min of groups 2p and 2p+1
+  q4k_scale_min_(sw, 2 * (int)p, s0, m0);
+  q4k_scale_min_(sw, 2 * (int)p + 1, s1, m1);
+  const float suml = alo.x + alo.y + alo.z + alo.w, sumh = ahi.x + ahi.y + ahi.z + ahi.w;
+  return dd.x * (s0 * sql + s1 * sqh) - dd.y * (m0 * suml + m1 * sumh);
+}
 TL_ALIGN(tl_gemv_q4k_row, 16, 4)  // a by float4; Q4_K by words
 __global__ void tl_gemv_q4k_row(const float* __restrict__ a, const unsigned char* __restrict__ W,
                                 float* __restrict__ y, unsigned N, unsigned K) {
@@ -2144,20 +2187,37 @@ __global__ void tl_gemv_q4k_row(const float* __restrict__ a, const unsigned char
   float acc = 0.0f;
   for (unsigned ib = warp; ib < nb; ib += nwarps) {
     const unsigned char* b = row + (size_t)ib * 144u;
-    const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(b));  // d, dmin
-    const uint3 sw = *reinterpret_cast<const uint3*>(b + 4);
     const unsigned w = *reinterpret_cast<const unsigned*>(b + 16 + 32 * p + 4 * j);
-    const float* ap = a + (size_t)ib * 256u + 64u * p + 4u * j;
-    const float4 alo = *reinterpret_cast<const float4*>(ap), ahi = *reinterpret_cast<const float4*>(ap + 32);
     const float lo[4] = {(float)(w & 0xFu), (float)((w >> 8) & 0xFu), (float)((w >> 16) & 0xFu), (float)((w >> 24) & 0xFu)};
     const float hi[4] = {(float)((w >> 4) & 0xFu), (float)((w >> 12) & 0xFu), (float)((w >> 20) & 0xFu), (float)((w >> 28) & 0xFu)};
-    const float sql = lo[0] * alo.x + lo[1] * alo.y + lo[2] * alo.z + lo[3] * alo.w;
-    const float sqh = hi[0] * ahi.x + hi[1] * ahi.y + hi[2] * ahi.z + hi[3] * ahi.w;
-    int s0, m0, s1, m1;  // scale / min of groups 2p and 2p+1
-    q4k_scale_min_(sw, 2 * (int)p, s0, m0);
-    q4k_scale_min_(sw, 2 * (int)p + 1, s1, m1);
-    const float suml = alo.x + alo.y + alo.z + alo.w, sumh = ahi.x + ahi.y + ahi.z + ahi.w;
-    acc += dd.x * (s0 * sql + s1 * sqh) - dd.y * (m0 * suml + m1 * sumh);
+    acc += k4_lane_(b, a + (size_t)ib * 256u + 64u * p + 4u * j, p, lo, hi);
+  }
+  gemv_row_block_store(acc, lane, warp, nwarps, y + n);
+}
+
+// Q5_K, 176 bytes a block, as Q4_K's (its quants at byte 48), and the fifth bits: the
+// lane's 4 bytes of qh at 4j, bit 2*pair of byte i weight 4j+i's in group 2*pair, bit
+// 2*pair+1 in group 2*pair+1. y_n = sum d*sc*q*a - dmin*m*a.
+TL_ALIGN(tl_gemv_q5k_row, 16, 4)  // a by float4; Q5_K by words
+__global__ void tl_gemv_q5k_row(const float* __restrict__ a, const unsigned char* __restrict__ W,
+                                float* __restrict__ y, unsigned N, unsigned K) {
+  const unsigned n = blockIdx.x;
+  if (n >= N) return;
+  const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
+  const unsigned nb = K / 256u, p = lane >> 3, j = lane & 7u;
+  const unsigned char* row = W + (size_t)n * nb * 176u;
+  float acc = 0.0f;
+  for (unsigned ib = warp; ib < nb; ib += nwarps) {
+    const unsigned char* b = row + (size_t)ib * 176u;
+    const unsigned w = *reinterpret_cast<const unsigned*>(b + 48 + 32 * p + 4 * j);
+    const unsigned h = *reinterpret_cast<const unsigned*>(b + 16 + 4 * j) >> (2 * p);
+    float lo[4], hi[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      lo[i] = (float)(((w >> (8 * i)) & 0xFu) | (((h >> (8 * i)) & 1u) << 4));
+      hi[i] = (float)(((w >> (8 * i + 4)) & 0xFu) | (((h >> (8 * i + 1)) & 1u) << 4));
+    }
+    acc += k4_lane_(b, a + (size_t)ib * 256u + 64u * p + 4u * j, p, lo, hi);
   }
   gemv_row_block_store(acc, lane, warp, nwarps, y + n);
 }

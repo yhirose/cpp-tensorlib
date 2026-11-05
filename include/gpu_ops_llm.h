@@ -203,7 +203,7 @@ inline bool finish_read(pending_read& r, float* out) {
 // bf16 (30) read by strides in elements (out[j] = W[idx * row_stride + j *
 // col_stride], so a [rows, k] table and its [k, rows] transpose both serve),
 // or a block format whose rows are whole blocks, read as gemv_quant reads them
-// (Q4_K 12, Q6_K 14, Q8_0 8; the strides unused). An index past the table
+// (a format quant_reads takes; the strides unused). An index past the table
 // gives zeros. `scale` multiplies the row (Gemma's embedding, times sqrt of its
 // width). False for a format the backend has no reader for.
 TL_GPU_DETECT_OWN(embed_row)
