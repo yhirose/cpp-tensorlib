@@ -1607,25 +1607,29 @@ TEST_CASE("generic compositions agree with the fused kernels") {
         std::vector<double> ref(N, 0.0);
         for (int64_t n = 0; n < N; n++)
           for (int64_t k = 0; k < K; k++) ref[n] += (double)q.w[(size_t)n * K + k] * a.raw()[k];
-        array W = dev(q.W), ad = dev(a), y = array::empty({N});
-        REQUIRE(gpu::gemv_quant(type, ad.device_span(), W.device_span(), y.device_span(), N, K));
+        // y between sentinels: no row past N is stored (a block of the kernel may hold
+        // more rows than are left).
+        const int64_t pad = 8;
+        array W = dev(q.W), ad = dev(a), yb = dev(with_sentinels(N, pad));
+        const gpu::span ys = yb.device_span().at(4 * pad);
+        REQUIRE(gpu::gemv_quant(type, ad.device_span(), W.device_span(), ys, N, K));
         // A weight off its format's alignment is refused, not misread.
         if (f.align == 4)
-          CHECK_FALSE(gpu::gemv_quant(type, ad.device_span(), W.device_span().at(2),
-                                      y.device_span(), N, K));
+          CHECK_FALSE(gpu::gemv_quant(type, ad.device_span(), W.device_span().at(2), ys, N, K));
         // So is an activation off 16 bytes (the kernels' vector loads).
-        CHECK_FALSE(gpu::gemv_quant(type, ad.device_span().at(4), W.device_span(),
-                                    y.device_span(), N, K));
+        CHECK_FALSE(gpu::gemv_quant(type, ad.device_span().at(4), W.device_span(), ys, N, K));
         tl::gpu::flush();
-        y.eval();
+        const std::vector<float> yv = host_values(yb);
         double worst = 0;
         for (int64_t n = 0; n < N; n++)
-          worst = tl::max_err(worst, std::fabs(y.raw()[n] - ref[n]) / (1.0 + std::fabs(ref[n])));
+          worst = tl::max_err(worst, std::fabs(yv[(size_t)(pad + n)] - ref[n]) /
+                                         (1.0 + std::fabs(ref[n])));
         CHECK(worst < 1e-5);
+        CHECK(sentinels_kept(yv, N, pad));
         // A format read by halves, from a base 2 bytes off 4: read right; 1 byte off:
         // refused.
         if (f.align == 2) {
-          const std::vector<float> wv = host_values(q.W), want = host_values(y);
+          const std::vector<float> wv = host_values(q.W), want = after_lead(yb, pad, N);
           for (const int lead : {2, 1}) {
             std::vector<unsigned char> b((size_t)lead + wv.size() * 4, 0);
             std::memcpy(b.data() + lead, wv.data(), wv.size() * 4);

@@ -355,7 +355,9 @@ inline bool own_nn::gemm_bf16_nt_f16acc_a16(gpu::span a, gpu::span B, gpu::span 
 // index in the GEMM's staging and the device code (context::tc_weight, cuda_nn.cuh's
 // WF); its GEMV, f16 dequantization and row-lookup kernels; its MMQ kernels' index
 // (context::mmq_), -1 where it has none; its GEMVs reading a prepared activation, by
-// form (act_slot_: q8, h16), null where it reads none. A block's
+// form (act_slot_: q8, h16), null where it reads none; and its float GEMV's launch, the
+// rows a block (the kernel's own count) and the block's threads (most: a row a block of
+// 4 warps), with a float a row and warp of shared memory for the sums. A block's
 // geometry is ggml's (gguf::ggml_block). Every reader of a format takes it from here.
 struct quant_fmt {
   int type;
@@ -363,6 +365,7 @@ struct quant_fmt {
   const char *gemv, *dequant, *embed;
   int mmq;
   const char* gemv_act[context::act_forms_max];
+  unsigned gemv_rows = 1, gemv_threads = 128;
 };
 inline constexpr quant_fmt quant_fmts_[] = {
     {12, context::tc_weight::q4k, "tl_gemv_q4k_row", "tl_dequant_f16_q4k", "tl_embed_row_q4k", 0,
@@ -373,9 +376,9 @@ inline constexpr quant_fmt quant_fmts_[] = {
     {13, context::tc_weight::q5k, "tl_gemv_q5k_row", "tl_dequant_f16_q5k", "tl_embed_row_q5k", -1,
      {"tl_gemv_q5k_q8_row", "tl_gemv_q5k_h16_row"}},
     {2, context::tc_weight::q40, "tl_gemv_q40_row", "tl_dequant_f16_q40", "tl_embed_row_q40", -1,
-     {"tl_gemv_q40_q8_row", nullptr}},
+     {"tl_gemv_q40_q8_row", nullptr}, 2, 64},
     {3, context::tc_weight::q41, "tl_gemv_q41_row", "tl_dequant_f16_q41", "tl_embed_row_q41", -1,
-     {"tl_gemv_q41_q8_row", nullptr}},
+     {"tl_gemv_q41_q8_row", nullptr}, 2, 64},
 };
 static_assert(sizeof(quant_fmts_) / sizeof(quant_fmts_[0]) <= context::quant_fmts_max, "slots");
 // The row of `type` where rows of k weights are a whole number of its blocks, else -1.
@@ -599,9 +602,10 @@ inline bool own_nn::gemv_quant(int type, gpu::span a, gpu::span W, gpu::span y, 
   c.device_read_(a.buf);
   c.device_read_(W.buf);
   c.device_write_(y.buf);
-  constexpr unsigned threads = 128;  // 4 warps a row
-  return c.launch_(c.cached_(c.gemv_quant_fn[fi], quant_fmts_[fi].gemv),
-                   {(unsigned)n}, {threads}, threads / 32 * sizeof(float), pa,
+  const quant_fmt& f = quant_fmts_[fi];
+  return c.launch_(c.cached_(c.gemv_quant_fn[fi], f.gemv),
+                   {((unsigned)n + f.gemv_rows - 1) / f.gemv_rows}, {f.gemv_threads},
+                   f.gemv_rows * f.gemv_threads / 32 * sizeof(float), pa,
                    reinterpret_cast<unsigned char*>(pw),
                    context::off_(y.buf, y.off), (unsigned)n, (unsigned)k);
 }

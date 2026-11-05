@@ -1350,8 +1350,8 @@ __device__ __forceinline__ void dq8_q80_(const unsigned char* row, unsigned gk, 
 // The 32-weight formats Q5_0, Q4_0 and Q4_1 hold their four low bits alike: 16 bytes,
 // byte j element j's in its low nibble and element j + 16's in its high one. The
 // nibbles of elements o .. o + 7 (o % 8 == 0) from those bytes at qs, by 16-bit loads
-// (the blocks are 2-byte aligned only), for the float GEMVs, the dequantization and the
-// row lookup (the int8 GEMVs read them in place).
+// (the blocks are 2-byte aligned only), for the dequantization and the row lookup (the
+// Q4_0 and Q4_1 GEMVs read them in place).
 __device__ __forceinline__ void nib32_(const unsigned char* qs, unsigned o, unsigned (&n)[8]) {
   const unsigned short* q16 = reinterpret_cast<const unsigned short*>(qs + (o & 15u));
   const unsigned sh = o & 16u ? 4u : 0u;  // elements 16.. are the high nibbles
@@ -2618,26 +2618,23 @@ __global__ void tl_gemv_q80_row(const float* __restrict__ a, const unsigned char
   gemv_row_block_store(acc, lane, warp, nwarps, y + n);
 }
 
-// Q5_0 and Q4_0, 22- and 18-byte blocks of 32 (2-byte aligned only), as Q8_0's: a warp
-// takes eight blocks at a time, lane = 4 * which + j taking the elements 8j.. of its
-// block (q50_vals_ or q40_vals_, q5 saying which) and the 8 activations they multiply.
-// y_n = sum d * q * a.
-static __device__ __forceinline__ void gemv_d32_row(const float* __restrict__ a,
-                                                    const unsigned char* __restrict__ W,
-                                                    float* __restrict__ y, unsigned N, unsigned K,
-                                                    bool q5) {
+// Q5_0, 22-byte blocks of 32 (2-byte aligned only), as Q8_0's: a warp takes eight blocks
+// at a time, lane = 4 * which + j taking the elements 8j.. of its block (q50_vals_) and
+// the 8 activations they multiply. y_n = sum d * q * a.
+TL_ALIGN(tl_gemv_q50_row, 16, 2)  // a by float4; Q5_0 by halves
+__global__ void tl_gemv_q50_row(const float* __restrict__ a, const unsigned char* __restrict__ W,
+                                float* __restrict__ y, unsigned N, unsigned K) {
   const unsigned n = blockIdx.x;
   if (n >= N) return;
   const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
-  const unsigned nb = K / 32u, j = lane & 3u, bb = q5 ? 22u : 18u;
-  const unsigned char* row = W + (size_t)n * nb * bb;
+  const unsigned nb = K / 32u, j = lane & 3u;
+  const unsigned char* row = W + (size_t)n * nb * 22u;
   float acc = 0.0f;
   for (unsigned ib = warp * 8u + (lane >> 2); ib < nb; ib += nwarps * 8u) {
-    const unsigned char* b = row + (size_t)ib * bb;
+    const unsigned char* b = row + (size_t)ib * 22u;
     const float d = __half2float(*reinterpret_cast<const __half*>(b));
     int q[8];
-    if (q5) q50_vals_(b, 8u * j, q);
-    else q40_vals_(b, 8u * j, q);
+    q50_vals_(b, 8u * j, q);
     const float* ap = a + (size_t)ib * 32u + 8u * j;
     const float4 a0 = *reinterpret_cast<const float4*>(ap), a1 = *reinterpret_cast<const float4*>(ap + 4);
     const float v[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
@@ -2648,45 +2645,82 @@ static __device__ __forceinline__ void gemv_d32_row(const float* __restrict__ a,
   }
   gemv_row_block_store(acc, lane, warp, nwarps, y + n);
 }
-TL_ALIGN(tl_gemv_q50_row, 16, 2)  // a by float4; Q5_0 by halves
-__global__ void tl_gemv_q50_row(const float* __restrict__ a, const unsigned char* __restrict__ W,
-                                float* __restrict__ y, unsigned N, unsigned K) {
-  gemv_d32_row(a, W, y, N, K, true);
+
+// Q4_0 and Q4_1, 18- and 20-byte blocks of 32 (2-byte aligned only): two rows a block
+// (quant_fmts_' gemv_rows), its warps splitting the blocks, lane = 2 * which + h taking
+// half a block, the 8 bytes 8h.. of its qs (elements 8h.. in the low nibbles, 16 + 8h..
+// in the high), for both rows, so a lane reads its 16 activations once for the two
+// (llama.cpp's Metal kernel_mul_mv_q4_0_f32). A nibble is multiplied where it lies in
+// its 16-bit half, masked and not shifted, against its activation divided by 1, 16,
+// 256 or 4096: powers of two, so each product is q * a as the float kernels make it.
+// Q4_0's - 8 is - 8 d sum(a), Q4_1's m is m sum(a), the lane's 16 activations summed.
+}  // extern "C"
+template <bool M1>
+static __device__ __forceinline__ void q4_row2_(const float* __restrict__ a,
+                                                const unsigned char* __restrict__ W,
+                                                float* __restrict__ y, unsigned N, unsigned K) {
+  constexpr unsigned bb = M1 ? 20u : 18u, qs = M1 ? 4u : 2u;
+  const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
+  const unsigned nb = K / 32u, h = lane & 1u, n0 = blockIdx.x * 2u;
+  // The second row past N reads the first and stores nothing.
+  const unsigned char* rows[2] = {W + (size_t)n0 * nb * bb,
+                                  W + (size_t)min(n0 + 1u, N - 1u) * nb * bb};
+  float acc[2] = {0.0f, 0.0f};
+  for (unsigned ib = warp * 16u + (lane >> 1); ib < nb; ib += nwarps * 16u) {
+    const float* ap = a + (size_t)ib * 32u + 8u * h;
+    const float4 a0 = *reinterpret_cast<const float4*>(ap), a1 = *reinterpret_cast<const float4*>(ap + 4);
+    const float4 a2 = *reinterpret_cast<const float4*>(ap + 16), a3 = *reinterpret_cast<const float4*>(ap + 20);
+    const float sum = (a0.x + a0.y + a0.z + a0.w) + (a1.x + a1.y + a1.z + a1.w) +
+                      (a2.x + a2.y + a2.z + a2.w) + (a3.x + a3.y + a3.z + a3.w);
+    // Half i of the 8 bytes: bits 0-3 element 2i, 8-11 2i + 1, 4-7 16 + 2i, 12-15 17 + 2i.
+    const float v[16] = {a0.x, a0.y * (1.f / 256.f), a2.x * (1.f / 16.f), a2.y * (1.f / 4096.f),
+                         a0.z, a0.w * (1.f / 256.f), a2.z * (1.f / 16.f), a2.w * (1.f / 4096.f),
+                         a1.x, a1.y * (1.f / 256.f), a3.x * (1.f / 16.f), a3.y * (1.f / 4096.f),
+                         a1.z, a1.w * (1.f / 256.f), a3.z * (1.f / 16.f), a3.w * (1.f / 4096.f)};
+#pragma unroll
+    for (int r = 0; r < 2; r++) {
+      const unsigned char* b = rows[r] + (size_t)ib * bb;
+      const unsigned short* q = reinterpret_cast<const unsigned short*>(b + qs + 8 * h);
+      float s = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        const unsigned w = q[i];
+        s += v[4 * i] * (float)(w & 0x000Fu) + v[4 * i + 1] * (float)(w & 0x0F00u) +
+             v[4 * i + 2] * (float)(w & 0x00F0u) + v[4 * i + 3] * (float)(w & 0xF000u);
+      }
+      const float d = __half2float(*reinterpret_cast<const __half*>(b));
+      if constexpr (M1) acc[r] += d * s + __half2float(*reinterpret_cast<const __half*>(b + 2)) * sum;
+      else acc[r] += d * (s - 8.0f * sum);
+    }
+  }
+  // Each warp's two sums, in the shared memory the launcher sizes (rows * warps floats).
+  extern __shared__ float gemv_row_sdata[];
+#pragma unroll
+  for (int r = 0; r < 2; r++) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc[r] += __shfl_down_sync(0xffffffffu, acc[r], off);
+    if (lane == 0) gemv_row_sdata[2u * warp + r] = acc[r];
+  }
+  __syncthreads();
+  if (threadIdx.x < 2u && n0 + threadIdx.x < N) {
+    float t = 0.0f;
+    for (unsigned w = 0; w < nwarps; w++) t += gemv_row_sdata[2u * w + threadIdx.x];
+    y[n0 + threadIdx.x] = t;
+  }
 }
 TL_ALIGN(tl_gemv_q40_row, 16, 2)  // a by float4; Q4_0 by halves
-__global__ void tl_gemv_q40_row(const float* __restrict__ a, const unsigned char* __restrict__ W,
-                                float* __restrict__ y, unsigned N, unsigned K) {
-  gemv_d32_row(a, W, y, N, K, false);
+extern "C" __global__ void tl_gemv_q40_row(const float* __restrict__ a,
+                                           const unsigned char* __restrict__ W,
+                                           float* __restrict__ y, unsigned N, unsigned K) {
+  q4_row2_<false>(a, W, y, N, K);
 }
-// Q4_1, 20 bytes a block of 32, read by halves as Q4_0's: y_n = sum d*q*a + m * sum a.
 TL_ALIGN(tl_gemv_q41_row, 16, 2)  // a by float4; Q4_1 by halves
-__global__ void tl_gemv_q41_row(const float* __restrict__ a, const unsigned char* __restrict__ W,
-                                float* __restrict__ y, unsigned N, unsigned K) {
-  const unsigned n = blockIdx.x;
-  if (n >= N) return;
-  const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
-  const unsigned nb = K / 32u, j = lane & 3u;
-  const unsigned char* row = W + (size_t)n * nb * 20u;
-  float acc = 0.0f;
-  for (unsigned ib = warp * 8u + (lane >> 2); ib < nb; ib += nwarps * 8u) {
-    const unsigned char* b = row + (size_t)ib * 20u;
-    const float d = __half2float(*reinterpret_cast<const __half*>(b));
-    const float m = __half2float(*reinterpret_cast<const __half*>(b + 2));
-    unsigned q[8];
-    nib32_(b + 4, 8u * j, q);
-    const float* ap = a + (size_t)ib * 32u + 8u * j;
-    const float4 a0 = *reinterpret_cast<const float4*>(ap), a1 = *reinterpret_cast<const float4*>(ap + 4);
-    const float v[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
-    float s = 0.0f, sa = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 8; i++) {
-      s += (float)q[i] * v[i];
-      sa += v[i];
-    }
-    acc += d * s + m * sa;
-  }
-  gemv_row_block_store(acc, lane, warp, nwarps, y + n);
+extern "C" __global__ void tl_gemv_q41_row(const float* __restrict__ a,
+                                           const unsigned char* __restrict__ W,
+                                           float* __restrict__ y, unsigned N, unsigned K) {
+  q4_row2_<true>(a, W, y, N, K);
 }
+extern "C" {
 
 // A word read as two halves, for blocks aligned to 2 bytes only.
 __device__ __forceinline__ unsigned ld32_h(const unsigned char* p) {
