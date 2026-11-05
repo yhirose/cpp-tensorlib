@@ -338,7 +338,7 @@ LLM inference
 `bench/models/chat_qwen.cpp` is the end-to-end proof of the header-only,
 zero-dependency, cross-platform claims above: it loads a real Qwen2.5,
 Qwen3, Qwen3.5, Gemma 3 or Llama 3.2 GGUF model (F16, BF16, or quantized as Q4_K / Q5_K / Q6_K /
-Q8_0 blocks, and Gemma 3 1B's Q5_0, which stay quantized on the device: Qwen3.8-27B Q4_K_M,
+Q8_0 / Q5_0 / Q4_0 / Q4_1 blocks, which stay quantized on the device: Qwen3.8-27B Q4_K_M,
 17.7 GiB, runs on a 24 GB
 RTX 3090) and chats, using nothing but this library's own
 kernels — own GGUF v3 reader (`include/gguf.h`), own GPT-2-byte-BPE and

@@ -11,22 +11,36 @@
 
 namespace {
 
-// The GGUF block formats the kernels read, a row each: the ggml type, and the byte
-// offsets of a block's half scales (its d, and dmin where it has one). Every test over
-// the formats takes them from here.
+// The GGUF block formats the kernels read, a row each: the ggml type, its name, the
+// byte alignment its GEMVs need of a weight (4 for the word loads into a Q4_K or Q5_K
+// block, 2 for the others' halves), and the byte offsets of a block's half scales (its
+// d, and its dmin or m where it has one). Every test over the formats takes them from
+// here.
 struct block_format {
   int type;
+  const char* name;
+  int align;
   size_t halves[2];
   int nhalves;
 };
 namespace gq = tl::gguf;
 inline constexpr block_format block_formats[] = {
-    {12, {offsetof(gq::block_q4_k, d), offsetof(gq::block_q4_k, dmin)}, 2},  // Q4_K
-    {14, {offsetof(gq::block_q6_k, d)}, 1},                                 // Q6_K
-    {8, {offsetof(gq::block_q8_0, d)}, 1},                                  // Q8_0
-    {6, {offsetof(gq::block_q5_0, d)}, 1},                                  // Q5_0
-    {13, {offsetof(gq::block_q5_k, d), offsetof(gq::block_q5_k, dmin)}, 2},  // Q5_K
+    {12, "Q4_K", 4, {offsetof(gq::block_q4_k, d), offsetof(gq::block_q4_k, dmin)}, 2},
+    {14, "Q6_K", 2, {offsetof(gq::block_q6_k, d)}, 1},
+    {8, "Q8_0", 2, {offsetof(gq::block_q8_0, d)}, 1},
+    {6, "Q5_0", 2, {offsetof(gq::block_q5_0, d)}, 1},
+    {13, "Q5_K", 4, {offsetof(gq::block_q5_k, d), offsetof(gq::block_q5_k, dmin)}, 2},
+    {2, "Q4_0", 2, {offsetof(gq::block_q4_0, d)}, 1},
+    {3, "Q4_1", 2, {offsetof(gq::block_q4_1, d), offsetof(gq::block_q4_1, m)}, 2},
 };
+// A row of K weights for a test over `type`: K itself for a 256-weight format, 35
+// blocks for a 32-weight one (an odd count: a row of 18-, 22- or 34-byte blocks puts
+// every other row 2 bytes off 4).
+inline int64_t test_row_k(int type, int64_t K) {
+  uint64_t elems = 0, bytes = 0;
+  tl::gguf::ggml_block(static_cast<tl::gguf::ggml_type>(type), elems, bytes);
+  return elems == 32 ? 35 * 32 : K;
+}
 
 // N rows of K weights in a GGUF block format (a row of block_formats) as one buffer
 // (for the caller to move to the device), and the same rows dequantized by the CPU

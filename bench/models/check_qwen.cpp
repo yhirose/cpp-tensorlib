@@ -1,12 +1,12 @@
 // M9 "actually chat" — numeric proof. Load a real Qwen2.5-0.5B-Instruct, Qwen3
 // or Qwen3.5 GGUF (F16 or BF16 weights, or Qwen3.5 0.8B's Q4_K_M, a fifth of it
-// Q5_K), Gemma 3 4B or 1B (Q4_K_M), or Llama 3.2 1B (F16 or Q4_K_M) or 3B
-// (Q4_K_M), and run the decoder end to end, verified
+// Q5_K), Gemma 3 4B or 1B (Q4_K_M), or Llama 3.2 1B (F16, Q4_K_M, or Q4_0 with
+// Q4_1) or 3B (Q4_K_M), and run the decoder end to end, verified
 // against a tight numpy reference that reads the SAME weights (tools/qwen_oracle.py
 // wrote the *_oracle_data.h headers: Gemma 3 1B's over a prompt past its
 // 512-position window, Llama 3.2 1B's over one long enough that its RoPE factors
 // turn the low-frequency pairs well apart; the model's arch and shape pick one,
-// and of two, the one that read the file's weights). Identical
+// and of several, the one that read the file's weights). Identical
 // weights => the C++ forward must match the reference to ~1e-4 at every checkpoint
 // (embedding, layer-0 residual, final norm, top-5 logits) AND reproduce the greedy
 // token sequence exactly. A file of other weights than its oracle's (another
@@ -21,6 +21,7 @@
 #include "gemma3_1b_oracle_data.h"
 #include "gemma3_oracle_data.h"
 #include "llama32_1b_oracle_data.h"
+#include "llama32_1b_q40_oracle_data.h"
 #include "llama32_1b_q4_oracle_data.h"
 #include "llama32_3b_oracle_data.h"
 #include "qwen.h"
@@ -510,11 +511,12 @@ int main(int argc, char** argv) {
       // unsloth/gemma-3-{4b,1b}-it-GGUF's gemma-3-*-it-Q4_K_M.gguf
       {"gemma3", 34, 2560, TL_ORACLE(gemma3oracle, 0x0b1451ea793e00e9ull)},     // Gemma 3 4B
       {"gemma3", 26, 1152, TL_ORACLE(gemma3_1boracle, 0x1f0d93832cf2bb46ull)},  // Gemma 3 1B
-      // unsloth/Llama-3.2-{1B,3B}-Instruct-GGUF's F16 and Q4_K_M
+      // unsloth/Llama-3.2-{1B,3B}-Instruct-GGUF's F16, Q4_K_M and Q4_0
       {"llama", 16, 2048, TL_ORACLE(llama32_1boracle, 0)},                     // Llama 3.2 1B, F16
       {"llama", 16, 2048, TL_ORACLE(llama32_1b_q4oracle, 0x00f056cb14a01068ull)},  // 1B Q4_K_M
+      {"llama", 16, 2048, TL_ORACLE(llama32_1b_q40oracle, 0xc82864007acd8011ull)},  // 1B Q4_0
       {"llama", 28, 3072, TL_ORACLE(llama32_3boracle, 0x398103f1bd23c54bull)}};    // 3B Q4_K_M
-  // The oracle for the model's shape; of two (a float file's and a quantized one's),
+  // The oracle for the model's shape; of several (a float file's and quantized ones'),
   // the one that read this file's weights, else the first.
   const Oracle* found = nullptr;
   for (const auto& r : oracles)

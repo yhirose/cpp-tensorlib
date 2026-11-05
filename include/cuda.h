@@ -701,13 +701,14 @@ struct context {
   // sums, and f16 sums reading the activation already f16 (no rounding stage).
   enum class tc_form { f32, f16, f16h };
   // The weight it reads: bf16 [N][K], f16 [N][K] (f16w), or the rows of block-quantized
-  // blocks (Q4_K, Q6_K, Q8_0, Q5_0, Q5_K); the quantized ones have the f32 and f16h forms
-  // only.
-  enum class tc_weight { bf16, q4k, q6k, q80, f16w, q50, q5k };
-  CUfunction gemm_tc_fn[7][3][4] = {};  // [weight][form][tile]
+  // blocks (Q4_K, Q6_K, Q8_0, Q5_0, Q5_K, Q4_0, Q4_1); the quantized ones have the f32
+  // and f16h forms only.
+  enum class tc_weight { bf16, q4k, q6k, q80, f16w, q50, q5k, q40, q41 };
+  CUfunction gemm_tc_fn[9][3][4] = {};  // [weight][form][tile]
   CUfunction gemm_tc_(tc_form f, tc_tile t, tc_weight w = tc_weight::bf16) {
     static const char* const forms[3] = {"f32", "f16", "f16h"};
-    static const char* const weights[7] = {"", "_q4k", "_q6k", "_q80", "_f16w", "_q50", "_q5k"};
+    static const char* const weights[9] = {"",     "_q4k", "_q6k", "_q80", "_f16w",
+                                           "_q50", "_q5k", "_q40", "_q41"};
     static const char* const tiles[4] = {"l", "m", "s", "xl"};
     if (t == tc_tile::xl && (w != tc_weight::f16w || f != tc_form::f16h)) return nullptr;
     if (w != tc_weight::bf16 && f == tc_form::f16) return nullptr;

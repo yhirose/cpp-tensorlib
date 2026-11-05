@@ -16,13 +16,13 @@ namespace metal {
 // (gtile, attn_kernel_): keyed below attn's range in the one pipeline cache, so
 // a new nn kernel joins this list rather than starting another family.
 enum class nn_kernel {
-  gemv_q4k, gemv_q6k, gemv_q80, gemv_q50, gemv_q5k,
+  gemv_q4k, gemv_q6k, gemv_q80, gemv_q50, gemv_q5k, gemv_q40, gemv_q41,
   gemm_q4k, gemm_q4k_32, gemm_q6k, gemm_q6k_32, gemm_q80, gemm_q80_32, gemm_q50, gemm_q50_32,
-  gemm_q5k, gemm_q5k_32,
+  gemm_q5k, gemm_q5k_32, gemm_q40, gemm_q40_32, gemm_q41, gemm_q41_32,
   rmsnorm_rope_64, rmsnorm_rope_128, rmsnorm_rope_256, gated_rmsnorm,
   gemm_bf16_steel, gemm_bf16_steel_32, gemm_bf16_f16acc, gemm_bf16_f16acc_32,
   embed_row_f32, embed_row_bf16, embed_row_q4k, embed_row_q6k, embed_row_q80, embed_row_q50,
-  embed_row_q5k,
+  embed_row_q5k, embed_row_q40, embed_row_q41,
 };
 constexpr int nn_kernel_key_(nn_kernel t) { return -201 - static_cast<int>(t); }
 inline const char* nn_kernel_name_(nn_kernel t) {
@@ -32,6 +32,8 @@ inline const char* nn_kernel_name_(nn_kernel t) {
     case nn_kernel::gemv_q80: return "gemv_q80_";
     case nn_kernel::gemv_q50: return "gemv_q50_";
     case nn_kernel::gemv_q5k: return "gemv_q5k_";
+    case nn_kernel::gemv_q40: return "gemv_q40_";
+    case nn_kernel::gemv_q41: return "gemv_q41_";
     case nn_kernel::gemm_q4k: return "gemm_q4k_nt_";
     case nn_kernel::gemm_q4k_32: return "gemm_q4k_nt32_";
     case nn_kernel::gemm_q6k: return "gemm_q6k_nt_";
@@ -42,6 +44,10 @@ inline const char* nn_kernel_name_(nn_kernel t) {
     case nn_kernel::gemm_q50_32: return "gemm_q50_nt32_";
     case nn_kernel::gemm_q5k: return "gemm_q5k_nt_";
     case nn_kernel::gemm_q5k_32: return "gemm_q5k_nt32_";
+    case nn_kernel::gemm_q40: return "gemm_q40_nt_";
+    case nn_kernel::gemm_q40_32: return "gemm_q40_nt32_";
+    case nn_kernel::gemm_q41: return "gemm_q41_nt_";
+    case nn_kernel::gemm_q41_32: return "gemm_q41_nt32_";
     case nn_kernel::rmsnorm_rope_64: return "rmsnorm_rope_64_";
     case nn_kernel::rmsnorm_rope_128: return "rmsnorm_rope_128_";
     case nn_kernel::rmsnorm_rope_256: return "rmsnorm_rope_256_";
@@ -57,6 +63,8 @@ inline const char* nn_kernel_name_(nn_kernel t) {
     case nn_kernel::embed_row_q80: return "embed_row_q80_";
     case nn_kernel::embed_row_q50: return "embed_row_q50_";
     case nn_kernel::embed_row_q5k: return "embed_row_q5k_";
+    case nn_kernel::embed_row_q40: return "embed_row_q40_";
+    case nn_kernel::embed_row_q41: return "embed_row_q41_";
   }
   return "";
 }
@@ -334,6 +342,8 @@ inline constexpr quant_fmt quant_fmts_[] = {
     {8, nn_kernel::gemv_q80, nn_kernel::gemm_q80, nn_kernel::gemm_q80_32, nn_kernel::embed_row_q80, false},
     {6, nn_kernel::gemv_q50, nn_kernel::gemm_q50, nn_kernel::gemm_q50_32, nn_kernel::embed_row_q50, false},
     {13, nn_kernel::gemv_q5k, nn_kernel::gemm_q5k, nn_kernel::gemm_q5k_32, nn_kernel::embed_row_q5k, true},
+    {2, nn_kernel::gemv_q40, nn_kernel::gemm_q40, nn_kernel::gemm_q40_32, nn_kernel::embed_row_q40, false},
+    {3, nn_kernel::gemv_q41, nn_kernel::gemm_q41, nn_kernel::gemm_q41_32, nn_kernel::embed_row_q41, false},
 };
 // The row of `type` where rows of k weights are a whole number of its blocks, else null.
 inline const quant_fmt* quant_fmt_(int type, int64_t k) {

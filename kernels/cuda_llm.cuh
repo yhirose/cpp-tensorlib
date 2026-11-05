@@ -174,11 +174,6 @@ __device__ __forceinline__ void embed_row_quant_core(const unsigned char* __rest
 #pragma unroll
   for (int i = 0; i < 8; i++) out[gk + i] = v[i] * scale;
 }
-TL_ALIGN(tl_embed_row_q4k, 8)
-TL_ALIGN(tl_embed_row_q6k, 2)
-TL_ALIGN(tl_embed_row_q80, 2)
-TL_ALIGN(tl_embed_row_q50, 2)
-TL_ALIGN(tl_embed_row_q5k, 8)
 extern "C" __global__ void tl_embed_row_f32(const float* W, const float* idx, float* out, unsigned K,
                                             unsigned rows, unsigned rs, unsigned cs, float scale) {
   embed_row_strided_core(W, idx, out, K, rows, rs, cs, scale);
@@ -188,26 +183,22 @@ extern "C" __global__ void tl_embed_row_bf16(const __nv_bfloat16* W, const float
                                              float scale) {
   embed_row_strided_core(W, idx, out, K, rows, rs, cs, scale);
 }
-extern "C" __global__ void tl_embed_row_q4k(const unsigned char* W, const float* idx, float* out,
-                                            unsigned K, unsigned rows, float scale) {
-  embed_row_quant_core<1>(W, idx, out, K, rows, scale);
-}
-extern "C" __global__ void tl_embed_row_q6k(const unsigned char* W, const float* idx, float* out,
-                                            unsigned K, unsigned rows, float scale) {
-  embed_row_quant_core<2>(W, idx, out, K, rows, scale);
-}
-extern "C" __global__ void tl_embed_row_q80(const unsigned char* W, const float* idx, float* out,
-                                            unsigned K, unsigned rows, float scale) {
-  embed_row_quant_core<3>(W, idx, out, K, rows, scale);
-}
-extern "C" __global__ void tl_embed_row_q50(const unsigned char* W, const float* idx, float* out,
-                                            unsigned K, unsigned rows, float scale) {
-  embed_row_quant_core<5>(W, idx, out, K, rows, scale);
-}
-extern "C" __global__ void tl_embed_row_q5k(const unsigned char* W, const float* idx, float* out,
-                                            unsigned K, unsigned rows, float scale) {
-  embed_row_quant_core<6>(W, idx, out, K, rows, scale);
-}
+// A format's row lookup: W as wf_align_ says.
+#define TL_EMBED_ROW_Q(SUF, WF)                                                              \
+  TL_ALIGN(tl_embed_row_##SUF, wf_align_(WF))                                                \
+  extern "C" __global__ void tl_embed_row_##SUF(const unsigned char* W, const float* idx,    \
+                                                float* out, unsigned K, unsigned rows,       \
+                                                float scale) {                               \
+    embed_row_quant_core<WF>(W, idx, out, K, rows, scale);                                   \
+  }
+TL_EMBED_ROW_Q(q4k, 1)
+TL_EMBED_ROW_Q(q6k, 2)
+TL_EMBED_ROW_Q(q80, 3)
+TL_EMBED_ROW_Q(q50, 5)
+TL_EMBED_ROW_Q(q5k, 6)
+TL_EMBED_ROW_Q(q40, 7)
+TL_EMBED_ROW_Q(q41, 8)
+#undef TL_EMBED_ROW_Q
 
 // ---- gpu_abi_llm.h's sample_ref on the device: metal_kernels_llm.metal's
 // sample_ (its comment says how the launches split the work), a warp for a

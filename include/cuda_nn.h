@@ -362,6 +362,8 @@ inline constexpr quant_fmt quant_fmts_[] = {
     {8, context::tc_weight::q80, "tl_gemv_q80_row", "tl_dequant_f16_q80", "tl_embed_row_q80", 1},
     {6, context::tc_weight::q50, "tl_gemv_q50_row", "tl_dequant_f16_q50", "tl_embed_row_q50", -1},
     {13, context::tc_weight::q5k, "tl_gemv_q5k_row", "tl_dequant_f16_q5k", "tl_embed_row_q5k", -1},
+    {2, context::tc_weight::q40, "tl_gemv_q40_row", "tl_dequant_f16_q40", "tl_embed_row_q40", -1},
+    {3, context::tc_weight::q41, "tl_gemv_q41_row", "tl_dequant_f16_q41", "tl_embed_row_q41", -1},
 };
 static_assert(sizeof(quant_fmts_) / sizeof(quant_fmts_[0]) <= context::quant_fmts_max, "slots");
 // The row of `type` where rows of k weights are a whole number of its blocks, else -1.
