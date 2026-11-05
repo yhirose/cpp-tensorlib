@@ -288,7 +288,7 @@ Token by token through the decode alone, 2.7e-3 int8 against 5.3e-7 f16.
 ## What differs between the two runs
 
 - **Prefill precision.** This library's prefill GEMM sums in f16 by default
-  (above; with `f32acc`, bf16 operands and f32 sums), and its attention rounds
+  (above; with `f32acc`, f32 operands and sums), and its attention rounds
   q, k and v to f16 (normalized q and k sit far inside f16's range — Qwen2.5's
   largest is ~220). The decode's attention sums in f32 over the f16 cache
   (below); the array API's attention stays f32. Against

@@ -698,8 +698,9 @@ struct context {
   // shared memory (tl_gemm_nt_tc), so a function is raised to its footprint
   // when it is first looked up.
   enum class tc_tile { l, m, s, xl };  // xl: the f16 weight's long-K tile only
-  // The form is the operands and sums: bf16 operands with f32 sums, f16 with f16
-  // sums, and f16 sums reading the activation already f16 (no rounding stage).
+  // The form is the operands and sums: f32 operands (each a bf16 pair, ~2^-16) with f32
+  // sums, f16 with f16 sums, and f16 sums reading the activation already f16 (no
+  // rounding stage).
   enum class tc_form { f32, f16, f16h };
   // The weight it reads: bf16 [N][K], f16 [N][K] (f16w), or the rows of block-quantized
   // blocks (Q4_K, Q6_K, Q8_0, Q5_0, Q5_K, Q4_0, Q4_1); the quantized ones have the f32
@@ -714,9 +715,7 @@ struct context {
   CUfunction gemm_tc_(tc_form f, tc_tile t, tc_weight w = tc_weight::bf16) {
     static const char* const forms[3] = {"f32", "f16", "f16h"};
     static const char* const tiles[4] = {"l", "m", "s", "xl"};
-    if (t == tc_tile::xl && (w != tc_weight::f16w || f != tc_form::f16h)) return nullptr;
-    if (w != tc_weight::bf16 && f == tc_form::f16) return nullptr;
-    if (w == tc_weight::f16w && f != tc_form::f16h) return nullptr;
+    if (!gemm_tc_has(t, f, w)) return nullptr;
     CUfunction& slot = gemm_tc_fn[static_cast<int>(w)][static_cast<int>(f)][static_cast<int>(t)];
     if (!slot) {
       const std::string name = std::string("tl_gemm_tc_") + forms[static_cast<int>(f)] +
@@ -724,21 +723,37 @@ struct context {
       slot = load_(name.c_str());
       if (slot && d.FuncSetAttribute)
         d.FuncSetAttribute(slot, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */,
-                           static_cast<int>(gemm_tc_shape(t).smem()));
+                           static_cast<int>(gemm_tc_shape(t, f, w).smem()));
     }
     return slot;
   }
-  // The tiles' shapes: tl_gemm_tc_*_{l,m,s} in tensorlib_cuda.cu spell the same
+  // The kernels there are: the quantized weights have the f32 and f16h forms, the f16
+  // weight f16h only; xl is the f16 weight's alone, and the f32 form has no l (its bf16
+  // pairs spill there over a quantized weight, and the m tile was faster anyway: pp512
+  // in f32 sums +5% on Q4_K_M files, +1-2% on an F16 one).
+  static constexpr bool gemm_tc_has(tc_tile t, tc_form f, tc_weight w) {
+    if (w != tc_weight::bf16 && f == tc_form::f16) return false;
+    if (w == tc_weight::f16w && f != tc_form::f16h) return false;
+    if (t == tc_tile::xl) return w == tc_weight::f16w && f == tc_form::f16h;
+    return t != tc_tile::l || f != tc_form::f32;
+  }
+  // The tiles' shapes: tl_gemm_tc_*_{l,m,s} in kernels/cuda_nn.cuh spell the same
   // numbers (BM, BN, BK, threads, stages); change them together. smem is the stages of
-  // (BM+BN) rows of (BK+8) 2-byte elements.
+  // (BM+BN) rows of (BK+8) 2-byte elements, in the f32 form each of A's rows twice and a
+  // quantized weight's too (their bf16 pairs; a bf16 weight has no residual), at BK 32
+  // to fit.
   struct tc_shape {
-    unsigned rows, cols, bk, threads, stages;
-    constexpr unsigned smem() const { return (rows + cols) * (bk + 8) * 2 * stages; }
+    unsigned rows, cols, bk, threads, stages, a_planes = 1, b_planes = 1;
+    constexpr unsigned smem() const {
+      return (rows * a_planes + cols * b_planes) * (bk + 8) * 2 * stages;
+    }
   };
-  static constexpr tc_shape gemm_tc_shape(tc_tile t) {
+  static constexpr tc_shape gemm_tc_shape(tc_tile t, tc_form f, tc_weight w) {
+    const bool pairs = f == tc_form::f32;
+    const unsigned bk = pairs ? 32 : 64, pa = pairs ? 2 : 1, pb = pairs && w != tc_weight::bf16 ? 2 : 1;
     return t == tc_tile::l ? tc_shape{128, 128, 32, 128, 2}
-         : t == tc_tile::m ? tc_shape{64, 128, 64, 256, 2}
-         : t == tc_tile::s ? tc_shape{64, 64, 64, 128, 2}
+         : t == tc_tile::m ? tc_shape{64, 128, bk, 256, 2, pa, pb}
+         : t == tc_tile::s ? tc_shape{64, 64, bk, 128, 2, pa, pb}
                            : tc_shape{256, 128, 32, 512, 3};
   }
 

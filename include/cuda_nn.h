@@ -44,10 +44,11 @@ struct own_nn {
                              int64_t n, int64_t k);
   // C[m, ldc-strided n columns] = A[m,K] . W[n,K]^T over GGUF block-quantized rows (type: a
   // format of quant_fmts_, K a whole number of its blocks). a16: A is f16 and the sums f16,
-  // else A f32, the operands rounded to bf16 and the sums f32 (the exact form: no f16 range
-  // to overflow). n even. mmq (with a16, a format whose quant_fmt has MMQ kernels, and
-  // K % 256 == 0): A is quantized to int8 and the product runs on the int8 tensor cores,
-  // nothing dequantized (tl_gemm_mmq_*): faster, and the activation rounded to 8 bits.
+  // else A f32, the operands f32 to ~2^-16 (bf16 pairs) and the sums f32 (the exact form:
+  // no f16 range to overflow, and the products an f32 GEMV's to ~1e-5). n even. mmq (with
+  // a16, a format whose quant_fmt has MMQ kernels, and K % 256 == 0): A is quantized to
+  // int8 and the product runs on the int8 tensor cores, nothing dequantized
+  // (tl_gemm_mmq_*): faster, and the activation rounded to 8 bits.
   static bool gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
                           int64_t n, int64_t k, int64_t ldc, bool mmq = false);
   // H16[m, ff] = act(A16 . Wg^T) * (A16 . Wu^T) in f16, W the fused [Wg | Wu] (2 ff rows of
@@ -239,7 +240,7 @@ inline tc_plan_ gemm_tc_plan_(context& c, context::tc_form form, unsigned m, uns
   using tile = context::tc_tile;
   constexpr int64_t busy = traits::fill_groups / 3;
   auto grid = [&](tile t) {
-    const auto sh = context::gemm_tc_shape(t);
+    const auto sh = context::gemm_tc_shape(t, form, w);
     return std::pair<unsigned, unsigned>{(n + sh.cols - 1) / sh.cols, (m + sh.rows - 1) / sh.rows};
   };
   auto blocks = [&](tile t) { return (int64_t)grid(t).first * grid(t).second; };
@@ -248,13 +249,13 @@ inline tc_plan_ gemm_tc_plan_(context& c, context::tc_form form, unsigned m, uns
   // two waves and loses to the 128-row tile), and K = 1024 shapes lose to the others.
   constexpr int64_t sms = traits::fill_groups / 2;
   const int64_t bx = blocks(tile::xl), waves = (bx + sms - 1) / sms;
-  const bool xl = w == context::tc_weight::f16w && form == context::tc_form::f16h && k >= 3072 &&
+  const bool xl = context::gemm_tc_has(tile::xl, form, w) && k >= 3072 &&
                   bx >= sms - 2 && bx * 4 >= waves * sms * 3;
   const tile t = xl                        ? tile::xl
-                 : blocks(tile::l) >= busy ? tile::l
+                 : blocks(tile::l) >= busy && context::gemm_tc_has(tile::l, form, w) ? tile::l
                  : blocks(tile::m) >= busy ? tile::m
                                            : tile::s;
-  const auto sh = context::gemm_tc_shape(t);
+  const auto sh = context::gemm_tc_shape(t, form, w);
   return {c.gemm_tc_(form, t, w), grid(t).first, grid(t).second, sh.threads, sh.smem()};
 }
 inline bool gemm_tc_launch_(context& c, const tc_plan_& p, void* pa, void* pB, float* po,

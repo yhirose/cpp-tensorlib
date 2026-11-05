@@ -1471,12 +1471,27 @@ __device__ __forceinline__ uint4 tc_dq8_(const unsigned char* row, unsigned gk) 
   dq8_<WF>(row, gk, v);
   return tc_pack8_<F16>(v);
 }
+// Eight f32 values as the exact form stages them: their bf16 roundings, and the bf16
+// of what each rounding left over (the gated delta rule's gdn_::mat pairs).
+__device__ __forceinline__ void tc_split8_(const float (&v)[8], uint4& hi, uint4& lo) {
+  float r[8];
+#pragma unroll
+  for (int q = 0; q < 8; q++) r[q] = v[q] - __bfloat162float(__float2bfloat16(v[q]));
+  hi = tc_pack8_<false>(v);
+  lo = tc_pack8_<false>(r);
+}
 
 // WF: the weight format B holds: 0 bf16 [N][K], 1 Q4_K, 2 Q6_K, 6 Q5_K blocks (rows of
 // K/256 blocks, K % 256 == 0), 3 Q8_0, 5 Q5_0, 7 Q4_0, 8 Q4_1 (rows of K/32 blocks), 4
 // f16 [N][K] (a block-quantized weight dequantized once ahead, tl_dequant_f16). C rows
 // are `ldc` apart, so a part of a fused projection writes its own columns of the shared
 // output.
+// The f32 form (!F16), the exact one, holds each f32 operand as a bf16 pair (tc_split8_)
+// and multiplies in three mmas, the residuals' product dropped, as the gated delta rule
+// does (CUTLASS's bf16x3): operands to ~2^-16 rather than bf16's 2^-8, so its products are
+// an f32 GEMV's to ~1e-5 and the batched prefill's logits the token-by-token ones'. A bf16
+// weight is exact as it is (no residual: two mmas). The pairs take twice the shared
+// memory, so its tiles stage BK 32 (gemm_tc_shape).
 template <int BM, int BN, int BK, int WM, int WN, bool F16, bool AH = false, int WF = 0>
 __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
                                                 const void* __restrict__ Bv,
@@ -1485,6 +1500,9 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
   static_assert(!AH || F16, "an f16 activation feeds the f16 form");
   using T = typename std::conditional<F16, __half, __nv_bfloat16>::type;     // operands
   using ACC = typename std::conditional<F16, unsigned, float>::type;         // sums
+  constexpr bool SPLIT = !F16;                  // the exact form's bf16 pairs
+  constexpr bool BLO = SPLIT && WF != 0;        // a weight with a residual to stage
+  constexpr int PA = SPLIT ? 2 : 1, PB = BLO ? 2 : 1;  // planes of each operand
   const float* A = static_cast<const float*>(Av);          // AH: really __half
   const __half* Ah = static_cast<const __half*>(Av);
   const __nv_bfloat16* B = static_cast<const __nv_bfloat16*>(Bv);
@@ -1499,8 +1517,9 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
   static_assert(AV >= 1 && BV >= 1 && FN % 2 == 0, "tile too small for its threads");
   extern __shared__ __align__(16) unsigned char tc_smem[];
   T* sm = reinterpret_cast<T*>(tc_smem);
-  auto As = [&](int s) { return sm + s * (BM + BN) * LD; };
-  auto Bs = [&](int s) { return sm + s * (BM + BN) * LD + BM * LD; };
+  // A stage: A's planes (high, then residual), then B's.
+  auto As = [&](int s) { return sm + s * (BM * PA + BN * PB) * LD; };
+  auto Bs = [&](int s) { return As(s) + BM * PA * LD; };
   const unsigned tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const unsigned wm = (warp / (BN / WN)) * WM, wn = (warp % (BN / WN)) * WN;
   const unsigned row0 = blockIdx.y * BM, col0 = blockIdx.x * BN;
@@ -1513,6 +1532,7 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
       for (int e = 0; e < NA; e++) acc[i][j][e] = ACC(0);
   float4 ra[AV][AH ? 1 : 2];  // 8 values a vector: 2 float4s, or 8 halves in one
   uint4 rb[BV];
+  float rq[BLO ? BV : 1][8];  // a quantized weight's values, until stage splits them
   // Vector id of a thread: row id / (BK/8), column (id % (BK/8)) * 8.
   auto load = [&](unsigned k0) {
 #pragma unroll
@@ -1537,6 +1557,11 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
       } else if constexpr (WF == 4) {
         rb[v] = gn < N && gk < K ? *reinterpret_cast<const uint4*>(Bq + (gn * (size_t)K + gk) * 2u)
                                  : make_uint4(0u, 0u, 0u, 0u);
+      } else if constexpr (BLO) {
+        if (gn < N && gk < K) dq8_<WF>(Bq + gn * qrow, gk, rq[v]);
+        else
+#pragma unroll
+          for (int q = 0; q < 8; q++) rq[v][q] = 0.0f;
       } else {
         rb[v] = gn < N && gk < K ? tc_dq8_<F16, WF>(Bq + gn * qrow, gk) : make_uint4(0u, 0u, 0u, 0u);
       }
@@ -1549,6 +1574,9 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
       T* d = As(s) + (id / (BK / 8)) * LD + (id % (BK / 8)) * 8;
       if constexpr (AH) {
         *reinterpret_cast<float4*>(d) = ra[v][0];
+      } else if constexpr (SPLIT) {
+        tc_split8_(*reinterpret_cast<const float(*)[8]>(&ra[v][0]), *reinterpret_cast<uint4*>(d),
+                   *reinterpret_cast<uint4*>(d + BM * LD));
       } else {
         const float* f = reinterpret_cast<const float*>(&ra[v][0]);
 #pragma unroll
@@ -1562,7 +1590,9 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
     for (int v = 0; v < BV; v++) {
       const unsigned id = tid + v * NT;
       T* d = Bs(s) + (id / (BK / 8)) * LD + (id % (BK / 8)) * 8;
-      if constexpr (WF != 0) {  // dequantized to T pairs already
+      if constexpr (BLO) {
+        tc_split8_(rq[v], *reinterpret_cast<uint4*>(d), *reinterpret_cast<uint4*>(d + BN * LD));
+      } else if constexpr (WF != 0) {  // dequantized to T pairs already
         *reinterpret_cast<uint4*>(d) = rb[v];
       } else if constexpr (F16) {
         const __nv_bfloat162* w = reinterpret_cast<const __nv_bfloat162*>(&rb[v]);
@@ -1595,6 +1625,28 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
 #pragma unroll
       for (int j = 0; j < FN; j += 2)
         tc_ldsm4_(fb[j][0], fb[j][1], fb[j + 1][0], fb[j + 1][1], b + (wn + 8 * j + lb_r) * LD + kk + lb_c);
+      if constexpr (SPLIT) {  // the residuals' terms first, then the high parts'
+        unsigned la[FM][4];
+#pragma unroll
+        for (int i = 0; i < FM; i++)
+          tc_ldsm4_(la[i][0], la[i][1], la[i][2], la[i][3],
+                    a + (BM + wm + 16 * i + la_r) * LD + kk + la_c);
+#pragma unroll
+        for (int i = 0; i < FM; i++)
+#pragma unroll
+          for (int j = 0; j < FN; j++) tc_mma_(acc[i][j], la[i], fb[j][0], fb[j][1], T());
+      }
+      if constexpr (BLO) {
+        unsigned lb[FN][2];
+#pragma unroll
+        for (int j = 0; j < FN; j += 2)
+          tc_ldsm4_(lb[j][0], lb[j][1], lb[j + 1][0], lb[j + 1][1],
+                    b + (BN + wn + 8 * j + lb_r) * LD + kk + lb_c);
+#pragma unroll
+        for (int i = 0; i < FM; i++)
+#pragma unroll
+          for (int j = 0; j < FN; j++) tc_mma_(acc[i][j], fa[i], lb[j][0], lb[j][1], T());
+      }
 #pragma unroll
       for (int i = 0; i < FM; i++)
 #pragma unroll
@@ -1617,7 +1669,8 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
 }
 // Three tiles, picked by how well the grid fills the GPU (gemm_tc_run_ in cuda.h):
 // L 128x128 for wide outputs, M 64x128 and S 64x64 for narrow ones. Dynamic
-// shared memory, (BM+BN)*(BK+8)*2 stages*2 bytes: 40/55/37 KB.
+// shared memory, (BM+BN)*(BK+8)*2 stages*2 bytes: 40/55/37 KB. The f32 form has M and
+// S only, its bf16 pairs at BK 32: 60/40 KB over a quantized weight, 40/30 over bf16.
 // A by 16-byte vectors, B as wf_align_ says; C by float2 stores.
 #define TL_GEMM_TC(NAME, BM, BN, BK, WM, WN, F16, AH, WF)                            \
   TL_ALIGN(NAME, 16, wf_align_(WF), 8)                                               \
@@ -1627,33 +1680,38 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
     gemm_nt_tc_core<BM, BN, BK, WM, WN, F16, AH, WF>(A, B, C, M, N, K, ldc);         \
   }
 // Per weight format: bf16 and the block-quantized ones (q4k, q6k, q80, q50, q5k, q40,
-// q41); per tile (l, m, s); per form: f32 (bf16 operands, f32 sums), f16 (f16 operands
-// and sums, A f32), f16h (as f16 with A already f16). The quantized weights have the
-// exact form (f32) and the f16h one: the prefill's two, as a backend that rounds
-// activations where they are made always has the second.
+// q41); per tile (l, m, s); per form: f32 (f32 operands as bf16 pairs, f32 sums; tiles m
+// and s), f16 (f16 operands and sums, A f32), f16h (as f16 with A already f16). The
+// quantized weights have the exact form (f32) and the f16h one: the prefill's two, as a
+// backend that rounds activations where they are made always has the second.
+// context::gemm_tc_has says the same.
 #define TL_GEMM_TC_TILES(PFX, F16, AH, WF)                                           \
   TL_GEMM_TC(PFX##_l, 128, 128, 32, 64, 64, F16, AH, WF)                             \
   TL_GEMM_TC(PFX##_m, 64, 128, 64, 32, 32, F16, AH, WF)                              \
   TL_GEMM_TC(PFX##_s, 64, 64, 64, 32, 32, F16, AH, WF)
-TL_GEMM_TC_TILES(tl_gemm_tc_f32, false, false, 0)
+#define TL_GEMM_TC_PAIRS(PFX, WF)                                                    \
+  TL_GEMM_TC(PFX##_m, 64, 128, 32, 32, 32, false, false, WF)                         \
+  TL_GEMM_TC(PFX##_s, 64, 64, 32, 32, 32, false, false, WF)
+TL_GEMM_TC_PAIRS(tl_gemm_tc_f32, 0)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16, true, false, 0)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h, true, true, 0)
-TL_GEMM_TC_TILES(tl_gemm_tc_f32_q4k, false, false, 1)
+TL_GEMM_TC_PAIRS(tl_gemm_tc_f32_q4k, 1)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q4k, true, true, 1)
-TL_GEMM_TC_TILES(tl_gemm_tc_f32_q6k, false, false, 2)
+TL_GEMM_TC_PAIRS(tl_gemm_tc_f32_q6k, 2)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q6k, true, true, 2)
-TL_GEMM_TC_TILES(tl_gemm_tc_f32_q80, false, false, 3)
+TL_GEMM_TC_PAIRS(tl_gemm_tc_f32_q80, 3)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q80, true, true, 3)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_f16w, true, true, 4)
-TL_GEMM_TC_TILES(tl_gemm_tc_f32_q50, false, false, 5)
+TL_GEMM_TC_PAIRS(tl_gemm_tc_f32_q50, 5)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q50, true, true, 5)
-TL_GEMM_TC_TILES(tl_gemm_tc_f32_q5k, false, false, 6)
+TL_GEMM_TC_PAIRS(tl_gemm_tc_f32_q5k, 6)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q5k, true, true, 6)
-TL_GEMM_TC_TILES(tl_gemm_tc_f32_q40, false, false, 7)
+TL_GEMM_TC_PAIRS(tl_gemm_tc_f32_q40, 7)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q40, true, true, 7)
-TL_GEMM_TC_TILES(tl_gemm_tc_f32_q41, false, false, 8)
+TL_GEMM_TC_PAIRS(tl_gemm_tc_f32_q41, 8)
 TL_GEMM_TC_TILES(tl_gemm_tc_f16h_q41, true, true, 8)
 #undef TL_GEMM_TC_TILES
+#undef TL_GEMM_TC_PAIRS
 
 // The f16 weight's fourth tile, for the long-K GEMMs of a big model (a 27B's
 // projections, K >= 3072): 256x128, BK 32, three cp.async stages, 16 warps of

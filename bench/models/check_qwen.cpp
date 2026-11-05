@@ -106,6 +106,17 @@ static std::vector<float> logits_of(qm::Model& M) {
   return std::vector<float>(l, l + M.c.VOCAB);
 }
 
+// The batched prefill held to the token-by-token steps, both in the f32 forms, by
+// their last-token top-5 logits (top5_maxrel): after the oracle's prompt, after the
+// first step from it, and after a prompt past a delta-rule chunk and a sliding
+// window. One bound for all three. The two paths add and round in other orders only
+// (every backend's exact GEMM keeps its operands f32, as the GEMVs do), which leaves
+// <= 1e-3 on every model here (Gemma 3 1B's 769-token prompt the most, 9.9e-4 on
+// CUDA), and a prefill that ignores the sliding window moves Gemma 3 1B's 576-token
+// prompt by 1.5e-2 (Metal). Operands rounded to bf16 left up to 1.1e-2 (CUDA's
+// GEMM before it kept them f32, on the repeated prompt of Qwen3.5's Q4_K_M).
+constexpr double batched_bound = 1e-2;
+
 // The imperative forward's logits after `ids`, from position 0.
 static std::vector<float> imperative_prompt(qm::Model& M, const std::vector<int>& ids) {
   qm::reset_cache(M);
@@ -350,15 +361,13 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   std::printf("\n  greedy %s\n", bf16_ok ? "MATCH" : "DIVERGE");
 
   // The chat's own decoder on the same weights: the prompt through begin() —
-  // batched as GEMMs where the backend can, on the tensor cores with the
-  // activations rounded to bf16 — then step(), then next() (a step ahead where
-  // the backend runs one) for the rest of the greedy run. Its top-5 logits are held to
-  // the imperative ones, after the prompt and after the first step: where the
-  // backend captures, its warm-up forward must leave the DeltaNet state as it
-  // found it, and a drift too small to move a short greedy run is a large one
-  // here (~0.3, where the bf16 rounding is ~3e-3 on Qwen and Gemma 3 4B, 1.9e-2 on
-  // Gemma 3 1B over its 769-token prompt, the most sensitive to it; over the whole
-  // vocabulary the rounding reaches ~0.1 in the tail, which is printed but not held).
+  // batched as GEMMs where the backend can — then step(), then next() (a step
+  // ahead where the backend runs one) for the rest of the greedy run. Its top-5
+  // logits are held to the imperative ones (batched_bound), after the prompt and
+  // after the first step: where the backend captures, its warm-up forward must
+  // leave the DeltaNet state as it found it, and a drift too small to move a short
+  // greedy run is a large one here (~0.3). Over the whole vocabulary the tail moves
+  // more (up to 1.4e-2, Gemma 3 1B), which is printed but not held.
   qm::reset_cache(B);
   qm::captured_decoder dec;
   std::vector<int> ids(O.prompt_ids, O.prompt_ids + NP);
@@ -368,8 +377,8 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   // by layer, as ||got - want|| / ||want||: a wrong position or RoPE in one layer
   // moves the whole layer (Gemma's global layers turned unscaled: 0.13 at the
   // first, 0.17 at the last), where the logits see it only through the attention
-  // it feeds. The two paths' roundings leave every layer within ~5e-3 (Gemma 3 4B's
-  // blocks, Qwen3.5 0.8B), about as much deep as shallow; a single element can
+  // it feeds. The two paths' roundings leave every layer within ~5e-4 (every model
+  // here), about as much deep as shallow; a single element can
   // differ far more (a large v), which a norm does not let decide.
   const auto got_cache = cache_rows(B, NP);
   double cache_err = 0;
@@ -396,7 +405,7 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   const double smr = maxrel(got_step, imp_step.data(), B.c.VOCAB);
   const double p5 = qm::top5_maxrel(got_prompt.data(), imp_prompt.data(), B.c.VOCAB),
                s5 = qm::top5_maxrel(got_step.data(), imp_step.data(), B.c.VOCAB);
-  const bool logits_ok = p5 < 5e-2 && s5 < 5e-2;
+  const bool logits_ok = p5 < batched_bound && s5 < batched_bound;
   std::printf("\ndecoder (%s prefill) top-5 logits vs imperative: prompt maxrel %.2e, "
               "first step %.2e %s (whole vocabulary %.2e, %.2e)",
               dec.batched ? "batched" : "token-by-token", p5, s5, logits_ok ? "OK" : "FAIL",
@@ -449,7 +458,7 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   bool long_ok = true;
   if (qm::prefill_batched(B, longp) >= 0) {
     const double l5 = qm::top5_maxrel(logits_of(B).data(), imp_long.data(), B.c.VOCAB);
-    long_ok = l5 < 1e-2;
+    long_ok = l5 < batched_bound;
     std::printf("\n%lld-token prompt, batched vs imperative: top-5 logits maxrel %.2e %s\n",
                 (long long)longp.size(), l5, long_ok ? "OK" : "FAIL");
   }

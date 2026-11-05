@@ -1469,8 +1469,8 @@ inline int64_t step_greedy(Model& M, int64_t id, int64_t pos,
 
 // The largest relative gap between two logit vectors over the reference's top
 // 5: the logits a greedy or a top-k sampler reads. (Over the whole vocabulary
-// the bf16 rounding of a batched prefill's activations reaches ~0.1 in the
-// tail, where nothing samples.)
+// the gap is larger in the tail, where nothing samples: between the batched
+// prefill and the token-by-token steps in their f32 forms, up to ~1.4e-2.)
 inline double top5_maxrel(const float* got, const float* ref, int64_t n) {
   std::vector<int64_t> idx((size_t)n);
   for (int64_t i = 0; i < n; i++) idx[(size_t)i] = i;

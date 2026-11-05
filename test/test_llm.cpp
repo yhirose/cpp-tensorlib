@@ -754,10 +754,11 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
           [&] { return host_close(host_values(yc), want, 1e-4f); });
     }
     if (gpu::caps::bf16_gemm) {
-      // The GEMM may round its activations to bf16 too (CUDA's runs on the
-      // tensor cores), so the oracle reads the rounded ones as well: exact
-      // inputs either way, and any gap left is the kernel's.
-      array A = dev(random_array({M, K}, 942).to_bf16().to_f32());
+      // The activations as they are, not rounded to bf16: the GEMM keeps them
+      // f32 (CUDA's tensor cores as bf16 pairs, to ~2^-16), as the decode's
+      // GEMVs do, so the batched prefill is the token-by-token one. Rounded,
+      // they would be off by ~5e-3 here.
+      array A = dev(random_array({M, K}, 942));
       array C = array::empty({M, N});
       REQUIRE(gpu::gemm_bf16_nt(A.device_span(), Wb.device_span(), C.device_span(), M, N, K));
       tl::gpu::flush();
@@ -794,7 +795,7 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
         const int64_t M2 = 130, N2 = 200;
         array W2 = random_array({N2, k2}, 943);
         array W2b = dev(W2.to_bf16()), W2t = dev(W2.to_bf16().to_f32().transpose());
-        array A2 = dev(random_array({M2, k2}, 944).to_bf16().to_f32());
+        array A2 = dev(random_array({M2, k2}, 944));
         array C2 = array::empty({M2, N2});
         REQUIRE(gpu::gemm_bf16_nt(A2.device_span(), W2b.device_span(), C2.device_span(), M2, N2,
                                   k2));
@@ -810,9 +811,9 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
         tl::gpu::flush();
         CHECK(same(C2h, A2.dot(W2t), 0.25f));
       }
-      // The f16-sum form: the same exact inputs (bf16 values sit inside f16),
-      // so only the f16 sums' rounding is left. A backend without the form
-      // sums in f32 and passes trivially.
+      // The f16-sum form: the activations rounded to f16 (2^-11) and the sums
+      // f16, the second by far the larger. A backend without the form sums in
+      // f32 and passes trivially.
       array C16 = array::empty({M, N});
       REQUIRE(gpu::gemm_bf16_nt_f16acc(A.device_span(), Wb.device_span(), C16.device_span(), M,
                                        N, K));

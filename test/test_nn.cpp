@@ -1676,9 +1676,10 @@ TEST_CASE("generic compositions agree with the fused kernels") {
           tl::gpu::flush();
           // The product and its terms' magnitude, and the worst error of an
           // output's N columns from col0 (rows ldc apart) relative to it. f32
-          // sums over operands at least bf16-exact (CUDA's tensor cores round
-          // both to bf16, Metal's keep f32): each term is off by at most 2^-8
-          // of itself, so the sum by 4e-3 of the terms' magnitude. A misread
+          // sums over f32 operands (CUDA's tensor cores hold each as a bf16
+          // pair, to ~2^-16; Metal's keep f32): ~1e-6 of the terms' magnitude,
+          // where operands rounded to bf16 were 3e-4..7e-4 off, enough to move
+          // the batched prefill's logits off the token-by-token ones'. A misread
           // weight is off by whole terms.
           std::vector<double> ref((size_t)(M * N)), mag((size_t)(M * N));
           for (int64_t i = 0; i < M; i++)
@@ -1698,7 +1699,7 @@ TEST_CASE("generic compositions agree with the fused kernels") {
               }
             return worst;
           };
-          constexpr double bound = 4e-3;
+          constexpr double bound = 2e-5;
           const std::vector<float> got = host_values(C);
           bool kept = true;
           for (int64_t i = 0; i < M; i++)
