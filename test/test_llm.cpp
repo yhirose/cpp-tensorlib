@@ -263,8 +263,8 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
   // The model path runs on raw device buffers through gpu::, outside the lazy
   // graph; each kernel here is checked against the array composition that
   // defines it. Shapes are Qwen2's head geometry (D=64, 14 q heads over 2 kv
-  // heads) at a context past the split-KV cutoff, plus the D=128
-  // instantiation. A backend without a kernel takes the generic composition,
+  // heads) at a context past the split-KV cutoff, and the other head widths
+  // (128, 256, 512). A backend without a kernel takes the generic composition,
   // which has to agree too; a bf16 cache needs the backend's own attention.
   if (!tl::gpu_available()) return;
   auto prev = tl::device_;
@@ -275,12 +275,11 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
 
   SUBCASE("kv_cache: append + attn, prefill, in f32 and f16") {
     // K and V as an f16 cache holds them (the reference reads those values).
-    auto held16 = [](const array& a) {
-      std::vector<float> v(a.raw(), a.raw() + a.size());
+    auto held16 = [](std::vector<float> v) {
       for (float& x : v) x = tl::f16_to_f32(tl::f32_to_f16(x));
-      return array::from(std::move(v), a.shape());
+      return v;
     };
-    for (int64_t D : {64, 128, 256}) {
+    for (int64_t D : {64, 128, 256, 512}) {
       for (const bool f16 : {false, true}) {
         if (f16 && !gpu::caps::kv_f16) continue;
         CAPTURE(D);
@@ -289,20 +288,22 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
         const float scale = 1.0f / std::sqrt((float)D);
         tl::kv_cache cache;
         REQUIRE(cache.init(HKV, MAXC, D, f16));
-        // T steps appended one at a time, then a query over all of them.
+        // T steps appended one at a time, then a query over all of them. K and V
+        // go up once in step order ([T,HKV,D]), so step t's rows are one span.
         auto K = random_array({HKV, T, D}, 900), V = random_array({HKV, T, D}, 901);
+        array Kt = dev(K.transpose({1, 0, 2}).clone()), Vt = dev(V.transpose({1, 0, 2}).clone());
         for (int64_t t = 0; t < T; t++) {
-          array k = dev(K.slice(1, t, 1).clone());  // [HKV,1,D]
-          array v = dev(V.slice(1, t, 1).clone());
-          REQUIRE(cache.append(k.device_span(), v.device_span()));
+          const int64_t at = t * HKV * D * 4;
+          REQUIRE(cache.append(Kt.device_span().at(at), Vt.device_span().at(at)));
         }
         CHECK(cache.pos == T);
         array q = dev(random_array({HQ, D}, 902));
         array out = array::empty({HQ, D});
         REQUIRE(cache.attn(q.device_span(), out.device_span(), HQ, scale));
         // Explicit: each q head attends its kv head's T rows.
-        auto Kr = f16 ? held16(K) : K;
-        auto Vr = f16 ? held16(V) : V;
+        const std::vector<float> qh = host_values(q),
+                                 Kr = f16 ? held16(host_values(K)) : host_values(K),
+                                 Vr = f16 ? held16(host_values(V)) : host_values(V);
         std::vector<float> want((size_t)HQ * D);
         for (int64_t h = 0; h < HQ; h++) {
           const int64_t kh = h / (HQ / HKV);
@@ -310,14 +311,15 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
           double m = -1e300, sum = 0;
           for (int64_t j = 0; j < T; j++) {
             double a = 0;
-            for (int64_t d = 0; d < D; d++) a += (double)q.at({h, d}) * Kr.at({kh, j, d});
+            for (int64_t d = 0; d < D; d++)
+              a += (double)qh[(size_t)(h * D + d)] * Kr[(size_t)((kh * T + j) * D + d)];
             s[j] = a * scale;
             m = std::max(m, s[j]);
           }
           for (auto& x : s) sum += (x = std::exp(x - m));
           for (int64_t d = 0; d < D; d++) {
             double e = 0;
-            for (int64_t j = 0; j < T; j++) e += s[j] * Vr.at({kh, j, d});
+            for (int64_t j = 0; j < T; j++) e += s[j] * Vr[(size_t)((kh * T + j) * D + d)];
             want[h * D + d] = (float)(e / sum);
           }
         }

@@ -380,6 +380,12 @@ struct attn_combine_params {
   uint32_t splits;
 };
 
+// The decode kernels' threadgroup: a lane per dim, up to 8 simdgroups (wider
+// heads give each thread more dims), the kernels' attn_decode_sg_ * 32.
+inline unsigned long attn_decode_threads_(int64_t D) {
+  return static_cast<unsigned long>(D < 256 ? D : 256);
+}
+
 // Keys per split, or 0 for the single-pass kernel: one threadgroup a head
 // leaves most of the GPU idle when a model has few heads, so cut the keys
 // until there are enough threadgroups. The kernel's rule: no split under 256
@@ -391,9 +397,12 @@ inline unsigned long attn_split_chunk_(int64_t heads, int64_t ctx) {
   return static_cast<unsigned long>(gpu::policy::split_chunk(ctx, parts, rule));
 }
 
-inline void attn_dispatch_(objc::id enc, const attn_params& p,
-                           unsigned long idx, int64_t heads, int64_t T) {
-  constexpr unsigned long rows = 32;
+// The queries a prefill threadgroup owns: attn_prefill_'s 32, or
+// attn_prefill_wide_'s 8 at 512.
+inline unsigned long attn_prefill_rows_(int64_t D) { return D < 512 ? 32 : 8; }
+
+inline void attn_dispatch_(objc::id enc, const attn_params& p, unsigned long idx,
+                           int64_t heads, int64_t T, unsigned long rows = 32) {
   set_bytes_(enc, p, idx);
   dispatch_grid_(enc,
                  {static_cast<unsigned long>(heads),
@@ -407,11 +416,12 @@ inline bool own_nn::quant_reads(int type, int64_t k) { return detail_::quant_fmt
 // q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D] cache read over
 // [0,pos0+T), query p at absolute position pos0+p (with a window, attending
 // only its last `window` keys). GQA via the head ratio.
-// The head widths and caches attn_kernel_ names (cuda's: 64 and 128 over
-// either cache, 256 over an f16 one). An f16 cache is staged four halves at a
-// time (load4_'s half4) without a word_aligned_ check: no composition takes an
-// f16 cache, so a refusal would leave the op unrun, and on the M1 Pro these
-// loads read a cache one half off right (test_nn checks it).
+// The head widths and caches attn_kernel_ names (64 and 128 over either
+// cache, 256 over an f16 one, 512 over either). An f16 cache is read four
+// halves at a time (load4_'s half4), or at 512 as fragments where it lies,
+// without a word_aligned_ check: no composition takes an f16 cache, so a
+// refusal would leave the op unrun, and on the M1 Pro these loads read a cache
+// one half off right (test_nn checks both, at 64 and 512).
 inline bool own_nn::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
                               gpu::span out, int64_t n_q_heads,
                               int64_t n_kv_heads, int64_t T, int64_t kv_max,
@@ -431,7 +441,7 @@ inline bool own_nn::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
                          static_cast<uint32_t>(n_q_heads / n_kv_heads),
                          static_cast<uint32_t>(pos0), scale,
                          static_cast<uint32_t>(window)};
-  detail_::attn_dispatch_(c.enc, p, 4ul, n_q_heads, T);
+  detail_::attn_dispatch_(c.enc, p, 4ul, n_q_heads, T, detail_::attn_prefill_rows_(D));
   return true;
 }
 
@@ -578,8 +588,8 @@ inline bool own_nn::gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
 }
 
 // One decode step: q [n_q_heads,D] against a [n_kv_heads,kv_max,D] cache read
-// over [0,ctx). GQA via the head ratio; head width 64, 128 or 256 over either
-// cache.
+// over [0,ctx). GQA via the head ratio; head width 64, 128, 256 or 512 over
+// either cache.
 inline bool own_nn::attn_decode(gpu::span q, gpu::span K, gpu::span V,
                              gpu::span out, int64_t n_q_heads,
                              int64_t n_kv_heads, int64_t ctx, int64_t kv_max,
@@ -612,7 +622,7 @@ inline bool own_nn::attn_decode(gpu::span q, gpu::span K, gpu::span V,
   detail_::dispatch_grid_(c.enc,
                           {static_cast<unsigned long>(n_q_heads),
                            split ? splits : 1ul, 1},
-                          {static_cast<unsigned long>(D), 1, 1});
+                          {detail_::attn_decode_threads_(D), 1, 1});
   if (!split) return true;
   c.bind_(attn_kernel_(attn_op::combine, D, false));  // partials are f32
   detail_::set_buf_(c.enc, dst, 0ul);

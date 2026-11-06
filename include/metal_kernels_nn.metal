@@ -296,6 +296,8 @@ kernel void rope_(device const float* x [[buffer(0)]],
 // rule, on simdgroup_matrix. A threadgroup is 4 simdgroups of 8 rows each
 // (queries, or keys for dK/dV); the products are 8×8 MMAs and the softmax
 // runs on each lane's own fragment elements, so scores never leave registers.
+// (attn_prefill_wide_, at 512, is the exception: its 4 simdgroups split one
+// 8-query block's dims and sum their partial scores through threadgroup memory.)
 // Loops over fragments are fully unrolled: a fragment array indexed by a loop
 // variable is spilled to memory, which costs more than the MMAs save.
 // Tiles are 16 rows at D=128: two tiles of 32 rows would fill all 32 KB of
@@ -364,6 +366,46 @@ static inline void attn_store_row_(device float* row,
     thread auto& e = f[i].thread_elements();
     *(device float2*)(row + i * 8) = float2(e[0], e[1]) * k;
   }
+}
+
+// One key tile of a block's online softmax: the raw scores s (q · K) masked to
+// each row's live keys [plo, plo + width], turned into their exp2 weights in
+// place, folded into the running max m and sum l, and the output fragments
+// rescaled to the new max.
+template <int KF, int DF>
+static inline void attn_softmax_tile_(thread simdgroup_matrix<float, 8, 8> (&s)[KF],
+                                      thread simdgroup_matrix<float, 8, 8> (&of)[DF], uint kt,
+                                      uint fn, uint plo, uint width, float sl2, thread float& m,
+                                      thread float& l) {
+  float mt = -1e30f;
+  _Pragma("clang loop unroll(full)")
+  for (int j = 0; j < KF; j++) {
+    thread auto& e = s[j].thread_elements();
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 2; k++) {
+      const uint col = kt + j * 8 + fn + k;
+      // Causal and window mask in one compare: a col below plo wraps past width.
+      e[k] = col - plo <= width ? e[k] * sl2 : -1e30f;
+      mt = max(mt, e[k]);
+    }
+  }
+  const float m_new = max(m, frag_row_max_(mt));
+  const float corr = exp2(m - m_new);
+  float ls = 0.0f;
+  _Pragma("clang loop unroll(full)")
+  for (int j = 0; j < KF; j++) {
+    thread auto& e = s[j].thread_elements();
+    _Pragma("clang loop unroll(full)")
+    for (int k = 0; k < 2; k++) {
+      e[k] = exp2(e[k] - m_new);
+      ls += e[k];
+    }
+  }
+  l = l * corr + frag_row_sum_(ls);
+  m = m_new;
+
+  _Pragma("clang loop unroll(full)")
+  for (int i = 0; i < DF; i++) of[i].thread_elements() *= corr;
 }
 
 // q, out [H,T,D]; K/V a cache of kv_stride elements per kv head read over
@@ -438,35 +480,7 @@ kernel void attn_prefill_(device const float* q   [[buffer(0)]],
       }
     }
 
-    float mt = -1e30f;
-    _Pragma("clang loop unroll(full)")
-    for (int j = 0; j < KF; j++) {
-      thread auto& e = s[j].thread_elements();
-      _Pragma("clang loop unroll(full)")
-      for (int k = 0; k < 2; k++) {
-        const uint col = kt + j * 8 + fn + k;
-        // Causal and window mask in one compare: a col below plo wraps past width.
-        e[k] = col - plo <= width ? e[k] * sl2 : -1e30f;
-        mt = max(mt, e[k]);
-      }
-    }
-    const float m_new = max(m, frag_row_max_(mt));
-    const float corr = exp2(m - m_new);
-    float ls = 0.0f;
-    _Pragma("clang loop unroll(full)")
-    for (int j = 0; j < KF; j++) {
-      thread auto& e = s[j].thread_elements();
-      _Pragma("clang loop unroll(full)")
-      for (int k = 0; k < 2; k++) {
-        e[k] = exp2(e[k] - m_new);
-        ls += e[k];
-      }
-    }
-    l = l * corr + frag_row_sum_(ls);
-    m = m_new;
-
-    _Pragma("clang loop unroll(full)")
-    for (int i = 0; i < DF; i++) of[i].thread_elements() *= corr;
+    attn_softmax_tile_(s, of, kt, fn, plo, width, sl2, m, l);
     simdgroup_matrix<float, 8, 8> vf;
     _Pragma("clang loop unroll(full)")
     for (int j = 0; j < KF; j++) {
@@ -491,6 +505,134 @@ TL_ATTN_PREFILL("attn_prefill_64_f16_", 64, 32, half)
 TL_ATTN_PREFILL("attn_prefill_128_f16_", 128, 16, half)
 TL_ATTN_PREFILL("attn_prefill_256_f16_", 256, 16, half)
 #undef TL_ATTN_PREFILL
+
+// Rows [r0, r0 + 8) of a row-major source (rows ld apart) as an 8×8 fragment,
+// or as its transpose; rows at or past `end` read as zero. The source is read
+// where it lies (an f16 cache as half: an MMA takes half and float operands
+// together, the products exact in f32).
+template <typename T>
+static inline void frag_rows_(thread simdgroup_matrix<T, 8, 8>& f, device const T* src, uint ld,
+                              uint r0, uint end, bool tr, uint fm, uint fn) {
+  if (r0 + 8 <= end) {
+    simdgroup_load(f, src + ulong(r0) * ld, ld, ulong2(0, 0), tr);
+    return;
+  }
+  thread auto& e = f.thread_elements();
+  _Pragma("clang loop unroll(full)")
+  for (int k = 0; k < 2; k++) {
+    const uint r = r0 + (tr ? fn + k : fm), c = tr ? fm : fn + k;
+    e[k] = r < end ? src[ulong(r) * ld + c] : T(0);
+  }
+}
+
+// The prefill at a head width too wide for attn_prefill_'s tiles (512, Gemma
+// 4's global layers): llama.cpp's form for its wide heads. A threadgroup owns
+// 8 queries (metal_nn.h's attn_prefill_rows_), and its 4 simdgroups split the
+// head's dims, each holding its quarter of q and of the output in registers.
+// Per tile of BK keys, each simdgroup's partial scores over its dims are
+// summed through threadgroup memory (double-buffered, one barrier a tile),
+// every simdgroup runs the same online softmax on the sums, and multiplies
+// its quarter of V. K and V are read from the cache where they lie, so no
+// tile is staged; the last tile's keys past the block read as zero. 8 keys a
+// tile hold the fewest registers, and ran fastest of 8, 16, 32 and 64 on the
+// M1 Pro.
+template <int AD, typename KT>
+kernel void attn_prefill_wide_(device const float* q   [[buffer(0)]],
+                               device const KT* K      [[buffer(1)]],
+                               device const KT* V      [[buffer(2)]],
+                               device float* out       [[buffer(3)]],
+                               constant attn_params& p [[buffer(4)]],
+                               uint2 tg  [[threadgroup_position_in_grid]],
+                               uint2 ntg [[threadgroups_per_grid]],
+                               uint tid  [[thread_index_in_threadgroup]],
+                               uint sid  [[simdgroup_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int BQ = 8, BK = 8, NSG = 4, DS = AD / NSG, DF = DS / 8, KF = BK / 8;
+  static_assert(2 * NSG * BQ * BK <= BQ * AD, "the partial scores fit where q was staged");
+  threadgroup float4 buf4[BQ * AD / 4];  // q's rows, then the partial scores
+  threadgroup float* buf = (threadgroup float*)buf4;
+
+  const uint T = p.T;
+  const uint h = tg.x;
+  const uint qbase = (ntg.y - 1u - tg.y) * BQ;  // heaviest tiles first
+  const uint kv_h = p.group ? h / p.group : h;
+  const uint d0 = sid * DS;  // this simdgroup's dims
+  device const KT* Kh = K + kv_h * p.kv_stride + d0;
+  device const KT* Vh = V + kv_h * p.kv_stride + d0;
+
+  // q staged whole, each simdgroup then taking its quarter: a coalesced read
+  // ran faster on the M1 Pro than each simdgroup's own fragments.
+  attn_stage_rows_<BQ, AD>(buf, q + h * T * AD, qbase, T, tid);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  simdgroup_matrix<float, 8, 8> qf[DF], of[DF];
+  _Pragma("clang loop unroll(full)")
+  for (int i = 0; i < DF; i++) {
+    simdgroup_load(qf[i], &buf[d0 + i * 8], AD);
+    of[i] = simdgroup_matrix<float, 8, 8>(0);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint fm = frag_row_(lane), fn = frag_col_(lane);
+  // The row's live keys [plo, pabs], as attn_prefill_'s.
+  const uint pabs = p.pos0 + qbase + fm, plo = attn_window_lo_(pabs + 1, p.window),
+             width = pabs - plo;
+  const uint last = qbase + BQ - 1 < T ? qbase + BQ - 1 : T - 1;
+  const uint kmax = p.pos0 + last;
+  const uint kt0 = attn_window_lo_(p.pos0 + qbase + 1, p.window) / BK * BK;
+  const float sl2 = p.scale * M_LOG2E_F;
+  float m = -1e20f, l = 0.0f;  // as attn_prefill_'s
+
+  uint parity = 0;
+  for (uint kt = kt0; kt <= kmax; kt += BK, parity ^= 1u) {
+    // This simdgroup's partial scores, into its slot of this tile's buffer.
+    threadgroup float* part = buf + parity * (NSG * BQ * BK);
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < KF; j++) {
+      simdgroup_matrix<float, 8, 8> s = simdgroup_matrix<float, 8, 8>(0);
+      simdgroup_matrix<KT, 8, 8> kf;
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < DF; i++) {
+        frag_rows_(kf, Kh + i * 8, AD, kt + j * 8, kmax + 1, true, fm, fn);
+        simdgroup_multiply_accumulate(s, qf[i], kf, s);
+      }
+      simdgroup_store(s, part + sid * BQ * BK + j * 8, BK);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // The whole scores, this lane's elements of them: the same in every simdgroup.
+    simdgroup_matrix<float, 8, 8> pf[KF];
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < KF; j++) {
+      thread auto& pe = pf[j].thread_elements();
+      _Pragma("clang loop unroll(full)")
+      for (int k = 0; k < 2; k++) {
+        pe[k] = 0.0f;
+        _Pragma("clang loop unroll(full)")
+        for (int g = 0; g < NSG; g++) pe[k] += part[g * BQ * BK + fm * BK + j * 8 + fn + k];
+      }
+    }
+    attn_softmax_tile_(pf, of, kt, fn, plo, width, sl2, m, l);
+    simdgroup_matrix<KT, 8, 8> vf;
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < KF; j++) {
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < DF; i++) {
+        frag_rows_(vf, Vh + i * 8, AD, kt + j * 8, kmax + 1, false, fm, fn);
+        simdgroup_multiply_accumulate(of[i], pf[j], vf, of[i]);
+      }
+    }
+  }
+
+  const uint qi = qbase + fm;
+  if (qi < T) attn_store_row_(out + (h * T + qi) * AD + d0 + fn, of, 1.0f / l);
+}
+#define TL_ATTN_PREFILL_WIDE(name, AD, KT)                                     \
+  template [[host_name(name)]] kernel void attn_prefill_wide_<AD, KT>(         \
+      device const float*, device const KT*, device const KT*, device float*, \
+      constant attn_params&, uint2, uint2, uint, uint, uint);
+TL_ATTN_PREFILL_WIDE("attn_prefill_512_", 512, float)
+TL_ATTN_PREFILL_WIDE("attn_prefill_512_f16_", 512, half)
+#undef TL_ATTN_PREFILL_WIDE
 
 // The query half of the pullback: dq and `stats` [2,H,T] (the row
 // logsumexp, then Δ = dO·O) for the key/value half. dq = scale·C·K / l with
@@ -1562,9 +1704,12 @@ TL_GEMV_Q("gemv_q41_", gemv_q41_dot_)
 // ---------------------------------------------------------------------------
 // Fused decode attention: one query row against the whole cache. cuda's
 // attn_decode_core, the same online softmax and merge. A threadgroup owns one
-// query head as AD threads, so a lane holds the output dims lane, lane + 32,
-// …; each simdgroup walks every NW-th key, reduces the score with simd_sum,
-// and the simdgroups' softmax states are merged through threadgroup memory.
+// query head as NW simdgroups (attn_decode_sg_: AD / 32, at most 8, so that
+// their merge fits threadgroup memory at AD = 512); a lane holds the dims
+// lane, lane + 32, … of the score and the running output, each simdgroup walks
+// every NW-th key and reduces the score with simd_sum, and the simdgroups'
+// softmax states are merged through threadgroup memory, a thread giving out
+// the dims tid, tid + NW * 32, ….
 //
 // Split-KV: a model with few heads leaves most of the GPU idle at one
 // threadgroup a head, so the keys are cut into chunks over the grid's y, each
@@ -1576,30 +1721,34 @@ struct attn_decode_params {
   float scale;
 };
 
+// metal_nn.h's attn_decode_threads_ / 32.
+constexpr int attn_decode_sg_(int AD) { return AD / 32 < 8 ? AD / 32 : 8; }
+
 // The softmax state of keys [k0, k1) for this threadgroup's head: `gm`, `gl`
-// and this thread's output dim `o`. The threadgroup arrays are the caller's
-// (threadgroup memory can only be declared in a kernel): qs [AD], sm/sl [NW]
-// and sacc [NW][AD].
-template <int AD, typename KT>
+// and this thread's output dims `o` (tid + u * NW * 32). The threadgroup
+// arrays are the caller's (threadgroup memory can only be declared in a
+// kernel): qs [AD], sm/sl [NW] and sacc [NW][AD].
+template <int AD, typename KT, int NW = attn_decode_sg_(AD), int R = AD / 32,
+          int NO = R / NW>
 static inline void attn_span_(device const float* qh, device const KT* Kh,
                              device const KT* Vh, uint k0, uint k1,
                              float scale, threadgroup float* qs,
                              threadgroup float* sm, threadgroup float* sl,
                              threadgroup float* sacc, uint tid, uint sgid,
                              uint lane, thread float& gm, thread float& gl,
-                             thread float& o) {
-  constexpr int NW = AD / 32;
-  qs[tid] = qh[tid];
+                             thread float (&o)[NO]) {
+  _Pragma("clang loop unroll(full)")
+  for (int u = 0; u < NO; u++) qs[tid + u * NW * 32] = qh[tid + u * NW * 32];
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  float m = -1e30f, l = 0.0f, acc[NW];
+  float m = -1e30f, l = 0.0f, acc[R];
   _Pragma("clang loop unroll(full)")
-  for (int r = 0; r < NW; r++) acc[r] = 0.0f;
+  for (int r = 0; r < R; r++) acc[r] = 0.0f;
   for (uint i = k0 + sgid; i < k1; i += NW) {
     device const KT* Ki = Kh + i * AD;
     float dot = 0.0f;
     _Pragma("clang loop unroll(full)")
-    for (int r = 0; r < NW; r++)
+    for (int r = 0; r < R; r++)
       dot += qs[lane + r * 32] * widen_(Ki[lane + r * 32]);
     const float sc = simd_sum(dot) * scale;
     const float m_new = max(m, sc);
@@ -1607,7 +1756,7 @@ static inline void attn_span_(device const float* qh, device const KT* Kh,
     l = l * corr + pr;
     device const KT* Vi = Vh + i * AD;
     _Pragma("clang loop unroll(full)")
-    for (int r = 0; r < NW; r++)
+    for (int r = 0; r < R; r++)
       acc[r] = acc[r] * corr + pr * widen_(Vi[lane + r * 32]);
     m = m_new;
   }
@@ -1619,19 +1768,21 @@ static inline void attn_span_(device const float* qh, device const KT* Kh,
     sl[sgid] = l;
   }
   _Pragma("clang loop unroll(full)")
-  for (int r = 0; r < NW; r++) sacc[sgid * AD + lane + r * 32] = acc[r];
+  for (int r = 0; r < R; r++) sacc[sgid * AD + lane + r * 32] = acc[r];
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   gm = -1e30f;
   _Pragma("clang loop unroll(full)")
   for (int w = 0; w < NW; w++) gm = max(gm, sm[w]);
   gl = 0.0f;
-  o = 0.0f;
+  _Pragma("clang loop unroll(full)")
+  for (int u = 0; u < NO; u++) o[u] = 0.0f;
   _Pragma("clang loop unroll(full)")
   for (int w = 0; w < NW; w++) {
     const float e = exp(sm[w] - gm);
     gl += sl[w] * e;
-    o += sacc[w * AD + tid] * e;
+    _Pragma("clang loop unroll(full)")
+    for (int u = 0; u < NO; u++) o[u] += sacc[w * AD + tid + u * NW * 32] * e;
   }
 }
 
@@ -1645,15 +1796,16 @@ kernel void attn_decode_(device const float* q          [[buffer(0)]],
                          uint tid  [[thread_index_in_threadgroup]],
                          uint sgid [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
-  constexpr int NW = AD / 32;
+  constexpr int NW = attn_decode_sg_(AD), NO = AD / (NW * 32);
   threadgroup float qs[AD], sm[NW], sl[NW], sacc[NW * AD];
   const uint kv_h = p.group ? h / p.group : h;
-  float gm, gl, o;
+  float gm, gl, o[NO];
   attn_span_<AD>(q + h * AD, K + kv_h * p.kv_stride, V + kv_h * p.kv_stride, 0,
                  p.ctx, p.scale, qs, sm, sl, sacc, tid, sgid, lane, gm, gl, o);
-  out[h * AD + tid] = o / gl;
+  _Pragma("clang loop unroll(full)")
+  for (int u = 0; u < NO; u++) out[h * AD + tid + u * NW * 32] = o[u] / gl;
 }
-// Every head width (64, 128, 256) over either cache, as cuda's.
+// Every head width (64, 128, 256, 512) over either cache.
 #define TL_ATTN_DECODE(name, AD, KT)                                         \
   template [[host_name(name)]] kernel void attn_decode_<AD, KT>(             \
       device const float*, device const KT*, device const KT*, device float*, \
@@ -1661,9 +1813,11 @@ kernel void attn_decode_(device const float* q          [[buffer(0)]],
 TL_ATTN_DECODE("attn_decode_64_", 64, float)
 TL_ATTN_DECODE("attn_decode_128_", 128, float)
 TL_ATTN_DECODE("attn_decode_256_", 256, float)
+TL_ATTN_DECODE("attn_decode_512_", 512, float)
 TL_ATTN_DECODE("attn_decode_64_f16_", 64, half)
 TL_ATTN_DECODE("attn_decode_128_f16_", 128, half)
 TL_ATTN_DECODE("attn_decode_256_f16_", 256, half)
+TL_ATTN_DECODE("attn_decode_512_f16_", 512, half)
 #undef TL_ATTN_DECODE
 
 // One key chunk of one head: partials pm[H*S] | pl[H*S] | pacc[H*S*AD], the
@@ -1679,12 +1833,14 @@ kernel void attn_decode_split_(device const float* q          [[buffer(0)]],
                                uint tid  [[thread_index_in_threadgroup]],
                                uint sgid [[simdgroup_index_in_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]]) {
-  constexpr int NW = AD / 32;
+  constexpr int NW = attn_decode_sg_(AD), NO = AD / (NW * 32);
   threadgroup float qs[AD], sm[NW], sl[NW], sacc[NW * AD];
   const uint h = tgp.x, s = tgp.y;
   const uint kv_h = p.group ? h / p.group : h;
   const uint k0 = s * p.chunk, k1 = min(p.ctx, k0 + p.chunk);
-  float gm = -1e30f, gl = 0.0f, o = 0.0f;
+  float gm = -1e30f, gl = 0.0f, o[NO];
+  _Pragma("clang loop unroll(full)")
+  for (int u = 0; u < NO; u++) o[u] = 0.0f;
   if (k0 < k1) {
     attn_span_<AD>(q + h * AD, K + kv_h * p.kv_stride, V + kv_h * p.kv_stride,
                    k0, k1, p.scale, qs, sm, sl, sacc, tid, sgid, lane, gm, gl,
@@ -1695,7 +1851,8 @@ kernel void attn_decode_split_(device const float* q          [[buffer(0)]],
     parts[at] = gm;
     parts[hs + at] = gl;
   }
-  parts[2 * hs + at * AD + tid] = o;
+  _Pragma("clang loop unroll(full)")
+  for (int u = 0; u < NO; u++) parts[2 * hs + at * AD + tid + u * NW * 32] = o[u];
 }
 #define TL_ATTN_SPLIT(name, AD, KT)                                          \
   template [[host_name(name)]] kernel void attn_decode_split_<AD, KT>(       \
@@ -1704,9 +1861,11 @@ kernel void attn_decode_split_(device const float* q          [[buffer(0)]],
 TL_ATTN_SPLIT("attn_decode_split_64_", 64, float)
 TL_ATTN_SPLIT("attn_decode_split_128_", 128, float)
 TL_ATTN_SPLIT("attn_decode_split_256_", 256, float)
+TL_ATTN_SPLIT("attn_decode_split_512_", 512, float)
 TL_ATTN_SPLIT("attn_decode_split_64_f16_", 64, half)
 TL_ATTN_SPLIT("attn_decode_split_128_f16_", 128, half)
 TL_ATTN_SPLIT("attn_decode_split_256_f16_", 256, half)
+TL_ATTN_SPLIT("attn_decode_split_512_f16_", 512, half)
 #undef TL_ATTN_SPLIT
 
 // Merge one head's S partials, rescaling each by exp(m_s − max m).
@@ -1742,6 +1901,7 @@ kernel void attn_combine_(device const float* parts        [[buffer(0)]],
 TL_ATTN_COMBINE("attn_combine_64_", 64)
 TL_ATTN_COMBINE("attn_combine_128_", 128)
 TL_ATTN_COMBINE("attn_combine_256_", 256)
+TL_ATTN_COMBINE("attn_combine_512_", 512)
 #undef TL_ATTN_COMBINE
 
 // ---------------------------------------------------------------------------

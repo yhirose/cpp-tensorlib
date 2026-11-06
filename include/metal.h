@@ -87,28 +87,32 @@ struct attn_kernel {
   explicit operator bool() const { return name != nullptr; }
 };
 // The table's shape, which also sets the keys' range: op, head width (64 / 128
-// / 256), cache (f32 / f16).
-constexpr int attn_ops_ = static_cast<int>(attn_op::count_), attn_widths_ = 3,
+// / 256 / 512), cache (f32 / f16).
+constexpr int attn_ops_ = static_cast<int>(attn_op::count_), attn_widths_ = 4,
               attn_caches_ = 2;
 constexpr int attn_key_last_ = -101 - (attn_ops_ * attn_widths_ * attn_caches_ - 1);
 inline attn_kernel attn_kernel_(attn_op op, int64_t D, bool f16) {
   static const char* const names[attn_ops_][attn_widths_][attn_caches_] = {
       {{"attn_prefill_64_", "attn_prefill_64_f16_"},
        {"attn_prefill_128_", "attn_prefill_128_f16_"},
-       {nullptr, "attn_prefill_256_f16_"}},
+       {nullptr, "attn_prefill_256_f16_"},
+       {"attn_prefill_512_", "attn_prefill_512_f16_"}},
       {{"attn_decode_64_", "attn_decode_64_f16_"},
        {"attn_decode_128_", "attn_decode_128_f16_"},
-       {"attn_decode_256_", "attn_decode_256_f16_"}},
+       {"attn_decode_256_", "attn_decode_256_f16_"},
+       {"attn_decode_512_", "attn_decode_512_f16_"}},
       {{"attn_decode_split_64_", "attn_decode_split_64_f16_"},
        {"attn_decode_split_128_", "attn_decode_split_128_f16_"},
-       {"attn_decode_split_256_", "attn_decode_split_256_f16_"}},
+       {"attn_decode_split_256_", "attn_decode_split_256_f16_"},
+       {"attn_decode_split_512_", "attn_decode_split_512_f16_"}},
       {{"attn_combine_64_", nullptr},
        {"attn_combine_128_", nullptr},
-       {"attn_combine_256_", nullptr}},
-      {{"attn_bwd_dq_64_", nullptr}, {"attn_bwd_dq_128_", nullptr}, {nullptr, nullptr}},
-      {{"attn_bwd_dkv_64_", nullptr}, {"attn_bwd_dkv_128_", nullptr}, {nullptr, nullptr}},
+       {"attn_combine_256_", nullptr},
+       {"attn_combine_512_", nullptr}},
+      {{"attn_bwd_dq_64_", nullptr}, {"attn_bwd_dq_128_", nullptr}, {nullptr, nullptr}, {nullptr, nullptr}},
+      {{"attn_bwd_dkv_64_", nullptr}, {"attn_bwd_dkv_128_", nullptr}, {nullptr, nullptr}, {nullptr, nullptr}},
   };
-  const int w = D == 64 ? 0 : D == 128 ? 1 : D == 256 ? 2 : -1;
+  const int w = D == 64 ? 0 : D == 128 ? 1 : D == 256 ? 2 : D == 512 ? 3 : -1;
   if (w < 0) return {0, nullptr};
   const int o = static_cast<int>(op), c = f16 ? 1 : 0;
   return {-101 - ((o * attn_widths_ + w) * attn_caches_ + c), names[o][w][c]};

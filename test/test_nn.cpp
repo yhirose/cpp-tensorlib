@@ -6,6 +6,7 @@
 #include "test_quant.h"
 #include "test_util.h"
 
+#include <bit>
 #include <numbers>
 #include <tuple>
 
@@ -1219,27 +1220,33 @@ TEST_CASE("generic compositions agree with the fused kernels") {
         },
         [&] { return host_close(host_values(pc), want, 1e-4f); }, true);
     // An f16 cache one half off (off the 4 bytes Metal's wider loads need):
-    // the same prefill, read right. It must run, since no composition takes
+    // the same prefill, read right, at 64 (Metal's half4 loads) and 512 (its
+    // fragments read where they lie). It must run, since no composition takes
     // an f16 cache.
-    if (gpu::caps::kv_f16) {
-      const int64_t floats = HKV * MAXC * D / 2 + 1;  // the f16 cache, and a float for the lead
+    for (const int64_t Dh : {D, int64_t{512}}) {
+      if (!gpu::caps::kv_f16) break;
+      CAPTURE(Dh);
+      const float sh = 1.0f / std::sqrt((float)Dh);
+      array Kn = dev(random_array({HKV, T2, Dh}, 968)), Vn = dev(random_array({HKV, T2, Dh}, 969));
+      array qh = dev(random_array({HQ, T2, Dh}, 970));
+      const int64_t floats = HKV * MAXC * Dh / 2 + 1;  // the f16 cache, and a float for the lead
       array Kh = dev(array::zeros({floats})), Vh = dev(array::zeros({floats}));
       array Khs = dev(array::zeros({floats})), Vhs = dev(array::zeros({floats}));
-      REQUIRE(gpu::kv_fill(Kh.device_span(), Vh.device_span(), K2.device_span(), V2.device_span(),
-                           T2, MAXC, HKV, D, true));
-      REQUIRE(gpu::kv_fill(Khs.device_span().at(2), Vhs.device_span().at(2), K2.device_span(),
-                           V2.device_span(), T2, MAXC, HKV, D, true));
-      array ph = array::empty({HQ, T2, D}), phs = array::empty({HQ, T2, D});
-      REQUIRE(gpu::attn_prefill(qp.device_span(), Kh.device_span(), Vh.device_span(),
-                                ph.device_span(), HQ, HKV, T2, MAXC, D, scale, true, 0));
+      REQUIRE(gpu::kv_fill(Kh.device_span(), Vh.device_span(), Kn.device_span(), Vn.device_span(),
+                           T2, MAXC, HKV, Dh, true));
+      REQUIRE(gpu::kv_fill(Khs.device_span().at(2), Vhs.device_span().at(2), Kn.device_span(),
+                           Vn.device_span(), T2, MAXC, HKV, Dh, true));
+      array ph = array::empty({HQ, T2, Dh}), phs = array::empty({HQ, T2, Dh});
+      REQUIRE(gpu::attn_prefill(qh.device_span(), Kh.device_span(), Vh.device_span(),
+                                ph.device_span(), HQ, HKV, T2, MAXC, Dh, sh, true, 0));
       tl::gpu::flush();
       const std::vector<float> want16 = host_values(ph);
       check_misaligned(
           "f16 prefill attention, K and V off 4 bytes",
           [&] {
-            return gpu::attn_prefill(qp.device_span(), Khs.device_span().at(2),
+            return gpu::attn_prefill(qh.device_span(), Khs.device_span().at(2),
                                      Vhs.device_span().at(2), phs.device_span(), HQ, HKV, T2, MAXC,
-                                     D, scale, true, 0);
+                                     Dh, sh, true, 0);
           },
           [&] { return host_close(host_values(phs), want16, 1e-6f); }, true);
     }
@@ -1250,7 +1257,7 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     // across the tile seams and the zero-filled tail. f16 operands hold it to
     // ~1e-3 of the exact composition; a backend without the form runs the
     // exact op itself.
-    for (int64_t D : {64, 128, 256}) {
+    for (int64_t D : {64, 128, 256, 512}) {
       const int64_t HKV = 2, HQ = 8, MAXC = 160, P0 = 37, T = 77;
       const float scale = 1.0f / std::sqrt((float)D);
       array Kc = dev(random_array({HKV, MAXC, D}, 1010)), Vc = dev(random_array({HKV, MAXC, D}, 1011));
@@ -1283,13 +1290,15 @@ TEST_CASE("generic compositions agree with the fused kernels") {
     // block's later rows start past keys its first row reads (their leading tiles all
     // masked). Against the windowed softmax written out, in f64 over the values the
     // cache holds (an f16 cache's rounding): the exact form to 1e-4, the f16 one to 2e-3.
-    // A key in or out by one moves a 20-key window's rows by ~5%.
+    // A key in or out by one moves a 20-key window's rows by ~5%. The cache's rows past
+    // the chunk are NaN (in f32 and in f16), as a reused buffer's may be: a kernel's
+    // last key tile reads past the chunk as zero, never what is there.
     auto held16 = [](std::vector<float> v) {
       for (float& x : v) x = tl::f16_to_f32(tl::f32_to_f16(x));
       return v;
     };
     const int64_t HKV = 2, HQ = 8, MAXC = 160, P0 = 37, T = 77, ctx = P0 + T;
-    for (int64_t D : {64, 128, 256}) {
+    for (int64_t D : {64, 128, 256, 512}) {
       for (const bool f16 : {false, true}) {
         if (f16 && !gpu::caps::kv_f16) continue;
         for (const int64_t W : {20, 50}) {
@@ -1304,7 +1313,9 @@ TEST_CASE("generic compositions agree with the fused kernels") {
             Vh = held16(Vh);
           }
           const int64_t floats = f16 ? HKV * MAXC * D / 2 : HKV * MAXC * D;
-          array Kc = dev(array::zeros({floats})), Vc = dev(array::zeros({floats}));
+          const array nans = array::from(
+              std::vector<float>((size_t)floats, std::bit_cast<float>(0xffffffffu)), {floats});
+          array Kc = dev(nans), Vc = dev(nans);
           array Ks = dev(array::from(std::vector<float>(Kh), {HKV, ctx, D})),
                 Vs = dev(array::from(std::vector<float>(Vh), {HKV, ctx, D}));
           REQUIRE(gpu::kv_fill(Kc.device_span(), Vc.device_span(), Ks.device_span(),
