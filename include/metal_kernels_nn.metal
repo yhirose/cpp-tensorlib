@@ -988,7 +988,7 @@ kernel void gemv_combine_(device const float* parts        [[buffer(0)]],
 // above: no split-K grid, because the row IS the parallel axis, and a
 // threadgroup reduction instead of a per-thread column.
 //
-// The reduce is shared by the bf16 and int4 forms, which differ only in how a
+// The reduce is shared by the bf16, f32 and int4 forms, which differ only in how a
 // thread reads its slice. `red` is the caller's [8] threadgroup scratch
 // (threadgroup memory can only be declared in a kernel); 8 covers the
 // 256-thread cap the host dispatches.
@@ -1009,21 +1009,23 @@ struct gemv_row_params {
   uint n, k;
 };
 
-// bf16 weights in [N,K]: cuda's tl_gemv_bf16_row. Eight contiguous halves per
-// thread per step, so consecutive threads read consecutive 16-byte spans of
-// the row. Requires k % 8 == 0 (every transformer dim; the host checks).
-kernel void gemv_bf16_row_(device const float* a      [[buffer(0)]],
-                           device const ushort* B     [[buffer(1)]],
-                           device float* y            [[buffer(2)]],
-                           constant gemv_row_params& p [[buffer(3)]],
-                           uint row  [[threadgroup_position_in_grid]],
-                           uint tid  [[thread_index_in_threadgroup]],
-                           uint nt   [[threads_per_threadgroup]],
-                           uint sgid [[simdgroup_index_in_threadgroup]],
-                           uint nsg  [[simdgroups_per_threadgroup]],
-                           uint lane [[thread_index_in_simdgroup]]) {
+// bf16 (ushort) or f32 weights in [N,K]: cuda's tl_gemv_bf16_row. Eight
+// contiguous weights per thread per step, so consecutive threads read
+// consecutive spans of the row. Requires k % 8 == 0 (every transformer dim;
+// the host checks).
+template <typename WT>
+kernel void gemv_row_(device const float* a      [[buffer(0)]],
+                      device const WT* B         [[buffer(1)]],
+                      device float* y            [[buffer(2)]],
+                      constant gemv_row_params& p [[buffer(3)]],
+                      uint row  [[threadgroup_position_in_grid]],
+                      uint tid  [[thread_index_in_threadgroup]],
+                      uint nt   [[threads_per_threadgroup]],
+                      uint sgid [[simdgroup_index_in_threadgroup]],
+                      uint nsg  [[simdgroups_per_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float red[8];
-  device const ushort* brow = B + (ulong)row * p.k;
+  device const WT* brow = B + (ulong)row * p.k;
   float acc = 0.0f;
   for (uint k0 = tid * 8; k0 < p.k; k0 += nt * 8) {
     _Pragma("clang loop unroll(full)")
@@ -1031,6 +1033,13 @@ kernel void gemv_bf16_row_(device const float* a      [[buffer(0)]],
   }
   gemv_row_store_(acc, red, y + row, tid, sgid, nsg, lane);
 }
+#define TL_GEMV_ROW(name, WT)                                                \
+  template [[host_name(name)]] kernel void gemv_row_<WT>(                    \
+      device const float*, device const WT*, device float*,                  \
+      constant gemv_row_params&, uint, uint, uint, uint, uint, uint);
+TL_GEMV_ROW("gemv_bf16_row_", ushort)
+TL_GEMV_ROW("gemv_f32_row_", float)
+#undef TL_GEMV_ROW
 
 // int4 weights: cuda's tl_gemv_q4. Same one-threadgroup-per-row shape, whose
 // quantization groups are contiguous in the [N,K] packing; a thread takes one

@@ -61,6 +61,7 @@ namespace gpu {
   X(gemv_f32_) X(gemv_bf16_) X(gemv_q4_) /* decode GEMVs, per weight dtype */  \
   X(gemv_combine_)   /* their split-K partials */                              \
   X(gemv_bf16_row_)  /* ... and the [N,K] weight layout's own */               \
+  X(gemv_f32_row_)   /* ... over f32 rows */                                   \
   X(gemm_bf16_nt_) X(gemm_bf16_nt32_) /* bf16-weight GEMM, per M tile */       \
   X(row_logsumexp_) X(xent_bwd_) X(adam_step_) /* cross-entropy, Adam */       \
   X(ssm_conv_) X(gated_delta_) /* Gated DeltaNet: its conv and its rule */

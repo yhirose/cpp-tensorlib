@@ -762,6 +762,16 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
           },
           [&] { return host_close(host_values(yc), want, 1e-4f); });
     }
+    // The f32 rows (gemv_f32_row): the backend's kernel at K = 72, and K = 70,
+    // off its k % 8 == 0, the GEMM it falls back to; on every backend.
+    for (const int64_t k : {K, K - 2}) {
+      CAPTURE(k);
+      array Wk = W.slice(1, 0, k).clone(), a = dev(random_array({1, k}, 943));
+      array Wd = dev(Wk), y = array::empty({1, N});
+      REQUIRE(gpu::gemv_f32_row(a.device_span(), Wd.device_span(), y.device_span(), N, k));
+      tl::gpu::flush();
+      CHECK(same(y, a.dot(Wk.transpose()), 1e-5f));
+    }
     if (gpu::caps::bf16_gemm) {
       // The activations as they are, not rounded to bf16: the GEMM keeps them
       // f32 (CUDA's tensor cores as bf16 pairs, to ~2^-16), as the decode's

@@ -281,6 +281,7 @@ struct context {
       case kop::gemv_q4_: return "gemv_q4_";
       case kop::gemv_combine_: return "gemv_combine_";
       case kop::gemv_bf16_row_: return "gemv_bf16_row_";
+      case kop::gemv_f32_row_: return "gemv_f32_row_";
       case kop::gemm_bf16_nt_: return "gemm_bf16_nt_";
       case kop::gemm_bf16_nt32_: return "gemm_bf16_nt32_";
       case kop::gather_axis_: return "gather_axis_";

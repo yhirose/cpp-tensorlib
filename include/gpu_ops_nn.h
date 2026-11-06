@@ -591,6 +591,18 @@ inline bool gemv_bf16_row(span a, span W, span y, int64_t n, int64_t k) {
                 policy::row_reduce(n, k));
 }
 
+// The same over f32 rows (Gemma 4's per-layer embedding projections, f32 in the
+// file): the backend's kernel where it has one and k % 8 == 0, else the f32
+// GEMM reading W transposed in place.
+inline bool gemv_f32_row(span a, span W, span y, int64_t n, int64_t k) {
+  if (n <= 0 || k <= 0) return false;
+  return (k % 8 == 0 &&
+          launch(kop::gemv_f32_row_, {in(a), in(W), out(y)},
+                 gemv_row_params{static_cast<uint32_t>(n), static_cast<uint32_t>(k)},
+                 policy::row_reduce(n, k))) ||
+         gemm(a, k, false, W, k, true, y, 1, n, k, 1.0f, 0.0f);
+}
+
 // The same over int4 weights: qw is [N][K/8] packed words and scales
 // [N][K/group] floats, two views that may share a buffer. K % group == 0 and
 // group % 8 == 0.

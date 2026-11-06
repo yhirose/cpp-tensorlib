@@ -734,8 +734,8 @@ struct Layer {
   // outputs, [NE] each (rmsnorm_res's wd); empty otherwise.
   array pa, pf;
   // Gemma 4: the residual's scale at the layer's end (layer_output_scale), and the
-  // per-layer embedding's gate [NE, PLE], projection [PLE, NE] (f32, as the file
-  // has them) and the norm of what it adds [NE] (Config::PLE; layer_tail_).
+  // per-layer embedding's gate [PLE, NE], projection [NE, PLE] (f32 rows, as the
+  // file has them: mm_f32_) and the norm of what it adds [NE] (Config::PLE; layer_tail_).
   float out_scale = 1.0f;
   array ple_gate, ple_proj, ple_post;
 };
@@ -768,7 +768,8 @@ struct Scratch {
   storage embed;        // staged embedding row [NE] (the step's input)
   std::vector<float> embed_stage;  // host gather target, uploaded into embed
   // Config::PLE: the token's own per-layer rows [NL*PLE] (staged), the slots
-  // ple_inputs_ fills [(NL+1)*PLE], and a layer's gated input [PLE];
+  // ple_inputs_ fills [(NL+1)*PLE] (and prefill_chunk_, a prompt's last row past
+  // the KV-sharing line: nothing lives here across steps), and a layer's gated input [PLE];
   // logits_tmp the softcap's [VOCAB].
   storage ple_tok, ple, ple_g, logits_tmp;
   std::vector<float> ple_stage;
@@ -985,10 +986,11 @@ inline void lm_head(const Model& M, gpu::span a, gpu::span logits) {
   softcap_(M, logits);
 }
 
-// y [T, N] = a [T, K] . W, an f32 [K,N] weight: a GEMV for one row.
+// y [T, N] = a [T, K] . W^T, an f32 weight in rows [N, K] (GGML's own order): a
+// row GEMV for one row.
 inline void mm_f32_(const array& W, gpu::span a, gpu::span y, int64_t T, int64_t N, int64_t K) {
-  if (T == 1) gpu::gemv_f32(a, sp(W), y, N, K);
-  else gpu::gemm(a, K, false, sp(W), N, false, y, T, N, K, 1.0f, 0.0f);
+  if (T == 1) gpu::gemv_f32_row(a, sp(W), y, N, K);
+  else gpu::gemm(a, K, false, sp(W), K, true, y, T, N, K, 1.0f, 0.0f);
 }
 
 // Gemma 4's per-layer embeddings of T tokens (Config::PLE; HF's
@@ -1164,13 +1166,19 @@ inline bool prefill_mmq(const Model& M, bool exact) { return M.mmq && prefill_a1
 // GEMV); callers check Model.row and fall back to token-by-token otherwise.
 // `exact` runs the chunk at full precision — the GEMMs' sums in f32 and the
 // attention's operands f32 — as the retry after an f16 overflow does.
-inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
+//
+// The layers past the KV-sharing line (Config::KV_SHARED) write no cache, so a
+// prompt needs them for its last row alone (llama.cpp's prune_shared): a chunk
+// that is not the prompt's `last` stops before them, and the last one goes on
+// with its last row only. Returns the row of P.h holding the chunk's last final
+// norm, -1 where it stopped.
+inline int64_t prefill_chunk_(Model& M, int64_t T, bool exact = false, bool last = true) {
   const Config& c = M.c;
   PrefillScratch& P = M.pscratch;
   // Absolute position of this chunk's first token — the caches are all at the
   // same place, and kv_cache::prefill appends there, so rope reads it from the
   // same source rather than taking it as a parameter that could disagree.
-  const int64_t pos0 = seq_cache(M).pos;
+  int64_t pos0 = seq_cache(M).pos;
   // The f16-sum GEMMs read their activation as f16 where prefill_a16 says; `a16s`
   // is that copy of `a`.
   const bool a16 = prefill_a16(M, exact), mmq = prefill_mmq(M, exact);
@@ -1212,15 +1220,33 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       gpu::rmsnorm_res_h16(xin, delta, w, xo, keep ? o : gpu::span{}, o16, c.NE, c.EPS, T, wd);
     else gpu::rmsnorm_res(xin, delta, w, xo, o, c.NE, c.EPS, T, wd);
   };
-  // A strided [T, n] block of rows `ld` apart, copied contiguous.
-  auto rows_out = [&](gpu::span src, int64_t ld, gpu::span dst, int64_t n) {
-    gpu::generic::copy_2d(src, ld, 1, sp(P.zero), dst, T, n);
+  // A strided [m, n] block of rows `ld` apart (m = T: the chunk's), copied contiguous.
+  auto rows_out = [&](gpu::span src, int64_t ld, gpu::span dst, int64_t n, int64_t m) {
+    gpu::generic::copy_2d(src, ld, 1, sp(P.zero), dst, m, n);
   };
-  gpu::span x = sp(P.emb);
-  if (c.PLE) ple_inputs_(M, x, T, sp(P.ple_tok), sp(P.ple));
+  gpu::span x = sp(P.emb), slots = sp(P.ple);
+  if (c.PLE) ple_inputs_(M, x, T, sp(P.ple_tok), slots);
   norm(x, sp(M.layers[0].an), sp(P.h), sp(P.h16), false);
   for (int64_t l = 0; l < c.NL; l++) {
     Layer& L = M.layers[l];
+    if (c.KV_SHARED && l == c.NL - c.KV_SHARED) {
+      if (!last) return -1;
+      if (T > 1) {
+        // The last row on its own: its residual as a view (nothing writes that
+        // buffer before the layer's residual add has read it), its per-layer
+        // inputs into one-row slots (the decode's, which hold nothing across
+        // steps), its input norm again.
+        x = at_f32(x, (T - 1) * c.NE);
+        if (c.PLE) {
+          rows_out(at_f32(slots, ((l + 1) * T + T - 1) * c.PLE), T * c.PLE,
+                   at_f32(sp(M.scratch.ple), (l + 1) * c.PLE), c.PLE, c.NL - l);
+          slots = sp(M.scratch.ple);
+        }
+        pos0 += T - 1;
+        T = 1;
+        norm(x, sp(L.an), sp(P.h), sp(P.h16), false);
+      }
+    }
     const gpu::span ro = sp(P.res[l & 1]);
     if (c.is_delta(l)) {
       // Gated DeltaNet over the chunk: the projection as one GEMM, then the
@@ -1239,7 +1265,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       if (!gpu::gated_rmsnorm(o, zp, PJ, sp(L.sn), a16 ? sp(P.at16) : sp(P.at), a16, T, c.SH, c.SDV,
                               c.EPS)) {
         gpu::rmsnorm(o, sp(L.sn), o, c.SDV, c.EPS, T * c.SH);
-        rows_out(zp, PJ, z, V);
+        rows_out(zp, PJ, z, V, T);
         if (a16) gpu::glu_h16(gpu::glu_act::silu, z, sp(P.at16), T * V, 1);
         else gpu::swiglu(z, sp(P.at), T * V);
       }
@@ -1279,7 +1305,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       gpu::span ao = sp(P.at);
       if (c.attn_gate) {
         gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, hd);
-        rows_out(at_f32(sp(P.qkv), (c.NH + 2 * c.NKV) * hd), AP, sp(P.gt), Q);
+        rows_out(at_f32(sp(P.qkv), (c.NH + 2 * c.NKV) * hd), AP, sp(P.gt), Q, T);
         gpu::unary(gpu::kop::sigmoid, sp(P.gt), sp(P.gs), T * Q, 1, 0);
         gpu::binary(gpu::kop::mul, ao, sp(P.gs), sp(P.gt), T * Q, 1, 0);
         ao = sp(P.gt);
@@ -1306,16 +1332,18 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
     gemm(sp(P.mb), sp(P.mb16), L.wd_row, sp(P.md), c.NE, ff);
     const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
     if (has_tail_(M, l)) {  // the logits read the last layer's norm
-      layer_tail_(M, L, l, T, ro, sp(P.md), sp(P.ple), sp(P.ple_gu), sp(P.ple_g));
+      layer_tail_(M, L, l, T, ro, sp(P.md), slots, sp(P.ple_gu), sp(P.ple_g));
       norm(ro, nextw, sp(P.h), sp(P.h16), l + 1 == c.NL);
     } else {
       norm_res(ro, sp(P.md), sp(L.pf), nextw, ro, sp(P.h), sp(P.h16), l + 1 == c.NL);
     }
     x = ro;
   }
-  // Leaves P.h holding the final RMSNorm for every row of the chunk. Logits are
+  // Leaves P.h holding the chunk's final RMSNorm from the row returned on (row 0
+  // alone where the layers past the KV-sharing line ran on the last row). Logits are
   // the caller's business: only the LAST chunk's last row is ever read, so
   // running the 272 MB lm_head here would waste a full GEMV per earlier chunk.
+  return T - 1;
 }
 
 // Widen `n` token embedding rows (whatever float the GGUF stored) into `dst`.
@@ -1382,15 +1410,15 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
   const int64_t T = (int64_t)ids.size();
   if (!can_prefill_batched(M, T) || !M.pscratch.init(c, chunk)) return -1;
   auto run = [&](bool full) {
-    int64_t last = 0;
+    int64_t row = 0;
     for (int64_t s = 0; s < T; s += chunk) {
-      last = std::min(chunk, T - s);
-      stage_embed_rows_(M, ids, s, last);
-      prefill_chunk_(M, last, full);
+      const int64_t n = std::min(chunk, T - s);
+      stage_embed_rows_(M, ids, s, n);
+      row = prefill_chunk_(M, n, full, s + n == T);
     }
     // Only the final row of the final chunk needs logits — one GEMV for the
     // whole prompt rather than one per chunk, read in place as a view of it.
-    lm_head(M, at_f32(sp(M.pscratch.h), (last - 1) * c.NE), sp(M.scratch.logits));
+    lm_head(M, at_f32(sp(M.pscratch.h), row * c.NE), sp(M.scratch.logits));
   };
   if (exact) {
     run(true);
@@ -1578,8 +1606,8 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
     }
     if (const auto* sc = m.tensor(p + "layer_output_scale.weight")) widen_(sc, 0, 1, &L.out_scale);
     if (c.PLE) {
-      L.ple_gate = load_w_T(m, p + "inp_gate.weight", c.NE, c.PLE, f32);
-      L.ple_proj = load_w_T(m, p + "proj.weight", c.PLE, c.NE, f32);
+      L.ple_gate = load_f32(m, p + "inp_gate.weight", c.PLE * c.NE);
+      L.ple_proj = load_f32(m, p + "proj.weight", c.NE * c.PLE);
       L.ple_post = load_f32(m, p + "post_norm.weight", c.NE);
     }
     if (c.is_delta(l)) {
