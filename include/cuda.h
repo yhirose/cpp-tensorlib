@@ -759,31 +759,44 @@ struct context {
                            : tc_shape{256, 128, 32, 512, 3};
   }
 
-  // The attention kernels, by kind, head width (64, 128, 256) and the KV cache's
-  // element type (f32, f16): tl_<kind>_{f32,f16}_<D>, looked up on first use. A
-  // width or type a kind has no kernel for comes back null (its launcher says no
-  // first). The tensor-core prefill at 256 stages Q in dynamic shared memory too:
-  // (64 queries + 2 buffers of K and V of 16 keys) rows of D + 8 halves, past the
-  // static 48 KB, so its function is raised to that on lookup (the kernel carves
-  // the same layout).
+  // The attention kernels, by kind, head width (64, 128, 256, 512) and the KV
+  // cache's element type (f32, f16): tl_<kind>_{f32,f16}_<D>, looked up on first
+  // use. A width or type a kind has no kernel for comes back null (its launcher
+  // says no first). A kernel whose shared memory is past the static 48 KB carves
+  // it from dynamic shared memory, attn_smem bytes of it, and its function is
+  // raised to that on lookup.
   enum class attn_k { decode, split, split_dpos, tiled, tc };
-  CUfunction attn_fns_[5][3][2] = {};
-  static constexpr unsigned attn_tc_smem(int64_t D) {
-    return D == 256 ? (64 + 4 * 16) * (256 + 8) * 2 : 0;
+  CUfunction attn_fns_[5][4][2] = {};
+  // The host twins of the kernels' layouts (cuda_nn.cuh): the tiled prefill's
+  // attn_tiled_smem_<512, 1> (16 queries, 8 keys a tile, f32 rows padded by one);
+  // the tensor-core prefill's at 256 (attn_prefill_tc_core_smem: 64 queries, then
+  // two buffers of K and V of 16 keys, f16 rows of D + 8) and at 512
+  // (attn_prefill_tc_wide_core: K and V of attn_tc_wide_bk keys, then the
+  // partial scores of attn_tc_wide_mq query tiles of 4 warps).
+  static constexpr unsigned attn_tc_wide_mq = 2;
+  static constexpr unsigned attn_tc_wide_bk(bool f16) { return f16 ? 32 : 16; }
+  static constexpr unsigned attn_smem(attn_k k, int64_t D, bool f16) {
+    if (k == attn_k::tiled && D == 512) return (16 * 513 + 8 * 513 + 8 * 512 + 16 * 9) * 4;
+    if (k == attn_k::tc && D == 256) return (64 + 4 * 16) * (256 + 8) * 2;
+    if (k == attn_k::tc && D == 512) {
+      const unsigned bk = attn_tc_wide_bk(f16);
+      return 2 * bk * (512 + 8) * 2 + attn_tc_wide_mq * 4 * (bk / 8) * 32 * 16;
+    }
+    return 0;
   }
   CUfunction attn_(attn_k k, int64_t D, bool f16) {
     static const char* const kind[5] = {"tl_attn_decode_", "tl_attn_decode_split_",
                                         "tl_attn_decode_split_dpos_", "tl_attn_prefill_tiled_",
                                         "tl_attn_prefill_tc_"};
-    const int di = D == 64 ? 0 : D == 128 ? 1 : D == 256 ? 2 : -1;
+    const int di = D == 64 ? 0 : D == 128 ? 1 : D == 256 ? 2 : D == 512 ? 3 : -1;
     if (di < 0) return nullptr;
     CUfunction& slot = attn_fns_[static_cast<int>(k)][di][f16];
     if (!slot) {
       char name[64];
       std::snprintf(name, sizeof name, "%s%s_%d", kind[static_cast<int>(k)], f16 ? "f16" : "f32", (int)D);
       slot = load_(name);
-      if (slot && k == attn_k::tc && D == 256 && d.FuncSetAttribute)
-        d.FuncSetAttribute(slot, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, static_cast<int>(attn_tc_smem(D)));
+      if (const unsigned smem = attn_smem(k, D, f16); slot && smem && d.FuncSetAttribute)
+        d.FuncSetAttribute(slot, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, static_cast<int>(smem));
     }
     return slot;
   }

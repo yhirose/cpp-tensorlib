@@ -774,9 +774,11 @@ struct attn_partials {
   }
 };
 
-// The head widths the decode-attention kernels are instantiated for: 64 and
-// 128 with either cache dtype, 256 with an f32 cache.
-inline bool attn_decode_head_ok(int64_t D) { return D == 64 || D == 128 || D == 256; }
+// The head widths the decode-attention kernels are instantiated for, each with
+// either cache dtype.
+inline bool attn_decode_head_ok(int64_t D) {
+  return D == 64 || D == 128 || D == 256 || D == 512;
+}
 
 // M9 fused decode attention: out(h,:) = softmax(scale·q(h,:)·K(kv,:)^T)·V(kv) in
 // one pass. q [n_q_heads,D], out [n_q_heads,D]; K/V are a [n_kv_heads,kv_max,D]
@@ -828,7 +830,6 @@ inline bool own_nn::attn_decode(gpu::span q, gpu::span K, gpu::span V,
 // cache read over [0,pos0+T). Query p is at absolute position pos0+p and attends
 // keys 0..pos0+p (with a window, its last `window` of them), so a long prompt can
 // be run in chunks (and a later turn appended to a live cache). GQA via group.
-// D∈{64,128}.
 // One block per (head, query tile); grid = (n_q_heads, ceil(T/tile)).
 inline bool own_nn::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
                               gpu::span out, int64_t n_q_heads,
@@ -836,9 +837,9 @@ inline bool own_nn::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
                               int64_t D, float scale, bool kv_f16,
                               int64_t pos0, int64_t window) {
   auto& c = context::get();
-  // D 64 or 128; 256 for an f16 cache (an f32 one there takes gpu::attn_prefill's
-  // GEMM form, which reads only f32).
-  if (!c.ready || (D != 128 && D != 64 && !(D == 256 && kv_f16))) return false;
+  // D 64 or 128; 256 and 512 for an f16 cache (an f32 one there takes
+  // gpu::attn_prefill's GEMM form, which reads only f32).
+  if (!c.ready || (D != 128 && D != 64 && !((D == 256 || D == 512) && kv_f16))) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
   if (T <= 0 || T > 65535) return false;  // one call is one prompt chunk
   c.device_read_(q.buf);
@@ -861,21 +862,21 @@ inline bool own_nn::attn_prefill(gpu::span q, gpu::span K, gpu::span V,
   const unsigned tile = attn_tile_queries(D);
   return c.launch_(c.attn_(context::attn_k::tiled, D, kv_f16),
                    {static_cast<unsigned>(n_q_heads), (uT + tile - 1) / tile},
-                   {attn_tile_threads}, 0, pq, pk, pv, po, uT, kv_stride, group,
-                   scale, up0, static_cast<unsigned>(window));
+                   {attn_tile_threads}, context::attn_smem(context::attn_k::tiled, D, kv_f16), pq, pk,
+                   pv, po, uT, kv_stride, group, scale, up0, static_cast<unsigned>(window));
 }
 
 // The same causal prefill on the tensor cores (tl_attn_prefill_tc_*), its
 // operands rounded to f16 as staged (an f16 cache's K and V already are): head
-// width 64, 128 or 256, operands where the kernel declares them. Inference only
-// (gpu::attn_prefill_f16).
+// width 64, 128, 256 or 512, operands where the kernel declares them. Inference
+// only (gpu::attn_prefill_f16).
 inline bool own_nn::attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V,
                                   gpu::span out, int64_t n_q_heads,
                                   int64_t n_kv_heads, int64_t T, int64_t kv_max,
                                   int64_t D, float scale, bool kv_f16,
                                   int64_t pos0, int64_t window) {
   auto& c = context::get();
-  if (!c.ready || (D != 64 && D != 128 && D != 256)) return false;
+  if (!c.ready || (D != 64 && D != 128 && D != 256 && D != 512)) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0) return false;
   if (T <= 0 || T > 65535) return false;
   float* pq = context::off_(q.buf, q.off);
@@ -886,10 +887,14 @@ inline bool own_nn::attn_prefill_f16(gpu::span q, gpu::span K, gpu::span V,
   c.device_read_(K.buf);
   c.device_read_(V.buf);
   c.device_write_(out.buf);
-  const unsigned uT = static_cast<unsigned>(T), bq = 64u;  // 4 warps, 16 queries each
+  // A block's queries and threads: 4 warps of 16 queries each, or at 512
+  // attn_tc_wide_mq tiles of 16 queries, 4 warps a tile splitting the dims.
+  const unsigned uT = static_cast<unsigned>(T);
+  const unsigned tiles = D == 512 ? context::attn_tc_wide_mq : 4u, bq = 16 * tiles;
+  const unsigned threads = D == 512 ? 128 * tiles : 128u;
   return c.launch_(c.attn_(context::attn_k::tc, D, kv_f16),
-                   {static_cast<unsigned>(n_q_heads), (uT + bq - 1) / bq}, {bq * 2},
-                   context::attn_tc_smem(D), pq,
+                   {static_cast<unsigned>(n_q_heads), (uT + bq - 1) / bq}, {threads},
+                   context::attn_smem(context::attn_k::tc, D, kv_f16), pq,
                    pk, pv, po, uT, static_cast<unsigned>(kv_max * D),
                    static_cast<unsigned>(n_q_heads / n_kv_heads), scale,
                    static_cast<unsigned>(pos0), static_cast<unsigned>(window));

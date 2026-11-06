@@ -156,6 +156,7 @@ int main() {
   for (const bool f16 : {false, true}) {
     ok &= decode_check(64, 14, 2, f16);  // Qwen2.5-0.5B
     ok &= decode_check(256, 8, 2, f16);  // Qwen3.5's full-attention layers
+    ok &= decode_check(512, 8, 1, f16);  // Gemma 4 E2B's global layers
   }
 
   // ---- Causal prefill at D=64 + prefill->decode handoff. ----

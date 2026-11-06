@@ -35,7 +35,7 @@ __device__ __forceinline__ unsigned attn_dpos_chunk(unsigned ctx, unsigned H) {
   chunk = (chunk + 3u) & ~3u;  // multiple of the warp count
   return chunk ? chunk : 4u;
 }
-// tl_attn_decode_split_dpos_{f32,f16}_{64,128,256}
+// tl_attn_decode_split_dpos_{f32,f16}_{64,128,256,512}
 // A window (win > 0) reads the rows [lo, ctx) as the host path does: K and V from row lo,
 // ctx - lo of them, split by their count.
 #define TL_ATTN_SPLIT_DPOS(AD, KT, TN)                                                               \
@@ -50,9 +50,11 @@ __device__ __forceinline__ unsigned attn_dpos_chunk(unsigned ctx, unsigned H) {
 TL_ATTN_SPLIT_DPOS(64, float, f32)
 TL_ATTN_SPLIT_DPOS(128, float, f32)
 TL_ATTN_SPLIT_DPOS(256, float, f32)
+TL_ATTN_SPLIT_DPOS(512, float, f32)
 TL_ATTN_SPLIT_DPOS(64, __half, f16)
 TL_ATTN_SPLIT_DPOS(128, __half, f16)
 TL_ATTN_SPLIT_DPOS(256, __half, f16)
+TL_ATTN_SPLIT_DPOS(512, __half, f16)
 #undef TL_ATTN_SPLIT_DPOS
 
 // Append one decode step's k,v (each [H_kv, D] contiguous) into the persistent
