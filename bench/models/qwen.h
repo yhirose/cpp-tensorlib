@@ -42,12 +42,13 @@ namespace gg = tl::gguf;
 namespace gpu = tl::gpu;
 
 // The shape of one decoder, read from the GGUF metadata (config_from_gguf)
-// rather than compiled in, so Qwen2.5, Qwen3, Qwen3.5, Gemma 3, Llama 3.2 and
-// PLaMo 3 — and every size of each — share one forward. Everything that differs between those
+// rather than compiled in, so Qwen2.5, Qwen3, Qwen3.5, Gemma 3, Gemma 4, Llama 3.2
+// and PLaMo 3 — and every size of each — share one forward. Everything that differs between those
 // families is a field here: the dims, the norm eps / rope base, and the
 // structural switches.
 struct Config {
-  std::string arch;  // "qwen2" | "qwen3" | "qwen35" | "gemma3" | "llama" | "plamo3": the family, for drivers
+  std::string arch;  // "qwen2" | "qwen3" | "qwen35" | "gemma3" | "gemma4" | "llama" | "plamo3": the family, for drivers
+  // HD and FF are the widest layer's (the scratch's sizes); hd(l) and ff(l) a layer's own.
   int64_t NL = 0, NE = 0, NH = 0, NKV = 0, HD = 0, FF = 0, VOCAB = 0;
   int64_t MAXC = 4096;  // KV capacity per layer (f32): NKV*MAXC*HD*8 B per layer
   float EPS = 1e-6f, ROPE_BASE = 1e6f;
@@ -101,22 +102,50 @@ struct Config {
   // their scores scaled by its mscale squared (scale).
   std::optional<gpu::yarn> yarn;
   // The attention's q scale: 1 / sqrt(HD), unless the family says otherwise
-  // (QSCALE > 0: Gemma 3 27B's 1 / sqrt(NE / NH)); a global layer's times YaRN's.
+  // (QSCALE > 0: Gemma 3 27B's 1 / sqrt(NE / NH), Gemma 4's 1); a global layer's times YaRN's.
   float QSCALE = 0.0f;
   float scale(int64_t l) const {
     const float s = QSCALE > 0.0f ? QSCALE : 1.0f / std::sqrt((float)HD);
     return yarn && !is_local(l) ? s * yarn->mscale() * yarn->mscale() : s;
   }
+  // Gemma 4. Its local layers' heads and RoPE are narrower than its global ones'
+  // (HD_LOCAL, ROT_LOCAL; 0 where they are not), and its MLP's width is a layer's
+  // own (FF_L; empty: FF on every layer). Its last KV_SHARED layers keep no K and V:
+  // each reads the cache of the last layer of its kind before them (kv_src, as
+  // llama.cpp's kv_source). v is RMS-normalized without a weight (v_norm). PLE wide
+  // per-layer embeddings a layer (Model::ple_*, ple_inputs_, layer_tail_), and the
+  // logits capped by SOFTCAP: tanh(logit / SOFTCAP) * SOFTCAP.
+  int64_t HD_LOCAL = 0, ROT_LOCAL = 0, KV_SHARED = 0, PLE = 0;
+  std::vector<int64_t> FF_L;
+  bool v_norm = false;
+  float SOFTCAP = 0.0f;
+  int64_t hd(int64_t l) const { return is_local(l) && HD_LOCAL ? HD_LOCAL : HD; }
+  int64_t rot(int64_t l) const { return is_local(l) && ROT_LOCAL ? ROT_LOCAL : ROT; }
+  int64_t ff(int64_t l) const { return FF_L.empty() ? FF : FF_L[l]; }
+  int64_t kv_src(int64_t l) const {
+    const int64_t first = NL - KV_SHARED;
+    if (l < first) return l;
+    for (int64_t j = first - 1; j >= 0; j--)
+      if (is_local(j) == is_local(l)) return j;
+    return l;  // none of its kind before (refused when read: config_from_gguf)
+  }
+  bool has_kv(int64_t l) const { return kv_src(l) == l; }
   bool hybrid() const { return INTERVAL > 1; }
   // The array path (forward(), the per-op oracle) models the plain decoder:
   // no DeltaNet layers, no Gemma post norms or GELU, every layer global, its RoPE
   // neither scaled nor divided by per-pair factors (array::rope has neither).
   bool array_path() const {
     return !hybrid() && !post_norms && act == gpu::glu_act::silu && local.empty() &&
-           ROPE_SCALE == 1.0f && !rope_factors;
+           ROPE_SCALE == 1.0f && !rope_factors && !PLE && !KV_SHARED && !v_norm &&
+           SOFTCAP == 0.0f && FF_L.empty() && !HD_LOCAL;
   }
   bool is_delta(int64_t l) const { return hybrid() && (l + 1) % INTERVAL != 0; }
-  // Output widths of the fused projections (and so of the scratch they land in).
+  // Output widths of the fused projections (and so of the scratch they land in):
+  // layer l's q|k|v(|gate), only q where it reads another layer's KV, and the widest.
+  int64_t attn_proj(int64_t l) const {
+    const int64_t d = hd(l);
+    return (NH + (has_kv(l) ? 2 * NKV : 0)) * d + (attn_gate ? NH * d : 0);
+  }
   int64_t attn_proj() const { return (NH + 2 * NKV) * HD + (attn_gate ? NH * HD : 0); }
   int64_t ssm_conv_ch() const { return 2 * SK * SDK + SH * SDV; }  // q|k|v
   int64_t ssm_v() const { return SH * SDV; }                        // the rule's out
@@ -140,7 +169,7 @@ struct Config {
 inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
   const std::string& arch = m.kv("general.architecture").as_str();
   if (arch != "qwen2" && arch != "qwen3" && arch != "qwen35" && arch != "gemma3" &&
-      arch != "llama" && arch != "plamo3")
+      arch != "gemma4" && arch != "llama" && arch != "plamo3")
     throw std::runtime_error("qwen: unsupported architecture " + arch);
   auto u32 = [&](const char* k) { return (int64_t)m.kv(arch + "." + k).as_u32(); };
   Config c;
@@ -149,7 +178,15 @@ inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
   c.NE = u32("embedding_length");
   c.NH = u32("attention.head_count");
   c.NKV = u32("attention.head_count_kv");
-  c.FF = u32("feed_forward_length");
+  // The MLP's width: one, or one a layer (Gemma 4's E models), the widest in FF.
+  if (const auto& f = m.kv(arch + ".feed_forward_length"); f.type == gg::val_type::array) {
+    for (const auto& v : f.arr)  // i32 in the converter's files
+      c.FF_L.push_back(v.type == gg::val_type::i32 ? (int64_t)v.as_i32() : (int64_t)v.as_u32());
+    if ((int64_t)c.FF_L.size() != c.NL) throw std::runtime_error("qwen: feed_forward_length is not one a layer");
+    c.FF = *std::max_element(c.FF_L.begin(), c.FF_L.end());
+  } else {
+    c.FF = u32("feed_forward_length");
+  }
   // Qwen3 states head_dim (key_length); Qwen2 derives it from the width.
   c.HD = m.has(arch + ".attention.key_length") ? u32("attention.key_length")
                                                : c.NE / c.NH;
@@ -280,6 +317,33 @@ inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
     // The 27B (62 layers) scales q by 1 / sqrt(NE / NH), the others by 1 / sqrt(HD).
     if (c.NL == 62) c.QSCALE = 1.0f / std::sqrt((float)(c.NE / c.NH));
   }
+  if (arch == "gemma4") {
+    // As llama.cpp's gemma4 (src/models/gemma4.cpp) and HF's modeling_gemma4.py:
+    // Gemma 3's embedding scale and GELU, an attention scale of 1, v normalized
+    // without a weight, the logits' softcap, the local layers' own head and RoPE
+    // widths, the KV-sharing layers and the per-layer embeddings.
+    c.EMB_SCALE = std::sqrt((float)c.NE);
+    c.act = gpu::glu_act::gelu_tanh;
+    c.QSCALE = 1.0f;
+    c.v_norm = true;
+    if (m.has(arch + ".final_logit_softcapping")) c.SOFTCAP = m.kv(arch + ".final_logit_softcapping").as_f32();
+    c.HD_LOCAL = u32("attention.key_length_swa");
+    c.ROT_LOCAL = m.has(arch + ".rope.dimension_count_swa") ? u32("rope.dimension_count_swa") : c.HD_LOCAL;
+    if (c.HD_LOCAL > c.HD || u32("attention.value_length") != c.HD ||
+        u32("attention.value_length_swa") != c.HD_LOCAL)
+      throw std::runtime_error("qwen: a gemma4 whose v heads are not its k heads, or local heads wider");
+    if (m.has(arch + ".attention.shared_kv_layers")) c.KV_SHARED = u32("attention.shared_kv_layers");
+    for (int64_t l = c.NL - c.KV_SHARED; l < c.NL; l++)
+      if (c.has_kv(l)) throw std::runtime_error("qwen: a KV-sharing layer with no layer of its kind before");
+    // The readers of a q gate and of k / v biases take q|k|v whole (no KV-sharing layer).
+    if (c.KV_SHARED && (c.attn_gate || c.qkv_bias))
+      throw std::runtime_error("qwen: KV-sharing layers with a q gate or a qkv bias");
+    if (m.has(arch + ".embedding_length_per_layer_input")) c.PLE = u32("embedding_length_per_layer_input");
+    // A global layer whose v is its k (12B, 31B: no attn_v) is not read yet.
+    for (int64_t l = 0; l < c.NL; l++)
+      if (c.has_kv(l) && !m.tensor("blk." + std::to_string(l) + ".attn_v.weight"))
+        throw std::runtime_error("qwen: a gemma4 layer without attn_v (its v is its k)");
+  }
   return c;
 }
 // Prompt tokens per batched prefill pass. Sets the PrefillScratch size (linear in
@@ -404,24 +468,30 @@ struct wpart {
 // Qwen3.5's gate; gate | up), read from the file's tensors: one a projection, or
 // the rows of one fused tensor (Config::fused_qkv, fused_gu). q and k in the
 // halves order the kernels turn (a llama file's rows are in NORM order:
-// wpart::norm_hd); Qwen3.5's q interleaves q and its gate a head at a time.
-inline std::vector<wpart> layer_qkv_parts(const Config& c, const std::string& p) {
-  const int64_t Q = c.NH * c.HD, KV = c.NKV * c.HD;
+// wpart::norm_hd); Qwen3.5's q interleaves q and its gate a head at a time. A layer
+// that reads another's KV (Config::kv_src) projects only q.
+inline std::vector<wpart> layer_qkv_parts(const Config& c, int64_t l) {
+  const std::string p = "blk." + std::to_string(l) + ".";
+  const int64_t hd = c.hd(l), Q = c.NH * hd, KV = c.NKV * hd;
   if (c.fused_qkv) {
     const std::string n = p + "attn_qkv.weight";
     return {{n, Q, 0, 0, 0}, {n, KV, 0, 0, Q}, {n, KV, 0, 0, Q + KV}};
   }
-  const int64_t nhd = c.rope_norm ? c.HD : 0;
-  std::vector<wpart> parts = {c.attn_gate ? wpart{p + "attn_q.weight", Q, c.HD, 2 * c.HD, 0}
-                                          : wpart{p + "attn_q.weight", Q, 0, 0, 0, nhd},
-                              {p + "attn_k.weight", KV, 0, 0, 0, nhd},
-                              {p + "attn_v.weight", KV}};
-  if (c.attn_gate) parts.push_back({p + "attn_q.weight", Q, c.HD, 2 * c.HD, c.HD});
+  const int64_t nhd = c.rope_norm ? hd : 0;
+  std::vector<wpart> parts = {c.attn_gate ? wpart{p + "attn_q.weight", Q, hd, 2 * hd, 0}
+                                          : wpart{p + "attn_q.weight", Q, 0, 0, 0, nhd}};
+  if (c.has_kv(l)) {
+    parts.push_back({p + "attn_k.weight", KV, 0, 0, 0, nhd});
+    parts.push_back({p + "attn_v.weight", KV});
+  }
+  if (c.attn_gate) parts.push_back({p + "attn_q.weight", Q, hd, 2 * hd, hd});
   return parts;
 }
-inline std::vector<wpart> layer_gu_parts(const Config& c, const std::string& p) {
-  if (c.fused_gu) return {{p + "ffn_up.weight", c.FF}, {p + "ffn_up.weight", c.FF, 0, 0, c.FF}};
-  return {{p + "ffn_gate.weight", c.FF}, {p + "ffn_up.weight", c.FF}};
+inline std::vector<wpart> layer_gu_parts(const Config& c, int64_t l) {
+  const std::string p = "blk." + std::to_string(l) + ".";
+  const int64_t ff = c.ff(l);
+  if (c.fused_gu) return {{p + "ffn_up.weight", ff}, {p + "ffn_up.weight", ff, 0, 0, ff}};
+  return {{p + "ffn_gate.weight", ff}, {p + "ffn_up.weight", ff}};
 }
 inline array load_w_T_cat(const gg::model& m, const std::vector<wpart>& parts,
                           int64_t in, tl::dtype wdt) {
@@ -663,6 +733,11 @@ struct Layer {
   // Config::post_norms (Gemma 3): the norms of the attention's and the MLP's
   // outputs, [NE] each (rmsnorm_res's wd); empty otherwise.
   array pa, pf;
+  // Gemma 4: the residual's scale at the layer's end (layer_output_scale), and the
+  // per-layer embedding's gate [NE, PLE], projection [PLE, NE] (f32, as the file
+  // has them) and the norm of what it adds [NE] (Config::PLE; layer_tail_).
+  float out_scale = 1.0f;
+  array ple_gate, ple_proj, ple_post;
 };
 
 // Persistent device scratch for the imperative decode step (C1): every per-step
@@ -692,6 +767,11 @@ struct Scratch {
   storage logit_sum;    // [1] the logits' sum: non-finite iff any logit is
   storage embed;        // staged embedding row [NE] (the step's input)
   std::vector<float> embed_stage;  // host gather target, uploaded into embed
+  // Config::PLE: the token's own per-layer rows [NL*PLE] (staged), the slots
+  // ple_inputs_ fills [(NL+1)*PLE], and a layer's gated input [PLE];
+  // logits_tmp the softcap's [VOCAB].
+  storage ple_tok, ple, ple_g, logits_tmp;
+  std::vector<float> ple_stage;
   void init(const Config& c) {
     {  // the widest input of a GEMV (the residual, the MLP's, the heads', DeltaNet's
        // values), up to whole Q4_K superblocks, prepared in any form (a check switches them)
@@ -715,6 +795,13 @@ struct Scratch {
     mdb = scratch_f32(c.NE);
     logits_sink = scratch_f32(c.VOCAB);
     logit_sum = scratch_f32(1);
+    if (c.PLE) {
+      ple_tok = scratch_f32(c.NL * c.PLE);
+      ple_stage.assign((size_t)(c.NL * c.PLE), 0.0f);
+      ple = scratch_f32((c.NL + 1) * c.PLE);
+      ple_g = scratch_f32(c.PLE);
+    }
+    if (c.SOFTCAP > 0.0f) logits_tmp = scratch_f32(c.VOCAB);
   }
 };
 
@@ -750,6 +837,11 @@ struct PrefillScratch {
   // the two norms' outputs, and the activations only a GEMM reads.
   storage h16, h216, at16, mb16;
   std::vector<float> emb_stage;  // host gather target, uploaded into emb
+  // Config::PLE, Scratch's over `cap` rows: the tokens' rows [cap, NL*PLE], the
+  // slots [(NL+1), cap, PLE], [gate | ple] rows [cap, 2*PLE] and a layer's gated
+  // input [cap, PLE].
+  storage ple_tok, ple, ple_gu, ple_g;
+  std::vector<float> ple_stage;
 
   bool init(const Config& c, int64_t chunk) {
     if (cap >= chunk) return true;  // already big enough
@@ -778,6 +870,13 @@ struct PrefillScratch {
     gu = scratch_f32(cap * 2 * c.FF);
     mb = scratch_f32(cap * c.FF);
     md = scratch_f32(cap * c.NE);
+    if (c.PLE) {
+      ple_tok = scratch_f32(cap * c.NL * c.PLE);
+      ple_stage.assign((size_t)(cap * c.NL * c.PLE), 0.0f);
+      ple = scratch_f32((c.NL + 1) * cap * c.PLE);
+      ple_gu = scratch_f32(cap * 2 * c.PLE);
+      ple_g = scratch_f32(cap * c.PLE);
+    }
     if constexpr (gpu::f16_activations) {
       auto half = [](int64_t n) { return scratch_f32((n + 1) / 2); };
       h16 = half(cap * c.NE);
@@ -801,6 +900,14 @@ struct Model {
   array outwT;
   array onorm;                // final norm [1, NE]
   array rope_freqs;           // the per-pair RoPE divisors [1, ROT/2] (Config::rope_factors)
+  // Config::PLE: the per-layer embeddings' table in the file [VOCAB, NL*PLE] (rows
+  // gathered on the host, as the embedding's), the projection of the embedding
+  // [NE -> NL*PLE] (bf16 rows, or [K,N] off the row path), and its norm's weight
+  // over sqrt(2) [PLE] (ple_inputs_).
+  const gg::tensor_info* ple_embd = nullptr;
+  wmat ple_proj_row;
+  array ple_projT, ple_norm;
+  array ones;                 // [HD] of 1: Config::v_norm's weight
   array outwT_q4;             // q4 lm_head (imperative decode, when q4_lmhead)
   tl::dtype wdt = tl::dtype::f32;  // the float weights' dtype, as build() chose
                                    // (bf16 under quant, whose projections are blocks)
@@ -836,8 +943,8 @@ struct Model {
 // its position scaled and its pairs divided by the file's factors where it has them.
 inline gpu::rope_freq rope_of(const Model& M, int64_t l) {
   const Config& c = M.c;
-  if (c.is_local(l)) return {c.ROPE_BASE_LOCAL, c.ROT};
-  return {c.ROPE_BASE, c.ROT, c.ROPE_SCALE, sp(M.rope_freqs)};  // empty: no factors
+  if (c.is_local(l)) return {c.ROPE_BASE_LOCAL, c.rot(l)};
+  return {c.ROPE_BASE, c.rot(l), c.ROPE_SCALE, sp(M.rope_freqs)};  // empty: no factors
 }
 
 // The KV cache's appends and attentions fail only on a caller's mistake (a position
@@ -863,9 +970,81 @@ inline void gemv_rw(const wmat& R, const array& W, gpu::span a, gpu::span y, int
   else gemv_w(W, a, y, n, k);
 }
 
-// logits = the lm head . a.
+// The final logits' cap where the family has one (Config::SOFTCAP: Gemma 4's
+// tanh(logit / cap) * cap), in place.
+inline void softcap_(const Model& M, gpu::span logits) {
+  const Config& c = M.c;
+  if (c.SOFTCAP <= 0.0f) return;
+  gpu::unary(gpu::kop::affine, logits, sp(M.scratch.logits_tmp), c.VOCAB, 1.0f / c.SOFTCAP, 0.0f);
+  gpu::unary_ext(gpu::unary_ext_op::tanh_, sp(M.scratch.logits_tmp), logits, c.VOCAB, c.SOFTCAP, 0.0f);
+}
+
+// logits = the lm head . a, capped (softcap_).
 inline void lm_head(const Model& M, gpu::span a, gpu::span logits) {
   gemv_rw(M.outw_row, M.outwT, a, logits, M.c.VOCAB, M.c.NE);
+  softcap_(M, logits);
+}
+
+// y [T, N] = a [T, K] . W, an f32 [K,N] weight: a GEMV for one row.
+inline void mm_f32_(const array& W, gpu::span a, gpu::span y, int64_t T, int64_t N, int64_t K) {
+  if (T == 1) gpu::gemv_f32(a, sp(W), y, N, K);
+  else gpu::gemm(a, K, false, sp(W), N, false, y, T, N, K, 1.0f, 0.0f);
+}
+
+// Gemma 4's per-layer embeddings of T tokens (Config::PLE; HF's
+// get_per_layer_inputs and project_per_layer_inputs) into `slots`, [(NL+1), T, PLE]:
+// layer l's at slot l + 1, so that slot l, where layer l's gate lands, sits next to
+// it (layer_tail_). The embedding x [T, NE] (already times sqrt(NE)) projected
+// [T, NL*PLE], each layer's slice RMS-normalized by the norm's weight over sqrt(2)
+// (eps times NE: HF divides the projection by sqrt(NE) first, which is the same
+// norm), plus `tok`, the tokens' own rows as staged (stage_ple_rows_: times
+// sqrt(PLE / 2)). One row is layer-major already, and goes straight into its
+// slots; T rows are summed into `tok` and split a layer at a time from there.
+inline void ple_inputs_(const Model& M, gpu::span x, int64_t T, gpu::span tok, gpu::span slots) {
+  const Config& c = M.c;
+  const int64_t NP = c.NL * c.PLE;
+  const gpu::span pj = T == 1 ? at_f32(slots, c.PLE) : slots;  // slots hold >= T * NP
+  if (T == 1) gemv_rw(M.ple_proj_row, M.ple_projT, x, pj, NP, c.NE);
+  else gpu::gemm_bf16_nt(x, M.ple_proj_row.at(M.ple_proj_row.parts[0]), pj, T, NP, c.NE);
+  gpu::rmsnorm(pj, sp(M.ple_norm), pj, c.PLE, c.EPS * (float)c.NE, T * c.NL);
+  if (T == 1) {
+    gpu::binary(gpu::kop::add, pj, tok, pj, NP, 1.0f, 0.0f);
+    return;
+  }
+  gpu::binary(gpu::kop::add, pj, tok, tok, T * NP, 1.0f, 0.0f);
+  gpu::split_heads(tok, {}, at_f32(slots, T * c.PLE), T, NP, 0, c.NL, c.PLE);
+}
+
+// The end of layer l over T rows where the family has more than the residual add
+// (Gemma 4): x + the MLP's output md post-normed, then (Config::PLE) the per-layer
+// embedding's input gelu(x . gate) * ple_l projected back, post-normed and added,
+// and the whole residual times the layer's scale. The next layer's input norm is
+// the caller's. gu [T, 2*PLE] and g [T, PLE] are scratch; md is reused.
+inline void layer_tail_(const Model& M, const Layer& L, int64_t l, int64_t T, gpu::span x,
+                        gpu::span md, gpu::span slots, gpu::span gu, gpu::span g) {
+  const Config& c = M.c;
+  const int64_t n = T * c.NE;
+  gpu::rmsnorm(md, sp(L.pf), md, c.NE, c.EPS, T);
+  if (c.PLE) {
+    gpu::binary(gpu::kop::add, x, md, x, n, 1.0f, 0.0f);
+    // Slot l held layer l - 1's input, read by now; the gate lands there, beside ple_l.
+    const gpu::span gate = at_f32(slots, l * T * c.PLE);
+    mm_f32_(L.ple_gate, x, gate, T, c.PLE, c.NE);
+    gpu::span gp = gate;  // [gate | ple_l] a row: one row's slots are
+    if (T > 1) {
+      gpu::merge_heads(gate, gu, T, 2, c.PLE);
+      gp = gu;
+    }
+    gpu::glu(gpu::glu_act::gelu_tanh, gp, g, c.PLE, T);
+    mm_f32_(L.ple_proj, g, md, T, c.NE, c.PLE);
+    gpu::rmsnorm(md, sp(L.ple_post), md, c.NE, c.EPS, T);
+  }
+  gpu::binary(gpu::kop::add, x, md, x, n, L.out_scale, 0.0f);
+}
+
+// Whether layer l ends past the residual add (layer_tail_).
+inline bool has_tail_(const Model& M, int64_t l) {
+  return M.c.PLE > 0 || M.layers[l].out_scale != 1.0f;
 }
 
 // Greedy token from the logits the most recent forward left in scratch (the one
@@ -920,15 +1099,16 @@ struct delta_snapshot {
   }
 };
 
-// The attention layers' KV caches, empty, in the form f16 says (Model::kv_f16):
+// The attention layers' KV caches, empty, in the form f16 says (Model::kv_f16)
+// (a layer that reads another's has none):
 // build()'s, and a caller's that runs the same weights with an f32 cache (check_qwen's
 // reference forward, on a quantized file's own blocks).
 inline void init_kv_caches(Model& M, bool f16) {
   const Config& c = M.c;
   M.kv_f16 = f16;
   for (int64_t l = 0; l < c.NL; l++)
-    if (!c.is_delta(l))
-      M.layers[l].cache.init(c.NKV, c.MAXC, c.HD, f16, c.is_local(l) ? c.SWA : 0);
+    if (!c.is_delta(l) && c.has_kv(l))
+      M.layers[l].cache.init(c.NKV, c.MAXC, c.hd(l), f16, c.is_local(l) ? c.SWA : 0);
 }
 
 // Reset the sequence to position 0 (replay from a fresh prefill): every KV
@@ -991,7 +1171,6 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
   // same place, and kv_cache::prefill appends there, so rope reads it from the
   // same source rather than taking it as a parameter that could disagree.
   const int64_t pos0 = seq_cache(M).pos;
-  const int64_t AP = c.attn_proj(), Q = c.NH * c.HD;
   // The f16-sum GEMMs read their activation as f16 where prefill_a16 says; `a16s`
   // is that copy of `a`.
   const bool a16 = prefill_a16(M, exact), mmq = prefill_mmq(M, exact);
@@ -1038,6 +1217,7 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
     gpu::generic::copy_2d(src, ld, 1, sp(P.zero), dst, T, n);
   };
   gpu::span x = sp(P.emb);
+  if (c.PLE) ple_inputs_(M, x, T, sp(P.ple_tok), sp(P.ple));
   norm(x, sp(M.layers[0].an), sp(P.h), sp(P.h16), false);
   for (int64_t l = 0; l < c.NL; l++) {
     Layer& L = M.layers[l];
@@ -1065,59 +1245,72 @@ inline void prefill_chunk_(Model& M, int64_t T, bool exact = false) {
       }
       gemm(sp(P.at), sp(P.at16), L.wsout_row, ro, c.NE, V);
     } else {
+      // A layer that reads another's KV (Config::kv_src) projects q alone and
+      // attends over that layer's cache, which has this chunk already.
+      const int64_t hd = c.hd(l), Q = c.NH * hd, AP = c.attn_proj(l);
+      const bool own = c.has_kv(l);
+      tl::kv_cache& kv = M.layers[c.kv_src(l)].cache;
       gemm(sp(P.h), sp(P.h16), L.wqkv_row, sp(P.qkv), AP, c.NE);
       // split_heads turns the [T, q|k|v] output into head-major [H, T, D] and
       // adds the bias — rope's own fused-bias form only indexes correctly at
       // T == 1, so the bias rides along here instead. One pass over every head;
       // k and v are views into its output.
-      gpu::split_heads(sp(P.qkv), sp(L.bqkv), sp(P.qkvh), T, AP, 0, c.NH + 2 * c.NKV,
-                       c.HD);
+      gpu::split_heads(sp(P.qkv), sp(L.bqkv), sp(P.qkvh), T, AP, 0,
+                       c.NH + (own ? 2 * c.NKV : 0), hd);
       const gpu::span qh = sp(P.qkvh);
-      const gpu::span kh = at_f32(qh, c.NH * T * c.HD);
-      const gpu::span vh = at_f32(qh, (c.NH + c.NKV) * T * c.HD);
-      // Qwen3: every q / k head row (HD wide, one per h*T + t) is RMS-normalized
-      // in place, before rope. v is untouched.
+      const gpu::span kh = at_f32(qh, c.NH * T * hd);
+      const gpu::span vh = at_f32(qh, (c.NH + c.NKV) * T * hd);
+      // Qwen3: every q / k head row (hd wide, one per h*T + t) is RMS-normalized
+      // in place, before rope. v is untouched, but for Gemma 4's weightless norm.
       // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
       const gpu::rope_freq rf = rope_of(M, l);
       if (c.qk_norm) {
-        gpu::rmsnorm_rope(qh, sp(L.qn), c.NH * T, T, c.HD, pos0, rf, c.EPS);
-        gpu::rmsnorm_rope(kh, sp(L.kn), c.NKV * T, T, c.HD, pos0, rf, c.EPS);
+        gpu::rmsnorm_rope(qh, sp(L.qn), c.NH * T, T, hd, pos0, rf, c.EPS);
+        if (own) gpu::rmsnorm_rope(kh, sp(L.kn), c.NKV * T, T, hd, pos0, rf, c.EPS);
       } else {
-        gpu::rope(qh, qh, c.NH * T, T, c.HD, pos0, rf);
-        gpu::rope(kh, kh, c.NKV * T, T, c.HD, pos0, rf);
+        gpu::rope(qh, qh, c.NH * T, T, hd, pos0, rf);
+        if (own) gpu::rope(kh, kh, c.NKV * T, T, hd, pos0, rf);
       }
-      cache_ok_(L.cache.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale(l), exact));
+      if (own && c.v_norm) gpu::rmsnorm(vh, sp(M.ones), vh, hd, c.EPS, c.NKV * T);
+      cache_ok_(own ? kv.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale(l), exact)
+                    : kv.attend(qh, sp(P.ah), T, c.NH, c.scale(l), exact));
       // Qwen3.5: times sigmoid of the gate, the tail of each projection row —
       // an f32 product, so only the plain form is rounded where it is made.
       gpu::span ao = sp(P.at);
       if (c.attn_gate) {
-        gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, c.HD);
-        rows_out(at_f32(sp(P.qkv), (c.NH + 2 * c.NKV) * c.HD), AP, sp(P.gt), Q);
+        gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, hd);
+        rows_out(at_f32(sp(P.qkv), (c.NH + 2 * c.NKV) * hd), AP, sp(P.gt), Q);
         gpu::unary(gpu::kop::sigmoid, sp(P.gt), sp(P.gs), T * Q, 1, 0);
         gpu::binary(gpu::kop::mul, ao, sp(P.gs), sp(P.gt), T * Q, 1, 0);
         ao = sp(P.gt);
         if (a16) gpu::cvt_h16(ao, sp(P.at16), T * Q);
       } else if (a16) {
-        gpu::merge_heads_h16(sp(P.ah), sp(P.at16), T, c.NH, c.HD);
+        gpu::merge_heads_h16(sp(P.ah), sp(P.at16), T, c.NH, hd);
       } else {
-        gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, c.HD);
+        gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, hd);
       }
       gemm(ao, sp(P.at16), L.wo_row, ro, c.NE, Q);
     }
     norm_res(x, ro, sp(L.pa), sp(L.fn), ro, sp(P.h2), sp(P.h216), false);
     // With MMQ, gate|up of one format is one GEMM whose epilogue is the GLU.
+    const int64_t ff = c.ff(l);
     const bool glu = mmq && L.wgu_row.parts.size() == 1 &&
                      gpu::gemm_quant_glu(L.wgu_row.parts[0].type, c.act, sp(P.h216),
                                          L.wgu_row.at(L.wgu_row.parts[0]),
-                                         sp(P.mb16), T, c.FF, c.NE);
+                                         sp(P.mb16), T, ff, c.NE);
     if (!glu) {
-      gemm(sp(P.h2), sp(P.h216), L.wgu_row, sp(P.gu), 2 * c.FF, c.NE);
-      if (a16) gpu::glu_h16(c.act, sp(P.gu), sp(P.mb16), c.FF, T);
-      else gpu::glu(c.act, sp(P.gu), sp(P.mb), c.FF, T);
+      gemm(sp(P.h2), sp(P.h216), L.wgu_row, sp(P.gu), 2 * ff, c.NE);
+      if (a16) gpu::glu_h16(c.act, sp(P.gu), sp(P.mb16), ff, T);
+      else gpu::glu(c.act, sp(P.gu), sp(P.mb), ff, T);
     }
-    gemm(sp(P.mb), sp(P.mb16), L.wd_row, sp(P.md), c.NE, c.FF);
+    gemm(sp(P.mb), sp(P.mb16), L.wd_row, sp(P.md), c.NE, ff);
     const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
-    norm_res(ro, sp(P.md), sp(L.pf), nextw, ro, sp(P.h), sp(P.h16), l + 1 == c.NL);  // the logits read the last
+    if (has_tail_(M, l)) {  // the logits read the last layer's norm
+      layer_tail_(M, L, l, T, ro, sp(P.md), sp(P.ple), sp(P.ple_gu), sp(P.ple_g));
+      norm(ro, nextw, sp(P.h), sp(P.h16), l + 1 == c.NL);
+    } else {
+      norm_res(ro, sp(P.md), sp(L.pf), nextw, ro, sp(P.h), sp(P.h16), l + 1 == c.NL);
+    }
     x = ro;
   }
   // Leaves P.h holding the final RMSNorm for every row of the chunk. Logits are
@@ -1140,13 +1333,32 @@ inline void gather_embed_rows_(const Model& M, const int* ids, int64_t n,
   }
 }
 
-// Stage `n` prompt embeddings starting at ids[from] into the batched scratch.
+// Config::PLE: `n` tokens' own per-layer rows, widened into `stage` and scaled
+// by sqrt(PLE / 2) (ple_inputs_), then uploaded into `dst`. Nothing where the
+// family has none.
+inline void stage_ple_rows_(const Model& M, const int* ids, int64_t n, std::vector<float>& stage,
+                            const storage& dst) {
+  const Config& c = M.c;
+  if (!c.PLE) return;
+  const int64_t NP = c.NL * c.PLE;
+  const float k = std::sqrt((float)c.PLE) / std::sqrt(2.0f);
+  for (int64_t i = 0; i < n; i++) {
+    float* row = stage.data() + i * NP;
+    widen_(M.ple_embd, (size_t)ids[i] * NP, NP, row);
+    for (int64_t j = 0; j < NP; j++) row[j] *= k;
+  }
+  gpu::upload(dst.native, stage.data(), n * NP);
+}
+
+// Stage `n` prompt embeddings starting at ids[from] into the batched scratch
+// (and their per-layer rows).
 inline void stage_embed_rows_(Model& M, const std::vector<int>& ids, int64_t from,
                               int64_t n) {
   const Config& c = M.c;
   float* v = M.pscratch.emb_stage.data();
   gather_embed_rows_(M, ids.data() + from, n, v);
   gpu::upload(M.pscratch.emb.native, v, n * c.NE);
+  stage_ple_rows_(M, ids.data() + from, n, M.pscratch.ple_stage, M.pscratch.ple_tok);
 }
 
 // Whether a prompt of `T` tokens should go through the batched prefill: the
@@ -1321,12 +1533,25 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
       .q4_lmhead = q4lm,
       .f16_acc = f16_acc,
       .kv_f16 = wdt == tl::dtype::bf16 && gpu::caps::kv_f16 && !std::getenv("TL_KV_F32")};
+  if (c.v_norm) M.ones = array::from(std::vector<float>((size_t)c.HD, 1.0f), {1, c.HD});
+  if (c.PLE) {
+    const int64_t NP = c.NL * c.PLE;
+    M.ple_embd = need(m, "per_layer_token_embd.weight");
+    // The projection's rows stay bf16 (the file's own; never block-quantized).
+    const std::vector<wpart> pj = {{"per_layer_model_proj.weight", NP}};
+    if (row) M.ple_proj_row = load_wmat(m, pj, c.NE, false);
+    else M.ple_projT = load_w_T_cat(m, pj, c.NE, wdt);
+    std::vector<float> w((size_t)c.PLE);
+    widen_(need(m, "per_layer_proj_norm.weight"), 0, w.size(), w.data());
+    for (float& v : w) v *= 1.0f / std::sqrt(2.0f);
+    M.ple_norm = array::from(std::move(w), {1, c.PLE});
+  }
   for (int64_t l = 0; l < c.NL; l++) {
     std::string p = "blk." + std::to_string(l) + ".";
     // Named per field: the ternaries below decide LAYOUT, and a positional list
     // of same-typed arrays is one transposed line away from a silent
     // wrong-weight bug that only shows up as slightly-off logits.
-    const std::vector<wpart> gu_parts = layer_gu_parts(c, p);
+    const std::vector<wpart> gu_parts = layer_gu_parts(c, l);
     // [K,N] weights: the array path's own (the oracle), and wo/wd, which the
     // imperative path reads too where it has no row copies.
     auto W = [&](bool want, const wpart& part, int64_t in) {
@@ -1337,19 +1562,25 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
     Layer L{
         .wg = W(oracle_w, gu_parts[0], c.NE),
         .wu = W(oracle_w, gu_parts[1], c.NE),
-        .wd = W(col_wo, down[0], c.FF),
+        .wd = W(col_wo, down[0], c.ff(l)),
         .an = load_f32(m, p + "attn_norm.weight", c.NE),
         .fn = load_f32(m, p + c.ffn_norm, c.NE),
         // gate|up and down: empty when q4m (replaced by wgu_q4 / wd_q4).
         .wgu_row = q4m ? wmat{} : dev(gu_parts, c.NE),
-        .wd_row = q4m ? wmat{} : dev(down, c.FF),
+        .wd_row = q4m ? wmat{} : dev(down, c.ff(l)),
         .wgu = col(gu_parts, c.NE),
         // q4 MLP (imperative, when q4m): quantize the f32 [K,N] fused/down.
         .wgu_q4 = q4m ? load_w_T_cat(m, gu_parts, c.NE, f32).to_q4() : array{},
-        .wd_q4 = q4m ? load_w_T_cat(m, down, c.FF, f32).to_q4() : array{}};
+        .wd_q4 = q4m ? load_w_T_cat(m, down, c.ff(l), f32).to_q4() : array{}};
     if (c.post_norms) {
       L.pa = load_f32(m, p + c.post_attn_norm, c.NE);
       L.pf = load_f32(m, p + c.post_ffn_norm, c.NE);
+    }
+    if (const auto* sc = m.tensor(p + "layer_output_scale.weight")) widen_(sc, 0, 1, &L.out_scale);
+    if (c.PLE) {
+      L.ple_gate = load_w_T(m, p + "inp_gate.weight", c.NE, c.PLE, f32);
+      L.ple_proj = load_w_T(m, p + "proj.weight", c.PLE, c.NE, f32);
+      L.ple_post = load_f32(m, p + "post_norm.weight", c.NE);
     }
     if (c.is_delta(l)) {
       // Gated DeltaNet. The fused projection's order puts z right before the
@@ -1381,32 +1612,35 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
       // Attention. Qwen3.5's q projection interleaves q and its output gate per
       // head; the fused load takes q's rows first and the gate's last, so the
       // output is q | k | v | gate and every slice downstream is contiguous.
-      const int64_t Q = c.NH * c.HD;
-      const std::vector<wpart> qkv_parts = layer_qkv_parts(c, p);
-      const wpart &wq_part = qkv_parts[0], &wk_part = qkv_parts[1], &wv_part = qkv_parts[2];
+      // A layer that reads another's KV (Config::kv_src) has q's weights only.
+      const int64_t hd = c.hd(l), Q = c.NH * hd, KV = c.NKV * hd;
+      const bool own = c.has_kv(l);
+      const std::vector<wpart> qkv_parts = layer_qkv_parts(c, l);
       auto bias = [&](const char* n, int64_t len) {
         return c.qkv_bias ? load_f32(m, p + n, len) : array{};
       };
       auto qk_norm = [&](const char* n) {
-        return c.qk_norm ? load_f32(m, p + n, c.HD) : array{};
+        return c.qk_norm ? load_f32(m, p + n, hd) : array{};
       };
-      L.wq = W(oracle_w, wq_part, c.NE);
+      L.wq = W(oracle_w, qkv_parts[0], c.NE);
       L.bq = bias("attn_q.bias", Q);
-      L.wk = W(oracle_w, wk_part, c.NE);
-      L.bk = bias("attn_k.bias", c.NKV * c.HD);
-      L.wv = W(oracle_w, wv_part, c.NE);
-      L.bv = bias("attn_v.bias", c.NKV * c.HD);
+      L.qn = qk_norm("attn_q_norm.weight");
+      if (own) {
+        L.wk = W(oracle_w, qkv_parts[1], c.NE);
+        L.bk = bias("attn_k.bias", KV);
+        L.wv = W(oracle_w, qkv_parts[2], c.NE);
+        L.bv = bias("attn_v.bias", KV);
+        L.kn = qk_norm("attn_k_norm.weight");
+      }
       const std::vector<wpart> wo_parts = {{p + "attn_output.weight", c.NE}};
       L.wo = W(col_wo, wo_parts[0], Q);
-      L.qn = qk_norm("attn_q_norm.weight");
-      L.kn = qk_norm("attn_k_norm.weight");
       L.wqkv_row = dev(qkv_parts, c.NE);
       L.wqkv = col(qkv_parts, c.NE);
       // bqkv = [bq|bk|bv], matching q|k|v's column order (batched path).
       if (row && c.qkv_bias)
         L.bqkv = load_f32_cat(m, {{p + "attn_q.bias", Q},
-                                  {p + "attn_k.bias", c.NKV * c.HD},
-                                  {p + "attn_v.bias", c.NKV * c.HD}});
+                                  {p + "attn_k.bias", KV},
+                                  {p + "attn_v.bias", KV}});
       L.wo_row = dev(wo_parts, Q);
     }
     M.layers.push_back(std::move(L));
@@ -1633,6 +1867,19 @@ inline bool gemv_q4_w(const array& Wq, gpu::span a, gpu::span y) {
   return gpu::gemv_q4(a, qw, qw.at(N * K / 2), y, N, K, tl::kQ4Group);
 }
 
+// Gather the embedding row for token `id` into the staged step input S.embed
+// (host gather + blocking upload; marks it device-current), and its per-layer
+// rows where the family has them (run_layers_ reads both): every step's input
+// is staged here. Kept out of a captured region since it involves a host
+// gather + blocking copy.
+inline void stage_embed(Model& M, int64_t id) {
+  const Config& c = M.c;
+  const int one = (int)id;
+  gather_embed_rows_(M, &one, 1, M.scratch.embed_stage.data());
+  gpu::upload(M.scratch.embed.native, M.scratch.embed_stage.data(), c.NE);
+  stage_ple_rows_(M, &one, 1, M.scratch.ple_stage, M.scratch.ple_tok);
+}
+
 // The NL decoder layers + final RMSNorm + lm_head gemv as direct gpu:: calls
 // on the Scratch buffers, reading layer-0 residual from x0 and writing logits
 // to S.logits. NO array nodes, NO host sync / blocking copy — so this region
@@ -1665,6 +1912,7 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
     gemv_rw(R, W, a, y, n, k, M.gemv_form, sp(S.act));
   };
   gpu::span x = x0;
+  if (c.PLE) ple_inputs_(M, x, 1, sp(S.ple_tok), sp(S.ple));
   gpu::rmsnorm(x, sp(M.layers[0].an), sp(S.hb), c.NE, c.EPS);
   for (int64_t l = 0; l < c.NL; l++) {
     Layer& L = M.layers[l];
@@ -1687,60 +1935,76 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
       }
       gv(L.wsout_row, L.wsout, sp(S.ab), ro, c.NE, V);  // ro = mixer @ ssm_out
     } else {
-      // Fused QKV: one GEMV -> [q(NH*HD) | k(NKV*HD) | v(NKV*HD)] in S.qkvb (then
+      // Fused QKV: one GEMV -> [q(NH*hd) | k(NKV*hd) | v(NKV*hd)] in S.qkvb (then
       // Qwen3.5's gate), and q, k and v are views of it: rope q & k in place,
       // bias-add v. Same per-column split-K as the separate wq/wk/wv GEMVs (bx=1,
-      // chunk=32), so bit-identical per column.
-      gv(L.wqkv_row, L.wqkv, sp(S.hb), sp(S.qkvb), c.attn_proj(), c.NE);
+      // chunk=32), so bit-identical per column. A layer that reads another's KV
+      // (Config::kv_src) projects q alone and attends over that layer's cache,
+      // which has this position already.
+      const int64_t hd = c.hd(l), Q = c.NH * hd;
+      const bool own = c.has_kv(l);
+      tl::kv_cache& kv = M.layers[c.kv_src(l)].cache;
+      gv(L.wqkv_row, L.wqkv, sp(S.hb), sp(S.qkvb), c.attn_proj(l), c.NE);
       const gpu::span qp = sp(S.qkvb);
-      const gpu::span kp = at_f32(qp, c.NH * c.HD);
-      const gpu::span vp = at_f32(qp, (c.NH + c.NKV) * c.HD);
-      // Qwen3: RMSNorm every q / k head (one row of HD each) in place, before rope.
+      const gpu::span kp = at_f32(qp, Q);
+      const gpu::span vp = at_f32(qp, (c.NH + c.NKV) * hd);
+      // Qwen3: RMSNorm every q / k head (one row of hd each) in place, before rope;
+      // Gemma 4's v too, without a weight.
       if (c.qk_norm) {
-        gpu::rmsnorm(qp, sp(L.qn), qp, c.HD, c.EPS, c.NH);
-        gpu::rmsnorm(kp, sp(L.kn), kp, c.HD, c.EPS, c.NKV);
+        gpu::rmsnorm(qp, sp(L.qn), qp, hd, c.EPS, c.NH);
+        if (own) gpu::rmsnorm(kp, sp(L.kn), kp, hd, c.EPS, c.NKV);
       }
+      if (own && c.v_norm) gpu::rmsnorm(vp, sp(M.ones), vp, hd, c.EPS, c.NKV);
       const gpu::rope_freq rf = rope_of(M, l);
       if (cap) {
-        gpu::rope_dpos(qp, qp, c.NH, 1, c.HD, d_pos, rf, sp(L.bq));
-        gpu::rope_dpos(kp, kp, c.NKV, 1, c.HD, d_pos, rf, sp(L.bk));
+        gpu::rope_dpos(qp, qp, c.NH, 1, hd, d_pos, rf, sp(L.bq));
+        if (own) gpu::rope_dpos(kp, kp, c.NKV, 1, hd, d_pos, rf, sp(L.bk));
       } else {
-        gpu::rope(qp, qp, c.NH, 1, c.HD, pos, rf, sp(L.bq));
-        gpu::rope(kp, kp, c.NKV, 1, c.HD, pos, rf, sp(L.bk));
+        gpu::rope(qp, qp, c.NH, 1, hd, pos, rf, sp(L.bq));
+        if (own) gpu::rope(kp, kp, c.NKV, 1, hd, pos, rf, sp(L.bk));
       }
-      if (c.qkv_bias) gpu::binary(gpu::kop::add, vp, sp(L.bv), vp, c.NKV * c.HD, 1, 0);
-      cache_ok_(cap ? L.cache.append_dpos(kp, vp, d_pos) &&
-                          L.cache.attn_dpos(qp, sp(S.ab), c.NH, d_pos, c.scale(l))
-                    : L.cache.append(kp, vp) && L.cache.attn(qp, sp(S.ab), c.NH, c.scale(l)));
+      if (c.qkv_bias) gpu::binary(gpu::kop::add, vp, sp(L.bv), vp, c.NKV * hd, 1, 0);
+      cache_ok_(cap ? (!own || kv.append_dpos(kp, vp, d_pos)) &&
+                          kv.attn_dpos(qp, sp(S.ab), c.NH, d_pos, c.scale(l))
+                    : (!own || kv.append(kp, vp)) && kv.attn(qp, sp(S.ab), c.NH, c.scale(l)));
       // Qwen3.5: the attention output times sigmoid of its gate (q|k|v's tail).
       gpu::span ao = sp(S.ab);
       if (c.attn_gate) {
-        const int64_t Q = c.NH * c.HD;
-        const gpu::span gate = at_f32(qp, (c.NH + 2 * c.NKV) * c.HD);
+        const gpu::span gate = at_f32(qp, (c.NH + 2 * c.NKV) * hd);
         gpu::unary(gpu::kop::sigmoid, gate, sp(S.gateb), Q, 1, 0);
         gpu::binary(gpu::kop::mul, ao, sp(S.gateb), sp(S.gateb), Q, 1, 0);
         ao = sp(S.gateb);
       }
-      gv(L.wo_row, L.wo, ao, ro, c.NE, c.NH * c.HD);  // ro = attn @ wo
+      gv(L.wo_row, L.wo, ao, ro, c.NE, Q);  // ro = attn @ wo
     }
     // x1 = x + (attn@wo) (Gemma 3: normalized by pa first); h2 = rmsnorm(x1, fn) — fused.
     gpu::rmsnorm_res(x, ro, sp(L.fn), ro, sp(S.h2b), c.NE, c.EPS, 1, sp(L.pa));
-    // Fused gate|up: one GEMV -> [gate(FF) | up(FF)] in S.gub; the GLU reads both.
+    // Fused gate|up: one GEMV -> [gate(ff) | up(ff)] in S.gub; the GLU reads both.
+    const int64_t ff = c.ff(l);
     if (M.q4_mlp) gemv_q4_w(L.wgu_q4, sp(S.h2b), sp(S.gub));  // [NE, 2*FF]
-    else gv(L.wgu_row, L.wgu, sp(S.h2b), sp(S.gub), 2 * c.FF, c.NE);
-    gpu::glu(c.act, sp(S.gub), sp(S.mb), c.FF);
+    else gv(L.wgu_row, L.wgu, sp(S.h2b), sp(S.gub), 2 * ff, c.NE);
+    gpu::glu(c.act, sp(S.gub), sp(S.mb), ff);
     if (M.q4_mlp) gemv_q4_w(L.wd_q4, sp(S.mb), sp(S.mdb));  // [FF, NE]
-    else gv(L.wd_row, L.wd, sp(S.mb), sp(S.mdb), c.NE, c.FF);
+    else gv(L.wd_row, L.wd, sp(S.mb), sp(S.mdb), c.NE, ff);
     // x2 = x1 + mlp (Gemma 3: normalized by pf first); next input norm = rmsnorm(x2,
-    // next an | final onorm) — fused.
+    // next an | final onorm) — fused, unless the layer ends past the add (layer_tail_).
     const gpu::span nextw = sp((l + 1 < c.NL) ? M.layers[l + 1].an : M.onorm);
-    gpu::rmsnorm_res(ro, sp(S.mdb), nextw, ro, sp(S.hb), c.NE, c.EPS, 1, sp(L.pf));
+    if (has_tail_(M, l)) {
+      layer_tail_(M, L, l, 1, ro, sp(S.mdb), sp(S.ple), {}, sp(S.ple_g));
+      gpu::rmsnorm(ro, nextw, sp(S.hb), c.NE, c.EPS);
+    } else {
+      gpu::rmsnorm_res(ro, sp(S.mdb), nextw, ro, sp(S.hb), c.NE, c.EPS, 1, sp(L.pf));
+    }
     x = ro;
   }
   // hb now holds the final RMSNorm output (folded into the last layer's seam).
   const gpu::span logits = logits_out ? logits_out : sp(S.logits);
-  if (M.q4_lmhead) gemv_q4_w(M.outwT_q4, sp(S.hb), logits);  // [NE, VOCAB]
-  else lm_head(M, sp(S.hb), logits);
+  if (M.q4_lmhead) {
+    gemv_q4_w(M.outwT_q4, sp(S.hb), logits);  // [NE, VOCAB]
+    softcap_(M, logits);
+  } else {
+    lm_head(M, sp(S.hb), logits);
+  }
   // Tail of the captured region: advance the shared device pos so the next
   // graph replay reads pos+1 (lm_head is pos-independent, so order vs it is free).
   if (cap) gpu::incr_u32(d_pos);
@@ -1752,9 +2016,8 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
 // gemv/rope/attn kernels; fused rmsnorm/swiglu match the array compositions) —
 // guarded greedy-exact by check_qwen and bench_qwen_decode. Returns the token.
 inline int64_t step_imperative(Model& M, int64_t id, int64_t pos) {
-  array e = embed_row(M, id);
-  e.realize();  // embed on device (native valid; uploaded on first read)
-  run_layers_(M, sp(e), pos);
+  stage_embed(M, id);
+  run_layers_(M, sp(M.scratch.embed), pos);
   return argmax_logits(M);
 }
 
@@ -1762,20 +2025,9 @@ inline int64_t step_imperative(Model& M, int64_t id, int64_t pos) {
 // mirror of scratch.logits). For the q4-vs-bf16 divergence measurement — the
 // quantization-quality analogue of step_imperative's greedy token.
 inline const float* imperative_logits(Model& M, int64_t id, int64_t pos) {
-  array e = embed_row(M, id);
-  e.realize();
-  run_layers_(M, sp(e), pos);
+  stage_embed(M, id);
+  run_layers_(M, sp(M.scratch.embed), pos);
   return host_read(M.scratch.logits);
-}
-
-// Gather the embedding row for token `id` into the staged step input S.embed
-// (host gather + blocking upload; marks it device-current). Kept out of a
-// captured region since it involves a host gather + blocking copy.
-inline void stage_embed(Model& M, int64_t id) {
-  const Config& c = M.c;
-  const int one = (int)id;
-  gather_embed_rows_(M, &one, 1, M.scratch.embed_stage.data());
-  gpu::upload(M.scratch.embed.native, M.scratch.embed_stage.data(), c.NE);
 }
 
 // Where a step can gather its input on the device (gpu::embed_row), from the
@@ -1902,7 +2154,8 @@ struct captured_decoder {
   // sampling), and its reader for the table's format, tried once here (embed_row refuses a format it has none
   // for, and its row is put in again before any step reads it).
   bool token_input_(Model& M, int64_t id) {
-    if (device_embed(M).type < 0 || !gpu::has_argmax_to || !gpu::has_embed_row ||
+    // A family with per-layer embeddings stages their rows on the host (stage_embed).
+    if (M.c.PLE || device_embed(M).type < 0 || !gpu::has_argmax_to || !gpu::has_embed_row ||
         (!sampler.greedy() && !gpu::has_sample_to) || M.c.VOCAB > gpu::policy::max_f32_index)
       return false;
     if (!d_tok.native || !d_draws.native) return false;

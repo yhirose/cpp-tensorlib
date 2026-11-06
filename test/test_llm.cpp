@@ -336,6 +336,13 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
         REQUIRE(c2.prefill(qp.device_span(), Kd.device_span(), Vd.device_span(), op.device_span(), T,
                            HQ, scale));
         CHECK(c2.pos == T);
+        // The same block attended again without an append (a layer reading this
+        // cache, Gemma 4's shared KV): prefill's own output.
+        array oa = array::empty({HQ, T, D});
+        REQUIRE(c2.attend(qp.device_span(), oa.device_span(), T, HQ, scale));
+        CHECK(c2.pos == T);
+        tl::gpu::flush();
+        CHECK(same(oa, op, 0.0f));
         array out2 = array::empty({HQ, D});
         REQUIRE(c2.attn(q.device_span(), out2.device_span(), HQ, scale));
         tl::gpu::flush();

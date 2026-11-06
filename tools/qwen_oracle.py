@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Tight numpy oracle for bench/models/check_qwen.cpp (Qwen2.5, Qwen3, Qwen3.5, Gemma 3, Llama 3.2,
-PLaMo 3).
+"""Tight numpy oracle for bench/models/check_qwen.cpp (Qwen2.5, Qwen3, Qwen3.5, Gemma 3, Gemma 4,
+Llama 3.2, PLaMo 3).
 
 Reads a Qwen2.5 / Qwen3 / Qwen3.5 F16 (or BF16) GGUF with its own minimal parser and runs the decoder
 in float32 numpy on the SAME weights the C++ loads, so the two must agree to
@@ -27,6 +27,15 @@ sliding window on 7 layers of 8, and YaRN on the global ones, unrounded
 (truncate false): the pairs' frequencies blended toward 1/factor, cos and sin
 times 0.1 ln(factor) + 1. Its prompt is a translation (PFML3) of LONG_USER, four
 times over: 2,542 tokens, past the 2048-position window.
+
+Gemma 4 (E2B) as HF's modeling_gemma4.py, which llama.cpp's gemma4.cpp follows: heads of
+256 on the local layers and 512 on the global ones, which turn only their first 64 pairs
+(rope_freqs.weight: 1 for those, 1e30 for the rest), v RMS-normalized without a weight,
+an attention scale of 1, the per-layer embeddings (a token's own row of
+per_layer_token_embd, gathered, never the whole table, plus a projection of its
+embedding), the last 20 layers reading the KV of the last layer of their kind before
+them, each layer's output times its layer_output_scale, and the logits capped at 30
+by tanh.
 
 The forward takes a run of tokens at once (the prompt, then one a step): each
 weight is read once a run, so a model whose f32 copy is not kept (the 2B's 10.7
@@ -160,6 +169,12 @@ class Dequantized:
         self.kept = {}
         self.keep_all = sum(int(t.n_elements) for t in r.tensors) * 4 < KEEP_ALL_BYTES
 
+    def rows(self, name, ids):
+        """Rows `ids` of a 2-D tensor, only those dequantized (Gemma 4's per-layer
+        embeddings: 9.4 GB as f32 whole)."""
+        t = self.info[name]
+        return np.asarray(self.dequantize(t.data[np.asarray(ids)], t.tensor_type), np.float32)
+
     def __contains__(self, name):
         return name in self.info
 
@@ -247,6 +262,13 @@ class Model:
         self.eps, self.base = g("attention.layer_norm_rms_epsilon"), g("rope.freq_base")
         self.arch = arch
         self.rot = kv.get(f"{arch}.rope.dimension_count", self.hd)
+        # Gemma 4: the local layers' heads and RoPE have their own width, the MLP's
+        # width is per layer, and the last `shared` layers keep no KV of their own.
+        self.hd_local = kv.get(f"{arch}.attention.key_length_swa", self.hd)
+        self.rot_local = kv.get(f"{arch}.rope.dimension_count_swa", self.hd_local)
+        self.shared = kv.get(f"{arch}.attention.shared_kv_layers", 0)
+        self.ple = kv.get(f"{arch}.embedding_length_per_layer_input", 0)
+        self.softcap = kv.get(f"{arch}.final_logit_softcapping", 0.0) if arch == "gemma4" else 0.0
         # Qwen3.5: every `interval`-th layer is full attention, the rest Gated DeltaNet.
         self.interval = kv.get(f"{arch}.full_attention_interval", 1)
         if arch == "qwen35":
@@ -280,9 +302,20 @@ class Model:
                                          kv.get(f"{arch}.rope.scaling.yarn_beta_slow", 1.0),
                                          bool(kv.get(f"{arch}.rope.scaling.yarn_truncate", True)))
             self.mscale = 0.1 * math.log(factor) + 1
-        self.k = [np.zeros((0, self.nkv, self.hd), np.float32) for _ in range(self.nl)]
-        self.v = [np.zeros((0, self.nkv, self.hd), np.float32) for _ in range(self.nl)]
+        self.k = [np.zeros((0, self.nkv, self.head_dim(l)), np.float32) for l in range(self.nl)]
+        self.v = [np.zeros((0, self.nkv, self.head_dim(l)), np.float32) for l in range(self.nl)]
         self.lm = self.t.get("output.weight", self.t["token_embd.weight"])
+
+    def head_dim(self, l):
+        return self.hd_local if self.local[l] else self.hd
+
+    def kv_source(self, l):
+        """The layer whose KV layer l reads: its own, or (Gemma 4's last `shared`)
+        the last layer of its kind before them (llama.cpp's kv_source)."""
+        first = self.nl - self.shared
+        if l < first:
+            return l
+        return max(j for j in range(first) if self.local[j] == self.local[l])
 
     def is_delta(self, l):
         return self.arch == "qwen35" and (l + 1) % self.interval != 0
@@ -331,6 +364,8 @@ class Model:
         return self.mlp(l, x)
 
     def attn(self, l, h, pos):
+        if self.arch == "gemma4":
+            return self.attn4(l, h, pos)
         t, p = self.t, f"blk.{l}."
         T, Q, KV = len(h), self.nh * self.hd, self.nkv * self.hd
         if p + "attn_qkv.weight" in t:  # PLaMo 3: q|k|v in one
@@ -353,9 +388,19 @@ class Model:
         q, k = (rope(y, p_, base, self.rot, f, self.norm, ms) for y in (q, k))
         self.k[l] = np.concatenate([self.k[l], k])
         self.v[l] = np.concatenate([self.v[l], v])
-        K, V = self.k[l], self.v[l]  # [ctx, kv, D], position = row
-        # Causal, and a local layer reads the last `window` positions, this one the
-        # last of them (llama.cpp's is_masked_swa; gpu::attn_window_lo).
+        out = self.attend(l, q, pos, np.float32(math.sqrt(self.hd))).reshape(T, Q)
+        if gate is not None:
+            out = out * sigmoid(gate)
+        o = out @ t[p + "attn_output.weight"].T
+        if self.w(p, "post_ffw_norm") is not None:  # Gemma 3, PLaMo 3: a norm after the attention too
+            o = rmsnorm(o, self.w(p, "post_attention_norm"), self.eps)
+        return o
+
+    def attend(self, l, q, pos, div):
+        """q [T, NH, D] over layer l's cache (its KV source's), the scores over `div`: causal, and a local
+        layer reads the last `window` positions, this one the last of them
+        (llama.cpp's is_masked_swa; gpu::attn_window_lo)."""
+        K, V = self.k[self.kv_source(l)], self.v[self.kv_source(l)]  # [ctx, kv, D], position = row
         kp = np.arange(len(K))[None, :]
         live = kp <= pos[:, None]
         if self.local[l]:
@@ -363,16 +408,30 @@ class Model:
         g = self.nh // self.nkv
         out = np.empty_like(q)
         for hh in range(self.nh):
-            sc = np.where(live, q[:, hh] @ K[:, hh // g].T / np.float32(math.sqrt(self.hd)), -np.inf)
+            sc = np.where(live, q[:, hh] @ K[:, hh // g].T / div, -np.inf)
             e = np.exp(sc - sc.max(-1, keepdims=True))
             out[:, hh] = (e / e.sum(-1, keepdims=True)) @ V[:, hh // g]
-        out = out.reshape(T, Q)
-        if gate is not None:
-            out = out * sigmoid(gate)
-        o = out @ t[p + "attn_output.weight"].T
-        if self.w(p, "post_ffw_norm") is not None:  # Gemma 3, PLaMo 3: a norm after the attention too
-            o = rmsnorm(o, self.w(p, "post_attention_norm"), self.eps)
-        return o
+        return out
+
+    def attn4(self, l, h, pos):
+        """Gemma 4: q, k RMS-normalized by their weights and v by none, before the
+        RoPE; an attention scale of 1; a layer past the KV-sharing line projects only
+        q and reads its source's cache, which already holds this run."""
+        t, p = self.t, f"blk.{l}."
+        T, hd = len(h), self.head_dim(l)
+        q = rmsnorm((h @ t[p + "attn_q.weight"].T).reshape(T, self.nh, hd), t[p + "attn_q_norm.weight"], self.eps)
+        base, f = (self.base_local, None) if self.local[l] else (self.base, self.factors)
+        rot = self.rot_local if self.local[l] else self.rot
+        q = rope(q, pos, base, rot, f)
+        if self.kv_source(l) == l:
+            k = h @ t[p + "attn_k.weight"].T
+            v = h @ t[p + "attn_v.weight"].T if p + "attn_v.weight" in t else k  # 12B/31B global: v is k
+            k = rmsnorm(k.reshape(T, self.nkv, hd), t[p + "attn_k_norm.weight"], self.eps)
+            v = rmsnorm(v.reshape(T, self.nkv, hd), np.float32(1), self.eps)
+            self.k[l] = np.concatenate([self.k[l], rope(k, pos, base, rot, f)])
+            self.v[l] = np.concatenate([self.v[l], v])
+        o = self.attend(l, q, pos, np.float32(1)).reshape(T, self.nh * hd) @ t[p + "attn_output.weight"].T
+        return rmsnorm(o, t[p + "post_attention_norm.weight"], self.eps)
 
     def mlp(self, l, x):
         t, p = self.t, f"blk.{l}."
@@ -384,7 +443,7 @@ class Model:
         else:  # PLaMo 3: gate|up in one
             gt, up = np.split(h2 @ t[p + "ffn_up.weight"].T, 2, axis=-1)
         del h2
-        a = (gelu if self.arch == "gemma3" else silu)(gt) * up
+        a = (gelu if self.arch in ("gemma3", "gemma4") else silu)(gt) * up
         del gt, up  # the [T, 2 FF] product, before ffn_down is dequantized
         o = a @ t[p + "ffn_down.weight"].T
         post = self.w(p, "post_ffw_norm")
@@ -392,23 +451,51 @@ class Model:
             o = rmsnorm(o, post, self.eps)
         return x + o
 
+    def per_layer_inputs(self, toks, x):
+        """Gemma 4's per-layer embeddings [T, NL, PLE] (HF's get_per_layer_inputs and
+        project_per_layer_inputs): the token's row of per_layer_token_embd times
+        sqrt(PLE), plus the embedding x (already times sqrt(NE)) projected, divided by
+        sqrt(NE) and RMS-normalized a layer's slice at a time, the sum over sqrt(2)."""
+        T, n = len(toks), self.ple
+        tok = self.t.rows("per_layer_token_embd.weight", toks).reshape(T, self.nl, n)
+        tok = tok * np.float32(math.sqrt(n))
+        proj = (x @ self.t["per_layer_model_proj.weight"].T) * np.float32(1 / math.sqrt(self.ne))
+        proj = rmsnorm(proj.reshape(T, self.nl, n), self.t["per_layer_proj_norm.weight"], self.eps)
+        return (proj + tok) * np.float32(1 / math.sqrt(2))
+
+    def layer_tail(self, l, x, ple):
+        """Gemma 4's end of a layer: the per-layer embedding's gated projection added
+        (post-normed), then the whole residual times the layer's scale."""
+        t, p = self.t, f"blk.{l}."
+        if ple is not None:
+            g = gelu(x @ t[p + "inp_gate.weight"].T) * ple[:, l]
+            x = x + rmsnorm(g @ t[p + "proj.weight"].T, t[p + "post_norm.weight"], self.eps)
+        s = t.get(p + "layer_output_scale.weight")
+        return x if s is None else x * s
+
     def run(self, toks, pos0):
         """The tokens at pos0.. through the model: the last one's embedding, layer-0
         residual, final norm and logits."""
         x = self.t["token_embd.weight"][np.asarray(toks)]
         emb, l0 = x[-1].copy(), None
-        if self.arch == "gemma3":
+        if self.arch in ("gemma3", "gemma4"):
             x = x * np.float32(np.sqrt(np.float32(self.ne)))
+        ple = self.per_layer_inputs(toks, x) if self.ple else None
         pos = pos0 + np.arange(len(toks))
         for l in range(self.nl):
             x = self.layer(l, x, pos)
+            if self.arch == "gemma4":
+                x = self.layer_tail(l, x, ple)
             if l == 0:
                 l0 = x[-1].copy()
         # float32 throughout: under numpy 2 a numpy float64 scalar (np.sqrt(2 / np.pi))
         # times a float32 array is float64, and every GEMV after it widens its weights.
         assert x.dtype == np.float32, x.dtype
         fn = rmsnorm(x[-1], self.t["output_norm.weight"], self.eps)
-        return emb, l0, fn, fn @ self.lm.T
+        logits = fn @ self.lm.T
+        if self.softcap:  # Gemma 4: tanh(logits / cap) * cap
+            logits = np.tanh(logits / np.float32(self.softcap)) * np.float32(self.softcap)
+        return emb, l0, fn, logits
 
 
 def arr(name, ctype, a):
@@ -419,10 +506,11 @@ def arr(name, ctype, a):
 
 def main():
     path, ns = sys.argv[1], sys.argv[2]
-    if load_gguf(path, read=False)[0]["general.architecture"] == "plamo3" and len(sys.argv) < 4:
-        sys.exit("plamo3: its prompt is text, so LLAMA_TOKENIZE is needed")  # before the model loads
+    if load_gguf(path, read=False)[0]["general.architecture"] in ("plamo3", "gemma4") and len(sys.argv) < 4:
+        sys.exit("plamo3, gemma4: the prompt is text, so LLAMA_TOKENIZE is needed")  # before the model loads
     m = Model(path)
-    long = tokenize(sys.argv[3], path, LONG_USER) if len(sys.argv) > 3 and m.arch != "plamo3" else None
+    long = (tokenize(sys.argv[3], path, LONG_USER) if len(sys.argv) > 3 and m.arch not in ("plamo3", "gemma4")
+            else None)
     if m.arch == "plamo3":  # a translation into Japanese (PFML3, the GGUF's chat template)
         pfml = ("<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input<|plamo:key|>lang"
                 "<|plamo:val|>en<|plamo:msg|>" + "\n\n".join([LONG_USER] * 4) +
@@ -430,6 +518,8 @@ def main():
         prompt = tokenize(sys.argv[3], path, pfml)
     elif m.arch == "gemma3":  # <bos><start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n
         prompt = [2, 105, 2364, 107] + (long or GEMMA_USER) + [106, 107, 105, 4368, 107]
+    elif m.arch == "gemma4":  # the chat template, no thinking: <bos><|turn>user\n...<turn|>\n<|turn>model\n
+        prompt = tokenize(sys.argv[3], path, "<bos><|turn>user\n" + LONG_USER + "<turn|>\n<|turn>model\n")
     elif m.arch == "llama":  # <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n...
         prompt = [128000, 128006, 882, 128007, 271] + (long or LLAMA_USER) + [128009, 128006, 78191, 128007, 271]
     elif m.arch == "qwen35":  # thinking template: ends with "<think>\n"
@@ -456,6 +546,7 @@ def main():
     print(f"// Generated by tools/qwen_oracle.py from {path.split('/')[-1]} ({m.arch}); do not edit.")
     print("// numpy float32 forward on the SAME weights (F16, or blocks dequantized exactly); C++ must")
     how = (" (a PFML3 translation of LONG_USER four times over, tokenized by llama-tokenize)" if m.arch == "plamo3"
+           else " (LONG_USER in the chat template, tokenized by llama-tokenize)" if m.arch == "gemma4"
            else " (LONG_USER, tokenized by llama-tokenize)" if long else "")
     print(f"// match to ~1e-4 + greedy exactly. Prompt: {len(prompt)} tokens{how}.")
     print(f"namespace {ns} {{")

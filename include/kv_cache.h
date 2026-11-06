@@ -9,8 +9,8 @@
 //
 // append() writes one token's k/v and advances; attn() runs the fused decode
 // attention over the cached prefix [0, pos); prefill() appends a block of T
-// tokens and runs the causal attention over it, so a long prompt runs in
-// chunks and a later turn extends a live cache. The cache is f32, or f16 with
+// tokens and runs the causal attention over it (attend()), so a long prompt runs
+// in chunks and a later turn extends a live cache. The cache is f32, or f16 with
 // init(..., true) where the backend has it (gpu::caps::kv_f16): half the bytes
 // every decode step streams, the values the tensor-core prefill rounds K and V
 // to anyway (llama.cpp's default cache), up to f16's 65504. q, out and the
@@ -82,8 +82,18 @@ struct kv_cache {
                       n_kv_heads, D, f16, pos)) {
       return false;
     }
-    const int64_t p0 = pos;
     pos += T;
+    return attend(q, out, T, n_q_heads, scale, exact);
+  }
+
+  // The causal attention of q/out [n_q_heads, T, D], the queries of the last T
+  // positions cached, over everything up to them: prefill()'s second half, and
+  // the whole of a layer that reads another layer's cache (Gemma 4's shared KV)
+  // after that layer's prefill has appended the block.
+  bool attend(gpu::span q, gpu::span out, int64_t T, int64_t n_q_heads, float scale,
+              bool exact = false) {
+    if (T <= 0 || T > pos) return false;
+    const int64_t p0 = pos - T;
     // A cache serves inference, so the attention may take the tensor cores.
     if (exact) {
       return gpu::attn_prefill(q, K.device_span(), V.device_span(), out, n_q_heads,
