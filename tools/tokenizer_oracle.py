@@ -77,6 +77,24 @@ EXTRA = {
         "<|plamo:key|>lang<|plamo:val|>ja<|plamo:msg|>今日の東京は晴れです。"
         "<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>",
     ],
+    # Gemma 4 (BPE with SentencePiece's spaces): every space is U+2581, the text is
+    # cut into runs of non-newlines and of newlines, and each run merges over its
+    # characters (not bytes). Its turns and channels are special tokens.
+    "gemma4": [
+        "  two spaces, then\n\n  an indent and a trailing tab\t",
+        "\n\n\n",
+        # The newline runs the vocabulary has whole (up to 31) are one token each.
+        "".join(f"x{'\n' * n}" for n in range(1, 41)),
+        "\n",
+        " ",
+        "one\n\n\n\n\n\n\n\ntwo\n",
+        "non-breaking space and ideographic　space",
+        "<bos><|turn>system\nBe brief.<turn|>\n<|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\n",
+        "<|turn>model\n<|channel>thought\n<channel|>Four.<turn|>",
+        "<|tool_response>{\"ok\": true}<eos>",
+        "<|image>x<|audio>y<|\"|>z<|\"|>",
+        "ＡＢＣ全角 and 한국어 and हिन्दी and 🇯🇵👨‍👩‍👧",
+    ],
 }
 
 

@@ -2,7 +2,8 @@
 // truth for the file's family: HF's Qwen2.5-0.5B-Instruct tokenizer
 // (tokenizer_oracle_data.h, GPT-2 BPE), or llama.cpp's llama-tokenize
 // (tools/tokenizer_oracle.py) on Qwen3.5, Llama 3 (GPT-2 BPE, each its own
-// pre-tokenizer), Gemma 3 (SentencePiece) and PLaMo 3 (its unigram).
+// pre-tokenizer), Gemma 3 (SentencePiece), Gemma 4 (its BPE over characters) and
+// PLaMo 3 (its unigram).
 // argv[1] = gguf path. Exit 0 iff every case encodes to the exact id
 // sequence and decode() round-trips the text.
 
@@ -13,6 +14,7 @@
 #include "../../include/tokenizer.h"
 #include "tokenizer_oracle_data.h"
 #include "tokenizer_oracle_gemma3.h"
+#include "tokenizer_oracle_gemma4.h"
 #include "tokenizer_oracle_llama3.h"
 #include "tokenizer_oracle_plamo3.h"
 #include "tokenizer_oracle_qwen35.h"
@@ -30,8 +32,9 @@ static std::vector<oracle_case> cases_of() {
 }
 // What a tokenizer makes of text that is not UTF-8, where llama.cpp reads each
 // bad byte as U+FFFD: a byte-level BPE keeps the bytes, so its oracle's ids do
-// not hold (skip); PLaMo 3's reads U+FFFD too, so they do but the text does not
-// come back (ids); SentencePiece's falls back to the bytes themselves (exact).
+// not hold (skip); PLaMo 3's and Gemma 4's read U+FFFD too, so they do but the
+// text does not come back (ids); SentencePiece's falls back to the bytes
+// themselves (exact).
 enum class not_utf8 { skip, ids, exact };
 // A family's ground truth, by the file's architecture and pre-tokenizer (a
 // vocabulary each), the token its chat template closes a turn with, and what
@@ -49,6 +52,7 @@ static const family families[] = {
     {"qwen35", "qwen35", cases_of<tokoracle_qwen35::cases>, "<|im_end|>", not_utf8::skip},
     {"llama", "llama-bpe", cases_of<tokoracle_llama3::cases>, "<|eot_id|>", not_utf8::skip},
     {"gemma3", "default", cases_of<tokoracle_gemma3::cases>, "<end_of_turn>", not_utf8::exact},
+    {"gemma4", "", cases_of<tokoracle_gemma4::cases>, "<turn|>", not_utf8::ids},
     {"plamo3", "default", cases_of<tokoracle_plamo3::cases>, "<|plamo:tag|>", not_utf8::ids,
      "\xee\xb8\x80"},
 };

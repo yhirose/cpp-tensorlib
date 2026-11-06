@@ -13,6 +13,9 @@
 //    adjacent pieces merge highest score first where the pair is a token, as
 //    llama.cpp's SPM tokenizer does (checked against its llama-tokenize); a
 //    piece the vocabulary lacks falls back to its bytes' <0xXX> tokens.
+//  - "gemma4": Gemma 4's BPE (encode_gemma4_): the same merges over characters
+//    rather than bytes, with the spaces as U+2581 and the text cut into runs of
+//    non-newlines and of newlines first (checked against llama-tokenize).
 //  - "plamo3": PLaMo 3's unigram (encode_plamo_): the cut of the text into
 //    pieces whose scores sum highest, after hard cuts around its markers and
 //    runs of one character, as PFN's tokenization_plamo.py and llama.cpp's
@@ -55,13 +58,16 @@ class tokenizer {
     const std::string model = m.kv("tokenizer.ggml.model").as_str();
     if (model == "llama") kind_ = kind::spm;
     else if (model == "plamo3") kind_ = kind::plamo;
+    else if (model == "gemma4") kind_ = kind::gemma4;
     else if (model != "gpt2") throw std::runtime_error("tokenizer: no tokenizer \"" + model + "\"");
-    if (kind_ != kind::bpe) {  // both score pieces and fall back to <0xXX> tokens
+    if (kind_ == kind::spm || kind_ == kind::plamo) {  // they score pieces
       const auto& sc = m.kv("tokenizer.ggml.scores");
       scores_.reserve(sc.arr.size());
       for (const auto& v : sc.arr) scores_.push_back(static_cast<float>(v.f));
       if (scores_.size() != tokens_.size())
         throw std::runtime_error("tokenizer: one score a token");
+    }
+    if (kind_ != kind::bpe) {  // spm, plamo and gemma4 fall back to <0xXX> tokens
       for (int b = 0; b < 256; b++) {
         char name[7];
         std::snprintf(name, sizeof name, "<0x%02X>", b);
@@ -69,6 +75,12 @@ class tokenizer {
         byte_id_[b] = it == token2id_.end() ? -1 : it->second;
         if (byte_id_[b] >= 0) byte_of_[byte_id_[b]] = static_cast<uint8_t>(b);
       }
+      // SentencePiece writes a missing character as its bytes if it can; the others
+      // (plamo3, gemma4) always do, so every byte token must be there.
+      if (kind_ != kind::spm)
+        for (int b = 0; b < 256; b++)
+          if (byte_id_[b] < 0)
+            throw std::runtime_error("tokenizer: a " + model + " vocabulary without <0xXX>");
     }
     if (kind_ == kind::spm) {
       // SentencePiece's default is to prefix a space; Gemma says not to.
@@ -82,7 +94,8 @@ class tokenizer {
         if (m.has(key)) *n = m.kv(key).as_u32();
       build_plamo_(tt);
     } else {
-      pre_ = pre_rule_(m.has("tokenizer.ggml.pre") ? m.kv("tokenizer.ggml.pre").as_str() : "");
+      if (kind_ == kind::bpe)
+        pre_ = pre_rule_(m.has("tokenizer.ggml.pre") ? m.kv("tokenizer.ggml.pre").as_str() : "");
       auto merges = m.kv("tokenizer.ggml.merges").as_str_array();
       merge_rank_.reserve(merges.size() * 2);
       for (size_t i = 0; i < merges.size(); i++)
@@ -92,12 +105,20 @@ class tokenizer {
     // Special tokens are matched atomically in encode: CONTROL (type 3, the chat
     // markers) and USER_DEFINED (type 4: HF "added tokens" that are not marked
     // special, e.g. Qwen3's <think> / </think>). Both are literal text the model
-    // was trained to see as one id, so neither may fall through to BPE.
-    // Indexed by first byte, longest first (Gemma has 6,415 of them).
+    // was trained to see as one id, so neither may fall through to BPE. So are
+    // the end-of-generation names llama.cpp makes CONTROL whatever their type
+    // (forced_control_names_). Indexed by first byte, longest first (Gemma has
+    // 6,415 of them).
+    auto special = [&](size_t i) { return tt.arr[i].i == 3 || tt.arr[i].i == 4; };
     for (size_t i = 0; i < tt.arr.size() && i < tokens_.size(); i++)
-      if ((tt.arr[i].i == 3 || tt.arr[i].i == 4) && !tokens_[i].empty())
+      if (special(i) && !tokens_[i].empty())
         specials_[static_cast<uint8_t>(tokens_[i][0])].emplace_back(tokens_[i],
                                                                     static_cast<int>(i));
+    for (const char* n : forced_control_names_)
+      if (auto it = token2id_.find(n);
+          it != token2id_.end() && static_cast<size_t>(it->second) < tt.arr.size() &&
+          !special(static_cast<size_t>(it->second)))
+        specials_[static_cast<uint8_t>(n[0])].emplace_back(n, it->second);
     for (auto& v : specials_)
       std::stable_sort(v.begin(), v.end(),
                        [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
@@ -110,11 +131,8 @@ class tokenizer {
     eog_ids_.push_back(eos_id_);
     for (const char* key : {"tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"})
       if (m.has(key)) eog_ids_.push_back(static_cast<int>(m.kv(key).as_u32()));
-    for (size_t i = 0; i < tokens_.size(); i++)
-      for (const char* s : {"<|eot_id|>", "<|im_end|>", "<|end|>", "<end_of_turn>",
-                            "<|endoftext|>", "<|eom_id|>", "<|end_of_text|>", "<EOT>",
-                            "_<EOT>", "<end_of_utterance>"})
-        if (tokens_[i] == s) eog_ids_.push_back(static_cast<int>(i));
+    for (const char* n : forced_control_names_)
+      if (auto it = token2id_.find(n); it != token2id_.end()) eog_ids_.push_back(it->second);
     // Qwen3.5 has no BOS (the template never adds one); -1 marks "none".
     bos_id_ = m.has("tokenizer.ggml.bos_token_id")
                   ? static_cast<int>(m.kv("tokenizer.ggml.bos_token_id").as_u32())
@@ -214,6 +232,24 @@ class tokenizer {
     return c0;
   }
 
+  // SentencePiece's spaces: each ' ' as U+2581, appended to s (the rule SPM and
+  // Gemma 4 share).
+  static void append_spm_spaces_(std::string& s, const char* data, size_t len) {
+    s.reserve(s.size() + len * 3);
+    for (size_t k = 0; k < len; k++) {
+      if (data[k] == ' ') s += "\xe2\x96\x81";
+      else s += data[k];
+    }
+  }
+
+  // The end-of-generation markers llama.cpp makes CONTROL tokens whatever the file
+  // types them (Gemma 4's <eos> is NORMAL in its file): they are matched whole in
+  // the text, and they end a generation.
+  static constexpr const char* forced_control_names_[] = {
+      "<|eot_id|>", "<|im_end|>", "<|end|>", "<end_of_turn>", "<|endoftext|>",
+      "<|eom_id|>", "<|end_of_text|>", "<EOT>", "_<EOT>", "<end_of_utterance>",
+      "<eos>", "<turn|>", "<|tool_response>"};
+
   static void append_cp_(std::string& s, uint32_t cp) {
     if (cp < 0x80) {
       s.push_back(static_cast<char>(cp));
@@ -240,6 +276,7 @@ class tokenizer {
     if (len == 0) return;
     if (kind_ == kind::spm) return encode_spm_(data, len, after_special, out);
     if (kind_ == kind::plamo) return encode_plamo_(data, len, out);
+    if (kind_ == kind::gemma4) return encode_gemma4_(data, len, out);
     std::string seg(data, len);
 
     // Decode to codepoints, keeping each codepoint's byte offset (off[k] is the
@@ -391,31 +428,106 @@ class tokenizer {
       }
     }
 
-    while (sym.size() > 1) {
-      int best_rank = -1;
-      size_t best_k = 0;
-      std::string key;
-      for (size_t k = 0; k + 1 < sym.size(); k++) {
-        key.assign(sym[k]);
-        key += ' ';
-        key += sym[k + 1];
-        auto it = merge_rank_.find(key);
-        if (it != merge_rank_.end() &&
-            (best_rank < 0 || it->second < best_rank)) {
-          best_rank = it->second;
-          best_k = k;
-        }
-      }
-      if (best_rank < 0) break;
-      sym[best_k] += sym[best_k + 1];
-      sym.erase(sym.begin() + static_cast<ptrdiff_t>(best_k) + 1);
-    }
+    merge_(sym);
 
     for (const auto& s : sym) {
       auto it = token2id_.find(s);
       if (it == token2id_.end())
         throw std::runtime_error("tokenizer: symbol not in vocab: " + s);
       out.push_back(it->second);
+    }
+  }
+
+  // The merges over a pretoken's symbols: the adjacent pair with the lowest rank
+  // becomes one symbol, the leftmost among equal ranks, until none is a merge.
+  void merge_(std::vector<std::string>& sym) const {
+    const int n = static_cast<int>(sym.size());
+    if (n < 2) return;
+    // A priority queue of the adjacent pairs that are merges (llama.cpp's
+    // llm_bigram_bpe): lowest rank first, leftmost among equals. A pair whose
+    // symbols changed since it was queued is stale and skipped.
+    std::vector<int> prev(n), next(n);
+    for (int k = 0; k < n; k++) {
+      prev[k] = k - 1;
+      next[k] = k + 1 < n ? k + 1 : -1;
+    }
+    struct bigram {
+      int rank, left, right;
+      size_t len;
+    };
+    auto lower = [](const bigram& a, const bigram& b) {
+      return a.rank > b.rank || (a.rank == b.rank && a.left > b.left);
+    };
+    std::priority_queue<bigram, std::vector<bigram>, decltype(lower)> q(lower);
+    std::string key;
+    auto offer = [&](int l, int r) {
+      if (l < 0 || r < 0) return;
+      key.assign(sym[l]);
+      key += ' ';
+      key += sym[r];
+      if (auto it = merge_rank_.find(key); it != merge_rank_.end())
+        q.push({it->second, l, r, sym[l].size() + sym[r].size()});
+    };
+    for (int k = 0; k + 1 < n; k++) offer(k, k + 1);
+    while (!q.empty()) {
+      const bigram b = q.top();
+      q.pop();
+      if (sym[b.left].empty() || sym[b.right].empty() || next[b.left] != b.right ||
+          sym[b.left].size() + sym[b.right].size() != b.len)
+        continue;
+      sym[b.left] += sym[b.right];
+      sym[b.right].clear();
+      next[b.left] = next[b.right];
+      if (next[b.right] >= 0) prev[next[b.right]] = b.left;
+      offer(prev[b.left], b.left);
+      offer(b.left, next[b.left]);
+    }
+    // The leftmost symbol is never merged away, so the chain's survivors keep
+    // their order from index 0.
+    size_t w = 0;
+    for (int k = 0; k != -1; k = next[k]) {
+      if (w != static_cast<size_t>(k)) sym[w] = std::move(sym[k]);
+      w++;
+    }
+    sym.resize(w);
+  }
+
+  // ---- Gemma 4 (tokenizer.ggml.model "gemma4") -------------------------------
+  // llama.cpp's gemma4 path: every space is U+2581 (SentencePiece's), and the
+  // text is cut into runs of non-newlines and runs of newlines. llama.cpp maps a
+  // run of newlines straight to its whole token where the vocabulary has one (up
+  // to 31); the merges reach the same token on their own (checked for every
+  // length up to 40). Each run merges over its characters, not its bytes,
+  // as bpe_ merges over its bytes; a character no token has falls back to its
+  // bytes' <0xXX> tokens.
+  void encode_gemma4_(const char* data, size_t len, std::vector<int>& out) const {
+    std::string seg;
+    append_spm_spaces_(seg, data, len);
+    size_t i = 0;
+    while (i < seg.size()) {
+      const bool newlines = seg[i] == '\n';
+      size_t e = i;
+      while (e < seg.size() && (seg[e] == '\n') == newlines) e++;
+      gemma4_bpe_(seg.data() + i, e - i, out);
+      i = e;
+    }
+  }
+
+  // One run's characters as llama.cpp reads them (a byte that is not UTF-8 is
+  // U+FFFD), merged and mapped to ids.
+  void gemma4_bpe_(const char* bytes, size_t n, std::vector<int>& out) const {
+    std::vector<std::string> sym;
+    for (uint32_t cp : utf8_cps_(bytes, n)) {
+      sym.emplace_back();
+      append_cp_(sym.back(), cp);
+    }
+    merge_(sym);
+    for (const auto& s : sym) {
+      if (auto it = token2id_.find(s); it != token2id_.end()) {
+        out.push_back(it->second);
+        continue;
+      }
+      for (char b : s) out.push_back(byte_id_[static_cast<uint8_t>(b)]);
     }
   }
 
@@ -429,10 +541,7 @@ class tokenizer {
                    std::vector<int>& out) const {
     std::string text;
     if (add_space_prefix_ && after_special) text = "\xe2\x96\x81";
-    for (size_t k = 0; k < len; k++) {
-      if (data[k] == ' ') text += "\xe2\x96\x81";
-      else text += data[k];
-    }
+    append_spm_spaces_(text, data, len);
     struct piece {
       size_t at, n;
       int prev, next;
@@ -488,8 +597,9 @@ class tokenizer {
       }
     }
   }
-  // A <0xXX> token to its byte, any other to its text: SentencePiece's with U+2581
-  // back to a space and a leading space the encoder prefixed dropped, PLaMo 3's as is.
+  // A <0xXX> token to its byte, any other to its text: SentencePiece's and Gemma 4's
+  // with U+2581 back to a space (SentencePiece's also dropping the leading space its
+  // encoder prefixed), PLaMo 3's as is.
   std::string decode_pieces_(const std::vector<int>& ids) const {
     std::string out;
     for (int id : ids) {
@@ -500,7 +610,7 @@ class tokenizer {
         continue;
       }
       const std::string& t = tokens_[id];
-      if (kind_ != kind::spm) {
+      if (kind_ != kind::spm && kind_ != kind::gemma4) {
         out += t;
         continue;
       }
@@ -532,12 +642,10 @@ class tokenizer {
   // boundary piece, which no token holds, so a cut there is the same; dropped).
   static constexpr int32_t plamo_unknown_ = -10000000;  // the score of a byte fallback
   void build_plamo_(const gguf::metadata_value& tt) {
-    for (int b = 0; b < 256; b++)
-      if (byte_id_[b] < 0) throw std::runtime_error("tokenizer: a plamo3 vocabulary without <0xXX>");
     plamo_nodes_.push_back({-1, 0});
     for (size_t id = 0; id < tokens_.size(); id++) {
       if ((id < tt.arr.size() && tt.arr[id].i == 6) || tokens_[id].empty()) continue;  // BYTE
-      const std::vector<uint32_t> cps = plamo_cps_(tokens_[id].data(), tokens_[id].size());
+      const std::vector<uint32_t> cps = utf8_cps_(tokens_[id].data(), tokens_[id].size());
       if (std::find(cps.begin(), cps.end(), 0xEE00u) != cps.end())
         throw std::runtime_error("tokenizer: a plamo3 piece holds U+EE00, the cut mark");
       int32_t node = 0;
@@ -559,7 +667,7 @@ class tokenizer {
   }
   // UTF-8 to code points as llama.cpp's unicode_cpts_from_utf8 reads it: a byte
   // that does not start a well-formed, shortest sequence is one U+FFFD.
-  static std::vector<uint32_t> plamo_cps_(const char* s, size_t n) {
+  static std::vector<uint32_t> utf8_cps_(const char* s, size_t n) {
     std::vector<uint32_t> out;
     out.reserve(n);
     for (size_t p = 0; p < n;) {
@@ -579,7 +687,7 @@ class tokenizer {
     return out;
   }
   void encode_plamo_(const char* data, size_t len, std::vector<int>& out) const {
-    const std::vector<uint32_t> cp = plamo_cps_(data, len);
+    const std::vector<uint32_t> cp = utf8_cps_(data, len);
     const size_t n = cp.size();
     std::vector<bool> cut(n + 1, false);
     // <|plamo:NAME|>
@@ -652,17 +760,18 @@ class tokenizer {
   }
   std::vector<std::string> tokens_;                    // id -> vocab string
   std::unordered_map<std::string, int> token2id_;      // vocab string -> id
-  std::unordered_map<std::string, int> merge_rank_;    // "A B" -> rank (gpt2)
-  // CONTROL + USER_DEFINED tokens by first byte, longest first.
+  std::unordered_map<std::string, int> merge_rank_;    // "A B" -> rank (gpt2, gemma4)
+  // CONTROL (with forced_control_names_) + USER_DEFINED tokens by first byte, longest first.
   std::vector<std::pair<std::string, int>> specials_[256];
   std::unordered_map<uint32_t, uint8_t> cp2byte_;      // inverse byte2cp (gpt2)
   pretok_rule pre_;                                    // (gpt2)
-  enum class kind { bpe, spm, plamo };                 // tokenizer.ggml.model gpt2, llama, plamo3
+  // tokenizer.ggml.model gpt2, llama, plamo3, gemma4
+  enum class kind { bpe, spm, plamo, gemma4 };
   kind kind_ = kind::bpe;
   std::vector<float> scores_;                          // a token's score (spm, plamo)
   bool add_space_prefix_ = true;                       // (spm)
-  int byte_id_[256] = {};                              // <0xXX>'s id (spm, plamo)
-  std::unordered_map<int, uint8_t> byte_of_;           // and back (spm, plamo)
+  int byte_id_[256] = {};                              // <0xXX>'s id (spm, plamo, gemma4)
+  std::unordered_map<int, uint8_t> byte_of_;           // and back (spm, plamo, gemma4)
   // (plamo) The pieces' trie: a node's edge by code point, and the token that
   // ends at the node (-1: none) with its score * 1e4.
   struct plamo_node {
