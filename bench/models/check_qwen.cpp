@@ -473,7 +473,9 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   // show anything: Gemma 3 4B's KL there is ~1e-13 though its logits move by up to
   // 1). How far int8 moves a model is the model's (Gemma 3 4B 1.4e-2, Qwen3-0.6B
   // 5e-4: docs/llama-cpp-comparison.md); the bound holds an int8 path that broke
-  // (Gemma's GLU epilogue run as SiLU: 3.7).
+  // (Gemma's GLU epilogue run as SiLU: 3.7). The top token must agree too, unless the
+  // f32 forward's top two are a near tie (qm::compare_logits): PLaMo 3 2B's are 0.006
+  // apart there, and the MMQ's rounding, which moves them ~0.26, turns them over.
   bool defaults_ok = true;
   B.mmq = chat_mmq;
   B.f16_acc = true;
@@ -488,12 +490,13 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
     const std::vector<float> got = logits_of(B);
     d.destroy();
     const double kl = qm::kl_div(ref_spread, got);
-    const bool top = qm::argmax(got) == qm::argmax(ref_spread);
-    defaults_ok = top && kl < 0.3;
+    const qm::logits_vs c = qm::compare_logits(ref_spread, got, qm::BOUND_Q8);
+    defaults_ok = (c.same_top || c.near_tie) && kl < 0.3;
     std::printf("\nthe chat's defaults (decode GEMV activations %s, prefill MMQ %s, sums in %s), a "
                 "spread-out prompt: KL %.2e from the f32 forward, top token %s %s\n",
                 qm::act_form_name(chat_form), mmq ? "on" : "off", f16 ? "f16" : "f32", kl,
-                top ? "same" : "different", defaults_ok ? "OK" : "FAIL");
+                c.same_top ? "same" : c.near_tie ? "turned over at a near tie" : "different",
+                defaults_ok ? "OK" : "FAIL");
   }
   return ok && bf16_ok && logits_ok && cache_ok && dec_ok && turn2_ok && sample_ok && long_ok && f16_ok &&
          defaults_ok;

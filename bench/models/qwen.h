@@ -1600,6 +1600,30 @@ inline int64_t argmax(const std::vector<float>& v) {
   return bi;
 }
 
+// How far a form that rounds the activation to 8 bits (the decode's q8 GEMVs, the
+// prefill's MMQ) may move a logit, as |d| / (1 + max |logit|): the bound check_quant
+// holds those forms to, and the closeness of two logits a near tie is (compare_logits).
+constexpr double BOUND_Q8 = 3e-1;
+
+// One set of logits against a reference's: the worst |d| / (1 + max |logit|), and
+// whether the top token agrees, or differs only where the reference's top two were
+// closer than `bound` lets a logit move (a near tie, which the forms' rounding may
+// turn either way).
+struct logits_vs {
+  double err;
+  bool same_top, near_tie;
+};
+inline logits_vs compare_logits(const std::vector<float>& want, const std::vector<float>& got,
+                                double bound) {
+  double mx = 0, ref = 0;
+  for (size_t i = 0; i < want.size(); i++) {
+    mx = tl::max_err(mx, (double)std::fabs(want[i] - got[i]));
+    ref = std::max(ref, (double)std::fabs(want[i]));
+  }
+  const int64_t ta = argmax(want), tb = argmax(got);
+  return {mx / (1.0 + ref), ta == tb, ta != tb && want[ta] - want[tb] < bound * (1.0 + ref)};
+}
+
 // q4 decode GEMV: y(N) = a(1,K) @ dequant(Wq). Wq is a q4 array (logical [K,N],
 // storage [packed [N][K/2] | scales [N][K/32]]); the scales are a view into the
 // same buffer (they ride along the base upload — the array path's split too).

@@ -27,8 +27,9 @@ namespace qm = qwenmodel;
 // its sums: nothing, or the activation to f16 (BOUND_EXACT; the exact prefill, whose
 // tensor-core GEMMs keep f32 operands as bf16 pairs, ~1e-3 at most: Gemma 3 4B 9.6e-4,
 // where a misread eighth of a block's weights is past 1 and bf16 operands were 1.7e-2);
-// the activation to 8 bits (BOUND_Q8).
-constexpr double BOUND_EXACT = 1e-2, BOUND_Q8 = 3e-1;
+// the activation to 8 bits (qm::BOUND_Q8).
+constexpr double BOUND_EXACT = 1e-2;
+using qm::BOUND_Q8;
 
 // Decode `steps` tokens; `force` (when given) is the token fed at each step,
 // else the greedy one. Returns the fed tokens, logits per step.
@@ -45,24 +46,6 @@ static std::vector<int64_t> run(qm::Model& M, int steps, std::vector<std::vector
                : qm::argmax(logits.back());
   }
   return fed;
-}
-
-// One set of logits against the oracle's: the worst |d| / (1 + max |logit|), and
-// whether the top token agrees, or differs only where the oracle's top two were
-// closer than `bound` lets a logit move (a near tie).
-struct compared {
-  double err;
-  bool same_top, near_tie;
-};
-static compared compare(const std::vector<float>& want, const std::vector<float>& got,
-                        double bound) {
-  double mx = 0, ref = 0;
-  for (size_t i = 0; i < want.size(); i++) {
-    mx = tl::max_err(mx, (double)std::fabs(want[i] - got[i]));
-    ref = std::max(ref, (double)std::fabs(want[i]));
-  }
-  const int64_t ta = qm::argmax(want), tb = qm::argmax(got);
-  return {mx / (1.0 + ref), ta == tb, ta != tb && want[ta] - want[tb] < bound * (1.0 + ref)};
 }
 
 int main(int argc, char** argv) {
@@ -115,7 +98,7 @@ int main(int argc, char** argv) {
     double worst = 0;
     int agree = 0, tie_flips = 0, bad = 0;
     for (int s = 0; s < steps; s++) {
-      const compared c = compare(la[s], lb[s], bound);
+      const qm::logits_vs c = qm::compare_logits(la[s], lb[s], bound);
       worst = tl::max_err(worst, c.err);
       c.same_top ? agree++ : c.near_tie ? tie_flips++ : bad++;
     }
@@ -139,7 +122,7 @@ int main(int argc, char** argv) {
     qm::prefill_batched(M, ids, qm::PREFILL_CHUNK, exact);
     const float* lg = qm::host_read(M.scratch.logits);
     const std::vector<float> got(lg, lg + M.c.VOCAB);
-    const compared c = compare(oracle_prompt, got, bound);
+    const qm::logits_vs c = qm::compare_logits(oracle_prompt, got, bound);
     const double kl = qm::kl_div(oracle_prompt, got);
     const bool ok = (c.same_top || c.near_tie) && (exact ? c.err < bound : kl < 0.3);
     ok_all = ok_all && ok;
