@@ -927,6 +927,13 @@ __device__ __forceinline__ void tc_ldsm2_(unsigned& r0, unsigned& r1, const void
                : "=r"(r0), "=r"(r1)
                : "r"((unsigned)__cvta_generic_to_shared(p)));
 }
+// x as a bf16 and the bf16 of what that rounding left over: an f32 operand to ~2^-16 in
+// two bf16 ones, whose products the tensor cores take (the gated delta rule's matrices,
+// the exact form of the prefill GEMM).
+__device__ __forceinline__ void bf16_split_(float x, __nv_bfloat16& hi, __nv_bfloat16& lo) {
+  hi = __float2bfloat16(x);
+  lo = __float2bfloat16(x - __bfloat162float(hi));
+}
 // One m16n8k16 step, per operand type and accumulator.
 __device__ __forceinline__ void tc_mma_(unsigned* c, const unsigned* a, unsigned b0,
                                         unsigned b1, __half) {  // f16 operands, f16 sums
@@ -990,9 +997,7 @@ struct mat {
   __nv_bfloat16 hi[R * P], lo[R * P];
   __device__ __forceinline__ void store(int r, int c, float x) {
     const int i = r * P + c;
-    const __nv_bfloat16 h = __float2bfloat16(x);
-    hi[i] = h;
-    lo[i] = __float2bfloat16(x - __bfloat162float(h));
+    bf16_split_(x, hi[i], lo[i]);
   }
   __device__ __forceinline__ float get(int r, int c) const {
     const int i = r * P + c;
@@ -1260,18 +1265,10 @@ TL_GDN_FUSED(128)
 TL_GDN_FUSED(64)
 TL_GDN_FUSED(32)
 #undef TL_GDN_FUSED
-// Eight consecutive weights of one block-quantized row (k = gk .. gk+7, gk % 8 == 0),
-// dequantized as ggml does and rounded to the GEMM's operand type, four pairs
-// packed in a uint4: what the GEMM stages for a B row chunk of a quantized weight.
-template <bool F16>
+// Two f32 values rounded to f16, packed in a word.
 __device__ __forceinline__ unsigned tc_pack2_(float a, float b) {
-  if constexpr (F16) {
-    const __half2 h = __floats2half2_rn(a, b);
-    return *reinterpret_cast<const unsigned*>(&h);
-  } else {
-    const __nv_bfloat162 h = __floats2bfloat162_rn(a, b);
-    return *reinterpret_cast<const unsigned*>(&h);
-  }
+  const __half2 h = __floats2half2_rn(a, b);
+  return *reinterpret_cast<const unsigned*>(&h);
 }
 // A Q4_K block's 6-bit scale and min of group j (0..7), ggml's get_scale_min_k4,
 // from its 12 scale bytes (block bytes 4..15) held as three words. Indexing a
@@ -1310,8 +1307,8 @@ __device__ __forceinline__ void kq_unpack_(const uint4& q, const uint4& qh, unsi
 // 6-bit scales and mins, 16-byte loads): Q4_K and Q5_K.
 __host__ __device__ constexpr bool kq4_(int wf) { return wf == 1 || wf == 6; }
 // Eight consecutive weights of a row as f32, dequantized as ggml does: v[0..8)
-// for k = gk .. gk+7. The GEMMs round them to their operand type (tc_dq8_*_),
-// embed_row writes them as they are.
+// for k = gk .. gk+7. The f16 GEMM and its dequantization round them to f16 (tc_dq8_),
+// the exact form splits them into bf16 pairs (tc_split8_), embed_row writes them as they are.
 __device__ __forceinline__ void dq8_q4k_(const unsigned char* row, unsigned gk, float (&v)[8]) {
   const unsigned char* b = row + (size_t)(gk >> 8) * 144u;
   const unsigned o = gk & 255u, g = o >> 5, p = g >> 1, l0 = o & 31u;
@@ -1460,25 +1457,30 @@ __host__ __device__ constexpr size_t quant_row_bytes_(unsigned K) {
 __host__ __device__ constexpr int wf_align_(int wf) {
   return wf == 1 || wf == 6 ? 8 : wf == 0 || wf == 4 ? 16 : 2;
 }
-template <bool F16>
-__device__ __forceinline__ uint4 tc_pack8_(const float (&v)[8]) {
-  return make_uint4(tc_pack2_<F16>(v[0], v[1]), tc_pack2_<F16>(v[2], v[3]),
-                    tc_pack2_<F16>(v[4], v[5]), tc_pack2_<F16>(v[6], v[7]));
-}
-template <bool F16, int WF>
+// Eight consecutive weights of one block-quantized row (k = gk .. gk+7, gk % 8 == 0),
+// dequantized as ggml does and rounded to f16, four pairs packed in a uint4: what the
+// f16 GEMM stages for a B row chunk of a quantized weight (and tl_dequant_f16 writes).
+template <int WF>
 __device__ __forceinline__ uint4 tc_dq8_(const unsigned char* row, unsigned gk) {
   float v[8];
   dq8_<WF>(row, gk, v);
-  return tc_pack8_<F16>(v);
+  return make_uint4(tc_pack2_(v[0], v[1]), tc_pack2_(v[2], v[3]), tc_pack2_(v[4], v[5]),
+                    tc_pack2_(v[6], v[7]));
 }
-// Eight f32 values as the exact form stages them: their bf16 roundings, and the bf16
-// of what each rounding left over (the gated delta rule's gdn_::mat pairs).
+// Eight f32 values as the exact form stages them (bf16_split_), the high parts and the
+// residuals each packed in a uint4.
 __device__ __forceinline__ void tc_split8_(const float (&v)[8], uint4& hi, uint4& lo) {
-  float r[8];
+  unsigned h[4], l[4];
 #pragma unroll
-  for (int q = 0; q < 8; q++) r[q] = v[q] - __bfloat162float(__float2bfloat16(v[q]));
-  hi = tc_pack8_<false>(v);
-  lo = tc_pack8_<false>(r);
+  for (int q = 0; q < 4; q++) {
+    __nv_bfloat16 h0, l0, h1, l1;
+    bf16_split_(v[2 * q], h0, l0);
+    bf16_split_(v[2 * q + 1], h1, l1);
+    h[q] = (unsigned)__bfloat16_as_ushort(h0) | (unsigned)__bfloat16_as_ushort(h1) << 16;
+    l[q] = (unsigned)__bfloat16_as_ushort(l0) | (unsigned)__bfloat16_as_ushort(l1) << 16;
+  }
+  hi = make_uint4(h[0], h[1], h[2], h[3]);
+  lo = make_uint4(l[0], l[1], l[2], l[3]);
 }
 
 // WF: the weight format B holds: 0 bf16 [N][K], 1 Q4_K, 2 Q6_K, 6 Q5_K blocks (rows of
@@ -1500,9 +1502,8 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
   static_assert(!AH || F16, "an f16 activation feeds the f16 form");
   using T = typename std::conditional<F16, __half, __nv_bfloat16>::type;     // operands
   using ACC = typename std::conditional<F16, unsigned, float>::type;         // sums
-  constexpr bool SPLIT = !F16;                  // the exact form's bf16 pairs
-  constexpr bool BLO = SPLIT && WF != 0;        // a weight with a residual to stage
-  constexpr int PA = SPLIT ? 2 : 1, PB = BLO ? 2 : 1;  // planes of each operand
+  constexpr bool BLO = !F16 && WF != 0;  // the exact form over a weight with a residual
+  constexpr int PA = F16 ? 1 : 2, PB = BLO ? 2 : 1;  // planes of each operand (bf16 pairs)
   const float* A = static_cast<const float*>(Av);          // AH: really __half
   const __half* Ah = static_cast<const __half*>(Av);
   const __nv_bfloat16* B = static_cast<const __nv_bfloat16*>(Bv);
@@ -1563,7 +1564,7 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
 #pragma unroll
           for (int q = 0; q < 8; q++) rq[v][q] = 0.0f;
       } else {
-        rb[v] = gn < N && gk < K ? tc_dq8_<F16, WF>(Bq + gn * qrow, gk) : make_uint4(0u, 0u, 0u, 0u);
+        rb[v] = gn < N && gk < K ? tc_dq8_<WF>(Bq + gn * qrow, gk) : make_uint4(0u, 0u, 0u, 0u);
       }
     }
   };
@@ -1574,16 +1575,14 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
       T* d = As(s) + (id / (BK / 8)) * LD + (id % (BK / 8)) * 8;
       if constexpr (AH) {
         *reinterpret_cast<float4*>(d) = ra[v][0];
-      } else if constexpr (SPLIT) {
+      } else if constexpr (!F16) {
         tc_split8_(*reinterpret_cast<const float(*)[8]>(&ra[v][0]), *reinterpret_cast<uint4*>(d),
                    *reinterpret_cast<uint4*>(d + BM * LD));
       } else {
         const float* f = reinterpret_cast<const float*>(&ra[v][0]);
 #pragma unroll
-        for (int q = 0; q < 4; q++) {
-          if constexpr (F16) *reinterpret_cast<__half2*>(d + 2 * q) = __floats2half2_rn(f[2 * q], f[2 * q + 1]);
-          else *reinterpret_cast<__nv_bfloat162*>(d + 2 * q) = __floats2bfloat162_rn(f[2 * q], f[2 * q + 1]);
-        }
+        for (int q = 0; q < 4; q++)
+          *reinterpret_cast<__half2*>(d + 2 * q) = __floats2half2_rn(f[2 * q], f[2 * q + 1]);
       }
     }
 #pragma unroll
@@ -1592,14 +1591,12 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
       T* d = Bs(s) + (id / (BK / 8)) * LD + (id % (BK / 8)) * 8;
       if constexpr (BLO) {
         tc_split8_(rq[v], *reinterpret_cast<uint4*>(d), *reinterpret_cast<uint4*>(d + BN * LD));
-      } else if constexpr (WF != 0) {  // dequantized to T pairs already
-        *reinterpret_cast<uint4*>(d) = rb[v];
-      } else if constexpr (F16) {
+      } else if constexpr (F16 && WF == 0) {  // a bf16 weight read as f16
         const __nv_bfloat162* w = reinterpret_cast<const __nv_bfloat162*>(&rb[v]);
 #pragma unroll
         for (int q = 0; q < 4; q++)
           *reinterpret_cast<__half2*>(d + 2 * q) = __float22half2_rn(__bfloat1622float2(w[q]));
-      } else {
+      } else {  // T pairs already: a bf16 weight in the f32 form, an f16 or dequantized one
         *reinterpret_cast<uint4*>(d) = rb[v];
       }
     }
@@ -1625,7 +1622,7 @@ __device__ __forceinline__ void gemm_nt_tc_core(const void* __restrict__ Av,
 #pragma unroll
       for (int j = 0; j < FN; j += 2)
         tc_ldsm4_(fb[j][0], fb[j][1], fb[j + 1][0], fb[j + 1][1], b + (wn + 8 * j + lb_r) * LD + kk + lb_c);
-      if constexpr (SPLIT) {  // the residuals' terms first, then the high parts'
+      if constexpr (!F16) {  // the residuals' terms first, then the high parts'
         unsigned la[FM][4];
 #pragma unroll
         for (int i = 0; i < FM; i++)
@@ -1816,7 +1813,7 @@ extern "C" __global__ void tl_gemm_tc_f16h_f16w_xl(const void* __restrict__ A,
 // A block-quantized weight run (rows x K) dequantized to f16 [rows][K], a thread eight
 // weights: the prefill does it once per projection per chunk instead of in every
 // row block's staging of the GEMM, which then reads plain f16 (72 against 45 TFLOPS).
-// The values are the staging's own (tc_dq8_*_<true>), so the GEMM's result is too.
+// The values are the staging's own (tc_dq8_), so the GEMM's result is too.
 template <int WF>
 __device__ __forceinline__ void dequant_f16_core(const unsigned char* __restrict__ W,
                                                  __half* __restrict__ out, unsigned rows, unsigned K) {
@@ -1825,7 +1822,7 @@ __device__ __forceinline__ void dequant_f16_core(const unsigned char* __restrict
   if (t >= (size_t)rows * per_row) return;
   const unsigned row = (unsigned)(t / per_row), gk = (unsigned)(t % per_row) << 3;
   const unsigned char* r = W + row * quant_row_bytes_<WF>(K);
-  const uint4 v = tc_dq8_<true, WF>(r, gk);
+  const uint4 v = tc_dq8_<WF>(r, gk);
   *reinterpret_cast<uint4*>(out + (size_t)row * K + gk) = v;
 }
 // A format's f16 dequantization: W as wf_align_ says, out by uint4.
