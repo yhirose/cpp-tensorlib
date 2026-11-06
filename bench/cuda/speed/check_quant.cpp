@@ -24,11 +24,11 @@
 namespace qm = qwenmodel;
 
 // The logits' bound (|d| / (1 + max |logit|)) by what a form rounds besides the order of
-// its sums: nothing, or the activation to f16 (BOUND_EXACT); both operands to bf16, as
-// the exact prefill's tensor-core GEMMs do (BOUND_BF16: Gemma 3 1B, the most sensitive
-// here, 1.5e-2, where a misread eighth of a block's weights is past 1); the activation
-// to 8 bits (BOUND_Q8).
-constexpr double BOUND_EXACT = 1e-2, BOUND_BF16 = 5e-2, BOUND_Q8 = 3e-1;
+// its sums: nothing, or the activation to f16 (BOUND_EXACT; the exact prefill, whose
+// tensor-core GEMMs keep f32 operands as bf16 pairs, ~1e-3 at most: Gemma 3 4B 9.6e-4,
+// where a misread eighth of a block's weights is past 1 and bf16 operands were 1.7e-2);
+// the activation to 8 bits (BOUND_Q8).
+constexpr double BOUND_EXACT = 1e-2, BOUND_Q8 = 3e-1;
 
 // Decode `steps` tokens; `force` (when given) is the token fed at each step,
 // else the greedy one. Returns the fed tokens, logits per step.
@@ -127,14 +127,14 @@ int main(int argc, char** argv) {
   M.gemv_form = chat_form;
   // The batched prefill over the same blocks: a prompt through GEMMs that
   // dequantize as they stage, against the f32 weights' prompt, in the exact
-  // form a non-finite prompt is redone in (the operands rounded to bf16, the sums f32:
-  // held to BOUND_BF16) and the fast one (f16 sums, and the blocks' MMQ rounding
+  // form a non-finite prompt is redone in (f32 operands and sums: held to
+  // BOUND_EXACT) and the fast one (f16 sums, and the blocks' MMQ rounding
   // activations to int8, which moves a model by its own amount — Gemma 3 4B's ~30x
   // Qwen's, docs/llama-cpp-comparison.md — so held by the KL of the two distributions,
   // a bound a broken path is far past, and its ties by q8's). A spread-out prompt,
   // which no prediction is sure of, so the distributions show it.
   for (bool exact : {true, false}) {
-    const double bound = exact ? BOUND_BF16 : BOUND_Q8;
+    const double bound = exact ? BOUND_EXACT : BOUND_Q8;
     qm::reset_cache(M);
     qm::prefill_batched(M, ids, qm::PREFILL_CHUNK, exact);
     const float* lg = qm::host_read(M.scratch.logits);
