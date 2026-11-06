@@ -907,27 +907,25 @@ struct context {
   CUdeviceptr mmq_scratch_(size_t bytes) {
     return grow_scratch_(mmq_scratch, mmq_scratch_bytes, bytes);
   }
-  CUfunction mmq_quant_fn = nullptr, mmq_fn[3][2] = {}, mmq_reduce_fn = nullptr;
+  CUfunction mmq_quant_fn = nullptr, mmq_fn[3][quant_fmts_max] = {}, mmq_reduce_fn = nullptr;
   // The partial products of a split-K MMQ GEMM (tl_mmq_reduce sums them into C).
   CUdeviceptr mmq_part_scratch = 0;
   size_t mmq_part_scratch_bytes = 0;
   CUdeviceptr mmq_part_scratch_(size_t bytes) {
     return grow_scratch_(mmq_part_scratch, mmq_part_scratch_bytes, bytes);
   }
-  // The MMQ GEMM (tl_gemm_mmq_q4k, _q80): 128 x 128 tiles of 256 threads, 84 KB of dynamic
-  // shared memory (TL_MMQ_SMEM in tensorlib_cuda.cu, change them together), raised on first
-  // lookup.
+  // The MMQ GEMM (tl_gemm_mmq_<format>): 128 x 128 tiles of 256 threads, 84 KB of dynamic
+  // shared memory (TL_MMQ_SMEM in kernels/cuda_nn.cuh, change them together), raised on
+  // first lookup.
   static constexpr unsigned mmq_tile = 128, mmq_threads = 256, mmq_smem = (128 + 128) * (272 + 64);
-  // i: the format's MMQ kernels (cuda_nn.h's quant_fmt::mmq: 0 Q4_K, 1 Q8_0); epi: 0 C
-  // in f32, 1 the SiLU GLU epilogue, 2 the GELU one (the kernels' EPI template
-  // argument; own_nn::gemm_quant_glu picks it by the activation).
-  CUfunction mmq_(int i, int epi) {
-    static const char* const names[3][2] = {{"tl_gemm_mmq_q4k", "tl_gemm_mmq_q80"},
-                                            {"tl_gemm_mmq_swiglu_q4k", "tl_gemm_mmq_swiglu_q80"},
-                                            {"tl_gemm_mmq_geglu_q4k", "tl_gemm_mmq_geglu_q80"}};
-    CUfunction& slot = mmq_fn[epi][i];
+  // The kernel of quant_fmts_ row fi, whose MMQ kernels end in `sfx` (cuda_nn.h's
+  // quant_fmt::mmq); epi: 0 C in f32, 1 the SiLU GLU epilogue, 2 the GELU one (the
+  // kernels' EPI template argument; own_nn::gemm_quant_glu picks it by the activation).
+  CUfunction mmq_(int fi, const char* sfx, int epi) {
+    static const char* const epis[3] = {"", "swiglu_", "geglu_"};
+    CUfunction& slot = mmq_fn[epi][fi];
     if (!slot) {
-      slot = load_(names[epi][i]);
+      slot = load_((std::string("tl_gemm_mmq_") + epis[epi] + sfx).c_str());
       if (slot && d.FuncSetAttribute)
         d.FuncSetAttribute(slot, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, static_cast<int>(mmq_smem));
     }

@@ -63,7 +63,7 @@ A GGUF whose projections are Q4_K, Q6_K or Q8_0 blocks keeps them as blocks on
 the device (uploaded from the file's mapping, never through a host copy): the
 decode GEMVs read them as they lie, dequantizing as ggml does (bit for bit,
 checked over every quantized value of Qwen3.8-27B's file), and the prefill
-multiplies Q4_K and Q8_0 on the int8 tensor cores (MMQ, below). The decode is
+multiplies Q4_K, Q5_K, Q8_0, Q4_0 and Q4_1 on the int8 tensor cores (MMQ, below). The decode is
 bound by the bytes it reads, so this is what lets a 27B model's 17.7 GiB sit on a
 24 GB card. Measured as the table above (same commits and day, two runs of
 each engine, alternated):
@@ -146,12 +146,13 @@ to fill the GPU. That prefill is then 61% GEMM, 21% dequantization, and reaches
 TFLOP take 310 ms at 86 TFLOPS). llama.cpp multiplies the quantized weights on the
 int8 tensor cores instead (twice the f16 rate, and no dequantization pass).
 
-So does the default prefill here, for Q4_K and Q8_0, as llama.cpp's MMQ does: the
+So does the default prefill here, for Q4_K, Q5_K, Q8_0, Q4_0 and Q4_1, as llama.cpp's MMQ does: the
 activation is rounded to int8 (a scale per 32 values) and multiplied with the
 weight's own integers on `mma.m16n8k32` s8, so nothing is dequantized and no f16
 copy of the weight is written and read back. As in llama.cpp's Ampere kernel, a
 128 x 128 tile of 8 warps unpacks the weight to int8 rows in shared memory once
-as it stages (the multiply loop is then the same for every format), K is split
+as it stages (the multiply loop is then the same for every format: Q5_K's fifth bit
+goes in at the unpack, Q4_0's -8 and Q4_1's min become the min term Q4_K has), K is split
 where the grid would leave SMs idle, and the fused gate|up projection writes
 silu(gate) * up in its epilogue. The price is the activation's 8 bits, as in
 llama.cpp: they change the logits (a greedy reply departs from the f16 path's
@@ -168,6 +169,8 @@ without it (it adds 4%). Alternated, pp512:
 | Qwen3.5-0.8B Q4_K_M | 28.3-29.4k | 32.6-33.2k | 26.7-28.6k |
 | Qwen3.5-0.8B Q8_0 | 30.4-30.5k | 31.9-34.7k | 30.1-30.5k |
 | Qwen3.8-27B Q4_K_M | 1,105-1,199 | 1,534-1,605 | 1,334-1,684 (median ~1,585) |
+| Llama 3.2 1B Q5_K_M | 21.1-21.4k | 29.7-30.2k | 26.6-26.7k |
+| Llama 3.2 1B Q4_0 | 21.4-21.5k | 31.8-31.9k | 30.0-30.1k |
 
 On the 27B a 64-token chunk goes from 314 to 605 tok/s, where the dequantization
 is most of the work. llama.cpp's 27B pp512 moved by a quarter between runs when

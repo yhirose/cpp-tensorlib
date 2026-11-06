@@ -45,14 +45,14 @@ struct own_nn {
   // C[m, ldc-strided n columns] = A[m,K] . W[n,K]^T over GGUF block-quantized rows (type: a
   // format of quant_fmts_, K a whole number of its blocks). a16: A is f16 and the sums f16,
   // else A f32, the operands rounded to bf16 and the sums f32 (the exact form: no f16 range
-  // to overflow). n even. mmq (with a16, Q4_K, or Q8_0 with
-  // K % 256 == 0):
-  // A is quantized to int8 and the product runs on the int8 tensor cores, nothing
-  // dequantized (tl_gemm_mmq_q4k, _q80): faster, and the activation rounded to 8 bits.
+  // to overflow). n even. mmq (with a16, a format whose quant_fmt names MMQ kernels: Q4_K,
+  // Q5_K, Q8_0, Q4_0, Q4_1; K % 256 == 0): A is quantized to int8 and the product runs on
+  // the int8 tensor cores, nothing dequantized (tl_gemm_mmq_*): faster, and the activation
+  // rounded to 8 bits.
   static bool gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu::span C, int64_t m,
                           int64_t n, int64_t k, int64_t ldc, bool mmq = false);
   // H16[m, ff] = act(A16 . Wg^T) * (A16 . Wu^T) in f16, W the fused [Wg | Wu] (2 ff rows of
-  // Q4_K or Q8_0, K % 256 == 0) on the int8 tensor cores, as gemm_quant(mmq) then
+  // one format with MMQ kernels, K % 256 == 0) on the int8 tensor cores, as gemm_quant(mmq) then
   // glu_h16 would make it. False where it does not apply (the caller does those two).
   static bool gemm_quant_glu(int type, gpu::glu_act act, gpu::span A16, gpu::span W,
                              gpu::span H16, int64_t m, int64_t ff, int64_t k);
@@ -363,21 +363,21 @@ struct quant_fmt {
   int type;
   context::tc_weight wf;
   const char *gemv, *dequant, *embed;
-  int mmq;
+  const char* mmq;  // the MMQ kernels' suffix (tl_gemm_mmq_<mmq>), null where it has none
   const char* gemv_act[context::act_forms_max];
   unsigned gemv_rows = 1, gemv_threads = 128;
 };
 inline constexpr quant_fmt quant_fmts_[] = {
-    {12, context::tc_weight::q4k, "tl_gemv_q4k_row", "tl_dequant_f16_q4k", "tl_embed_row_q4k", 0,
+    {12, context::tc_weight::q4k, "tl_gemv_q4k_row", "tl_dequant_f16_q4k", "tl_embed_row_q4k", "q4k",
      {"tl_gemv_q4k_q8_row", "tl_gemv_q4k_h16_row"}},
-    {14, context::tc_weight::q6k, "tl_gemv_q6k_row", "tl_dequant_f16_q6k", "tl_embed_row_q6k", -1, {}},
-    {8, context::tc_weight::q80, "tl_gemv_q80_row", "tl_dequant_f16_q80", "tl_embed_row_q80", 1, {}},
-    {6, context::tc_weight::q50, "tl_gemv_q50_row", "tl_dequant_f16_q50", "tl_embed_row_q50", -1, {}},
-    {13, context::tc_weight::q5k, "tl_gemv_q5k_row", "tl_dequant_f16_q5k", "tl_embed_row_q5k", -1,
+    {14, context::tc_weight::q6k, "tl_gemv_q6k_row", "tl_dequant_f16_q6k", "tl_embed_row_q6k", nullptr, {}},
+    {8, context::tc_weight::q80, "tl_gemv_q80_row", "tl_dequant_f16_q80", "tl_embed_row_q80", "q80", {}},
+    {6, context::tc_weight::q50, "tl_gemv_q50_row", "tl_dequant_f16_q50", "tl_embed_row_q50", nullptr, {}},
+    {13, context::tc_weight::q5k, "tl_gemv_q5k_row", "tl_dequant_f16_q5k", "tl_embed_row_q5k", "q5k",
      {"tl_gemv_q5k_q8_row", "tl_gemv_q5k_h16_row"}},
-    {2, context::tc_weight::q40, "tl_gemv_q40_row", "tl_dequant_f16_q40", "tl_embed_row_q40", -1,
+    {2, context::tc_weight::q40, "tl_gemv_q40_row", "tl_dequant_f16_q40", "tl_embed_row_q40", "q40",
      {"tl_gemv_q40_q8_row", nullptr}, 2, 64},
-    {3, context::tc_weight::q41, "tl_gemv_q41_row", "tl_dequant_f16_q41", "tl_embed_row_q41", -1,
+    {3, context::tc_weight::q41, "tl_gemv_q41_row", "tl_dequant_f16_q41", "tl_embed_row_q41", "q41",
      {"tl_gemv_q41_q8_row", nullptr}, 2, 64},
 };
 static_assert(sizeof(quant_fmts_) / sizeof(quant_fmts_[0]) <= context::quant_fmts_max, "slots");
@@ -394,11 +394,10 @@ inline int quant_fmt_(int type, int64_t k) {
 inline bool own_nn::quant_reads(int type, int64_t k) { return quant_fmt_(type, k) >= 0; }
 
 // The MMQ GEMM (tl_gemm_mmq_*): A (f16, M x K) rounded to int8 into a scratch, then the
-// product with the block rows at W (a format with MMQ kernels: quant_fmt::mmq, here
-// `mq`) into out: f32 C columns (epi 0), or f16 act(gate) * up of a fused gate|up W, n
+// product with the block rows at W (quant_fmts_ row fi, a format with MMQ kernels) into out: f32 C columns (epi 0), or f16 act(gate) * up of a fused gate|up W, n
 // the outputs (epi 1 + glu_act: context::mmq_). False where the GLU would need K split
 // (the caller then takes the unfused path).
-inline bool mmq_run_(context& c, int mq, int epi, void* pa, void* pw, void* out, unsigned uM,
+inline bool mmq_run_(context& c, int fi, int epi, void* pa, void* pw, void* out, unsigned uM,
                      unsigned uN, unsigned uK, unsigned ldc) {
   constexpr unsigned tile = context::mmq_tile;
   // A tile a block and one block an SM: a grid short of the SMs (a narrow projection,
@@ -416,7 +415,7 @@ inline bool mmq_run_(context& c, int mq, int epi, void* pa, void* pw, void* out,
   const size_t scales = (size_t)(uK / 32) * mpad * 8;  // float2 (d, d * sum) a group and row
   const CUdeviceptr scr = c.mmq_scratch_(scales + (size_t)mpad * uK);
   CUfunction quant = c.cached_(c.mmq_quant_fn, "tl_quant_act_mmq");
-  CUfunction gemm = c.mmq_(mq, epi);
+  CUfunction gemm = c.mmq_(fi, quant_fmts_[fi].mmq, epi);
   if (!scr || !quant || !gemm) return false;
   void* ps = reinterpret_cast<void*>(scr);
   void* pq = reinterpret_cast<char*>(ps) + scales;
@@ -449,8 +448,8 @@ inline bool own_nn::gemm_quant(int type, bool a16, gpu::span A, gpu::span W, gpu
   c.device_read_(A.buf);
   c.device_read_(W.buf);
   c.device_rmw_(C.buf);  // a part writes some columns of a shared output
-  if (mmq && a16 && f.mmq >= 0 && k % 256 == 0)
-    return mmq_run_(c, f.mmq, 0, pa, pw, pc, (unsigned)m, (unsigned)n, (unsigned)k, (unsigned)ldc);
+  if (mmq && a16 && f.mmq && k % 256 == 0)
+    return mmq_run_(c, fi, 0, pa, pw, pc, (unsigned)m, (unsigned)n, (unsigned)k, (unsigned)ldc);
   if (!a16) {  // the exact form dequantizes in the GEMM's staging
     return gemm_tc_run_(c, context::tc_form::f32, pa, pw, pc, (unsigned)m, (unsigned)n, (unsigned)k,
                         (unsigned)ldc, f.wf);
@@ -485,7 +484,7 @@ inline bool own_nn::gemm_quant_glu(int type, gpu::glu_act act, gpu::span A16, gp
                                  gpu::span H16, int64_t m, int64_t ff, int64_t k) {
   auto& c = context::get();
   const int fi = quant_fmt_(type, k);
-  if (!c.ready || m <= 0 || ff <= 0 || ff % 2 || k % 256 || fi < 0 || quant_fmts_[fi].mmq < 0)
+  if (!c.ready || m <= 0 || ff <= 0 || ff % 2 || k % 256 || fi < 0 || !quant_fmts_[fi].mmq)
     return false;
   void* pa = context::off_(A16.buf, A16.off);
   void* pw = context::off_(W.buf, W.off);
@@ -498,7 +497,7 @@ inline bool own_nn::gemm_quant_glu(int type, gpu::glu_act act, gpu::span A16, gp
     case gpu::glu_act::silu: epi = 1; break;
     case gpu::glu_act::gelu_tanh: epi = 2; break;
   }
-  return mmq_run_(c, quant_fmts_[fi].mmq, epi, pa, pw, ph, (unsigned)m, (unsigned)ff, (unsigned)k,
+  return mmq_run_(c, fi, epi, pa, pw, ph, (unsigned)m, (unsigned)ff, (unsigned)k,
                   (unsigned)ff);
 }
 

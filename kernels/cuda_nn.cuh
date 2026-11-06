@@ -1769,7 +1769,10 @@ TL_DEQUANT_F16(q41, 8)
 //   d_a (d_w sum q a  -  m_w sum a)
 // and sum q a is one m16n8k32 s8 mma:
 //   Q4_K: q the nibbles 0..15, d_w = d sc and m_w = dmin mn of the group's 6-bit scales;
-//   Q8_0: q the int8s, d_w the block's d, m_w = 0.
+//   Q5_K: as Q4_K, each nibble's fifth bit from qh (q 0..31);
+//   Q8_0: q the int8s, d_w the block's d, m_w = 0;
+//   Q4_0: q the nibbles, d_w the block's d, m_w = 8 d (its q - 8);
+//   Q4_1: q the nibbles, d_w the block's d, m_w = -m (its d q + m).
 // Nothing is dequantized to f16: each tile of the weight is unpacked to int8 (and its
 // group scales to f32) once, as it is staged, and both operands are then read with
 // ldmatrix by the same loop for every format. The price is the 8-bit rounding of the
@@ -1855,7 +1858,7 @@ __device__ __forceinline__ void tc_mma_s8_(int* c, const unsigned* a, unsigned b
 #define TL_MMQ_THREADS 256
 #define TL_MMQ_LDK 272  // a staged row: 256 int8 + 16, so ldmatrix's 8 rows hit distinct banks
 #define TL_MMQ_SMEM ((TL_MMQ_BM + TL_MMQ_BN) * (TL_MMQ_LDK + 64))  // int8 rows and 8 float2 scales a row
-template <int WF, int EPI = 0>  // WF: 1 Q4_K, 3 Q8_0; EPI: 0 C in f32, else the GLU
+template <int WF, int EPI = 0>  // WF: 1 Q4_K, 6 Q5_K, 3 Q8_0, 7 Q4_0, 8 Q4_1; EPI: 0 C in f32, else the GLU
 __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq,
                                               const float2* __restrict__ As_g,
                                               const unsigned char* __restrict__ W,
@@ -1864,7 +1867,12 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
                                               unsigned kchunk, unsigned zstride) {
   constexpr int BM = TL_MMQ_BM, BN = TL_MMQ_BN, NT = TL_MMQ_THREADS, LDK = TL_MMQ_LDK;
   constexpr int WM = 32, WN = 64, FM = WM / 16, FN = WN / 8;
-  constexpr int NB = BN * 8 / NT;  // weight items a thread: (row, 16 B of nibbles) or (row, Q8_0 block)
+  // Weight items a thread: (row, 16 B of a K-quant's nibbles) or (row, a 32-weight block).
+  constexpr int NB = BN * 8 / NT;
+  constexpr bool KQ = WF == 1 || WF == 6;  // a K-quant: super-blocks of 256, 6-bit scales
+  // A 32-weight block's words (read whole, from the word at or before it): Q8_0's 34 bytes
+  // and Q4_0's 18 start 2 bytes into one at odd blocks, Q4_1's 20 are whole words.
+  constexpr int BW = WF == 3 ? 9 : 5;
   static_assert((BM / WM) * (BN / WN) * 32 == NT, "a warp a 32 x 64 tile");
   extern __shared__ __align__(16) unsigned char mmq_sm[];
   signed char* As = reinterpret_cast<signed char*>(mmq_sm);                       // [BM][LDK]
@@ -1876,7 +1884,7 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
   const unsigned tm = blockIdx.x, tn = blockIdx.y;  // the activation's tile, the weight's
   const unsigned row0 = tm * BM, col0 = tn * BN;
   const unsigned nk = K / 256;
-  const size_t wrow = (size_t)nk * (WF == 1 ? 144 : 272);  // bytes a weight row
+  const size_t wrow = quant_row_bytes_<WF>(K), wstep = wrow / nk;  // bytes a row, a super-block's
   const unsigned kt0 = blockIdx.z * kchunk, kt1 = min(nk, kt0 + kchunk);
   float* C = static_cast<float*>(Cv) + (size_t)blockIdx.z * zstride;
   // The weight row a tile row stages: the next 128, or (GLU) gate rows of 32 outputs then
@@ -1897,8 +1905,9 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
 #pragma unroll
       for (int e = 0; e < 4; e++) acc[i][j][e] = 0.0f;
   uint4 ra[BM * 16 / NT], rs[BM * 4 / NT];  // the activation's int8 rows and scales
-  uint4 rb[WF == 1 ? NB : 1], rh[WF == 1 ? NB : 1];  // Q4_K: 16 B of nibbles, the header
-  unsigned rw[WF == 3 ? NB : 1][9];                  // Q8_0: the 9 words a block lies in
+  uint4 rb[KQ ? NB : 1], rh[KQ ? NB : 1];  // a K-quant: 16 B of nibbles, the header
+  uint4 rq[WF == 6 ? NB : 1];              // Q5_K: the same 16 weights' bytes of qh
+  unsigned rw[KQ ? 1 : NB][BW];            // a 32-weight block's words
   auto fetch = [&](unsigned kt) {
 #pragma unroll
     for (int v = 0; v < BM * 16 / NT; v++) {
@@ -1913,14 +1922,15 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
 #pragma unroll
     for (int v = 0; v < NB; v++) {
       const unsigned id = tid + v * NT, r = id >> 3, c = id & 7, gn = wrow_of(r);
-      if constexpr (WF == 1) {  // chunk c of the nibbles; the header for group c's scales
-        const unsigned char* b = W + gn * wrow + (size_t)kt * 144;
-        rb[v] = *reinterpret_cast<const uint4*>(b + 16 + c * 16);
+      const unsigned char* b = W + gn * wrow + (size_t)kt * wstep;
+      if constexpr (KQ) {  // chunk c of the nibbles; the header for group c's scales
+        rb[v] = *reinterpret_cast<const uint4*>(b + (WF == 6 ? 48 : 16) + c * 16);
         rh[v] = *reinterpret_cast<const uint4*>(b);
-      } else {  // block c: rows are whole words and W 16-aligned, so an odd block starts 2 B into one
-        const unsigned* w = reinterpret_cast<const unsigned*>(W + gn * wrow + (size_t)(kt * 8 + c) * 34 - 2 * (c & 1));
+        if constexpr (WF == 6) rq[v] = *reinterpret_cast<const uint4*>(b + 16 + (c & 1) * 16);
+      } else {  // block c: rows are whole words and W 16-aligned
+        const unsigned* w = reinterpret_cast<const unsigned*>(b + c * (wstep / 8) - (WF == 8 ? 0 : 2 * (c & 1)));
 #pragma unroll
-        for (int i = 0; i < 9; i++) rw[v][i] = w[i];
+        for (int i = 0; i < BW; i++) rw[v][i] = w[i];
       }
     }
   };
@@ -1938,15 +1948,24 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
 #pragma unroll
     for (int v = 0; v < NB; v++) {
       const unsigned id = tid + v * NT, r = id >> 3, c = id & 7;
-      if constexpr (WF == 1) {
-        // 16 bytes of pair c / 2: low nibbles are group 2 (c / 2), high the next one.
+      if constexpr (KQ) {
+        // 16 bytes of pair c / 2: low nibbles are group 2 (c / 2), high the next one; Q5_K's
+        // fifth bits are bits 2 (c / 2) and the next of the same weights' qh bytes.
         const unsigned p = c >> 1, h = c & 1;
-        const uint4 x = rb[v];
-        *reinterpret_cast<uint4*>(Bs + r * LDK + 64 * p + 16 * h) =
-            make_uint4(x.x & 0x0F0F0F0Fu, x.y & 0x0F0F0F0Fu, x.z & 0x0F0F0F0Fu, x.w & 0x0F0F0F0Fu);
-        *reinterpret_cast<uint4*>(Bs + r * LDK + 64 * p + 32 + 16 * h) =
-            make_uint4((x.x >> 4) & 0x0F0F0F0Fu, (x.y >> 4) & 0x0F0F0F0Fu, (x.z >> 4) & 0x0F0F0F0Fu,
-                       (x.w >> 4) & 0x0F0F0F0Fu);
+        const unsigned* x = reinterpret_cast<const unsigned*>(&rb[v]);
+        unsigned lo[4], hi[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          lo[i] = x[i] & 0x0F0F0F0Fu;
+          hi[i] = (x[i] >> 4) & 0x0F0F0F0Fu;
+          if constexpr (WF == 6) {
+            const unsigned qh = reinterpret_cast<const unsigned*>(&rq[v])[i] >> (2 * p);
+            lo[i] |= (qh & 0x01010101u) << 4;
+            hi[i] |= (qh & 0x02020202u) << 3;
+          }
+        }
+        *reinterpret_cast<uint4*>(Bs + r * LDK + 64 * p + 16 * h) = make_uint4(lo[0], lo[1], lo[2], lo[3]);
+        *reinterpret_cast<uint4*>(Bs + r * LDK + 64 * p + 32 + 16 * h) = make_uint4(hi[0], hi[1], hi[2], hi[3]);
         // Group c's d sc and dmin mn, from d, dmin and the 12 bytes of 6-bit scales.
         const uint4 hw = rh[v];
         const float2 dd = __half22float2(*reinterpret_cast<const __half2*>(&hw.x));
@@ -1954,15 +1973,31 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
         q4k_scale_min_(make_uint3(hw.y, hw.z, hw.w), (int)c, sc, mn);
         BSs[c * BN + r] = make_float2(dd.x * (float)sc, dd.y * (float)mn);
       } else {
+        // The block's header, then its weights, from the word the block starts in (2 B into
+        // it at an odd Q8_0 or Q4_0 block).
         const unsigned* w = rw[v];
-        const bool odd = c & 1;
-        const float d = __half2float(__ushort_as_half((unsigned short)(odd ? w[0] >> 16 : w[0] & 0xFFFFu)));
-        unsigned q[8];
+        const bool odd = WF != 8 && (c & 1);
+        const unsigned hd = odd ? w[0] >> 16 : w[0];
+        const float d = __half2float(__ushort_as_half((unsigned short)(hd & 0xFFFFu)));
+        constexpr int NQ = WF == 3 ? 8 : 4;  // words of int8s or of nibbles
+        unsigned q[NQ];
 #pragma unroll
-        for (int i = 0; i < 8; i++) q[i] = odd ? w[i + 1] : __funnelshift_r(w[i], w[i + 1], 16);
-        *reinterpret_cast<uint4*>(Bs + r * LDK + c * 32) = make_uint4(q[0], q[1], q[2], q[3]);
-        *reinterpret_cast<uint4*>(Bs + r * LDK + c * 32 + 16) = make_uint4(q[4], q[5], q[6], q[7]);
-        BSs[c * BN + r] = make_float2(d, 0.0f);
+        for (int i = 0; i < NQ; i++)
+          q[i] = WF == 8 ? w[i + 1] : odd ? w[i + 1] : __funnelshift_r(w[i], w[i + 1], 16);
+        signed char* dst = Bs + r * LDK + c * 32;
+        if constexpr (WF == 3) {
+          *reinterpret_cast<uint4*>(dst) = make_uint4(q[0], q[1], q[2], q[3]);
+          *reinterpret_cast<uint4*>(dst + 16) = make_uint4(q[4], q[5], q[6], q[7]);
+          BSs[c * BN + r] = make_float2(d, 0.0f);
+        } else {  // weights 0..15 the low nibbles, 16..31 the high ones
+          *reinterpret_cast<uint4*>(dst) = make_uint4(q[0] & 0x0F0F0F0Fu, q[1] & 0x0F0F0F0Fu,
+                                                      q[2] & 0x0F0F0F0Fu, q[3] & 0x0F0F0F0Fu);
+          *reinterpret_cast<uint4*>(dst + 16) =
+              make_uint4((q[0] >> 4) & 0x0F0F0F0Fu, (q[1] >> 4) & 0x0F0F0F0Fu, (q[2] >> 4) & 0x0F0F0F0Fu,
+                         (q[3] >> 4) & 0x0F0F0F0Fu);
+          const float m = WF == 7 ? 8.0f * d : -__half2float(__ushort_as_half((unsigned short)(w[0] >> 16)));
+          BSs[c * BN + r] = make_float2(d, m);
+        }
       }
     }
   };
@@ -2002,7 +2037,7 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
           acc[i][j][1] = fmaf((float)c[1], as[i][0].x * bs.z, acc[i][j][1]);
           acc[i][j][2] = fmaf((float)c[2], as[i][1].x * bs.x, acc[i][j][2]);
           acc[i][j][3] = fmaf((float)c[3], as[i][1].x * bs.z, acc[i][j][3]);
-          if constexpr (WF == 1) {  // the min term
+          if constexpr (WF != 3) {  // the min term
             acc[i][j][0] = fmaf(-as[i][0].y, bs.y, acc[i][j][0]);
             acc[i][j][1] = fmaf(-as[i][0].y, bs.w, acc[i][j][1]);
             acc[i][j][2] = fmaf(-as[i][1].y, bs.y, acc[i][j][2]);
@@ -2047,22 +2082,27 @@ __device__ __forceinline__ void gemm_mmq_core(const signed char* __restrict__ Aq
       }
   }
 }
-// The int8 rows and their scales by 16 bytes, Q4_K by uint4 and Q8_0 by words; C by
-// float2 (GLU: __half2).
+// The int8 rows and their scales by 16 bytes, a K-quant's blocks by uint4 and the 32-weight
+// ones by words; C by float2 (GLU: __half2).
 #define TL_GEMM_MMQ(NAME, WF, EPI)                                                                   \
-  TL_ALIGN(NAME, 16, 16, (WF) == 1 ? 16 : 4, (EPI) ? 4 : 8)                                   \
+  TL_ALIGN(NAME, 16, 16, (WF) == 1 || (WF) == 6 ? 16 : 4, (EPI) ? 4 : 8)                      \
   extern "C" __global__ void __launch_bounds__(TL_MMQ_THREADS, 1)                              \
   NAME(const signed char* __restrict__ Aq, const float2* __restrict__ As_g,                    \
        const unsigned char* __restrict__ W, void* __restrict__ C, unsigned M, unsigned N,      \
        unsigned K, unsigned Mpad, unsigned ldc, unsigned kchunk, unsigned zstride) {            \
     gemm_mmq_core<WF, EPI>(Aq, As_g, W, C, M, N, K, Mpad, ldc, kchunk, zstride);                \
   }
-TL_GEMM_MMQ(tl_gemm_mmq_q4k, 1, 0)
-TL_GEMM_MMQ(tl_gemm_mmq_q80, 3, 0)
-TL_GEMM_MMQ(tl_gemm_mmq_swiglu_q4k, 1, 1)
-TL_GEMM_MMQ(tl_gemm_mmq_swiglu_q80, 3, 1)
-TL_GEMM_MMQ(tl_gemm_mmq_geglu_q4k, 1, 2)
-TL_GEMM_MMQ(tl_gemm_mmq_geglu_q80, 3, 2)
+// Per format, the plain product and the two GLU epilogues.
+#define TL_GEMM_MMQ_FMT(SFX, WF)                \
+  TL_GEMM_MMQ(tl_gemm_mmq_##SFX, WF, 0)         \
+  TL_GEMM_MMQ(tl_gemm_mmq_swiglu_##SFX, WF, 1)  \
+  TL_GEMM_MMQ(tl_gemm_mmq_geglu_##SFX, WF, 2)
+TL_GEMM_MMQ_FMT(q4k, 1)
+TL_GEMM_MMQ_FMT(q5k, 6)
+TL_GEMM_MMQ_FMT(q80, 3)
+TL_GEMM_MMQ_FMT(q40, 7)
+TL_GEMM_MMQ_FMT(q41, 8)
+#undef TL_GEMM_MMQ_FMT
 #undef TL_GEMM_MMQ
 // C[M, N columns ldc apart] = the sum of z partial products, each M x N, stride apart.
 TL_ALIGN(tl_mmq_reduce, 8, 8)

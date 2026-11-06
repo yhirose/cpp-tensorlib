@@ -23,20 +23,37 @@ using namespace tl::cuda;
 using kop = tl::gpu::kop;
 
 
-// One Q4_K weight of a super-block (144 bytes: d, dmin, 12 bytes of 6-bit scales and
-// mins, 128 bytes of nibbles), as ggml dequantizes it.
-static float q4k_value(const uint8_t* b, int k) {
-  const float d = tl::f16_to_f32((uint16_t)(b[0] | b[1] << 8)), dmin = tl::f16_to_f32((uint16_t)(b[2] | b[3] << 8));
-  const uint8_t* q = b + 4;
-  const int g = k / 32;
-  const int sc = g < 4 ? (q[g] & 63) : ((q[g + 4] & 0xF) | ((q[g - 4] >> 6) << 4));
-  const int mn = g < 4 ? (q[g + 4] & 63) : ((q[g + 4] >> 4) | ((q[g] >> 6) << 4));
-  const uint8_t byte = b[16 + 32 * (g / 2) + (k % 32)];
-  return d * sc * (float)((g & 1) ? byte >> 4 : byte & 15) - dmin * mn;
-}
-// One Q8_0 weight: a block is d (f16) then 32 int8.
-static float q80_value(const uint8_t* b, int k) {
-  return tl::f16_to_f32((uint16_t)(b[0] | b[1] << 8)) * (float)(int8_t)b[2 + k];
+// The formats with MMQ kernels (quant_fmts_' mmq), as ggml_type codes and names.
+static const struct {
+  int type;
+  const char* name;
+} mmq_formats[] = {{12, "Q4_K"}, {13, "Q5_K"}, {8, "Q8_0"}, {2, "Q4_0"}, {3, "Q4_1"}};
+
+// `rows` rows of K weights in format `type`: random bytes, each block's f16 header made
+// sane (d, and the second half where the format has one: Q4_K's and Q5_K's dmin, Q4_1's
+// min), and the same rows dequantized as ggml does.
+template <class G>
+static std::vector<uint8_t> random_blocks(int type, int64_t rows, int64_t K, G& g, std::vector<float>& w) {
+  const auto t = static_cast<tl::gguf::ggml_type>(type);
+  uint64_t elems = 0, blk = 0;
+  tl::gguf::ggml_block(t, elems, blk);
+  const size_t rowb = (size_t)K / elems * blk;
+  std::vector<uint8_t> W((size_t)rows * rowb);
+  for (auto& v : W) v = (uint8_t)(g() >> 8);
+  const bool second = type == 12 || type == 13 || type == 3;
+  for (size_t b = 0; b < W.size() / blk; b++) {
+    const uint16_t dh = tl::f32_to_f16(0.002f + 0.001f * (float)(g() % 8)),
+                   mh = tl::f32_to_f16(0.001f * (float)((int)(g() % 8) - (type == 3 ? 4 : 0)));
+    W[b * blk] = (uint8_t)dh;
+    W[b * blk + 1] = (uint8_t)(dh >> 8);
+    if (second) {
+      W[b * blk + 2] = (uint8_t)mh;
+      W[b * blk + 3] = (uint8_t)(mh >> 8);
+    }
+  }
+  w.resize((size_t)rows * K);
+  for (int64_t r = 0; r < rows; r++) tl::gguf::dequant_range(t, &W[(size_t)r * rowb], 0, K, &w[(size_t)r * K]);
+  return W;
 }
 
 static int failures = 0;
@@ -221,32 +238,20 @@ int main() {
     release(o, 0, nullptr);
   }
 
-  // ---- the prefill GEMM over Q4_K and Q8_0 weights on the int8 tensor cores (gemm_quant, mmq) ----
+  // ---- the prefill GEMM over block-quantized weights on the int8 tensor cores (gemm_quant, mmq) ----
   // Rows past the 128-row tile (M = 200), columns past the 128-column one (N = 300) and a
   // wider output row (ldc); K four super-blocks, which a grid this small splits in two
   // (the partial products' reduction is checked with the rest). Two references: the exact product of the
   // dequantized weights with the activation rounded to int8 as the kernel does (the
   // kernel must reproduce it to f32 rounding), and the same with the activation as given
   // (what the rounding costs).
-  for (const int type : {12, 8}) {
-    const char* name = type == 12 ? "Q4_K" : "Q8_0";
+  for (const auto& fmt : mmq_formats) {
+    const int type = fmt.type;
+    const char* name = fmt.name;
     const int64_t M = 200, N = 300, K = 1024, ldc = N + 8;
-    const size_t blk = type == 12 ? 144 : 34, rowb = (size_t)K / (type == 12 ? 256 : 32) * blk;
-    std::vector<uint8_t> W((size_t)N * rowb);
-    for (auto& v : W) v = (uint8_t)(g() >> 8);
-    for (size_t b = 0; b < W.size() / blk; b++) {  // sane d (and dmin)
-      const uint16_t dh = tl::f32_to_f16(0.002f + 0.001f * (float)(g() % 8)), mh = tl::f32_to_f16(0.001f * (float)(g() % 8));
-      W[b * blk] = (uint8_t)dh;
-      W[b * blk + 1] = (uint8_t)(dh >> 8);
-      if (type == 12) {
-        W[b * blk + 2] = (uint8_t)mh;
-        W[b * blk + 3] = (uint8_t)(mh >> 8);
-      }
-    }
-    auto weight = [&](int64_t n, int64_t k) {
-      return type == 12 ? q4k_value(&W[(size_t)n * rowb + (size_t)(k / 256) * 144], (int)(k % 256))
-                        : q80_value(&W[(size_t)n * rowb + (size_t)(k / 32) * 34], (int)(k % 32));
-    };
+    std::vector<float> wv;
+    const std::vector<uint8_t> W = random_blocks(type, N, K, g, wv);
+    auto weight = [&](int64_t n, int64_t k) { return wv[(size_t)(n * K + k)]; };
     float* cw = nullptr;
     float* ca = nullptr;
     float* cc = nullptr;
@@ -310,21 +315,12 @@ int main() {
   // pinned to the next. FF = 150 leaves a partial 64-output tile; K = 512 keeps the grid
   // unsplit (the GLU does not split K).
   for (const auto act : {tl::gpu::glu_act::silu, tl::gpu::glu_act::gelu_tanh})
-  for (const int type : {12, 8}) {
+  for (const auto& fmt : mmq_formats) {
+    const int type = fmt.type;
     const char* const aname = act == tl::gpu::glu_act::silu ? "silu" : "gelu";
     const int64_t M = 200, FF = 150, N = 2 * FF, K = 512;
-    const size_t blk = type == 12 ? 144 : 34, rowb = (size_t)K / (type == 12 ? 256 : 32) * blk;
-    std::vector<uint8_t> W((size_t)N * rowb);
-    for (auto& v : W) v = (uint8_t)(g() >> 8);
-    for (size_t b = 0; b < W.size() / blk; b++) {
-      const uint16_t dh = tl::f32_to_f16(0.002f + 0.001f * (float)(g() % 8)), mh = tl::f32_to_f16(0.001f * (float)(g() % 8));
-      W[b * blk] = (uint8_t)dh;
-      W[b * blk + 1] = (uint8_t)(dh >> 8);
-      if (type == 12) {
-        W[b * blk + 2] = (uint8_t)mh;
-        W[b * blk + 3] = (uint8_t)(mh >> 8);
-      }
-    }
+    std::vector<float> wv;
+    const std::vector<uint8_t> W = random_blocks(type, N, K, g, wv);
     float* cw = nullptr;
     float* ca = nullptr;
     float* cc = nullptr;
@@ -356,10 +352,9 @@ int main() {
     }
     std::printf("  mmq %s %s glu: %lld of %lld outputs differ from gemm + glu_h16, "
                 "%lld glu_h16 from glu rounded\n",
-                type == 12 ? "Q4_K" : "Q8_0", aname, (long long)mismatches, (long long)(M * FF),
-                (long long)rounding);
+                fmt.name, aname, (long long)mismatches, (long long)(M * FF), (long long)rounding);
     check(launched && mismatches == 0 && rounding == 0,
-          (std::string("mmq ") + (type == 12 ? "Q4_K " : "Q8_0 ") + aname + " glu").c_str());
+          (std::string("mmq ") + fmt.name + " " + aname + " glu").c_str());
     release(w, 0, nullptr);
     release(a, 0, nullptr);
     release(o, 0, nullptr);

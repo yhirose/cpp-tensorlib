@@ -716,7 +716,7 @@ struct Model {
   // The form the decode's block-quantized GEMVs read their activation in, where their
   // format has a GEMV for it (TL_GEMV_ACT; gpu::quant_act_reads).
   gpu::act_form gemv_form = gpu::act_form::f32;
-  bool mmq = false;           // prefill Q4_K / Q8_0 GEMMs on the int8 tensor cores (TL_NO_MMQ: f16)
+  bool mmq = false;           // prefill GEMMs on the int8 tensor cores, formats with MMQ (TL_NO_MMQ: f16)
   bool quant = false;         // the projections are block-quantized blocks, read as such
   std::vector<Layer> layers;
   Scratch scratch;
