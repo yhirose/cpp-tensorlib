@@ -152,7 +152,8 @@ weight's own integers on `mma.m16n8k32` s8, so nothing is dequantized and no f16
 copy of the weight is written and read back. As in llama.cpp's Ampere kernel, a
 128 x 128 tile of 8 warps unpacks the weight to int8 rows in shared memory once
 as it stages (the multiply loop is then the same for every format: Q5_K's fifth bit
-goes in at the unpack, Q4_0's -8 and Q4_1's min become the min term Q4_K has), K is split
+goes in at the unpack and Q4_0's -8 there too, as signed int8s; Q4_1's min becomes the min
+term Q4_K has), K is split
 where the grid would leave SMs idle, and the fused gate|up projection writes
 silu(gate) * up in its epilogue. The price is the activation's 8 bits, as in
 llama.cpp: they change the logits (a greedy reply departs from the f16 path's

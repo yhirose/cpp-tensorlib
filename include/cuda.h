@@ -705,11 +705,14 @@ struct context {
   // blocks (Q4_K, Q6_K, Q8_0, Q5_0, Q5_K, Q4_0, Q4_1); the quantized ones have the f32
   // and f16h forms only.
   enum class tc_weight { bf16, q4k, q6k, q80, f16w, q50, q5k, q40, q41 };
+  // A weight's suffix in its kernels' names (tl_gemm_tc_f32_q4k, tl_gemm_mmq_q4k): empty for bf16.
+  static const char* weight_sfx_(tc_weight w) {
+    static const char* const s[9] = {"", "_q4k", "_q6k", "_q80", "_f16w", "_q50", "_q5k", "_q40", "_q41"};
+    return s[static_cast<int>(w)];
+  }
   CUfunction gemm_tc_fn[9][3][4] = {};  // [weight][form][tile]
   CUfunction gemm_tc_(tc_form f, tc_tile t, tc_weight w = tc_weight::bf16) {
     static const char* const forms[3] = {"f32", "f16", "f16h"};
-    static const char* const weights[9] = {"",     "_q4k", "_q6k", "_q80", "_f16w",
-                                           "_q50", "_q5k", "_q40", "_q41"};
     static const char* const tiles[4] = {"l", "m", "s", "xl"};
     if (t == tc_tile::xl && (w != tc_weight::f16w || f != tc_form::f16h)) return nullptr;
     if (w != tc_weight::bf16 && f == tc_form::f16) return nullptr;
@@ -717,7 +720,7 @@ struct context {
     CUfunction& slot = gemm_tc_fn[static_cast<int>(w)][static_cast<int>(f)][static_cast<int>(t)];
     if (!slot) {
       const std::string name = std::string("tl_gemm_tc_") + forms[static_cast<int>(f)] +
-                               weights[static_cast<int>(w)] + "_" + tiles[static_cast<int>(t)];
+                               weight_sfx_(w) + "_" + tiles[static_cast<int>(t)];
       slot = load_(name.c_str());
       if (slot && d.FuncSetAttribute)
         d.FuncSetAttribute(slot, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */,
@@ -907,7 +910,7 @@ struct context {
   CUdeviceptr mmq_scratch_(size_t bytes) {
     return grow_scratch_(mmq_scratch, mmq_scratch_bytes, bytes);
   }
-  CUfunction mmq_quant_fn = nullptr, mmq_fn[3][quant_fmts_max] = {}, mmq_reduce_fn = nullptr;
+  CUfunction mmq_quant_fn = nullptr, mmq_fn[3][9] = {}, mmq_reduce_fn = nullptr;  // [epi][tc_weight]
   // The partial products of a split-K MMQ GEMM (tl_mmq_reduce sums them into C).
   CUdeviceptr mmq_part_scratch = 0;
   size_t mmq_part_scratch_bytes = 0;
@@ -918,14 +921,14 @@ struct context {
   // shared memory (TL_MMQ_SMEM in kernels/cuda_nn.cuh, change them together), raised on
   // first lookup.
   static constexpr unsigned mmq_tile = 128, mmq_threads = 256, mmq_smem = (128 + 128) * (272 + 64);
-  // The kernel of quant_fmts_ row fi, whose MMQ kernels end in `sfx` (cuda_nn.h's
-  // quant_fmt::mmq); epi: 0 C in f32, 1 the SiLU GLU epilogue, 2 the GELU one (the
-  // kernels' EPI template argument; own_nn::gemm_quant_glu picks it by the activation).
-  CUfunction mmq_(int fi, const char* sfx, int epi) {
-    static const char* const epis[3] = {"", "swiglu_", "geglu_"};
-    CUfunction& slot = mmq_fn[epi][fi];
+  // The MMQ kernel of weight format w (one quant_fmt::mmq marks as having them); epi: 0 C
+  // in f32, 1 the SiLU GLU epilogue, 2 the GELU one (the kernels' EPI template argument;
+  // own_nn::gemm_quant_glu picks it by the activation).
+  CUfunction mmq_(tc_weight w, int epi) {
+    static const char* const epis[3] = {"", "_swiglu", "_geglu"};
+    CUfunction& slot = mmq_fn[epi][static_cast<int>(w)];
     if (!slot) {
-      slot = load_((std::string("tl_gemm_mmq_") + epis[epi] + sfx).c_str());
+      slot = load_((std::string("tl_gemm_mmq") + epis[epi] + weight_sfx_(w)).c_str());
       if (slot && d.FuncSetAttribute)
         d.FuncSetAttribute(slot, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, static_cast<int>(mmq_smem));
     }
