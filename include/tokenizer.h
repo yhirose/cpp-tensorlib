@@ -13,6 +13,11 @@
 //    adjacent pieces merge highest score first where the pair is a token, as
 //    llama.cpp's SPM tokenizer does (checked against its llama-tokenize); a
 //    piece the vocabulary lacks falls back to its bytes' <0xXX> tokens.
+//  - "plamo3": PLaMo 3's unigram (encode_plamo_): the cut of the text into
+//    pieces whose scores sum highest, after hard cuts around its markers and
+//    runs of one character, as PFN's tokenization_plamo.py and llama.cpp's
+//    plamo2 tokenizer (checked against its llama-tokenize); a character no
+//    piece covers is written as its bytes' <0xXX> tokens.
 //
 // Either way special tokens in the text (CONTROL and USER_DEFINED) are matched
 // whole, and decode() gives back the raw UTF-8 (special tokens as their text).
@@ -20,6 +25,7 @@
 // Header-only, C++17, stdlib only (gguf.h adds POSIX mmap).
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -46,16 +52,16 @@ class tokenizer {
       token2id_.emplace(tokens_[i], static_cast<int>(i));
 
     const auto& tt = m.kv("tokenizer.ggml.token_type");
-    spm_ = m.kv("tokenizer.ggml.model").as_str() == "llama";
-    if (spm_) {
+    const std::string model = m.kv("tokenizer.ggml.model").as_str();
+    if (model == "llama") kind_ = kind::spm;
+    else if (model == "plamo3") kind_ = kind::plamo;
+    else if (model != "gpt2") throw std::runtime_error("tokenizer: no tokenizer \"" + model + "\"");
+    if (kind_ != kind::bpe) {  // both score pieces and fall back to <0xXX> tokens
       const auto& sc = m.kv("tokenizer.ggml.scores");
       scores_.reserve(sc.arr.size());
       for (const auto& v : sc.arr) scores_.push_back(static_cast<float>(v.f));
       if (scores_.size() != tokens_.size())
         throw std::runtime_error("tokenizer: one score a token");
-      // SentencePiece's default is to prefix a space; Gemma says not to.
-      add_space_prefix_ = !m.has("tokenizer.ggml.add_space_prefix") ||
-                          m.kv("tokenizer.ggml.add_space_prefix").u != 0;
       for (int b = 0; b < 256; b++) {
         char name[7];
         std::snprintf(name, sizeof name, "<0x%02X>", b);
@@ -63,6 +69,18 @@ class tokenizer {
         byte_id_[b] = it == token2id_.end() ? -1 : it->second;
         if (byte_id_[b] >= 0) byte_of_[byte_id_[b]] = static_cast<uint8_t>(b);
       }
+    }
+    if (kind_ == kind::spm) {
+      // SentencePiece's default is to prefix a space; Gemma says not to.
+      add_space_prefix_ = !m.has("tokenizer.ggml.add_space_prefix") ||
+                          m.kv("tokenizer.ggml.add_space_prefix").u != 0;
+    } else if (kind_ == kind::plamo) {
+      // The runs cut around: the file's (PFN's tokenizer_config), else 4 and 2 as
+      // llama.cpp has them (its converter does not write the keys).
+      for (auto [key, n] : {std::pair{"tokenizer.ggml.break_around_repeated_chars_threshold", &plamo_repeat_},
+                            std::pair{"tokenizer.ggml.break_around_consecutive_spaces_threshold", &plamo_spaces_}})
+        if (m.has(key)) *n = m.kv(key).as_u32();
+      build_plamo_(tt);
     } else {
       pre_ = pre_rule_(m.has("tokenizer.ggml.pre") ? m.kv("tokenizer.ggml.pre").as_str() : "");
       auto merges = m.kv("tokenizer.ggml.merges").as_str_array();
@@ -147,7 +165,7 @@ class tokenizer {
 
   // Decode ids back to raw UTF-8 bytes (inverse of the byte2cp mapping).
   std::string decode(const std::vector<int>& ids) const {
-    if (spm_) return decode_spm_(ids);
+    if (kind_ != kind::bpe) return decode_pieces_(ids);
     std::string joined;
     for (int id : ids) {
       if (id < 0 || static_cast<size_t>(id) >= tokens_.size())
@@ -220,7 +238,8 @@ class tokenizer {
   void encode_segment_(const char* data, size_t len, bool after_special,
                        std::vector<int>& out) const {
     if (len == 0) return;
-    if (spm_) return encode_spm_(data, len, after_special, out);
+    if (kind_ == kind::spm) return encode_spm_(data, len, after_special, out);
+    if (kind_ == kind::plamo) return encode_plamo_(data, len, out);
     std::string seg(data, len);
 
     // Decode to codepoints, keeping each codepoint's byte offset (off[k] is the
@@ -469,9 +488,9 @@ class tokenizer {
       }
     }
   }
-  // U+2581 back to a space, a <0xXX> token to its byte; a leading space the
-  // encoder prefixed is dropped.
-  std::string decode_spm_(const std::vector<int>& ids) const {
+  // A <0xXX> token to its byte, any other to its text: SentencePiece's with U+2581
+  // back to a space and a leading space the encoder prefixed dropped, PLaMo 3's as is.
+  std::string decode_pieces_(const std::vector<int>& ids) const {
     std::string out;
     for (int id : ids) {
       if (id < 0 || static_cast<size_t>(id) >= tokens_.size())
@@ -481,6 +500,10 @@ class tokenizer {
         continue;
       }
       const std::string& t = tokens_[id];
+      if (kind_ != kind::spm) {
+        out += t;
+        continue;
+      }
       for (size_t k = 0; k < t.size(); k++) {
         if (t.compare(k, 3, "\xe2\x96\x81") == 0) {
           out += ' ';
@@ -490,10 +513,143 @@ class tokenizer {
         }
       }
     }
-    if (add_space_prefix_ && !out.empty() && out[0] == ' ') out.erase(0, 1);
+    if (kind_ == kind::spm && add_space_prefix_ && !out.empty() && out[0] == ' ') out.erase(0, 1);
     return out;
   }
 
+  // ---- PLaMo 3 (tokenizer.ggml.model "plamo3") ---------------------------------
+  // A unigram over code points: of every way to cut a run of text into pieces
+  // (tokens other than the <0xXX> bytes), the one whose scores sum highest, as
+  // PFN's tokenization_plamo.py and llama.cpp's llm_tokenizer_plamo2 have it.
+  // Scores are rounded to integers (score * 1e4); among equal sums the longer
+  // piece wins at each position; a code point no piece covers costs 1e7 and is
+  // written as its UTF-8 bytes' tokens (a candidate at every position, which
+  // loses ties: it is taken even where a longer piece starts, when that piece
+  // leads nowhere better). Before that, hard cuts: around each <|plamo:NAME|>
+  // (NAME up to 64 code points, neither '|' nor white space, Python's \s),
+  // around each run of plamo_repeat_ or more of one code point other than '\n'
+  // and of plamo_spaces_ or more spaces, and at U+EE00 (the reference's
+  // boundary piece, which no token holds, so a cut there is the same; dropped).
+  static constexpr int32_t plamo_unknown_ = -10000000;  // the score of a byte fallback
+  void build_plamo_(const gguf::metadata_value& tt) {
+    for (int b = 0; b < 256; b++)
+      if (byte_id_[b] < 0) throw std::runtime_error("tokenizer: a plamo3 vocabulary without <0xXX>");
+    plamo_nodes_.push_back({-1, 0});
+    for (size_t id = 0; id < tokens_.size(); id++) {
+      if ((id < tt.arr.size() && tt.arr[id].i == 6) || tokens_[id].empty()) continue;  // BYTE
+      const std::vector<uint32_t> cps = plamo_cps_(tokens_[id].data(), tokens_[id].size());
+      if (std::find(cps.begin(), cps.end(), 0xEE00u) != cps.end())
+        throw std::runtime_error("tokenizer: a plamo3 piece holds U+EE00, the cut mark");
+      int32_t node = 0;
+      for (uint32_t c : cps) {
+        auto [it, added] = plamo_edges_.try_emplace(plamo_edge_(node, c),
+                                                    static_cast<int32_t>(plamo_nodes_.size()));
+        if (added) plamo_nodes_.push_back({-1, 0});
+        node = it->second;
+      }
+      // A later token of the same text replaces an earlier one, as in both references.
+      const float s = scores_[id];
+      plamo_nodes_[node] = std::isfinite(s) ? plamo_node{static_cast<int32_t>(id),
+                                                         static_cast<int32_t>(std::round(s * 1e4))}
+                                            : plamo_node{-1, 0};
+    }
+  }
+  static uint64_t plamo_edge_(int32_t node, uint32_t c) {
+    return static_cast<uint64_t>(node) << 21 | c;
+  }
+  // UTF-8 to code points as llama.cpp's unicode_cpts_from_utf8 reads it: a byte
+  // that does not start a well-formed, shortest sequence is one U+FFFD.
+  static std::vector<uint32_t> plamo_cps_(const char* s, size_t n) {
+    std::vector<uint32_t> out;
+    out.reserve(n);
+    for (size_t p = 0; p < n;) {
+      const auto b = [&](size_t k) { return static_cast<uint8_t>(s[p + k]); };
+      const size_t len = b(0) < 0x80 ? 1 : b(0) < 0xC0 ? 0 : b(0) < 0xE0 ? 2 : b(0) < 0xF0 ? 3 : b(0) < 0xF8 ? 4 : 0;
+      uint32_t c = len == 1 ? b(0) : len ? b(0) & (0x7Fu >> len) : 0;
+      bool ok = len && p + len <= n;
+      for (size_t k = 1; ok && k < len; k++) {
+        ok = (b(k) & 0xC0) == 0x80;
+        c = c << 6 | (b(k) & 0x3Fu);
+      }
+      static constexpr uint32_t least[] = {0, 0, 0x80, 0x800, 0x10000};
+      if (ok && (c < least[len] || c > 0x10FFFF)) ok = false;
+      out.push_back(ok ? c : 0xFFFD);
+      p += ok ? len : 1;
+    }
+    return out;
+  }
+  void encode_plamo_(const char* data, size_t len, std::vector<int>& out) const {
+    const std::vector<uint32_t> cp = plamo_cps_(data, len);
+    const size_t n = cp.size();
+    std::vector<bool> cut(n + 1, false);
+    // <|plamo:NAME|>
+    static constexpr char prefix[] = "<|plamo:";
+    const size_t pn = sizeof prefix - 1;
+    for (size_t i = 0; i + pn <= n;) {
+      if (!std::equal(prefix, prefix + pn, cp.begin() + static_cast<ptrdiff_t>(i))) {
+        i++;
+        continue;
+      }
+      size_t j = i + pn;
+      while (j < n && j - (i + pn) < 64 && cp[j] != '|' && !tokdata::is_WS(cp[j])) j++;
+      if (j + 1 < n && cp[j] == '|' && cp[j + 1] == '>') {
+        cut[i] = cut[j + 2] = true;
+        i = j + 2;
+      } else {
+        i++;
+      }
+    }
+    // Runs of one code point, within the cuts above.
+    for (size_t i = 0; i < n;) {
+      size_t e = i + 1;
+      while (e < n && cp[e] == cp[i] && !cut[e]) e++;
+      if ((plamo_repeat_ && cp[i] != '\n' && e - i >= plamo_repeat_) ||
+          (plamo_spaces_ && cp[i] == ' ' && e - i >= plamo_spaces_))
+        cut[i] = cut[e] = true;
+      i = e;
+    }
+    size_t start = 0;
+    for (size_t e = 0; e <= n; e++) {
+      const bool mark = e < n && cp[e] == 0xEE00;
+      if (e == n || cut[e] || mark) {
+        plamo_dp_(cp.data() + start, e - start, out);
+        start = e + mark;
+      }
+    }
+  }
+  // The best cut of one run, from its end: cost[i] the least cost of cp[i, n),
+  // the pieces at i tried longest first so a tie keeps the longer.
+  void plamo_dp_(const uint32_t* cp, size_t n, std::vector<int>& out) const {
+    if (n == 0) return;
+    std::vector<int64_t> cost(n + 1, int64_t{1} << 60);
+    std::vector<int32_t> len(n + 1, 0), id(n + 1, -1);
+    cost[n] = 0;
+    std::vector<std::pair<int32_t, int32_t>> at;  // (length, node) of the pieces at i
+    for (size_t i = n; i-- > 0;) {
+      at.clear();
+      int32_t node = 0;
+      for (size_t k = i; k < n; k++) {
+        auto it = plamo_edges_.find(plamo_edge_(node, cp[k]));
+        if (it == plamo_edges_.end()) break;
+        node = it->second;
+        if (plamo_nodes_[node].id >= 0) at.emplace_back(static_cast<int32_t>(k + 1 - i), node);
+      }
+      for (auto p = at.rbegin(); p != at.rend(); ++p) {
+        const int64_t s = cost[i + p->first] - plamo_nodes_[p->second].score;
+        if (s < cost[i]) cost[i] = s, len[i] = p->first, id[i] = plamo_nodes_[p->second].id;
+      }
+      if (cost[i + 1] - plamo_unknown_ < cost[i]) cost[i] = cost[i + 1] - plamo_unknown_, len[i] = 1, id[i] = -1;
+    }
+    for (size_t i = 0; i < n; i += static_cast<size_t>(len[i])) {
+      if (id[i] >= 0) {
+        out.push_back(id[i]);
+        continue;
+      }
+      std::string bytes;
+      append_cp_(bytes, cp[i]);
+      for (char b : bytes) out.push_back(byte_id_[static_cast<uint8_t>(b)]);
+    }
+  }
   std::vector<std::string> tokens_;                    // id -> vocab string
   std::unordered_map<std::string, int> token2id_;      // vocab string -> id
   std::unordered_map<std::string, int> merge_rank_;    // "A B" -> rank (gpt2)
@@ -501,11 +657,20 @@ class tokenizer {
   std::vector<std::pair<std::string, int>> specials_[256];
   std::unordered_map<uint32_t, uint8_t> cp2byte_;      // inverse byte2cp (gpt2)
   pretok_rule pre_;                                    // (gpt2)
-  bool spm_ = false;                                   // tokenizer.ggml.model "llama"
-  std::vector<float> scores_;                          // a token's merge score (spm)
+  enum class kind { bpe, spm, plamo };                 // tokenizer.ggml.model gpt2, llama, plamo3
+  kind kind_ = kind::bpe;
+  std::vector<float> scores_;                          // a token's score (spm, plamo)
   bool add_space_prefix_ = true;                       // (spm)
-  int byte_id_[256] = {};                              // <0xXX>'s id (spm)
-  std::unordered_map<int, uint8_t> byte_of_;           // and back (spm)
+  int byte_id_[256] = {};                              // <0xXX>'s id (spm, plamo)
+  std::unordered_map<int, uint8_t> byte_of_;           // and back (spm, plamo)
+  // (plamo) The pieces' trie: a node's edge by code point, and the token that
+  // ends at the node (-1: none) with its score * 1e4.
+  struct plamo_node {
+    int32_t id, score;
+  };
+  std::vector<plamo_node> plamo_nodes_;
+  std::unordered_map<uint64_t, int32_t> plamo_edges_;
+  size_t plamo_repeat_ = 4, plamo_spaces_ = 2;  // (plamo) the runs cut around; 0: none
   int eos_id_ = -1;
   std::vector<int> eog_ids_;  // is_eog's ids
   int bos_id_ = -1;

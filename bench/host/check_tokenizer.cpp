@@ -2,7 +2,7 @@
 // truth for the file's family: HF's Qwen2.5-0.5B-Instruct tokenizer
 // (tokenizer_oracle_data.h, GPT-2 BPE), or llama.cpp's llama-tokenize
 // (tools/tokenizer_oracle.py) on Qwen3.5, Llama 3 (GPT-2 BPE, each its own
-// pre-tokenizer) and Gemma 3 (SentencePiece).
+// pre-tokenizer), Gemma 3 (SentencePiece) and PLaMo 3 (its unigram).
 // argv[1] = gguf path. Exit 0 iff every case encodes to the exact id
 // sequence and decode() round-trips the text.
 
@@ -14,6 +14,7 @@
 #include "tokenizer_oracle_data.h"
 #include "tokenizer_oracle_gemma3.h"
 #include "tokenizer_oracle_llama3.h"
+#include "tokenizer_oracle_plamo3.h"
 #include "tokenizer_oracle_qwen35.h"
 
 struct oracle_case {
@@ -27,23 +28,37 @@ static std::vector<oracle_case> cases_of() {
   for (const auto& c : cases()) out.push_back({c.text, c.ids});
   return out;
 }
+// What a tokenizer makes of text that is not UTF-8, where llama.cpp reads each
+// bad byte as U+FFFD: a byte-level BPE keeps the bytes, so its oracle's ids do
+// not hold (skip); PLaMo 3's reads U+FFFD too, so they do but the text does not
+// come back (ids); SentencePiece's falls back to the bytes themselves (exact).
+enum class not_utf8 { skip, ids, exact };
 // A family's ground truth, by the file's architecture and pre-tokenizer (a
-// vocabulary each), and the token its chat template closes a turn with. A
-// byte-level BPE (bpe) keeps the bytes of text that is not UTF-8 where
-// llama.cpp reads each bad one as U+FFFD, so its oracle's such cases are skipped.
+// vocabulary each), the token its chat template closes a turn with, and what
+// its tokenizer leaves out of the text it gives back (PLaMo 3: U+EE00, a cut).
 struct family {
   const char *arch, *pre;
   std::vector<oracle_case> (*cases)();
   const char* turn;
-  bool bpe;
+  not_utf8 on_bad_utf8;
+  const char* dropped = nullptr;
 };
 static const family families[] = {
-    {"qwen2", "qwen2", cases_of<tokoracle::cases>, "<|im_end|>", true},
-    {"qwen3", "qwen2", cases_of<tokoracle::cases>, "<|im_end|>", true},
-    {"qwen35", "qwen35", cases_of<tokoracle_qwen35::cases>, "<|im_end|>", true},
-    {"llama", "llama-bpe", cases_of<tokoracle_llama3::cases>, "<|eot_id|>", true},
-    {"gemma3", "default", cases_of<tokoracle_gemma3::cases>, "<end_of_turn>", false},
+    {"qwen2", "qwen2", cases_of<tokoracle::cases>, "<|im_end|>", not_utf8::skip},
+    {"qwen3", "qwen2", cases_of<tokoracle::cases>, "<|im_end|>", not_utf8::skip},
+    {"qwen35", "qwen35", cases_of<tokoracle_qwen35::cases>, "<|im_end|>", not_utf8::skip},
+    {"llama", "llama-bpe", cases_of<tokoracle_llama3::cases>, "<|eot_id|>", not_utf8::skip},
+    {"gemma3", "default", cases_of<tokoracle_gemma3::cases>, "<end_of_turn>", not_utf8::exact},
+    {"plamo3", "default", cases_of<tokoracle_plamo3::cases>, "<|plamo:tag|>", not_utf8::ids,
+     "\xee\xb8\x80"},
 };
+// The text as the family's decode gives it back: without what it drops.
+static std::string given_back(const family& f, std::string s) {
+  if (!f.dropped) return s;
+  const std::string d = f.dropped;
+  for (size_t p; (p = s.find(d)) != std::string::npos;) s.erase(p, d.size());
+  return s;
+}
 
 // Whether s is UTF-8: each lead byte followed by the continuation bytes it names.
 static bool utf8(const std::string& s) {
@@ -90,7 +105,8 @@ int main(int argc, char** argv) {
   const std::vector<oracle_case> cases = fam->cases();
   for (size_t c = 0; c < cases.size(); c++) {
     const auto& cs = cases[c];
-    if (fam->bpe && !utf8(cs.text)) {
+    const bool not_text = !utf8(cs.text);
+    if (not_text && fam->on_bad_utf8 == not_utf8::skip) {
       std::printf("case %zu: skipped (not UTF-8: llama.cpp reads U+FFFD, this BPE the bytes)\n", c);
       continue;
     }
@@ -98,10 +114,12 @@ int main(int argc, char** argv) {
 
     bool ids_ok = (got == cs.ids);
     std::string rt = tok.decode(got);
-    bool rt_ok = (rt == cs.text);
+    const bool rt_checked = !(not_text && fam->on_bad_utf8 == not_utf8::ids);
+    bool rt_ok = !rt_checked || rt == given_back(*fam, cs.text);
 
     if (ids_ok && rt_ok) {
-      std::printf("case %zu: PASS (%zu ids, round-trip ok)\n", c, got.size());
+      std::printf("case %zu: PASS (%zu ids, round-trip %s)\n", c, got.size(),
+                  rt_checked ? "ok" : "not checked: not UTF-8");
     } else {
       all_ok = false;
       std::printf("case %zu: FAIL%s%s\n", c, ids_ok ? "" : " [ids]",
@@ -118,7 +136,7 @@ int main(int argc, char** argv) {
       }
       if (!rt_ok)
         std::printf("  round-trip mismatch: got %zu bytes, want %zu bytes\n",
-                    rt.size(), cs.text.size());
+                    rt.size(), given_back(*fam, cs.text).size());
     }
   }
 

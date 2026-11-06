@@ -53,6 +53,33 @@ CASES = [
 ]
 
 
+# A family's own cases, after CASES: what its tokenizer does that no other's does.
+EXTRA = {
+    # PLaMo 3: hard cuts around <|plamo:NAME|> (64 code points at most, no '|' or
+    # white space in NAME), runs of 4+ of one character (not newlines) and 2+
+    # spaces, and U+EE00, a cut that is dropped; its translation prompt.
+    "plamo3": [
+        "helloooo and hellooo, aaaa bbbbbbbb, ----====, 😀😀😀😀😀",
+        "two  spaces, three   spaces, tabs\t\t\t\t and newlines\n\n\n\n\nend",
+        "<|plamo:msg|>known<|plamo:foo|>unknown<|plamo:a b|>space<|plamo:|>empty<|plamo:x|y|>bar",
+        "<|plamo:" + "n" * 64 + "|>sixty-four <|plamo:" + "n" * 65 + "|>sixty-five",
+        "mark\uee00in\uee00\uee00the middle\uee00",
+        "\ufeffbyte order mark first",
+        # White space ends a marker's NAME as Python's \\s has it (U+001C-001F too).
+        "<|plamo:a\x1cb|>, <|plamo:a\u3000b|>, <|plamo:a\u00a0b|>",
+        # A character that is only ever inside longer pieces: its bytes win at a
+        # position where a piece starts (PFN's fallback is a candidate everywhere).
+        "\u05d9\u05e8\u05d9 \u05d9\u05d3\u05d9",
+        "<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input"
+        "<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>The weather in Tokyo is sunny today."
+        "<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>ja<|plamo:msg|>",
+        "<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input"
+        "<|plamo:key|>lang<|plamo:val|>ja<|plamo:msg|>今日の東京は晴れです。"
+        "<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>en<|plamo:msg|>",
+    ],
+}
+
+
 def raw(text):
     return text if isinstance(text, bytes) else text.encode("utf-8")
 
@@ -87,7 +114,7 @@ def main():
     print(f"namespace tokoracle_{name} {{")
     print("struct Case { std::string text; std::vector<int> ids; };")
     print("inline std::vector<Case> cases() { return {")
-    for text in CASES:
+    for text in CASES + EXTRA.get(name, []):
         ids = tokenize(exe, model, text)
         print(f'  {{ {cpp_string(text)}, {{{",".join(map(str, ids))}}} }},')
     print("};}\n}")
