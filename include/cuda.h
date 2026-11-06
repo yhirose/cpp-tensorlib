@@ -334,10 +334,12 @@ struct context {
   // recording a CUDA graph, then restored — so no launcher needs a stream arg.
   CUstream stream = nullptr;
   CUstream cap_stream = nullptr;  // dedicated capture stream (created on demand)
-  // Diagnostic knob: when true, gemv_run_ forces gy=1 and gemm_bf16_nt one K
-  // slice (no split-K, so no MemsetD8Async + atomicAdd combine): the A/B of the
-  // split-K path at the small Qwen shapes, and bit-reproducible runs
-  // (tensorlib_dump_logits `fixed`). Default off.
+  // Diagnostic knob: when true, gemv_run_ forces gy=1, and gemm_bf16_nt and the
+  // f32 GEMM (sgemm_splitk_) one K slice (no split-K, so no MemsetD8Async +
+  // atomicAdd combine): the A/B of the split-K path at the small Qwen shapes, and
+  // bit-reproducible runs (tensorlib_dump_logits `fixed`, check_qwen's f16
+  // overflow retry). Those three are every split-K this backend adds with
+  // atomics. Default off.
   bool no_splitk = false;
   std::unordered_map<int, CUfunction> fns;
 
@@ -1217,9 +1219,9 @@ inline const sgemm_tile& sgemm_tile_(int64_t m, int64_t n, int64_t k,
   return sgemm_tiles[big ? 1 : 0];
 }
 
-// Diagnostic knob: the GEMV and the bf16 GEMM skip split-K (whose slices add
-// into the output with atomics, in no fixed order), so a run's numbers are the
-// same bytes every time. See context::no_splitk.
+// Diagnostic knob: the GEMV, the bf16 GEMM and the f32 GEMM skip split-K (whose
+// slices add into the output with atomics, in no fixed order), so a run's
+// numbers are the same bytes every time. See context::no_splitk.
 inline void set_no_splitk(bool v) { context::get().no_splitk = v; }
 inline bool pending() { return context::get().pending; }
 
@@ -1713,6 +1715,7 @@ struct sgemm_splitk {
   unsigned S, chunk;
 };
 inline sgemm_splitk sgemm_splitk_(long base_blocks, unsigned k, const sgemm_tile& t) {
+  if (context::get().no_splitk) return {1, k};
   auto by_chunk = [k](unsigned chunk) -> sgemm_splitk {
     if (chunk >= k) return {1, k};
     return {(k + chunk - 1) / chunk, chunk};

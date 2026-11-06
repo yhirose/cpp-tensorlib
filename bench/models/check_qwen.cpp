@@ -126,14 +126,26 @@ static std::vector<float> imperative_prompt(qm::Model& M, const std::vector<int>
   return logits_of(M);
 }
 
+// Sums whose order is fixed run to run, or not. CUDA's split-K adds its K
+// slices into the output with atomics, in no fixed order, and set_no_splitk
+// turns it off; the other backends have no such sums.
+static void fixed_sums(bool on) {
+#ifdef TENSORLIB_CUDA
+  tl::cuda::set_no_splitk(on);
+#else
+  (void)on;
+#endif
+}
+
 // The batched prefill's f16 sums (the default where the backend has them),
 // against `ref`, an f32 forward's logits for the same prompt: the top-5
 // logits to 2e-2 and the same greedy token. Then the safety net: with the
 // first layer's FFN norm scaled by 1e5 the f16 sums overflow (the MLP's input
 // passes f16's range), and the prompt must be redone once, exactly, from the
-// state it started at — an exact prefill of the same model, to the lm_head's
-// split-K rounding (its atomic sums land in any order; a missed restore would
-// be off by far more).
+// state it started at: an exact prefill of the same model, both with their
+// sums in a fixed order (fixed_sums). Split-K's atomics would move them apart
+// by their own rounding, which Gemma 4 E2B grows to 2e-3 to 6e-3; a missed
+// restore is off by far more.
 static bool check_f16_sums(qm::Model& B, const std::vector<int>& ids,
                            const std::vector<float>& ref) {
   const bool was = B.f16_acc;
@@ -153,12 +165,14 @@ static bool check_f16_sums(qm::Model& B, const std::vector<int>& ids,
   B.layers[0].fn = (fn * 1e5f).clone();
   B.layers[0].fn.eval();
   const int64_t retries = B.f16_retries;
+  fixed_sums(true);
   qm::reset_cache(B);
   qm::prefill_batched(B, ids);
   const std::vector<float> redone = logits_of(B);
   qm::reset_cache(B);
   qm::prefill_batched(B, ids, qm::PREFILL_CHUNK, /*exact=*/true);
   const std::vector<float> f32 = logits_of(B);
+  fixed_sums(false);
   B.layers[0].fn = fn;
   B.f16_acc = was;
   // Both finite first: a NaN compares unequal to nothing, so it would pass
