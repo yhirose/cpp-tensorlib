@@ -2936,7 +2936,7 @@ __global__ void tl_gemv_q6k_row(const float* __restrict__ a, const unsigned char
   gemv_row_block_store(acc, lane, warp, nwarps, y + n);
 }
 
-// Warp-per-row bf16 GEMV (M9 decode lever A): weights in [N,K] (K contiguous per
+// Warp-per-row bf16 (and f32) GEMV (M9 decode lever A): weights in [N,K] (K contiguous per
 // output row = GGML-native, so the loader drops the transpose). ONE BLOCK per
 // output row n (grid.x == N); its threads split K, each lane consuming 8 bf16
 // per step via one 16-byte uint4 load — consecutive lanes read consecutive 16B,
@@ -2952,30 +2952,55 @@ __global__ void tl_gemv_q6k_row(const float* __restrict__ a, const unsigned char
 // get one block per SM instead of leaving most of the GPU idle. Requires
 // K % 8 == 0 (every transformer dim); the last partial block is handled by the
 // per-thread k0 < K guard (tail threads simply skip — no K % 256 requirement).
-TL_ALIGN(tl_gemv_bf16_row, 4, 16)  // B: 8 bf16 a uint4
-__global__ void tl_gemv_bf16_row(const float* __restrict__ a,
-                                 const __nv_bfloat16* __restrict__ B,
-                                 float* __restrict__ y, unsigned N, unsigned K) {
+}  // extern "C"
+// Eight consecutive weights of a row as f32: bf16 by one uint4, f32 by two float4s.
+__device__ __forceinline__ void gemv_row_ld8_(const __nv_bfloat16* p, float* w) {
+  const uint4 raw = *reinterpret_cast<const uint4*>(p);
+  const float2 f0 = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(raw.x));
+  const float2 f1 = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(raw.y));
+  const float2 f2 = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(raw.z));
+  const float2 f3 = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162&>(raw.w));
+  w[0] = f0.x; w[1] = f0.y; w[2] = f1.x; w[3] = f1.y;
+  w[4] = f2.x; w[5] = f2.y; w[6] = f3.x; w[7] = f3.y;
+}
+__device__ __forceinline__ void gemv_row_ld8_(const float* p, float* w) {
+  const float4 v0 = *reinterpret_cast<const float4*>(p), v1 = *reinterpret_cast<const float4*>(p + 4);
+  w[0] = v0.x; w[1] = v0.y; w[2] = v0.z; w[3] = v0.w;
+  w[4] = v1.x; w[5] = v1.y; w[6] = v1.z; w[7] = v1.w;
+}
+template <typename WT>
+__device__ void gemv_row_core(const float* __restrict__ a, const WT* __restrict__ B,
+                              float* __restrict__ y, unsigned N, unsigned K) {
   const unsigned n = blockIdx.x;
   if (n >= N) return;
   const unsigned tid = threadIdx.x;
   const unsigned lane = tid & 31u;
   const unsigned warp_id = tid >> 5;
   const unsigned nwarps = blockDim.x >> 5;
-  const __nv_bfloat16* row = B + (size_t)n * K;
+  const WT* row = B + (size_t)n * K;
   float acc = 0.0f;
   for (unsigned k0 = tid * 8u; k0 < K; k0 += blockDim.x * 8u) {
-    uint4 raw = *reinterpret_cast<const uint4*>(&row[k0]);
-    float2 f0 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.x));
-    float2 f1 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.y));
-    float2 f2 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.z));
-    float2 f3 = __bfloat1622float2(reinterpret_cast<__nv_bfloat162&>(raw.w));
-    acc += a[k0 + 0] * f0.x + a[k0 + 1] * f0.y + a[k0 + 2] * f1.x +
-           a[k0 + 3] * f1.y + a[k0 + 4] * f2.x + a[k0 + 5] * f2.y +
-           a[k0 + 6] * f3.x + a[k0 + 7] * f3.y;
+    float w[8];
+    gemv_row_ld8_(row + k0, w);
+    acc += a[k0 + 0] * w[0] + a[k0 + 1] * w[1] + a[k0 + 2] * w[2] +
+           a[k0 + 3] * w[3] + a[k0 + 4] * w[4] + a[k0 + 5] * w[5] +
+           a[k0 + 6] * w[6] + a[k0 + 7] * w[7];
   }
   gemv_row_block_store(acc, lane, warp_id, nwarps, &y[n]);
 }
+TL_ALIGN(tl_gemv_bf16_row, 4, 16)  // B: 8 bf16 a uint4
+extern "C" __global__ void tl_gemv_bf16_row(const float* __restrict__ a,
+                                             const __nv_bfloat16* __restrict__ B,
+                                             float* __restrict__ y, unsigned N, unsigned K) {
+  gemv_row_core(a, B, y, N, K);
+}
+// The same over f32 rows (gpu::gemv_f32_row: Gemma 4's per-layer embeddings).
+TL_ALIGN(tl_gemv_f32_row, 4, 16)  // B: 8 floats as two float4s
+extern "C" __global__ void tl_gemv_f32_row(const float* __restrict__ a, const float* __restrict__ B,
+                                            float* __restrict__ y, unsigned N, unsigned K) {
+  gemv_row_core(a, B, y, N, K);
+}
+extern "C" {
 
 // ---- M8 int4-weight decode GEMV: y[n] = sum_k a[k] * dequant(Wq[n,k]) ----
 // The quantized-inference heart: weights are group-symmetric int4 in [N,K]

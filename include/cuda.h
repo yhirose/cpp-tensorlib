@@ -270,6 +270,7 @@ inline const char* kernel_name_(kop op) {
     case kop::ssm_conv_: return "tl_ssm_conv";
     case kop::gated_delta_: return "tl_gated_delta";
     case kop::gemv_bf16_row_: return "tl_gemv_bf16_row";
+    case kop::gemv_f32_row_: return "tl_gemv_f32_row";
     case kop::gemv_q4_: return "tl_gemv_q4";
     case kop::kv_append_: return "tl_kv_append";
     case kop::kv_append_f16_: return "tl_kv_append_f16";
