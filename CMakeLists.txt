@@ -320,7 +320,8 @@ add_test(NAME llm_block COMMAND tensorlib_check_llm_block)
 #   chat_qwen:   own GGUF loader + own BPE tokenizer -> prompt in, text out.
 #   dump_logits: every forward path's logits on fixed prompts, to compare a change's
 #                before and after byte for byte.
-foreach(qwen_target check_qwen chat_qwen dump_logits)
+#   translate:   PLaMo 3 Translate, text on stdin translated to stdout.
+foreach(qwen_target check_qwen chat_qwen dump_logits translate)
   add_executable(tensorlib_${qwen_target} bench/models/${qwen_target}.cpp)
   target_include_directories(tensorlib_${qwen_target} BEFORE PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench/models)
@@ -341,6 +342,7 @@ if(TENSORLIB_CUDA)
   tensorlib_enable_cuda(tensorlib_check_qwen)
   tensorlib_enable_cuda(tensorlib_chat_qwen)
   tensorlib_enable_cuda(tensorlib_dump_logits)
+  tensorlib_enable_cuda(tensorlib_translate)
 endif()
 
 # Own CPU GEMM bench (M5 tuning). Links OpenBLAS for the off-Apple gate when
