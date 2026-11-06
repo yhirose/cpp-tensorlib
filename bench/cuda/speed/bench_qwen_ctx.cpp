@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
   // (a MemFree sync + realloc) as S steps up across ctx 256..max, and those
   // reallocs would otherwise land inside timed tokens of the imperative curve.
   qm::set_cache_pos(M, max_ctx);
-  M.layers[0].cache.attn(M.scratch.qb.device_span(), M.scratch.ab.device_span(), C.NH, C.scale());
+  M.layers[0].cache.attn(M.scratch.qb.device_span(), M.scratch.ab.device_span(), C.NH, C.scale(0));
   cu::flush();
 
   // ---- 1. per-position decode curve.
@@ -136,9 +136,9 @@ int main(int argc, char** argv) {
     // attn() reads ctx = pos; attn_dpos() reads ctx = *d_pos + 1. Same ctx.
     cu::upload_u32(d_pos, (unsigned)(ctx - 1));
     auto& L0 = M.layers[0];
-    L0.cache.attn(M.scratch.qb.device_span(), {refb, 0}, C.NH, C.scale());
+    L0.cache.attn(M.scratch.qb.device_span(), {refb, 0}, C.NH, C.scale(0));
     cu::sync_to_host(refb, false);
-    L0.cache.attn_dpos(M.scratch.qb.device_span(), {gotb, 0}, C.NH, {d_pos, 0}, C.scale());
+    L0.cache.attn_dpos(M.scratch.qb.device_span(), {gotb, 0}, C.NH, {d_pos, 0}, C.scale(0));
     cu::sync_to_host(gotb, false);
     bool bit_eq = std::memcmp(ref_host, got_host, C.NH * C.HD * 4) == 0;
     auto time_24x = [&](auto&& attn1) {  // REPS x 24-layer attn -> ms per rep
@@ -149,10 +149,10 @@ int main(int argc, char** argv) {
       return (now_ms() - t) / REPS;
     };
     auto host1 = [&](qm::Layer& L) {
-      L.cache.attn(M.scratch.qb.device_span(), M.scratch.ab.device_span(), C.NH, C.scale());
+      L.cache.attn(M.scratch.qb.device_span(), M.scratch.ab.device_span(), C.NH, C.scale(0));
     };
     auto dpos1 = [&](qm::Layer& L) {
-      L.cache.attn_dpos(M.scratch.qb.device_span(), M.scratch.ab.device_span(), C.NH, {d_pos, 0}, C.scale());
+      L.cache.attn_dpos(M.scratch.qb.device_span(), M.scratch.ab.device_span(), C.NH, {d_pos, 0}, C.scale(0));
     };
     double host_ms = 1e30, dpos_ms = 1e30;
     for (int r = 0; r < 3; r++) {  // min of 3, host/dpos interleaved (WSL2 noise)

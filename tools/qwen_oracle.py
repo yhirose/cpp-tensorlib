@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Tight numpy oracle for bench/models/check_qwen.cpp (Qwen2.5, Qwen3, Qwen3.5, Gemma 3, Llama 3.2).
+"""Tight numpy oracle for bench/models/check_qwen.cpp (Qwen2.5, Qwen3, Qwen3.5, Gemma 3, Llama 3.2,
+PLaMo 3).
 
 Reads a Qwen2.5 / Qwen3 / Qwen3.5 F16 (or BF16) GGUF with its own minimal parser and runs the decoder
 in float32 numpy on the SAME weights the C++ loads, so the two must agree to
@@ -20,7 +21,21 @@ on the file's rows, where the C++ reads them back in the model's order and turns
 halves (qwen.h's wpart::norm_hd): two independent routes to the same numbers.
 Llama 3's rope_freqs.weight divides the pairs' angles, as llama.cpp's freq factors.
 
+PLaMo 3 (its Translate models) as PFN's modeling_plamo.py: q|k|v in one tensor and
+gate|up in one, post norms (their offsets already in the GGUF's weights), a
+sliding window on 7 layers of 8, and YaRN on the global ones, unrounded
+(truncate false): the pairs' frequencies blended toward 1/factor, cos and sin
+times 0.1 ln(factor) + 1. Its prompt is a translation (PFML3) of LONG_USER, four
+times over: 2,542 tokens, past the 2048-position window.
+
+The forward takes a run of tokens at once (the prompt, then one a step): each
+weight is read once a run, so a model whose f32 copy is not kept (the 2B's 10.7
+GB) dequantizes it once for the prompt rather than once a token. Qwen3.5's
+DeltaNet layers still go token by token within the run.
+
   python3 -I tools/qwen_oracle.py MODEL.gguf NAMESPACE [LLAMA_TOKENIZE] > bench/models/X_oracle_data.h
+
+(PLaMo 3 needs LLAMA_TOKENIZE: its prompt is text.)
 
 The prompt is fixed token ids (the chat template around one user sentence), so
 no tokenizer is involved; Qwen2.5 and Qwen3 differ only in the system prompt.
@@ -170,18 +185,33 @@ def rmsnorm(x, w, eps):
     return x / np.sqrt((x * x).mean(-1, keepdims=True) + eps) * w
 
 
-def rope(x, pos, base, rot=None, factors=None, norm=False):
-    """x [H, D]: its first `rot` dims turn as pairs (j, j + rot/2), or with `norm`
-    (llama.cpp's NORM) (2j, 2j + 1), by pos * base^(-2j/rot) / factors[j]."""
+def rope(x, pos, base, rot=None, factors=None, norm=False, mscale=1.0):
+    """x [T, H, D], token t at position pos[t]: its first `rot` dims turn as pairs
+    (j, j + rot/2), or with `norm` (llama.cpp's NORM) (2j, 2j + 1), by
+    pos * base^(-2j/rot) / factors[j], cos and sin times mscale (YaRN's)."""
     rot = rot or x.shape[-1]
-    ang = pos * base ** (-np.arange(0, rot, 2, dtype=np.float64) / rot)
+    ang = np.asarray(pos, np.float64)[:, None] * base ** (-np.arange(0, rot, 2, dtype=np.float64) / rot)
     if factors is not None:
         ang = ang / factors.astype(np.float64)
-    c, s = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    c = (np.cos(ang) * mscale).astype(np.float32)[:, None, :]
+    s = (np.sin(ang) * mscale).astype(np.float32)[:, None, :]
     ia, ib = (slice(0, rot, 2), slice(1, rot, 2)) if norm else (slice(0, rot // 2), slice(rot // 2, rot))
     a, b, out = x[..., ia], x[..., ib], x.copy()
     out[..., ia], out[..., ib] = a * c - b * s, a * s + b * c
     return out
+
+
+def yarn_divisors(base, rot, factor, orig_ctx, beta_fast, beta_slow, truncate):
+    """YaRN's pair divisors, as PFN's RotaryEmbedding._compute_buffers (and HF's
+    _compute_yarn_parameters): pair j's frequency times g_j = ramp_j / factor +
+    (1 - ramp_j), ramp_j rising from 0 at `low` to 1 at `high`."""
+    dim = lambda beta: rot * math.log(orig_ctx / (beta * 2 * math.pi)) / (2 * math.log(base))
+    low, high = dim(beta_fast), dim(beta_slow)
+    if truncate:
+        low, high = math.floor(low), math.ceil(high)
+    low, high = max(low, 0), min(high, rot - 1)
+    ramp = np.clip((np.arange(rot // 2, dtype=np.float64) - low) / max(high - low, 0.001), 0, 1)
+    return 1 / (ramp / factor + (1 - ramp))
 
 
 def gelu(x):  # tanh form: ggml's, and PyTorch's approximate='tanh'
@@ -225,15 +255,16 @@ class Model:
             self.ssm_conv = g("ssm.conv_kernel")
             self.conv_state = [None] * self.nl  # [conv-1, C] last inputs
             self.state = [None] * self.nl       # [heads, dk, dv]
-        # RoPE: a linear scaling on the global layers; Gemma 3's local layers
-        # (sliding window) turn at their own base, unscaled. As llama.cpp
-        # (src/models/gemma3.cpp, load_swa_pattern); see qwen.h's Config.
-        linear = kv.get(f"{arch}.rope.scaling.type") == "linear"
-        self.scale = 1 / g("rope.scaling.factor") if linear else 1.0
+        # RoPE: a linear scaling (Gemma 3) or YaRN (PLaMo 3) on the global layers;
+        # the local layers (sliding window) turn at their own base, unscaled. As
+        # llama.cpp (src/models/gemma3.cpp and plamo3.cpp, load_swa_pattern with
+        # their default patterns, 6 and 8); see qwen.h's Config.
+        scaling = kv.get(f"{arch}.rope.scaling.type", "none")
+        self.scale = 1 / g("rope.scaling.factor") if scaling == "linear" else 1.0
         self.local = [False] * self.nl
-        self.window = kv.get(f"{arch}.attention.sliding_window", 0) if arch == "gemma3" else 0
+        self.window = kv.get(f"{arch}.attention.sliding_window", 0)
         if self.window > 0:
-            pat = kv.get(f"{arch}.attention.sliding_window_pattern", 6)
+            pat = kv.get(f"{arch}.attention.sliding_window_pattern", 8 if arch == "plamo3" else 6)
             self.local = ([bool(b) for b in pat] if isinstance(pat, list)
                           else [pat == 0 or l % pat < pat - 1 for l in range(self.nl)])
             self.base_local = kv.get(f"{arch}.rope.freq_base_swa", 10000.0)
@@ -241,8 +272,16 @@ class Model:
         # global layers (llama.cpp's LLM_ARCH_LLAMA; qwen.h's rope_of).
         self.norm = arch == "llama"
         self.factors = self.t.get("rope_freqs.weight")
-        self.k = [[] for _ in range(self.nl)]
-        self.v = [[] for _ in range(self.nl)]
+        self.mscale = 1.0
+        if scaling == "yarn":  # PLaMo 3
+            factor = g("rope.scaling.factor")
+            self.factors = yarn_divisors(self.base, self.rot, factor, g("rope.scaling.original_context_length"),
+                                         kv.get(f"{arch}.rope.scaling.yarn_beta_fast", 32.0),
+                                         kv.get(f"{arch}.rope.scaling.yarn_beta_slow", 1.0),
+                                         bool(kv.get(f"{arch}.rope.scaling.yarn_truncate", True)))
+            self.mscale = 0.1 * math.log(factor) + 1
+        self.k = [np.zeros((0, self.nkv, self.hd), np.float32) for _ in range(self.nl)]
+        self.v = [np.zeros((0, self.nkv, self.hd), np.float32) for _ in range(self.nl)]
         self.lm = self.t.get("output.weight", self.t["token_embd.weight"])
 
     def is_delta(self, l):
@@ -273,71 +312,103 @@ class Model:
         o = rmsnorm(o, t[p + "ssm_norm.weight"], self.eps) * silu(z)
         return o.reshape(-1) @ t[p + "ssm_out.weight"].T
 
+    def w(self, p, base):
+        """A layer tensor, named with .weight or bare (PLaMo 3's post norms); None if neither."""
+        for n in (p + base + ".weight", p + base):
+            if n in self.t:
+                return self.t[n]
+        return None
+
     def layer(self, l, x, pos):
-        t, p = self.t, f"blk.{l}."
-        h = rmsnorm(x, t[p + "attn_norm.weight"], self.eps)
+        """x [T, NE], token t at position pos[t]. The mixer's run-long temporaries
+        (scores [T, ctx] a head) are gone before the MLP's weights are read."""
+        h = rmsnorm(x, self.t[f"blk.{l}.attn_norm.weight"], self.eps)
         if self.is_delta(l):
-            x = x + self.delta(l, h)
-            return self.mlp(l, x)
-        q, k, v = (h @ t[p + n + ".weight"].T for n in ("attn_q", "attn_k", "attn_v"))
+            x = x + np.stack([self.delta(l, r) for r in h])
+        else:
+            x = x + self.attn(l, h, pos)
+        del h
+        return self.mlp(l, x)
+
+    def attn(self, l, h, pos):
+        t, p = self.t, f"blk.{l}."
+        T, Q, KV = len(h), self.nh * self.hd, self.nkv * self.hd
+        if p + "attn_qkv.weight" in t:  # PLaMo 3: q|k|v in one
+            qkv = h @ t[p + "attn_qkv.weight"].T
+            q, k, v = qkv[:, :Q], qkv[:, Q:Q + KV], qkv[:, Q + KV:]
+        else:
+            q, k, v = (h @ t[p + n + ".weight"].T for n in ("attn_q", "attn_k", "attn_v"))
         gate = None
         if self.arch == "qwen35":  # q|gate interleaved per head
-            q = q.reshape(self.nh, 2 * self.hd)
-            q, gate = q[:, : self.hd], q[:, self.hd:]
-            q = q.reshape(-1)
+            q = q.reshape(T, self.nh, 2 * self.hd)
+            q, gate = q[..., : self.hd].reshape(T, Q), q[..., self.hd:].reshape(T, Q)
         if p + "attn_q.bias" in t:
             q, k, v = q + t[p + "attn_q.bias"], k + t[p + "attn_k.bias"], v + t[p + "attn_v.bias"]
-        q, k, v = q.reshape(self.nh, self.hd), k.reshape(self.nkv, self.hd), v.reshape(self.nkv, self.hd)
-        if p + "attn_q_norm.weight" in t:  # Qwen3: per-head q/k RMSNorm before rope
+        q, k, v = q.reshape(T, self.nh, self.hd), k.reshape(T, self.nkv, self.hd), v.reshape(T, self.nkv, self.hd)
+        if p + "attn_q_norm.weight" in t:  # Qwen3, PLaMo 3: per-head q/k RMSNorm before rope
             q = rmsnorm(q, t[p + "attn_q_norm.weight"], self.eps)
             k = rmsnorm(k, t[p + "attn_k_norm.weight"], self.eps)
-        base, p_, f = ((self.base_local, pos, None) if self.local[l]
-                       else (self.base, pos * self.scale, self.factors))
-        q, k = (rope(y, p_, base, self.rot, f, self.norm) for y in (q, k))
-        self.k[l].append(k)
-        self.v[l].append(v)
-        # A local layer reads the last `window` positions, this one the last of them
-        # (llama.cpp's is_masked_swa; gpu::attn_window_lo).
-        lo = max(0, pos + 1 - self.window) if self.local[l] else 0
-        K, V = np.stack(self.k[l][lo:], 1), np.stack(self.v[l][lo:], 1)  # [kv, T, D]
+        base, p_, f, ms = ((self.base_local, pos, None, 1.0) if self.local[l]
+                           else (self.base, pos * self.scale, self.factors, self.mscale))
+        q, k = (rope(y, p_, base, self.rot, f, self.norm, ms) for y in (q, k))
+        self.k[l] = np.concatenate([self.k[l], k])
+        self.v[l] = np.concatenate([self.v[l], v])
+        K, V = self.k[l], self.v[l]  # [ctx, kv, D], position = row
+        # Causal, and a local layer reads the last `window` positions, this one the
+        # last of them (llama.cpp's is_masked_swa; gpu::attn_window_lo).
+        kp = np.arange(len(K))[None, :]
+        live = kp <= pos[:, None]
+        if self.local[l]:
+            live &= kp > pos[:, None] - self.window
         g = self.nh // self.nkv
         out = np.empty_like(q)
         for hh in range(self.nh):
-            s = K[hh // g] @ q[hh] / math.sqrt(self.hd)
-            e = np.exp(s - s.max())
-            out[hh] = (e / e.sum()) @ V[hh // g]
+            sc = np.where(live, q[:, hh] @ K[:, hh // g].T / np.float32(math.sqrt(self.hd)), -np.inf)
+            e = np.exp(sc - sc.max(-1, keepdims=True))
+            out[:, hh] = (e / e.sum(-1, keepdims=True)) @ V[:, hh // g]
+        out = out.reshape(T, Q)
         if gate is not None:
             out = out * sigmoid(gate)
-        o = out.reshape(-1) @ t[p + "attn_output.weight"].T
-        if p + "post_ffw_norm.weight" in t:  # Gemma 3: a norm after the attention too
-            o = rmsnorm(o, t[p + "post_attention_norm.weight"], self.eps)
-        return self.mlp(l, x + o)
+        o = out @ t[p + "attn_output.weight"].T
+        if self.w(p, "post_ffw_norm") is not None:  # Gemma 3, PLaMo 3: a norm after the attention too
+            o = rmsnorm(o, self.w(p, "post_attention_norm"), self.eps)
+        return o
 
     def mlp(self, l, x):
         t, p = self.t, f"blk.{l}."
         # Qwen3.5 names the pre-FFN norm post_attention_norm.
-        n = p + ("ffn_norm.weight" if p + "ffn_norm.weight" in t else "post_attention_norm.weight")
-        h2 = rmsnorm(x, t[n], self.eps)
-        gt, up = h2 @ t[p + "ffn_gate.weight"].T, h2 @ t[p + "ffn_up.weight"].T
-        o = ((gelu if self.arch == "gemma3" else silu)(gt) * up) @ t[p + "ffn_down.weight"].T
-        if p + "post_ffw_norm.weight" in t:  # Gemma 3
-            o = rmsnorm(o, t[p + "post_ffw_norm.weight"], self.eps)
+        w = self.w(p, "ffn_norm")
+        h2 = rmsnorm(x, w if w is not None else self.w(p, "post_attention_norm"), self.eps)
+        if p + "ffn_gate.weight" in t:
+            gt, up = h2 @ t[p + "ffn_gate.weight"].T, h2 @ t[p + "ffn_up.weight"].T
+        else:  # PLaMo 3: gate|up in one
+            gt, up = np.split(h2 @ t[p + "ffn_up.weight"].T, 2, axis=-1)
+        del h2
+        a = (gelu if self.arch == "gemma3" else silu)(gt) * up
+        del gt, up  # the [T, 2 FF] product, before ffn_down is dequantized
+        o = a @ t[p + "ffn_down.weight"].T
+        post = self.w(p, "post_ffw_norm")
+        if post is not None:  # Gemma 3, PLaMo 3
+            o = rmsnorm(o, post, self.eps)
         return x + o
 
-    def step(self, tok, pos, logits=True):
-        x = self.t["token_embd.weight"][tok]
-        emb, l0 = x.copy(), None
+    def run(self, toks, pos0):
+        """The tokens at pos0.. through the model: the last one's embedding, layer-0
+        residual, final norm and logits."""
+        x = self.t["token_embd.weight"][np.asarray(toks)]
+        emb, l0 = x[-1].copy(), None
         if self.arch == "gemma3":
             x = x * np.float32(np.sqrt(np.float32(self.ne)))
+        pos = pos0 + np.arange(len(toks))
         for l in range(self.nl):
             x = self.layer(l, x, pos)
             if l == 0:
-                l0 = x.copy()
+                l0 = x[-1].copy()
         # float32 throughout: under numpy 2 a numpy float64 scalar (np.sqrt(2 / np.pi))
         # times a float32 array is float64, and every GEMV after it widens its weights.
         assert x.dtype == np.float32, x.dtype
-        fn = rmsnorm(x, self.t["output_norm.weight"], self.eps)
-        return emb, l0, fn, fn @ self.lm.T if logits else None
+        fn = rmsnorm(x[-1], self.t["output_norm.weight"], self.eps)
+        return emb, l0, fn, fn @ self.lm.T
 
 
 def arr(name, ctype, a):
@@ -348,9 +419,16 @@ def arr(name, ctype, a):
 
 def main():
     path, ns = sys.argv[1], sys.argv[2]
+    if load_gguf(path, read=False)[0]["general.architecture"] == "plamo3" and len(sys.argv) < 4:
+        sys.exit("plamo3: its prompt is text, so LLAMA_TOKENIZE is needed")  # before the model loads
     m = Model(path)
-    long = tokenize(sys.argv[3], path, LONG_USER) if len(sys.argv) > 3 else None
-    if m.arch == "gemma3":  # <bos><start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n
+    long = tokenize(sys.argv[3], path, LONG_USER) if len(sys.argv) > 3 and m.arch != "plamo3" else None
+    if m.arch == "plamo3":  # a translation into Japanese (PFML3, the GGUF's chat template)
+        pfml = ("<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>input<|plamo:key|>lang"
+                "<|plamo:val|>en<|plamo:msg|>" + "\n\n".join([LONG_USER] * 4) +
+                "<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>ja<|plamo:msg|>")
+        prompt = tokenize(sys.argv[3], path, pfml)
+    elif m.arch == "gemma3":  # <bos><start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n
         prompt = [2, 105, 2364, 107] + (long or GEMMA_USER) + [106, 107, 105, 4368, 107]
     elif m.arch == "llama":  # <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n...
         prompt = [128000, 128006, 882, 128007, 271] + (long or LLAMA_USER) + [128009, 128006, 78191, 128007, 271]
@@ -361,27 +439,25 @@ def main():
                   [151645, 198, 151644, 77091, 198])
     total, t0 = len(prompt) + N_GREEDY, time.perf_counter()
 
-    def step(tok, pos, logits=True):  # a run takes minutes: its progress on stderr
-        out = m.step(tok, pos, logits)
-        if pos == 0 or (pos + 1) % 25 == 0 or pos + 1 == total:
-            print(f"{pos + 1}/{total} tokens, {time.perf_counter() - t0:.0f} s", file=sys.stderr, flush=True)
+    def run(toks, pos):  # a run takes minutes: its progress on stderr
+        out = m.run(toks, pos)
+        print(f"{pos + len(toks)}/{total} tokens, {time.perf_counter() - t0:.0f} s", file=sys.stderr, flush=True)
         return out
 
-    pos = 0
-    for tok in prompt:  # the logits of the last prompt token only (the lm head is the largest read)
-        emb, l0, fn, logits = step(tok, pos, pos == len(prompt) - 1)
-        pos += 1
+    emb, l0, fn, logits = run(prompt, 0)
+    pos = len(prompt)
     top5 = np.argsort(-logits)[:5]
     greedy, nxt = [], int(np.argmax(logits))
     for _ in range(N_GREEDY):
         greedy.append(nxt)
-        nxt = int(np.argmax(step(nxt, pos)[3]))
+        nxt = int(np.argmax(run([nxt], pos)[3]))
         pos += 1
     print("#pragma once")
     print(f"// Generated by tools/qwen_oracle.py from {path.split('/')[-1]} ({m.arch}); do not edit.")
     print("// numpy float32 forward on the SAME weights (F16, or blocks dequantized exactly); C++ must")
-    print(f"// match to ~1e-4 + greedy exactly. Prompt: {len(prompt)} tokens"
-          f"{' (LONG_USER, tokenized by llama-tokenize)' if long else ''}.")
+    how = (" (a PFML3 translation of LONG_USER four times over, tokenized by llama-tokenize)" if m.arch == "plamo3"
+           else " (LONG_USER, tokenized by llama-tokenize)" if long else "")
+    print(f"// match to ~1e-4 + greedy exactly. Prompt: {len(prompt)} tokens{how}.")
     print(f"namespace {ns} {{")
     print(arr("emb_last", "float", emb))
     print(arr("l0_last", "float", l0))

@@ -297,13 +297,13 @@ int main(int argc, char** argv) {
       c.pos = 0;
       for (int64_t i = 0; i < T; i++) {
         c.append({ks, 0}, {vs, 0});  // same row values each step; only the cost matters
-        c.attn({qs, 0}, {os, 0}, C.NH, C.scale());
+        c.attn({qs, 0}, {os, 0}, C.NH, C.scale(0));
       }
     });
     // Batched: bulk kv_fill + one causal tiled attn_prefill.
     double batched = min_ms(3, 1, [&] {
       c.pos = 0;
-      c.prefill({qs, 0}, {ks, 0}, {vs, 0}, {os, 0}, T, C.NH, C.scale());
+      c.prefill({qs, 0}, {ks, 0}, {vs, 0}, {os, 0}, T, C.NH, C.scale(0));
     });
     std::printf("  %6lld  %14.3f  %14.3f  %7.1fx\n", (long long)T, per_tok,
                 batched, per_tok / batched);

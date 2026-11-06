@@ -24,6 +24,8 @@
 #include "llama32_1b_q40_oracle_data.h"
 #include "llama32_1b_q4_oracle_data.h"
 #include "llama32_3b_oracle_data.h"
+#include "plamo3_08b_oracle_data.h"
+#include "plamo3_2b_oracle_data.h"
 #include "qwen.h"
 #include "qwen35_oracle_data.h"
 #include "qwen35_q4_oracle_data.h"
@@ -524,7 +526,10 @@ int main(int argc, char** argv) {
       {"llama", 16, 2048, TL_ORACLE(llama32_1boracle, 0)},                     // Llama 3.2 1B, F16
       {"llama", 16, 2048, TL_ORACLE(llama32_1b_q4oracle, 0x00f056cb14a01068ull)},  // 1B Q4_K_M
       {"llama", 16, 2048, TL_ORACLE(llama32_1b_q40oracle, 0xc82864007acd8011ull)},  // 1B Q4_0
-      {"llama", 28, 3072, TL_ORACLE(llama32_3boracle, 0x398103f1bd23c54bull)}};    // 3B Q4_K_M
+      {"llama", 28, 3072, TL_ORACLE(llama32_3boracle, 0x398103f1bd23c54bull)},     // 3B Q4_K_M
+      // pfnet/plamo-3-translate-{0.8b,2b}-GGUF's Q4_K_M: a translation past their 2048 window
+      {"plamo3", 16, 1536, TL_ORACLE(plamo3_08b_oracle, 0x335382c3619c87caull)},  // 0.8B
+      {"plamo3", 24, 2560, TL_ORACLE(plamo3_2b_oracle, 0x3a71c1c9190a2585ull)}};   // 2B
   // The oracle for the model's shape; of several (a float file's and quantized ones'),
   // the one that read this file's weights, else the first.
   const Oracle* found = nullptr;

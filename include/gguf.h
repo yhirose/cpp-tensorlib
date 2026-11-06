@@ -61,6 +61,7 @@ struct metadata_value {
   uint32_t as_u32() const { need(val_type::u32); return static_cast<uint32_t>(u); }
   int32_t as_i32() const { need(val_type::i32); return static_cast<int32_t>(i); }
   float as_f32() const { need(val_type::f32); return static_cast<float>(f); }
+  bool as_bool() const { need(val_type::boolean); return u != 0; }
   uint64_t as_u64() const { need(val_type::u64); return u; }
   const std::string& as_str() const { need(val_type::string); return s; }
 

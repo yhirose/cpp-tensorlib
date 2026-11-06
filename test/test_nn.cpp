@@ -221,6 +221,33 @@ TEST_CASE("rope turns by libm's cos and sin at large positions") {
   }
 }
 
+TEST_CASE("yarn: the pairs' divisors and the scores' scale, rounded outward or not") {
+  // PLaMo 3's global layers: base 1e6, 128 dims, factor 256 over 4096 positions.
+  // Unrounded, the blend runs from pair 13.96 to 30.02 (PFN's RotaryEmbedding);
+  // rounded, from 13 to 31 (ggml's default). Expected values: the formula in
+  // float64 (HF's float32 is 1.1e-5 off at pair 30, where the blend's last step
+  // divides by a small sum).
+  struct pair_value {
+    size_t j;
+    float unrounded, rounded;
+  };
+  const pair_value want[] = {{0, 1.0f, 1.0f},           {13, 1.0f, 1.0f},
+                             {14, 1.0023016f, 1.0585803f}, {20, 1.5988576f, 1.6323061f},
+                             {30, 199.27819f, 16.879121f}, {31, 256.0f, 256.0f},
+                             {63, 256.0f, 256.0f}};
+  for (bool truncate : {false, true}) {
+    const tl::gpu::yarn y{256.0f, 4096, 32.0f, 1.0f, truncate};
+    const std::vector<float> d = y.divisors(1e6f, 128);
+    REQUIRE(d.size() == 64);
+    for (const auto& w : want) {
+      INFO("truncate " << truncate << ", pair " << w.j);
+      const float v = truncate ? w.rounded : w.unrounded;
+      CHECK(std::fabs(d[w.j] - v) <= 1e-5f * v);
+    }
+  }
+  CHECK(std::fabs(tl::gpu::yarn{256.0f, 4096}.mscale() - 1.5545177f) <= 1e-6f);
+}
+
 TEST_CASE("layer_norm matches its composition, across the pool and on the GPU") {
   // The nine-op composition the fused node replaces.
   auto composed = [](const array& x, const array& g, const array& b) {

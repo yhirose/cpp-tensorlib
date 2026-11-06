@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 #include "gpu_abi_nn.h"
 #include "gpu_ops.h"
@@ -59,6 +60,40 @@ inline bool layer_norm_bwd(span x, span g, span dy, span dx, span dg, span db,
     return false;
   }
 }
+
+// YaRN (a GGUF's rope.scaling.type "yarn") as rope_freq's factors and a scale of
+// the attention's scores, as ggml's rope_yarn, HF's _compute_yarn_parameters and
+// PLaMo 3's RotaryEmbedding have it. Pair j keeps its frequency below the pair
+// `low`, is slowed `factor` times above `high`, and between them blends the two
+// linearly; low and high are the pairs that turn beta_fast and beta_slow times
+// over the orig_ctx positions trained on, rounded outward where `truncate` (the
+// default of ggml and HF; PLaMo 3's says not). cos and sin are scaled by
+// mscale() on q and on k both, so the scores by its square.
+struct yarn {
+  float factor = 1.0f;
+  int64_t orig_ctx = 0;
+  float beta_fast = 32.0f, beta_slow = 1.0f;
+  bool truncate = true;
+  // rot/2 divisors of the pairs' angles (rope_freq::factors).
+  std::vector<float> divisors(float base, int64_t rot) const {
+    const double pi = 3.14159265358979323846;
+    auto pair = [&](double beta) {
+      return rot * std::log(static_cast<double>(orig_ctx) / (beta * 2 * pi)) / (2 * std::log(static_cast<double>(base)));
+    };
+    double low = pair(beta_fast), high = pair(beta_slow);
+    if (truncate) low = std::floor(low), high = std::ceil(high);
+    low = std::max(low, 0.0);
+    high = std::min(high, static_cast<double>(rot - 1));
+    std::vector<float> d(static_cast<size_t>(rot / 2));
+    for (size_t j = 0; j < d.size(); j++) {
+      const double ramp = std::clamp((static_cast<double>(j) - low) / std::max(high - low, 0.001), 0.0, 1.0);
+      d[j] = static_cast<float>(1.0 / (ramp / factor + (1.0 - ramp)));
+    }
+    return d;
+  }
+  // 1 where the positions are not stretched (HF's get_mscale; llama.cpp's nets the same).
+  float mscale() const { return factor <= 1.0f ? 1.0f : 0.1f * std::log(factor) + 1.0f; }
+};
 
 // ---- the nn ops by composition. Each fused op below is a kernel a backend may
 // have; where it does not — the shared launch declines, or `own` has no such
