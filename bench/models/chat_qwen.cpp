@@ -27,6 +27,19 @@ static double ms_since(clk::time_point t) {
 
 namespace qm = qwenmodel;
 
+// What a Gemma 4 file's chat template puts after the model's turn when it is not
+// thinking: an empty thought channel (12B's and 31B's), or nothing (E2B's). There is
+// no jinja here, so the template is read by what it contains, as llama.cpp's
+// llm_chat_detect_template tells templates apart: the channel as a string literal
+// in it, its newline escaped.
+static std::string gemma4_reply_prefix(const qm::gg::model& m) {
+  const std::string channel = "<|channel>thought\n<channel|>", key = "tokenizer.chat_template";
+  std::string literal = "'";
+  for (char ch : channel) literal += ch == '\n' ? std::string("\\n") : std::string(1, ch);
+  literal += "'";
+  return m.has(key) && m.kv(key).as_str().find(literal) != std::string::npos ? channel : "";
+}
+
 int main(int argc, char** argv) {
   if (!tl::gpu_available()) {
     std::printf("no GPU device — skipping chat\n");
@@ -67,8 +80,8 @@ int main(int argc, char** argv) {
   // front, exactly what the template's enable_thinking=false does.
   // Qwen3.5's template opens the <think> block itself. Gemma 3's opens with
   // <bos> and has no system turn; so does Gemma 4's, its turns <|turn> ... <turn|>,
-  // and without thinking (the default) E2B's adds nothing after the model's
-  // opening. Llama 3's is llama.cpp's built-in one
+  // then what its template adds without thinking (gemma4_reply_prefix). Llama 3's
+  // is llama.cpp's built-in one
   // (LLM_CHAT_TEMPLATE_LLAMA_3), opening with <|begin_of_text|>: 3.1's and 3.2's
   // own jinja adds a system turn with a knowledge cutoff and today's date, left
   // out here.
@@ -98,7 +111,7 @@ int main(int argc, char** argv) {
   if (gemma3) {
     templated = "<bos><start_of_turn>user\n" + user + "<end_of_turn>\n<start_of_turn>model\n";
   } else if (gemma4) {
-    templated = "<bos><|turn>user\n" + user + "<turn|>\n<|turn>model\n";
+    templated = "<bos><|turn>user\n" + user + "<turn|>\n<|turn>model\n" + gemma4_reply_prefix(m);
   } else if (llama) {
     templated = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n" + user +
                 "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
