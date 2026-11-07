@@ -81,7 +81,7 @@ inline graph_exec capture_end() { return nullptr; }
 inline bool graph_launch(graph_exec) { return false; }
 inline void graph_destroy(graph_exec) {}
 inline void upload_u32(void*, unsigned) {}
-inline int64_t attn_dpos_partials_bytes(int64_t, int64_t, int64_t) { return 0; }
+inline int64_t attn_dpos_partials_bytes(int64_t, int64_t, int64_t, int64_t) { return 0; }
 
 }  // namespace null_gpu
 }  // namespace tl

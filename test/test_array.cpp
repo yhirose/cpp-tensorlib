@@ -2149,18 +2149,19 @@ TEST_CASE("policy: a split measures its groups against the device's fill") {
   CHECK(split_parts(4, 511, gemv) == 1);     // too short a K
   CHECK(split_parts(0, 4096, gemv) == 1);
 
-  // CUDA's decode attention: twice the fill, 256 keys to split, 128 a part,
-  // parts in whole warps of 4.
-  constexpr split_rule attn{328, 256, 128, 4};
-  CHECK(split_parts(14, 1000, attn) == 7);   // 24 wanted, 1000 / 128 allow 7
-  CHECK(split_chunk(1000, 7, attn) == 144);  // 143 rounded up
-  CHECK((1000 + 144 - 1) / 144 == 7);
-  CHECK(split_parts(14, 255, attn) == 1);
+  // CUDA's decode attention: twice the fill over its rows (Qwen2.5 0.5B's 14
+  // q heads over 2 kv heads, two a block: 8 rows), 64 keys to split, 32 a
+  // part, parts in fours.
+  constexpr split_rule attn{328, 64, 32, 4};
+  CHECK(split_parts(8, 1000, attn) == 31);   // 41 wanted, 1000 / 32 allow 31
+  CHECK(split_chunk(1000, 31, attn) == 36);  // 33 rounded up
+  CHECK((1000 + 36 - 1) / 36 == 28);         // so 28 launch
+  CHECK(split_parts(8, 63, attn) == 1);
   CHECK(split_parts(400, 4096, attn) == 1);
-  CHECK(split_parts(14, 4096, attn) == 24);
+  CHECK(split_parts(8, 4096, attn) == 41);
   // parts never fall as k grows: the captured graph's grid is sized at max_ctx
   for (int64_t ctx = 1; ctx < 4096; ctx++) {
-    CHECK(split_parts(14, ctx, attn) <= split_parts(14, ctx + 1, attn));
+    CHECK(split_parts(8, ctx, attn) <= split_parts(8, ctx + 1, attn));
   }
 
   // CUDA's bf16 GEMM: four times the fill, slices at least 448 deep in

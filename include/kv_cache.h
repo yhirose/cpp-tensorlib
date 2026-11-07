@@ -117,7 +117,7 @@ struct kv_cache {
                  gpu::span d_pos, float scale) {
     if (!dpos_partials.native) {
       const int64_t bytes =
-          gpu::attn_dpos_partials_bytes(n_q_heads, max_ctx, D);
+          gpu::attn_dpos_partials_bytes(n_q_heads, n_kv_heads, max_ctx, D);
       if (bytes <= 0) return false;
       dpos_partials = storage::make(bytes / 4);
       if (!dpos_partials.native) return false;

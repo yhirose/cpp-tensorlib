@@ -170,7 +170,7 @@ inline bool own_llm::kv_append_dpos(gpu::span Kc, gpu::span Vc, gpu::span k_new,
 }
 
 // Decode attention with ctx = *d_pos + 1, split-KV on a capacity-static grid:
-// gridDim.y = S_max = attn_split_count(H, max_ctx), a constant for the cache's
+// gridDim.y = S_max = attn_split_count(rows, max_ctx), a constant for the cache's
 // lifetime — so the launch is capturable — while each block derives its live
 // split bounds from *d_pos (attn_dpos_chunk, the device twin of
 // attn_split_count + attn_split_chunk). Splits past the live count write
@@ -205,9 +205,10 @@ inline bool own_llm::attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
   unsigned group = (unsigned)(n_q_heads / n_kv_heads);
   // A window (< kv_max) bounds the live keys, and so the splits, at its length; the
   // partials, sized from kv_max, hold at least as many.
-  unsigned S = attn_split_count(uh, window > 0 ? window : kv_max);
+  const unsigned rows = attn_dec_rows(n_q_heads, n_kv_heads, D);
+  unsigned S = attn_split_count(rows, window > 0 ? window : kv_max);
   attn_partials p(context::off_(partials.buf, partials.off), (size_t)uh * S);
-  if (!c.launch_(c.attn_(context::attn_k::split_dpos, D, kv_f16), {uh, S}, {uD}, 0, pq, pk, pv, p.pm,
+  if (!c.launch_(c.attn_(context::attn_k::split_dpos, D, kv_f16), {rows, S}, {attn_dec_threads(D)}, 0, pq, pk, pv, p.pm,
                  p.pl, p.pacc, pp, kv_stride, group, scale, (unsigned)window)) {
     return false;
   }
@@ -319,9 +320,10 @@ inline bool own_llm::sample_to(gpu::span a, int64_t n, const gpu::sampling& s,
 // The KV cache itself is tl::kv_cache (kv_cache.h), written once over the
 // gpu:: facade; its graph-capture forms call kv_append_dpos / attn_decode_dpos
 // above and size their partials here.
-inline int64_t attn_dpos_partials_bytes(int64_t n_q_heads, int64_t max_ctx,
+inline int64_t attn_dpos_partials_bytes(int64_t n_q_heads, int64_t n_kv_heads, int64_t max_ctx,
                                         int64_t D) {
-  const unsigned S = attn_split_count(static_cast<unsigned>(n_q_heads), max_ctx);
+  if (n_kv_heads <= 0 || n_q_heads % n_kv_heads) return 0;
+  const unsigned S = attn_split_count(attn_dec_rows(n_q_heads, n_kv_heads, D), max_ctx);
   return static_cast<int64_t>(
       attn_partials::bytes(static_cast<size_t>(n_q_heads) * S, D));
 }

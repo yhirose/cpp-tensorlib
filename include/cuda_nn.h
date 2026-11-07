@@ -710,22 +710,29 @@ inline bool own_nn::cvt_h16(gpu::span src, gpu::span dst16, int64_t n) {
 // ---- M9 batched-prefill layout moves between token-major projections and
 // head-major attention.
 
-// Split-KV split-count heuristic: how many ctx-splits make grid = heads×S fill
-// the SMs (heads alone is ~32 blocks « 82 SMs; target ~4 blocks/SM, and each
-// split needs >=64 keys to amortize its fixed cost). Shared by attn_decode
+// The decode attention's blocks (attn_dec_core): a kv head and attn_dec_heads(D)
+// of the q heads that share it, attn_dec_threads(D) threads. These are the
+// kernel's attn_dec_heads<AD> and attn_dec_warps<AD> (where the measurements
+// behind them are), its ABI: a block derives its heads from the same numbers.
+// rows is grid.x, the blocks one split has.
+inline constexpr int64_t attn_dec_heads(int64_t D) { return D == 256 ? 1 : 2; }
+inline constexpr unsigned attn_dec_threads(int64_t D) { return 32 * (D == 512 ? 4 : 8); }
+inline unsigned attn_dec_rows(int64_t n_q_heads, int64_t n_kv_heads, int64_t D) {
+  const int64_t group = n_q_heads / n_kv_heads;
+  return static_cast<unsigned>(n_kv_heads * ((group + attn_dec_heads(D) - 1) / attn_dec_heads(D)));
+}
+
+// Split-KV split-count heuristic: how many ctx-splits make grid = rows×S fill
+// the SMs (rows alone are a few blocks « 82 SMs). Shared by attn_decode
 // (evaluated at the live ctx) and attn_decode_dpos (evaluated at max_ctx, so
-// the CUDA-graph grid is pos-independent).
-// The kernel's rule: 128-thread blocks, so twice the fill (~4 per SM); no
-// split under 256 keys, a split at least 64 keys and a multiple of its 4
-// warps. A block's warps walk their keys in series, so it is the length of a
-// split, not the bytes, that sets the time at depth: 64 against 128 took
-// Qwen2.5-0.5B at 2048 cached tokens from 396 to 426 tok/s, and 32 bought
-// nothing more.
-inline constexpr gpu::policy::split_rule attn_split_rule{
-    2 * traits::fill_groups, 256, 64, 4};
-inline unsigned attn_split_count(unsigned n_heads, int64_t ctx) {
-  return static_cast<unsigned>(
-      gpu::policy::split_parts(n_heads, ctx, attn_split_rule));
+// the CUDA-graph grid is pos-independent). Twice the fill (~4 blocks a SM); no
+// split under 64 keys, a split at least 32 keys and a multiple of 4. Against
+// 256 and 64 (the rule of the one-q-head-a-block form), the same shapes as
+// attn_dec_core's took 128 to 512 cached tokens from 7-14 us a layer to 4-8;
+// 16 keys a split or 128 to start were no better.
+inline constexpr gpu::policy::split_rule attn_split_rule{2 * traits::fill_groups, 64, 32, 4};
+inline unsigned attn_split_count(unsigned rows, int64_t ctx) {
+  return static_cast<unsigned>(gpu::policy::split_parts(rows, ctx, attn_split_rule));
 }
 
 // Launch shape of the tiled prefill attention — the ONE place it lives. It is
@@ -749,13 +756,13 @@ inline constexpr unsigned attn_bwd_tile(int64_t D) {
 }
 
 // Keys per split for the split-KV kernels: ceil(ctx / attn_split_count), rounded
-// up to a multiple of 4 warps. The device-side attn_dpos_chunk in
-// tensorlib_cuda.cu is the twin of attn_split_count + this rounding and MUST
-// stay in lockstep — the host/dpos bit-identity rests on it. Guarded by the
-// attn64 ctest's host-vs-dpos bit-equality sweep.
-inline unsigned attn_split_chunk(unsigned n_heads, int64_t ctx) {
+// up to a multiple of 4. The device-side attn_dpos_chunk in cuda_llm.cuh is the
+// twin of attn_split_count + this rounding and MUST stay in lockstep — the
+// host/dpos bit-identity rests on it. Guarded by the attn64 ctest's
+// host-vs-dpos bit-equality sweep.
+inline unsigned attn_split_chunk(unsigned rows, int64_t ctx) {
   return static_cast<unsigned>(gpu::policy::split_chunk(
-      ctx, attn_split_count(n_heads, ctx), attn_split_rule));
+      ctx, attn_split_count(rows, ctx), attn_split_rule));
 }
 
 // Split-KV partials scratch: ONE buffer laid out pm[H*S] | pl[H*S] | pacc[H*S*D]
@@ -803,24 +810,25 @@ inline bool own_nn::attn_decode(gpu::span q, gpu::span K, gpu::span V,
   unsigned uh = static_cast<unsigned>(n_q_heads), uctx = static_cast<unsigned>(ctx);
   unsigned kv_stride = static_cast<unsigned>(kv_max * D);
   unsigned group = static_cast<unsigned>(n_q_heads / n_kv_heads);
+  const unsigned rows = attn_dec_rows(n_q_heads, n_kv_heads, D);
 
-  // Split ctx over gridDim.y so grid = heads×S fills the SMs (see
-  // attn_split_count; chunk below is rounded to a multiple of 4 warps).
-  unsigned S = attn_split_count(uh, ctx);
+  // Split ctx over gridDim.y so grid = rows×S fills the SMs (see
+  // attn_split_count; chunk below is rounded to a multiple of 4).
+  unsigned S = attn_split_count(rows, ctx);
   unsigned uD = static_cast<unsigned>(D);
   if (S == 1) {
-    return c.launch_(c.attn_(context::attn_k::decode, D, kv_f16), {uh}, {uD}, 0, pq, pk, pv, po,
-                     uctx, kv_stride, group, scale);
+    return c.launch_(c.attn_(context::attn_k::decode, D, kv_f16), {rows}, {attn_dec_threads(D)}, 0,
+                     pq, pk, pv, po, uctx, kv_stride, group, scale);
   }
 
-  unsigned chunk = attn_split_chunk(uh, ctx);
+  unsigned chunk = attn_split_chunk(rows, ctx);
   S = (uctx + chunk - 1) / chunk;  // recompute after rounding
   size_t hs = (size_t)uh * S;
   CUdeviceptr scr = c.attn_scratch_(attn_partials::bytes(hs, D));
   if (!scr) return false;
   attn_partials p(reinterpret_cast<float*>(scr), hs);
-  if (!c.launch_(c.attn_(context::attn_k::split, D, kv_f16), {uh, S}, {uD}, 0, pq, pk, pv, p.pm,
-                 p.pl, p.pacc, uctx, kv_stride, group, chunk, scale)) {
+  if (!c.launch_(c.attn_(context::attn_k::split, D, kv_f16), {rows, S}, {attn_dec_threads(D)}, 0, pq,
+                 pk, pv, p.pm, p.pl, p.pacc, uctx, kv_stride, group, chunk, scale)) {
     return false;
   }
   return p.combine(c, po, uh, uD, S);

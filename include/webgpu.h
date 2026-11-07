@@ -1143,7 +1143,7 @@ inline void graph_destroy(graph_exec) {}
 inline void upload(void*, const float*, int64_t) {}
 inline void upload_bytes(void*, int64_t, const void*, int64_t) {}
 inline void upload_u32(void*, unsigned) {}
-inline int64_t attn_dpos_partials_bytes(int64_t, int64_t, int64_t) { return 0; }
+inline int64_t attn_dpos_partials_bytes(int64_t, int64_t, int64_t, int64_t) { return 0; }
 
 // Every CPU-side buffer read funnels through array::raw()/data(), which call
 // this: one choke point makes mixed CPU/GPU graphs safe.

@@ -10,42 +10,44 @@
 // (the launcher sets gridDim.y = S_max from max_ctx), work bounds from the
 // DYNAMIC position: each block recomputes the host launcher's split heuristic
 // from *d_pos, so one instantiated graph replays correctly at every pos AND
-// stays split-KV-flat at long ctx (the earlier S=1 pin was linear in ctx).
-// Splits past ceil(ctx/chunk) see k0 >= ctx, fall through the core's loop
-// empty, and write the neutral partial (m=-1e30, l=0, acc=0) that contributes
-// exact zeros in tl_attn_combine — so the output is bit-identical to the host
-// path (single-block or split) at the same pos. Body is attn_decode_split_core,
-// byte-identical to the by-value kernels.
+// stays split-KV-flat at long ctx. Splits past ceil(ctx/chunk) see k0 >= ctx
+// and write the neutral partial that contributes exact zeros in
+// tl_attn_combine, so the output is bit-identical to the host path (single
+// pass or split) at the same pos. Body is attn_dec_core, as the by-value
+// kernels'.
 //
-// attn_dpos_chunk is the device twin of cuda.h's attn_split_count +
-// attn_split_chunk and MUST stay in lockstep with them — that equality is what
-// the host/dpos bit-identity rests on (guarded by the attn64 ctest's
-// host-vs-dpos bit-equality sweep). ctx <= max_ctx is a cache invariant, so the
-// live split count never exceeds the launched gridDim.y (attn_split_count is
-// monotone in ctx).
-__device__ __forceinline__ unsigned attn_dpos_chunk(unsigned ctx, unsigned H) {
+// attn_dpos_chunk is the device twin of cuda_nn.h's attn_split_count +
+// attn_split_chunk (its rule attn_split_rule) and MUST stay in lockstep with
+// them: the host/dpos bit-identity rests on it (guarded by the attn64 ctest's
+// host-vs-dpos bit-equality sweep). `rows` is gridDim.x, the blocks a split
+// has (attn_dec_rows). ctx <= max_ctx is a cache invariant, so the live split
+// count never exceeds the launched gridDim.y (attn_split_count is monotone in
+// ctx).
+__device__ __forceinline__ unsigned attn_dpos_chunk(unsigned ctx, unsigned rows) {
+  constexpr unsigned target = 328, min_k = 64, min_part = 32, granule = 4;  // attn_split_rule
   unsigned S = 1;
-  if (H < 328u && ctx >= 256u) {  // target ~4 blocks/SM (328 = 4 * 82 SMs)
-    unsigned want = (328u + H - 1u) / H;
-    unsigned max_s = ctx / 64u;  // >=64 keys per split
+  if (rows < target && ctx >= min_k) {
+    unsigned want = (target + rows - 1u) / rows;
+    const unsigned max_s = ctx / min_part;
     if (want > max_s) want = max_s;
     if (want > 1u) S = want;
   }
   unsigned chunk = (ctx + S - 1u) / S;
-  chunk = (chunk + 3u) & ~3u;  // multiple of the warp count
-  return chunk ? chunk : 4u;
+  chunk = (chunk + granule - 1u) / granule * granule;
+  return chunk ? chunk : granule;
 }
 // tl_attn_decode_split_dpos_{f32,f16}_{64,128,256,512}
 // A window (win > 0) reads the rows [lo, ctx) as the host path does: K and V from row lo,
 // ctx - lo of them, split by their count.
 #define TL_ATTN_SPLIT_DPOS(AD, KT, TN)                                                               \
-  extern "C" __global__ void tl_attn_decode_split_dpos_##TN##_##AD(                                  \
-      const float* q, const KT* K, const KT* V, float* pm, float* pl, float* pacc,                   \
-      const unsigned* __restrict__ d_pos, unsigned kv_stride, unsigned group, float scale,           \
-      unsigned win) {                                                                                \
+  extern "C" __global__ void __launch_bounds__(32 * attn_dec_warps<AD>)                                \
+      tl_attn_decode_split_dpos_##TN##_##AD(const float* q, const KT* K, const KT* V, float* pm,    \
+                                            float* pl, float* pacc,                                \
+                                            const unsigned* __restrict__ d_pos, unsigned kv_stride, \
+                                            unsigned group, float scale, unsigned win) {           \
     const unsigned ctx = *d_pos + 1u, lo = attn_window_lo_(ctx, win), n = ctx - lo;                 \
-    attn_decode_split_core<AD, KT>(q, K + (size_t)lo * AD, V + (size_t)lo * AD, pm, pl, pacc, n,    \
-                                   kv_stride, group, attn_dpos_chunk(n, gridDim.x), scale);          \
+    attn_dec_split<AD, KT>(q, K + (size_t)lo * AD, V + (size_t)lo * AD, pm, pl, pacc, n, kv_stride,  \
+                           group, attn_dpos_chunk(n, gridDim.x), scale);                            \
   }
 TL_ATTN_SPLIT_DPOS(64, float, f32)
 TL_ATTN_SPLIT_DPOS(128, float, f32)

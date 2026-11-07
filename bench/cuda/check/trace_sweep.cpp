@@ -100,7 +100,7 @@ void capture(int64_t D) {
   const int64_t hq = 14, hkv = 2, kv_max = 2048;
   buf pos(4), x(hq * D * 4), xo(hq * D * 4), knew(hkv * D * 4), vnew(hkv * D * 4),
       K(hkv * kv_max * D * 4), V(hkv * kv_max * D * 4), o(hq * D * 4),
-      partials(cu::attn_dpos_partials_bytes(hq, kv_max, D));
+      partials(cu::attn_dpos_partials_bytes(hq, hkv, kv_max, D));
   cu::upload_u32(pos, 5);
   if (!cu::capture_begin()) return;
   tl::gpu::rope_dpos({x, 0}, {xo, 0}, hq, 1, D, {pos, 0}, {10000.0f});

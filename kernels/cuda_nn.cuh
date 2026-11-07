@@ -3047,29 +3047,17 @@ __global__ void tl_gemv_q4(const float* __restrict__ a,
 }
 
 // ---- M9 fused decode attention (flash-attention, one query row per head) ----
-// out(h,:) = softmax(scale * q(h,:) · K(h)^T) · V(h), computed in ONE pass with
-// the online-softmax recurrence so the ctx-long scores are never materialized
-// and K,V are each read exactly once (the decode floor is KV bandwidth). This
-// replaces the array path's 3 launches × 2 materializations × (heads×layers)
-// — which is launch/materialize-bound, not compute-bound — for the regime that
-// dominates decode-token time.
+// out(h,:) = softmax(scale * q(h,:) · K(kv(h))^T) · V(kv(h)), computed in ONE pass
+// with the online-softmax recurrence so the ctx-long scores are never
+// materialized. A block takes a kv head and some of the q heads that share it
+// (GQA), and reads each key once for them (attn_dec_core). The first form took
+// one q head a block and read V only after K's scores: it took PLaMo 3 2B (24
+// q heads over 4) from 7 to 29 us a layer between 64 and 2048 cached tokens,
+// about six times the bytes' time; this one takes 4 and 13.
 //
-// One block per head, blockDim = head_dim AD (NW = AD/32 warps). Each warp owns
-// keys i = warp, warp+NW, ...; its 32 lanes cooperatively reduce the AD-long
-// score (coalesced K/V row reads, warp-shuffle reduction, no block sync in the
-// loop), keeping per-warp (m,l,acc) running state. A final shared-memory step
-// merges the NW warps' partial softmax states (flash rescale-by-exp(m_w-m)).
-//
-// head_dim generalization (M9): the kernels are templated on AD (compile-time,
-// because acc[]/sacc[][] are register/smem arrays sized AD/32) and instantiated
-// for {64,128} — the head dims of the target models (Qwen2 = 64, llama-7B = 128)
-// — 256 (Qwen3.5's full-attention layers) and 512 (Gemma 4's global layers),
-// each for an f32 and an f16 cache. Each lane holds NW = AD/32 dims (d = lane,
-// lane+32, ..., lane+(NW-1)*32) and there are exactly NW warps, so the warp count
-// and the per-lane dim count coincide. At 512 the merge's sacc is 32 KB, inside
-// the 48 KB of static shared memory. extern "C" wrappers below give each
-// instantiation a stable symbol (the driver loads kernels by name):
-// tl_attn_decode_{f32,f16}_{64,128,256,512}, etc.
+// Templated on AD (compile-time: the per-lane query and accumulator stripes are
+// register arrays) and instantiated at 64, 128, 256 and 512, each for an f32
+// and an f16 cache: tl_attn_decode_{f32,f16}_{64,128,256,512}, etc.
 
 }  // extern "C"
 // The KV cache's element type: the cores below are templated on KT ∈ {float, __half}.
@@ -3089,122 +3077,163 @@ __device__ __forceinline__ unsigned attn_window_lo_(unsigned n, unsigned w) {
   return w && n > w ? n - w : 0u;
 }
 
-// Shared middle of the decode-attention family. Stages the head's query into
-// shared memory, runs the online-softmax score loop over keys [k0, k1) (each
-// warp owns keys i = k0+warp, +NW, ...; its 32 lanes cooperatively reduce the
-// AD-long dot), then merges the NW warps' partial states. Leaves every thread
-// holding the block-level (gm, gl) and its dim's UN-normalized accumulator `o`:
-// the single-pass kernels normalize and store o/gl, the split kernel writes all
-// three as partials for tl_attn_combine. An empty range (k0 >= k1 — a dpos
-// split past the live count) yields the neutral partial (gm=-1e30, gl=0, o=0)
-// that combines as exact zeros.
-template <int AD, typename KT>
-__device__ __forceinline__ void attn_span_core(
-    const float* __restrict__ qh, const KT* __restrict__ Kh,
-    const KT* __restrict__ Vh, unsigned k0, unsigned k1, float scale,
-    float& gm_out, float& gl_out, float& o_out) {
-  constexpr int NW = AD / 32;                        // warps == dims-per-lane
-  const unsigned tid = threadIdx.x;                  // 0..AD-1
-  const unsigned lane = tid & 31u, warp = tid >> 5;  // NW warps of 32
-  __shared__ float q_sh[AD];
-  q_sh[tid] = qh[tid];
-  __syncthreads();
+// The decode attention's shape, a twin of the host's (cuda_nn.h): a block of
+// attn_dec_warps<AD> warps takes attn_dec_heads<AD> q heads of one kv head.
+// Measured as GPU time a layer at Qwen2.5 0.5B, Llama 3.2 1B and 3B, Qwen3
+// 0.6B, PLaMo 3 2B, Qwen3.5, Gemma 3 and Gemma 4 E2B's shapes, 32 to 4096
+// cached tokens, against 1, 2, 4 and 8 heads by 4 and 8 warps: two heads by 8
+// warps at 64 and 128, where more heads leave too few blocks; one by 8 at 256,
+// whose single kv head of 2 MB at 2048 tokens the L2 serves to every q head
+// anyway; two by 4 at 512, where 8 warps of two heads' stripes leave too few
+// blocks a SM.
+template <int AD>
+constexpr int attn_dec_heads = AD == 256 ? 1 : 2;
+template <int AD>
+constexpr int attn_dec_warps = AD == 512 ? 4 : 8;
 
-  float m = -1e30f, l = 0.0f;
-  float acc[NW] = {};  // lane holds dims d = lane, lane+32, ..., lane+(NW-1)*32
-  // A warp's keys, U at a time: the U K rows are read and their scores reduced
-  // together, so each key's load latency overlaps the others' instead of
-  // standing alone at the head of a serial chain; the softmax update and the V
-  // accumulation then take the keys one by one, in the order they would have
-  // gone alone, so the sums are the same. (A tail of fewer than U keys masks
-  // the rest out.)
-  constexpr int U = 4;
-  for (unsigned i0 = k0 + warp; i0 < k1; i0 += (unsigned)(NW * U)) {
-    float sc[U];
+// The decode attention's core. Block blockIdx.x is one kv head and a slice of
+// GB of the q heads that share it (GQA): it reads each of its keys [k0, k1)
+// once for all of them. A slice's heads past the group's last run on zero
+// queries and store nothing, so the loop has no branch on the head count (one
+// costs this kernel twice its time).
+// Its warps take the keys in turn (key i = k0 + warp, + NWB, ..., U at a
+// time), each lane a stripe of every key's dims (lane, lane + 32, ...): K and
+// V rows are read together at the top of the step, so a key costs one wait
+// for memory, not one for K and then one for V. Each head's partial dot goes
+// through a butterfly that gives every lane the sum, and each head runs its
+// online softmax on the warp. The NWB warps' states then merge through shared
+// memory, one barrier for all heads. FINAL normalizes and stores the output;
+// else each head writes its partial (m, l, acc at the local max) for
+// tl_attn_combine, at split blockIdx.y of gridDim.y. An empty range (k0 >=
+// k1, a dpos split past the live count) writes the neutral partial (m = -1e30,
+// l = 0, acc = 0), which combines as exact zeros.
+template <int AD, typename KT, bool FINAL>
+__device__ __forceinline__ void attn_dec_core(const float* __restrict__ q, const KT* __restrict__ K,
+                                              const KT* __restrict__ V, float* __restrict__ out,
+                                              float* __restrict__ pm, float* __restrict__ pl,
+                                              float* __restrict__ pacc, unsigned k0, unsigned k1,
+                                              unsigned kv_stride, unsigned group, float scale) {
+  constexpr int NR = AD / 32, GB = attn_dec_heads<AD>, NWB = attn_dec_warps<AD>, NT = 32 * NWB;
+  constexpr int U = 2;
+  const unsigned slices = (group + GB - 1) / GB;  // a kv head's q heads, GB at a time
+  const unsigned kv_h = blockIdx.x / slices;
+  const unsigned h0 = kv_h * group + (blockIdx.x % slices) * GB;
+  const unsigned gn = min((unsigned)GB, kv_h * group + group - h0);  // this block's real heads
+  const KT* Kh = K + (size_t)kv_h * kv_stride;
+  const KT* Vh = V + (size_t)kv_h * kv_stride;
+  const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+
+  __shared__ float q_sh[GB][AD];
+  for (unsigned e = tid; e < GB * AD; e += NT)
+    q_sh[e / AD][e % AD] = e / AD < gn ? q[(size_t)h0 * AD + e] : 0.0f;
+  __syncthreads();
+  float qr[GB][NR], acc[GB][NR], m[GB], l[GB];
+#pragma unroll
+  for (int g = 0; g < GB; g++) {
+    m[g] = -1e30f;
+    l[g] = 0.0f;
+#pragma unroll
+    for (int r = 0; r < NR; r++) {
+      qr[g][r] = q_sh[g][lane + r * 32];
+      acc[g][r] = 0.0f;
+    }
+  }
+
+  // The steps are the block's, not the warp's (t0 from k0, every warp the same
+  // count), and a key past the range reads the last one's row and is skipped
+  // after the shuffles: nothing before them branches, so the compiler sees the
+  // warp converged there (with the warp's own range it outlined them behind a
+  // WARPSYNC that kept a register on the stack).
+  for (unsigned t0 = k0; t0 < k1; t0 += (unsigned)(NWB * U)) {
+    const unsigned i0 = t0 + warp;
+    float kr[U][NR], vr[U][NR], sc[U][GB];
 #pragma unroll
     for (int u = 0; u < U; u++) {
-      const unsigned i = i0 + (unsigned)(u * NW);
-      float partial = 0.0f;
-      if (i < k1) {
-        const KT* Ki = Kh + (size_t)i * AD;
+      const unsigned i = min(i0 + (unsigned)(u * NWB), k1 - 1);
 #pragma unroll
-        for (int r = 0; r < NW; r++)
-          partial += q_sh[lane + r * 32] * kv_ld(Ki[lane + r * 32]);
+      for (int r = 0; r < NR; r++) {
+        kr[u][r] = kv_ld(Kh[(size_t)i * AD + lane + r * 32]);
+        vr[u][r] = kv_ld(Vh[(size_t)i * AD + lane + r * 32]);
       }
-      sc[u] = partial;
     }
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
+    for (int u = 0; u < U; u++)
+#pragma unroll
+      for (int g = 0; g < GB; g++) {
+        float s = 0.0f;
+#pragma unroll
+        for (int r = 0; r < NR; r++) s += qr[g][r] * kr[u][r];
+        sc[u][g] = s;
+      }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
 #pragma unroll
       for (int u = 0; u < U; u++)
-        sc[u] += __shfl_down_sync(0xffffffffu, sc[u], off);
-    }
+#pragma unroll
+        for (int g = 0; g < GB; g++) sc[u][g] += __shfl_xor_sync(0xffffffffu, sc[u][g], off);
 #pragma unroll
     for (int u = 0; u < U; u++) {
-      const unsigned i = i0 + (unsigned)(u * NW);
-      if (i >= k1) break;
-      float s = __shfl_sync(0xffffffffu, sc[u], 0) * scale;  // lane0's sum
-      float m_new = fmaxf(m, s);
-      float corr = __expf(m - m_new);
-      float p = __expf(s - m_new);
-      l = l * corr + p;
-      const KT* Vi = Vh + (size_t)i * AD;
+      if (i0 + (unsigned)(u * NWB) < k1) {
 #pragma unroll
-      for (int r = 0; r < NW; r++)
-        acc[r] = acc[r] * corr + p * kv_ld(Vi[lane + r * 32]);
-      m = m_new;
+        for (int g = 0; g < GB; g++) {
+          const float s = sc[u][g] * scale;
+          const float m_new = fmaxf(m[g], s), corr = __expf(m[g] - m_new), p = __expf(s - m_new);
+          l[g] = l[g] * corr + p;
+#pragma unroll
+          for (int r = 0; r < NR; r++) acc[g][r] = acc[g][r] * corr + p * vr[u][r];
+          m[g] = m_new;
+        }
+      }
     }
   }
 
-  // Merge the NW warps' partial softmax states through shared memory (warps
-  // whose key range was empty carry m=-1e30, l=0 and contribute exp(-inf)=0).
-  __shared__ float sm[NW], sl[NW], sacc[NW][AD];
-  if (lane == 0) {
-    sm[warp] = m;
-    sl[warp] = l;
-  }
+  // Merge the warps' states (a warp whose keys were none carries m = -1e30,
+  // l = 0 and adds exp(-inf) = 0), every head at once.
+  __shared__ float sm[NWB][GB], sl[NWB][GB], sacc[NWB][GB][AD];
 #pragma unroll
-  for (int r = 0; r < NW; r++) sacc[warp][lane + r * 32] = acc[r];
+  for (int g = 0; g < GB; g++) {
+    if (lane == 0) {
+      sm[warp][g] = m[g];
+      sl[warp][g] = l[g];
+    }
+#pragma unroll
+    for (int r = 0; r < NR; r++) sacc[warp][g][lane + r * 32] = acc[g][r];
+  }
   __syncthreads();
-
-  float gm = -1e30f;
+  for (unsigned e = tid; e < gn * AD; e += NT) {
+    const unsigned g = e / AD, d = e % AD;
+    float gm = -1e30f;
 #pragma unroll
-  for (int w = 0; w < NW; w++) gm = fmaxf(gm, sm[w]);
-  float gl = 0.0f, o = 0.0f;
+    for (int w = 0; w < NWB; w++) gm = fmaxf(gm, sm[w][g]);
+    float gl = 0.0f, o = 0.0f;
 #pragma unroll
-  for (int w = 0; w < NW; w++) {
-    float e = __expf(sm[w] - gm);
-    gl += sl[w] * e;
-    o += sacc[w][tid] * e;
+    for (int w = 0; w < NWB; w++) {
+      const float x = __expf(sm[w][g] - gm);
+      gl += sl[w][g] * x;
+      o += sacc[w][g][d] * x;
+    }
+    if constexpr (FINAL) {
+      out[(size_t)h0 * AD + e] = o / gl;
+    } else {
+      const size_t sidx = (size_t)(h0 + g) * gridDim.y + blockIdx.y;
+      if (d == 0) {
+        pm[sidx] = gm;
+        pl[sidx] = gl;
+      }
+      pacc[sidx * AD + d] = o;  // un-normalized accumulator at the local max
+    }
   }
-  gm_out = gm;
-  gl_out = gl;
-  o_out = o;
 }
 
-template <int AD, typename KT = float>
-__device__ void attn_decode_core(const float* __restrict__ q,
-                                  const KT* __restrict__ K,
-                                  const KT* __restrict__ V,
-                                  float* __restrict__ out, unsigned ctx,
-                                  unsigned kv_stride, unsigned group,
-                                  float scale) {
-  const unsigned h = blockIdx.x;                // query head
-  const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
-  // K,V are [H_kv, max_ctx, D]; kv_stride = max_ctx*D lets a persistent cache be
-  // read as its valid prefix [0,ctx) (kv_stride==ctx*AD is the no-cache case).
-  float gm, gl, o;
-  attn_span_core<AD, KT>(q + (size_t)h * AD, K + (size_t)kv_h * kv_stride,
-                         V + (size_t)kv_h * kv_stride, 0, ctx, scale, gm, gl, o);
-  out[(size_t)h * AD + threadIdx.x] = o / gl;
-}
+// One pass over all ctx keys: grid.x = the kv heads' slices (attn_dec_rows).
+// K, V are [H_kv, max_ctx, D] read over [0, ctx); kv_stride = max_ctx * D.
 // tl_attn_decode_{f32,f16}_{64,128,256,512}
 #define TL_ATTN_DECODE(AD, KT, TN)                                                             \
-  extern "C" __global__ void tl_attn_decode_##TN##_##AD(const float* q, const KT* K, const KT* V, \
-                                                        float* out, unsigned ctx,                \
-                                                        unsigned kv_stride, unsigned group,      \
-                                                        float scale) {                           \
-    attn_decode_core<AD, KT>(q, K, V, out, ctx, kv_stride, group, scale);                       \
+  extern "C" __global__ void __launch_bounds__(32 * attn_dec_warps<AD>)                        \
+      tl_attn_decode_##TN##_##AD(const float* q, const KT* K, const KT* V, float* out,          \
+                                 unsigned ctx, unsigned kv_stride, unsigned group, float scale) { \
+    attn_dec_core<AD, KT, true>(q, K, V, out, nullptr, nullptr, nullptr, 0, ctx, kv_stride,      \
+                                group, scale);                                                  \
   }
 TL_ATTN_DECODE(64, float, f32)
 TL_ATTN_DECODE(128, float, f32)
@@ -3216,40 +3245,23 @@ TL_ATTN_DECODE(256, __half, f16)
 TL_ATTN_DECODE(512, __half, f16)
 #undef TL_ATTN_DECODE
 
-// Split-KV (flash-decoding): the one-block-per-head kernel above launches only
-// H blocks — a few % of the 82 SMs, so it's occupancy-bound. Partition ctx over
-// gridDim.y so grid = H×S fills the SMs; each (head,split) block writes its
-// partial softmax state (m,l,acc at its local max) to scratch, and tl_attn_
-// combine merges the S partials per head. K,V are still each read exactly once.
-template <int AD, typename KT = float>
-__device__ void attn_decode_split_core(const float* __restrict__ q,
-                                        const KT* __restrict__ K,
-                                        const KT* __restrict__ V,
-                                        float* __restrict__ pm,
-                                        float* __restrict__ pl,
-                                        float* __restrict__ pacc, unsigned ctx,
-                                        unsigned kv_stride, unsigned group,
-                                        unsigned chunk, float scale) {
-  const unsigned h = blockIdx.x, sp = blockIdx.y, S = gridDim.y;
-  const unsigned kv_h = group ? h / group : h;  // GQA: q head -> shared kv head
-  const unsigned k0 = sp * chunk;
-  const unsigned k1 = (k0 + chunk < ctx) ? (k0 + chunk) : ctx;
-  float gm, gl, o;
-  attn_span_core<AD, KT>(q + (size_t)h * AD, K + (size_t)kv_h * kv_stride,
-                         V + (size_t)kv_h * kv_stride, k0, k1, scale, gm, gl, o);
-  const size_t sidx = (size_t)h * S + sp;
-  if (threadIdx.x == 0) {
-    pm[sidx] = gm;
-    pl[sidx] = gl;
-  }
-  pacc[sidx * AD + threadIdx.x] = o;  // un-normalized accumulator at local max
+// Split-KV (flash-decoding): the kv heads' slices alone are a few blocks, so
+// ctx is cut into gridDim.y splits of `chunk` keys; each (slice, split) block
+// writes its heads' partials, and tl_attn_combine merges a head's splits.
+template <int AD, typename KT>
+__device__ __forceinline__ void attn_dec_split(const float* q, const KT* K, const KT* V, float* pm,
+                                               float* pl, float* pacc, unsigned ctx,
+                                               unsigned kv_stride, unsigned group, unsigned chunk,
+                                               float scale) {
+  const unsigned k0 = blockIdx.y * chunk, k1 = k0 + chunk < ctx ? k0 + chunk : ctx;
+  attn_dec_core<AD, KT, false>(q, K, V, nullptr, pm, pl, pacc, k0, k1, kv_stride, group, scale);
 }
 // tl_attn_decode_split_{f32,f16}_{64,128,256,512}
 #define TL_ATTN_SPLIT(AD, KT, TN)                                                                    \
-  extern "C" __global__ void tl_attn_decode_split_##TN##_##AD(                                       \
+  extern "C" __global__ void __launch_bounds__(32 * attn_dec_warps<AD>) tl_attn_decode_split_##TN##_##AD( \
       const float* q, const KT* K, const KT* V, float* pm, float* pl, float* pacc, unsigned ctx,     \
       unsigned kv_stride, unsigned group, unsigned chunk, float scale) {                             \
-    attn_decode_split_core<AD, KT>(q, K, V, pm, pl, pacc, ctx, kv_stride, group, chunk, scale);     \
+    attn_dec_split<AD, KT>(q, K, V, pm, pl, pacc, ctx, kv_stride, group, chunk, scale);           \
   }
 TL_ATTN_SPLIT(64, float, f32)
 TL_ATTN_SPLIT(128, float, f32)
