@@ -1180,13 +1180,23 @@ inline int64_t prefill_chunk_(Model& M, int64_t T, bool exact = false, bool last
   // same source rather than taking it as a parameter that could disagree.
   int64_t pos0 = seq_cache(M).pos;
   // The f16-sum GEMMs read their activation as f16 where prefill_a16 says; `a16s`
-  // is that copy of `a`.
-  const bool a16 = prefill_a16(M, exact), mmq = prefill_mmq(M, exact);
+  // is that copy of `a`. One row (a one-token chunk, or the last row past the
+  // KV-sharing line) is a decode step's product: the decode's GEMVs, which read the
+  // weights once at their bandwidth where a tile GEMM wastes all its rows but one
+  // (E2B's 20 shared layers took a quarter of a Metal pp512), and read f32.
+  bool a16 = false, mmq = false;
+  auto set_forms = [&] {
+    a16 = T > 1 && prefill_a16(M, exact);
+    mmq = T > 1 && prefill_mmq(M, exact);
+  };
+  set_forms();
   // A GEMM a run of one format, each into its columns of y. The bf16 GEMMs
   // write y densely, so a bf16 run is the whole projection, as every bf16 build
   // loads it (load_wmat).
   auto gemm = [&](gpu::span a, gpu::span a16s, const wmat& W, gpu::span y, int64_t n,
                   int64_t k) {
+    if (T == 1)
+      return gemv_m(W, a, y, exact ? gpu::act_form::f32 : M.gemv_form, sp(M.scratch.act));
     for (const auto& p : W.parts) {
       const gpu::span w = W.at(p);
       if (p.type != bf16_type) {
@@ -1244,6 +1254,7 @@ inline int64_t prefill_chunk_(Model& M, int64_t T, bool exact = false, bool last
         }
         pos0 += T - 1;
         T = 1;
+        set_forms();
         norm(x, sp(L.an), sp(P.h), sp(P.h16), false);
       }
     }

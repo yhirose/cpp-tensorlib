@@ -478,6 +478,15 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
     long_ok = l5 < batched_bound;
     std::printf("\n%lld-token prompt, batched vs imperative: top-5 logits maxrel %.2e %s\n",
                 (long long)longp.size(), l5, long_ok ? "OK" : "FAIL");
+    // Again with its last chunk one token (as a 513-token prompt's is), which runs
+    // on the decode's GEMVs.
+    qm::reset_cache(B);
+    qm::prefill_batched(B, longp, (int64_t)longp.size() - 1);
+    const double o5 = qm::top5_maxrel(logits_of(B).data(), imp_long.data(), B.c.VOCAB);
+    const bool one_ok = o5 < batched_bound;
+    long_ok &= one_ok;
+    std::printf("the same in chunks of %lld and 1: top-5 logits maxrel %.2e %s\n",
+                (long long)longp.size() - 1, o5, one_ok ? "OK" : "FAIL");
   }
   const bool f16_ok = !qm::can_prefill_batched(B, (int64_t)longp.size()) ||
                       check_f16_sums(B, longp, imp_long);
