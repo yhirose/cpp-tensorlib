@@ -28,14 +28,17 @@ sliding window on 7 layers of 8, and YaRN on the global ones, unrounded
 times 0.1 ln(factor) + 1. Its prompt is a translation (PFML3) of LONG_USER, four
 times over: 2,542 tokens, past the 2048-position window.
 
-Gemma 4 (E2B) as HF's modeling_gemma4.py, which llama.cpp's gemma4.cpp follows: heads of
+Gemma 4 (E2B, 12B) as HF's modeling_gemma4.py, which llama.cpp's gemma4.cpp follows: heads of
 256 on the local layers and 512 on the global ones, which turn only their first 64 pairs
 (rope_freqs.weight: 1 for those, 1e30 for the rest), v RMS-normalized without a weight,
 an attention scale of 1, the per-layer embeddings (a token's own row of
 per_layer_token_embd, gathered, never the whole table, plus a projection of its
 embedding), the last 20 layers reading the KV of the last layer of their kind before
 them, each layer's output times its layer_output_scale, and the logits capped at 30
-by tanh.
+by tanh. The 12B's and 31B's kv heads are a layer's own (fewer on the global layers),
+and a global layer has no attn_v: its v is its k projection, before k's norm and RoPE.
+Its prompt is the file's own chat template rendered by jinja2 (12B's and 31B's open an
+empty thought channel), LONG_USER repeated until it passes the sliding window.
 
 The forward takes a run of tokens at once (the prompt, then one a step): each
 weight is read once a run, so a model whose f32 copy is not kept (the 2B's 10.7
@@ -257,7 +260,9 @@ class Model:
         arch = kv["general.architecture"]
         g = lambda k: kv[f"{arch}.{k}"]
         self.nl, self.ne = g("block_count"), g("embedding_length")
-        self.nh, self.nkv = g("attention.head_count"), g("attention.head_count_kv")
+        # The kv heads: one count, or one a layer (Gemma 4 12B and 31B: fewer on the global layers).
+        self.nh, nkv = g("attention.head_count"), g("attention.head_count_kv")
+        self.nkv = nkv if isinstance(nkv, list) else [nkv] * self.nl
         self.hd = kv.get(f"{arch}.attention.key_length", self.ne // self.nh)
         self.eps, self.base = g("attention.layer_norm_rms_epsilon"), g("rope.freq_base")
         self.arch = arch
@@ -302,8 +307,8 @@ class Model:
                                          kv.get(f"{arch}.rope.scaling.yarn_beta_slow", 1.0),
                                          bool(kv.get(f"{arch}.rope.scaling.yarn_truncate", True)))
             self.mscale = 0.1 * math.log(factor) + 1
-        self.k = [np.zeros((0, self.nkv, self.head_dim(l)), np.float32) for l in range(self.nl)]
-        self.v = [np.zeros((0, self.nkv, self.head_dim(l)), np.float32) for l in range(self.nl)]
+        self.k = [np.zeros((0, self.nkv[l], self.head_dim(l)), np.float32) for l in range(self.nl)]
+        self.v = [np.zeros((0, self.nkv[l], self.head_dim(l)), np.float32) for l in range(self.nl)]
         self.lm = self.t.get("output.weight", self.t["token_embd.weight"])
 
     def head_dim(self, l):
@@ -367,7 +372,7 @@ class Model:
         if self.arch == "gemma4":
             return self.attn4(l, h, pos)
         t, p = self.t, f"blk.{l}."
-        T, Q, KV = len(h), self.nh * self.hd, self.nkv * self.hd
+        T, Q, KV = len(h), self.nh * self.hd, self.nkv[l] * self.hd
         if p + "attn_qkv.weight" in t:  # PLaMo 3: q|k|v in one
             qkv = h @ t[p + "attn_qkv.weight"].T
             q, k, v = qkv[:, :Q], qkv[:, Q:Q + KV], qkv[:, Q + KV:]
@@ -379,7 +384,7 @@ class Model:
             q, gate = q[..., : self.hd].reshape(T, Q), q[..., self.hd:].reshape(T, Q)
         if p + "attn_q.bias" in t:
             q, k, v = q + t[p + "attn_q.bias"], k + t[p + "attn_k.bias"], v + t[p + "attn_v.bias"]
-        q, k, v = q.reshape(T, self.nh, self.hd), k.reshape(T, self.nkv, self.hd), v.reshape(T, self.nkv, self.hd)
+        q, k, v = q.reshape(T, self.nh, self.hd), k.reshape(T, self.nkv[l], self.hd), v.reshape(T, self.nkv[l], self.hd)
         if p + "attn_q_norm.weight" in t:  # Qwen3, PLaMo 3: per-head q/k RMSNorm before rope
             q = rmsnorm(q, t[p + "attn_q_norm.weight"], self.eps)
             k = rmsnorm(k, t[p + "attn_k_norm.weight"], self.eps)
@@ -405,7 +410,7 @@ class Model:
         live = kp <= pos[:, None]
         if self.local[l]:
             live &= kp > pos[:, None] - self.window
-        g = self.nh // self.nkv
+        g = self.nh // self.nkv[self.kv_source(l)]
         out = np.empty_like(q)
         for hh in range(self.nh):
             sc = np.where(live, q[:, hh] @ K[:, hh // g].T / div, -np.inf)
@@ -426,8 +431,8 @@ class Model:
         if self.kv_source(l) == l:
             k = h @ t[p + "attn_k.weight"].T
             v = h @ t[p + "attn_v.weight"].T if p + "attn_v.weight" in t else k  # 12B/31B global: v is k
-            k = rmsnorm(k.reshape(T, self.nkv, hd), t[p + "attn_k_norm.weight"], self.eps)
-            v = rmsnorm(v.reshape(T, self.nkv, hd), np.float32(1), self.eps)
+            k = rmsnorm(k.reshape(T, self.nkv[l], hd), t[p + "attn_k_norm.weight"], self.eps)
+            v = rmsnorm(v.reshape(T, self.nkv[l], hd), np.float32(1), self.eps)
             self.k[l] = np.concatenate([self.k[l], rope(k, pos, base, rot, f)])
             self.v[l] = np.concatenate([self.v[l], v])
         o = self.attend(l, q, pos, np.float32(1)).reshape(T, self.nh * hd) @ t[p + "attn_output.weight"].T
@@ -506,7 +511,8 @@ def arr(name, ctype, a):
 
 def main():
     path, ns = sys.argv[1], sys.argv[2]
-    if load_gguf(path, read=False)[0]["general.architecture"] in ("plamo3", "gemma4") and len(sys.argv) < 4:
+    meta = load_gguf(path, read=False)[0]
+    if meta["general.architecture"] in ("plamo3", "gemma4") and len(sys.argv) < 4:
         sys.exit("plamo3, gemma4: the prompt is text, so LLAMA_TOKENIZE is needed")  # before the model loads
     m = Model(path)
     long = (tokenize(sys.argv[3], path, LONG_USER) if len(sys.argv) > 3 and m.arch not in ("plamo3", "gemma4")
@@ -518,8 +524,18 @@ def main():
         prompt = tokenize(sys.argv[3], path, pfml)
     elif m.arch == "gemma3":  # <bos><start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n
         prompt = [2, 105, 2364, 107] + (long or GEMMA_USER) + [106, 107, 105, 4368, 107]
-    elif m.arch == "gemma4":  # the chat template, no thinking: <bos><|turn>user\n...<turn|>\n<|turn>model\n
-        prompt = tokenize(sys.argv[3], path, "<bos><|turn>user\n" + LONG_USER + "<turn|>\n<|turn>model\n")
+    elif m.arch == "gemma4":
+        # The file's own chat template, without thinking (E2B's: <bos><|turn>user\n...<turn|>\n<|turn>model\n;
+        # 12B's and 31B's add an empty thought channel after it), around LONG_USER, repeated
+        # until the prompt passes the sliding window (E2B's 512 once, 12B's 1024 twice).
+        import jinja2
+        template = jinja2.Environment().from_string(meta["tokenizer.chat_template"])
+        repeats, prompt = 0, []
+        while len(prompt) <= m.window:
+            repeats += 1
+            user = "\n\n".join([LONG_USER] * repeats)
+            prompt = tokenize(sys.argv[3], path, template.render(
+                messages=[{"role": "user", "content": user}], add_generation_prompt=True, bos_token="<bos>"))
     elif m.arch == "llama":  # <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n...
         prompt = [128000, 128006, 882, 128007, 271] + (long or LLAMA_USER) + [128009, 128006, 78191, 128007, 271]
     elif m.arch == "qwen35":  # thinking template: ends with "<think>\n"
@@ -546,7 +562,8 @@ def main():
     print(f"// Generated by tools/qwen_oracle.py from {path.split('/')[-1]} ({m.arch}); do not edit.")
     print("// numpy float32 forward on the SAME weights (F16, or blocks dequantized exactly); C++ must")
     how = (" (a PFML3 translation of LONG_USER four times over, tokenized by llama-tokenize)" if m.arch == "plamo3"
-           else " (LONG_USER in the chat template, tokenized by llama-tokenize)" if m.arch == "gemma4"
+           else (f" (LONG_USER {repeats} time(s) in the file's chat template, tokenized by "
+                 "llama-tokenize)") if m.arch == "gemma4"
            else " (LONG_USER, tokenized by llama-tokenize)" if long else "")
     print(f"// match to ~1e-4 + greedy exactly. Prompt: {len(prompt)} tokens{how}.")
     print(f"namespace {ns} {{")

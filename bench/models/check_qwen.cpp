@@ -1,9 +1,9 @@
 // M9 "actually chat" — numeric proof. Load a real Qwen2.5-0.5B-Instruct, Qwen3
 // or Qwen3.5 GGUF (F16 or BF16 weights, or Qwen3.5 0.8B's Q4_K_M, a fifth of it
-// Q5_K), Gemma 3 4B or 1B (Q4_K_M), Gemma 4 E2B (Q4_K_M), or Llama 3.2 1B (F16,
-// Q4_K_M, or Q4_0 with Q4_1) or 3B (Q4_K_M), and run the decoder end to end, verified
+// Q5_K), Gemma 3 4B or 1B (Q4_K_M), Gemma 4 E2B or 12B (Q4_K_M), or Llama 3.2 1B
+// (F16, Q4_K_M, or Q4_0 with Q4_1) or 3B (Q4_K_M), and run the decoder end to end, verified
 // against a tight numpy reference that reads the SAME weights (tools/qwen_oracle.py
-// wrote the *_oracle_data.h headers: Gemma 3 1B's and Gemma 4 E2B's over a prompt
+// wrote the *_oracle_data.h headers: Gemma 3 1B's and Gemma 4 E2B's and 12B's over a prompt
 // past their 512-position window, Llama 3.2 1B's over one long enough that its RoPE factors
 // turn the low-frequency pairs well apart; the model's arch and shape pick one,
 // and of several, the one that read the file's weights). Identical
@@ -20,6 +20,7 @@
 
 #include "gemma3_1b_oracle_data.h"
 #include "gemma3_oracle_data.h"
+#include "gemma4_12b_oracle_data.h"
 #include "gemma4_e2b_oracle_data.h"
 #include "llama32_1b_oracle_data.h"
 #include "llama32_1b_q40_oracle_data.h"
@@ -51,7 +52,21 @@ struct Oracle {
   // and no other's: a Q4_K_M from another quantizer (an imatrix, another choice
   // of Q6_K tensors) carries the same label but other blocks.
   uint64_t weights = 0;
+  // A model whose forward has rows that rounding turns over (Gemma 4 12B: about 10 of
+  // its prompt's 1534 change entirely at layer 29 between numpy in f32 and numpy with
+  // an f16 KV cache, their neighbours within 1e-4): two paths that round differently
+  // disagree there, and on every logit that reads them, by far more than the bounds
+  // below allow a wiring error. Its paths are held as the chat's defaults are
+  // (agree), and its KV cache's error, which those rows decide, is shown only.
+  bool sensitive = false;
+  // Whether two paths' logits for the same tokens agree, as this model is held:
+  // the top-5 logits within `bound`, or a sensitive model's by their distributions.
+  bool agree(const std::vector<float>& want, const std::vector<float>& got, double bound) const;
 };
+static Oracle sensitive(Oracle o) {
+  o.sensitive = true;
+  return o;
+}
 
 // A file's weights by their bytes: FNV-1a over each tensor's name, ggml type and
 // first 64 bytes of data, in file order. What a block oracle names (Oracle.weights),
@@ -120,6 +135,25 @@ static std::vector<float> logits_of(qm::Model& M) {
 // GEMM before it kept them f32, on the repeated prompt of Qwen3.5's Q4_K_M).
 constexpr double batched_bound = 1e-2;
 
+// Two paths' logits for the same tokens, each check printing the measure it holds:
+// the top-5 logits within `bound`, or the distributions as qm::close_by_kl holds
+// them (the chat's defaults); Oracle::agree takes the one a model is held to.
+static bool top5_agree(const std::vector<float>& want, const std::vector<float>& got, double bound) {
+  const double t5 = qm::top5_maxrel(got.data(), want.data(), (int64_t)want.size());
+  std::printf("top-5 logits maxrel %.2e", t5);
+  return t5 < bound;
+}
+static bool kl_agree(const std::vector<float>& want, const std::vector<float>& got) {
+  const double kl = qm::kl_div(want, got);
+  const qm::logits_vs c = qm::compare_logits(want, got, qm::BOUND_Q8);
+  std::printf("KL %.2e, top token %s", kl,
+              c.same_top ? "same" : c.near_tie ? "turned over at a near tie" : "different");
+  return qm::close_by_kl(c, kl);
+}
+bool Oracle::agree(const std::vector<float>& want, const std::vector<float>& got, double bound) const {
+  return sensitive ? kl_agree(want, got) : top5_agree(want, got, bound);
+}
+
 // The imperative forward's logits after `ids`, from position 0.
 static std::vector<float> imperative_prompt(qm::Model& M, const std::vector<int>& ids) {
   qm::reset_cache(M);
@@ -140,7 +174,8 @@ static void fixed_sums(bool on) {
 
 // The batched prefill's f16 sums (the default where the backend has them),
 // against `ref`, an f32 forward's logits for the same prompt: the top-5
-// logits to 2e-2 and the same greedy token. Then the safety net: with the
+// logits to 2e-2 and the same greedy token (a sensitive model's as Oracle::agree
+// holds it). Then the safety net: with the
 // first layer's FFN norm scaled by 1e5 the f16 sums overflow (the MLP's input
 // passes f16's range), and the prompt must be redone once, exactly, from the
 // state it started at: an exact prefill of the same model, both with their
@@ -148,7 +183,7 @@ static void fixed_sums(bool on) {
 // by their own rounding, which Gemma 4 E2B grows to 2e-3 to 6e-3; a missed
 // restore is off by far more.
 static bool check_f16_sums(qm::Model& B, const std::vector<int>& ids,
-                           const std::vector<float>& ref) {
+                           const std::vector<float>& ref, const Oracle& O) {
   const bool was = B.f16_acc;
   B.f16_acc = true;
   if (!qm::prefill_sums_f16(B, false)) {  // nothing to hold: its prefill sums in f32 still
@@ -158,10 +193,10 @@ static bool check_f16_sums(qm::Model& B, const std::vector<int>& ids,
   }
   qm::reset_cache(B);
   const int64_t tok = qm::prefill_batched(B, ids);
-  const double t5 = qm::top5_maxrel(logits_of(B).data(), ref.data(), B.c.VOCAB);
-  const bool close = t5 < 2e-2 && tok == qm::argmax(ref);
-  std::printf("\nf16 sums: top-5 logits maxrel %.2e vs f32, token %lld %s\n", t5, (long long)tok,
-              close ? "OK" : "FAIL");
+  std::printf("\nf16 sums vs f32: ");
+  const bool close =
+      O.agree(ref, logits_of(B), 2e-2) && (O.sensitive || tok == qm::argmax(ref));
+  std::printf(", token %lld %s\n", (long long)tok, close ? "OK" : "FAIL");
   const tl::array fn = B.layers[0].fn;
   B.layers[0].fn = (fn * 1e5f).clone();
   B.layers[0].fn.eval();
@@ -396,7 +431,8 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   // first, 0.17 at the last), where the logits see it only through the attention
   // it feeds. The two paths' roundings leave every layer within ~5e-4 (every model
   // here), about as much deep as shallow; a single element can
-  // differ far more (a large v), which a norm does not let decide.
+  // differ far more (a large v), which a norm does not let decide. A sensitive
+  // model's few turned-over rows decide it (Gemma 4 12B 5e-2): shown, not held.
   const auto got_cache = cache_rows(B, NP);
   double cache_err = 0;
   int64_t cache_worst = -1;
@@ -410,23 +446,22 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
     const double err = std::sqrt(dd / ww);
     if (err > cache_err) cache_err = err, cache_worst = (int64_t)l;
   }
-  const bool cache_ok = cache_err < 3e-2;
+  const bool cache_ok = O.sensitive || cache_err < 3e-2;
   std::printf("\ndecoder (%s prefill) k / v cache vs imperative: relative error %.2e (attention "
               "layer %lld) %s",
               dec.batched ? "batched" : "token-by-token", cache_err, (long long)cache_worst,
-              cache_ok ? "OK" : "FAIL");
+              O.sensitive ? "(not held: a sensitive model)" : cache_ok ? "OK" : "FAIL");
   const double pmr = maxrel(got_prompt, imp_prompt.data(), B.c.VOCAB);
   const int64_t first = tok;
   const int64_t second = dec.step(B, first);
   const std::vector<float> got_step = logits_of(B);
   const double smr = maxrel(got_step, imp_step.data(), B.c.VOCAB);
-  const double p5 = qm::top5_maxrel(got_prompt.data(), imp_prompt.data(), B.c.VOCAB),
-               s5 = qm::top5_maxrel(got_step.data(), imp_step.data(), B.c.VOCAB);
-  const bool logits_ok = p5 < batched_bound && s5 < batched_bound;
-  std::printf("\ndecoder (%s prefill) top-5 logits vs imperative: prompt maxrel %.2e, "
-              "first step %.2e %s (whole vocabulary %.2e, %.2e)",
-              dec.batched ? "batched" : "token-by-token", p5, s5, logits_ok ? "OK" : "FAIL",
-              pmr, smr);
+  std::printf("\ndecoder (%s prefill) vs imperative, prompt: ",
+              dec.batched ? "batched" : "token-by-token");
+  bool logits_ok = O.agree(imp_prompt, got_prompt, batched_bound);
+  std::printf("; first step: ");
+  logits_ok &= O.agree(imp_step, got_step, batched_bound);
+  std::printf(" %s (whole vocabulary maxrel %.2e, %.2e)", logits_ok ? "OK" : "FAIL", pmr, smr);
   bool dec_ok = true;
   std::printf("\ndecoder (%s), greedy %lld:\n  cpp:", dec.ok() ? "graph capture" : "imperative",
               (long long)NB);
@@ -466,7 +501,7 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   // A prompt past one chunk of the delta rule (32 tokens), so the batched
   // prefill takes the backend's chunked form where it has one, and past a
   // sliding window (Gemma 3's local layers), so both paths read one: its last
-  // token's top-5 logits against the imperative path's.
+  // token's logits against the imperative path's (Oracle::agree).
   std::vector<int> longp;
   const int64_t n_long = std::max<int64_t>(96, B.c.SWA > 0 ? B.c.SWA + 64 : 0);
   for (int64_t i = 0; i < n_long; i++) longp.push_back(O.prompt_ids[i % NP]);
@@ -474,22 +509,20 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   qm::reset_cache(B);
   bool long_ok = true;
   if (qm::prefill_batched(B, longp) >= 0) {
-    const double l5 = qm::top5_maxrel(logits_of(B).data(), imp_long.data(), B.c.VOCAB);
-    long_ok = l5 < batched_bound;
-    std::printf("\n%lld-token prompt, batched vs imperative: top-5 logits maxrel %.2e %s\n",
-                (long long)longp.size(), l5, long_ok ? "OK" : "FAIL");
+    std::printf("\n%lld-token prompt, batched vs imperative: ", (long long)longp.size());
+    long_ok = O.agree(imp_long, logits_of(B), batched_bound);
+    std::printf(" %s\n", long_ok ? "OK" : "FAIL");
     // Again with its last chunk one token (as a 513-token prompt's is), which runs
     // on the decode's GEMVs.
     qm::reset_cache(B);
     qm::prefill_batched(B, longp, (int64_t)longp.size() - 1);
-    const double o5 = qm::top5_maxrel(logits_of(B).data(), imp_long.data(), B.c.VOCAB);
-    const bool one_ok = o5 < batched_bound;
+    std::printf("the same in chunks of %lld and 1: ", (long long)longp.size() - 1);
+    const bool one_ok = O.agree(imp_long, logits_of(B), batched_bound);
     long_ok &= one_ok;
-    std::printf("the same in chunks of %lld and 1: top-5 logits maxrel %.2e %s\n",
-                (long long)longp.size() - 1, o5, one_ok ? "OK" : "FAIL");
+    std::printf(" %s\n", one_ok ? "OK" : "FAIL");
   }
   const bool f16_ok = !qm::can_prefill_batched(B, (int64_t)longp.size()) ||
-                      check_f16_sums(B, longp, imp_long);
+                      check_f16_sums(B, longp, imp_long, O);
 
   // The chat's own defaults, its activation forms and f16 sums: the decoder's logits
   // after a spread-out prompt, held to the f32 forward's by the KL of their
@@ -513,14 +546,11 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
     d.begin(B, spread);
     const std::vector<float> got = logits_of(B);
     d.destroy();
-    const double kl = qm::kl_div(ref_spread, got);
-    const qm::logits_vs c = qm::compare_logits(ref_spread, got, qm::BOUND_Q8);
-    defaults_ok = (c.same_top || c.near_tie) && kl < 0.3;
     std::printf("\nthe chat's defaults (decode GEMV activations %s, prefill MMQ %s, sums in %s), a "
-                "spread-out prompt: KL %.2e from the f32 forward, top token %s %s\n",
-                qm::act_form_name(chat_form), mmq ? "on" : "off", f16 ? "f16" : "f32", kl,
-                c.same_top ? "same" : c.near_tie ? "turned over at a near tie" : "different",
-                defaults_ok ? "OK" : "FAIL");
+                "spread-out prompt, from the f32 forward: ",
+                qm::act_form_name(chat_form), mmq ? "on" : "off", f16 ? "f16" : "f32");
+    defaults_ok = kl_agree(ref_spread, got);
+    std::printf(" %s\n", defaults_ok ? "OK" : "FAIL");
   }
   return ok && bf16_ok && logits_ok && cache_ok && dec_ok && turn2_ok && sample_ok && long_ok && f16_ok &&
          defaults_ok;
@@ -551,6 +581,9 @@ int main(int argc, char** argv) {
       {"gemma3", 26, 1152, TL_ORACLE(gemma3_1boracle, 0x1f0d93832cf2bb46ull)},  // Gemma 3 1B
       // unsloth/gemma-4-E2B-it-GGUF's gemma-4-E2B-it-Q4_K_M.gguf, past its 512 window
       {"gemma4", 35, 1536, TL_ORACLE(gemma4_e2b_oracle, 0xfd1769fcfb2b2478ull)},
+      // and gemma-4-12b-it-GGUF's Q4_K_M: kv heads a layer's own, a global layer's v its k,
+      // its prompt twice LONG_USER, past its 1024 window
+      {"gemma4", 48, 3840, sensitive(TL_ORACLE(gemma4_12b_oracle, 0x6d183d8cd40a4e55ull))},
       // unsloth/Llama-3.2-{1B,3B}-Instruct-GGUF's F16, Q4_K_M and Q4_0
       {"llama", 16, 2048, TL_ORACLE(llama32_1boracle, 0)},                     // Llama 3.2 1B, F16
       {"llama", 16, 2048, TL_ORACLE(llama32_1b_q4oracle, 0x00f056cb14a01068ull)},  // 1B Q4_K_M
@@ -716,7 +749,7 @@ int main(int argc, char** argv) {
       for (auto t : got) std::printf(" %lld", (long long)t);
       bf16_ok = got == want;
       std::printf("\n  greedy %s\n", bf16_ok ? "MATCH" : "DIVERGE");
-      bf16_ok &= check_f16_sums(B, ids, array_prompt);
+      bf16_ok &= check_f16_sums(B, ids, array_prompt, O);
       bf16_ok &= check_sampled(B, ids);
     }
   }

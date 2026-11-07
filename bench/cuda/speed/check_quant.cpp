@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
     const std::vector<float> got(lg, lg + M.c.VOCAB);
     const qm::logits_vs c = qm::compare_logits(oracle_prompt, got, bound);
     const double kl = qm::kl_div(oracle_prompt, got);
-    const bool ok = (c.same_top || c.near_tie) && (exact ? c.err < bound : kl < 0.3);
+    const bool ok = exact ? (c.same_top || c.near_tie) && c.err < bound : qm::close_by_kl(c, kl);
     ok_all = ok_all && ok;
     std::printf("prefill 200 tokens (%s) | first token %lld vs %lld | logits worst |d|/(1+max) %.2e, "
                 "KL %.2e %s\n",

@@ -48,9 +48,10 @@ namespace gpu = tl::gpu;
 // structural switches.
 struct Config {
   std::string arch;  // "qwen2" | "qwen3" | "qwen35" | "gemma3" | "gemma4" | "llama" | "plamo3": the family, for drivers
-  // HD and FF are the widest layer's (the scratch's sizes); hd(l) and ff(l) a layer's own.
+  // HD and FF are the widest layer's (the scratch's sizes), and NKV the most kv heads
+  // a layer has; nkv(l), hd(l) and ff(l) a layer's own.
   int64_t NL = 0, NE = 0, NH = 0, NKV = 0, HD = 0, FF = 0, VOCAB = 0;
-  int64_t MAXC = 4096;  // KV capacity per layer (f32): NKV*MAXC*HD*8 B per layer
+  int64_t MAXC = 4096;  // KV capacity per layer (f32): nkv(l)*MAXC*hd(l)*8 B per layer
   float EPS = 1e-6f, ROPE_BASE = 1e6f;
   // Qwen2 puts a bias on the q/k/v projections; Qwen3 drops it.
   bool qkv_bias = false;
@@ -110,18 +111,25 @@ struct Config {
   }
   // Gemma 4. Its local layers' heads and RoPE are narrower than its global ones'
   // (HD_LOCAL, ROT_LOCAL; 0 where they are not), and its MLP's width is a layer's
-  // own (FF_L; empty: FF on every layer). Its last KV_SHARED layers keep no K and V:
+  // own (FF_L; empty: FF on every layer), and so are its kv heads (NKV_L; the 12B and
+  // 31B have fewer on the global layers). Its last KV_SHARED layers keep no K and V:
   // each reads the cache of the last layer of its kind before them (kv_src, as
-  // llama.cpp's kv_source). v is RMS-normalized without a weight (v_norm). PLE wide
+  // llama.cpp's kv_source). v is RMS-normalized without a weight (v_norm). The layers
+  // k_eq_v marks (the 12B's and 31B's global ones: HF's attention_k_eq_v) have no v
+  // projection: v is the k projection's output, before k's norm and RoPE, which the
+  // load makes by reading k's rows for v's too (layer_qkv_parts). PLE wide
   // per-layer embeddings a layer (Model::ple_*, ple_inputs_, layer_tail_), and the
   // logits capped by SOFTCAP: tanh(logit / SOFTCAP) * SOFTCAP.
   int64_t HD_LOCAL = 0, ROT_LOCAL = 0, KV_SHARED = 0, PLE = 0;
-  std::vector<int64_t> FF_L;
+  std::vector<int64_t> FF_L, NKV_L;
+  std::vector<bool> k_eq_v;  // per layer; empty: every layer has its v projection
   bool v_norm = false;
   float SOFTCAP = 0.0f;
   int64_t hd(int64_t l) const { return is_local(l) && HD_LOCAL ? HD_LOCAL : HD; }
   int64_t rot(int64_t l) const { return is_local(l) && ROT_LOCAL ? ROT_LOCAL : ROT; }
   int64_t ff(int64_t l) const { return FF_L.empty() ? FF : FF_L[l]; }
+  int64_t nkv(int64_t l) const { return NKV_L.empty() ? NKV : NKV_L[l]; }
+  bool v_is_k(int64_t l) const { return l < (int64_t)k_eq_v.size() && k_eq_v[l]; }
   int64_t kv_src(int64_t l) const {
     const int64_t first = NL - KV_SHARED;
     if (l < first) return l;
@@ -137,16 +145,24 @@ struct Config {
   bool array_path() const {
     return !hybrid() && !post_norms && act == gpu::glu_act::silu && local.empty() &&
            ROPE_SCALE == 1.0f && !rope_factors && !PLE && !KV_SHARED && !v_norm &&
-           SOFTCAP == 0.0f && FF_L.empty() && !HD_LOCAL;
+           SOFTCAP == 0.0f && FF_L.empty() && !HD_LOCAL && NKV_L.empty() &&
+           std::find(k_eq_v.begin(), k_eq_v.end(), true) == k_eq_v.end();
   }
   bool is_delta(int64_t l) const { return hybrid() && (l + 1) % INTERVAL != 0; }
+  // Layer l's heads in its q|k|v projection: q's, and k's and v's where it keeps
+  // its own KV (not where it reads another layer's: Config::kv_src).
+  int64_t qkv_heads(int64_t l) const { return NH + (has_kv(l) ? 2 * nkv(l) : 0); }
   // Output widths of the fused projections (and so of the scratch they land in):
-  // layer l's q|k|v(|gate), only q where it reads another layer's KV, and the widest.
-  int64_t attn_proj(int64_t l) const {
-    const int64_t d = hd(l);
-    return (NH + (has_kv(l) ? 2 * NKV : 0)) * d + (attn_gate ? NH * d : 0);
+  // layer l's q|k|v(|gate), and the widest layer's, its q|k|v alone and with the gate.
+  int64_t attn_proj(int64_t l) const { return (qkv_heads(l) + (attn_gate ? NH : 0)) * hd(l); }
+  int64_t qkv_proj() const { return widest_([&](int64_t l) { return qkv_heads(l) * hd(l); }); }
+  int64_t attn_proj() const { return widest_([&](int64_t l) { return attn_proj(l); }); }
+  template <class F>
+  int64_t widest_(F f) const {
+    int64_t w = 0;
+    for (int64_t l = 0; l < NL; l++) w = std::max(w, f(l));
+    return w;
   }
-  int64_t attn_proj() const { return (NH + 2 * NKV) * HD + (attn_gate ? NH * HD : 0); }
   int64_t ssm_conv_ch() const { return 2 * SK * SDK + SH * SDV; }  // q|k|v
   int64_t ssm_v() const { return SH * SDV; }                        // the rule's out
   // q|k|v | alpha | beta | z. The decode scratch puts the rule's output right
@@ -177,16 +193,26 @@ inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
   c.NL = u32("block_count");
   c.NE = u32("embedding_length");
   c.NH = u32("attention.head_count");
-  c.NKV = u32("attention.head_count_kv");
-  // The MLP's width: one, or one a layer (Gemma 4's E models), the widest in FF.
-  if (const auto& f = m.kv(arch + ".feed_forward_length"); f.type == gg::val_type::array) {
+  // A dim that is one number, or one a layer (into `per`, left empty where every layer's
+  // is the same): the widest layer's.
+  auto layer_dim = [&](const char* k, std::vector<int64_t>& per) {
+    const auto& f = m.kv(arch + "." + k);
+    if (f.type != gg::val_type::array) return u32(k);
     for (const auto& v : f.arr)  // i32 in the converter's files
-      c.FF_L.push_back(v.type == gg::val_type::i32 ? (int64_t)v.as_i32() : (int64_t)v.as_u32());
-    if ((int64_t)c.FF_L.size() != c.NL) throw std::runtime_error("qwen: feed_forward_length is not one a layer");
-    c.FF = *std::max_element(c.FF_L.begin(), c.FF_L.end());
-  } else {
-    c.FF = u32("feed_forward_length");
-  }
+      per.push_back(v.type == gg::val_type::i32 ? (int64_t)v.as_i32() : (int64_t)v.as_u32());
+    if ((int64_t)per.size() != c.NL) throw std::runtime_error("qwen: " + std::string(k) + " is not one a layer");
+    const int64_t widest = *std::max_element(per.begin(), per.end());
+    if (std::count(per.begin(), per.end(), widest) == c.NL) per.clear();
+    return widest;
+  };
+  // The kv heads (Gemma 4 12B and 31B: fewer on the global layers) and the MLP's
+  // width (Gemma 4's E models), each one a layer or one for all. Every q head reads
+  // one kv head: a layer's q heads are a multiple of its kv heads.
+  c.NKV = layer_dim("attention.head_count_kv", c.NKV_L);
+  c.FF = layer_dim("feed_forward_length", c.FF_L);
+  for (int64_t l = 0; l < c.NL; l++)
+    if (c.nkv(l) <= 0 || c.NH % c.nkv(l))
+      throw std::runtime_error("qwen: layer " + std::to_string(l) + "'s q heads are not a multiple of its kv heads");
   // Qwen3 states head_dim (key_length); Qwen2 derives it from the width.
   c.HD = m.has(arch + ".attention.key_length") ? u32("attention.key_length")
                                                : c.NE / c.NH;
@@ -221,7 +247,7 @@ inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
   };
   c.fused_qkv = rows(a0 + "attn_q.weight") < 0 && rows(a0 + "attn_qkv.weight") >= 0;
   if (c.fused_qkv) {
-    if (rows(a0 + "attn_qkv.weight") != (c.NH + 2 * c.NKV) * c.HD)
+    if (rows(a0 + "attn_qkv.weight") != c.qkv_heads(c.first_attn()) * c.HD)
       throw std::runtime_error("qwen: " + a0 + "attn_qkv.weight is not q|k|v");
   } else {
     const int64_t wq = rows(a0 + "attn_q.weight");
@@ -339,10 +365,15 @@ inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
     if (c.KV_SHARED && (c.attn_gate || c.qkv_bias))
       throw std::runtime_error("qwen: KV-sharing layers with a q gate or a qkv bias");
     if (m.has(arch + ".embedding_length_per_layer_input")) c.PLE = u32("embedding_length_per_layer_input");
-    // A global layer whose v is its k (12B, 31B: no attn_v) is not read yet.
+    // A layer that keeps its KV with no attn_v takes k's projection for v (12B, 31B:
+    // the global layers). GGUF has no key for it (HF's attention_k_eq_v): the tensor's
+    // absence is the switch, as llama.cpp's gemma4.cpp reads it. A v bias would have
+    // nothing to add to.
+    c.k_eq_v.assign(c.NL, false);
     for (int64_t l = 0; l < c.NL; l++)
-      if (c.has_kv(l) && !m.tensor("blk." + std::to_string(l) + ".attn_v.weight"))
-        throw std::runtime_error("qwen: a gemma4 layer without attn_v (its v is its k)");
+      c.k_eq_v[l] = c.has_kv(l) && !m.tensor("blk." + std::to_string(l) + ".attn_v.weight");
+    if (std::count(c.k_eq_v.begin(), c.k_eq_v.end(), true) && (c.qkv_bias || c.fused_qkv))
+      throw std::runtime_error("qwen: a v that is k, with a qkv bias or a fused qkv");
   }
   return c;
 }
@@ -469,10 +500,13 @@ struct wpart {
 // the rows of one fused tensor (Config::fused_qkv, fused_gu). q and k in the
 // halves order the kernels turn (a llama file's rows are in NORM order:
 // wpart::norm_hd); Qwen3.5's q interleaves q and its gate a head at a time. A layer
-// that reads another's KV (Config::kv_src) projects only q.
+// that reads another's KV (Config::kv_src) projects only q, and one whose v is its k
+// (Config::v_is_k) reads k's rows for v too: the same projection twice, so v leaves
+// the GEMV as k does, before k's norm and RoPE, and every path downstream is a plain
+// q|k|v layer's.
 inline std::vector<wpart> layer_qkv_parts(const Config& c, int64_t l) {
   const std::string p = "blk." + std::to_string(l) + ".";
-  const int64_t hd = c.hd(l), Q = c.NH * hd, KV = c.NKV * hd;
+  const int64_t hd = c.hd(l), Q = c.NH * hd, KV = c.nkv(l) * hd;
   if (c.fused_qkv) {
     const std::string n = p + "attn_qkv.weight";
     return {{n, Q, 0, 0, 0}, {n, KV, 0, 0, Q}, {n, KV, 0, 0, Q + KV}};
@@ -481,8 +515,9 @@ inline std::vector<wpart> layer_qkv_parts(const Config& c, int64_t l) {
   std::vector<wpart> parts = {c.attn_gate ? wpart{p + "attn_q.weight", Q, hd, 2 * hd, 0}
                                           : wpart{p + "attn_q.weight", Q, 0, 0, 0, nhd}};
   if (c.has_kv(l)) {
-    parts.push_back({p + "attn_k.weight", KV, 0, 0, 0, nhd});
-    parts.push_back({p + "attn_v.weight", KV});
+    const wpart k{p + "attn_k.weight", KV, 0, 0, 0, nhd};
+    parts.push_back(k);
+    parts.push_back(c.v_is_k(l) ? k : wpart{p + "attn_v.weight", KV});
   }
   if (c.attn_gate) parts.push_back({p + "attn_q.weight", Q, hd, 2 * hd, hd});
   return parts;
@@ -710,7 +745,7 @@ struct Layer {
   // (f32 weights, or a backend without the row GEMV) the split-K GEMV reads
   // column-major [K,N] arrays: wqkv and wgu, and wo/wd shared with the oracle.
   // bqkv = [bq|bk|bv], the fused QKV projection's own column order, so the
-  // batched prefill splits all NH+2*NKV heads (and adds their bias) in one pass.
+  // batched prefill splits all qkv_heads(l) heads (and adds their bias) in one pass.
   wmat wqkv_row, wgu_row, wo_row, wd_row;
   array wqkv, wgu, bqkv;
   // q4 (group-symmetric int4, group=32) copies of the large bandwidth-bound MLP
@@ -819,8 +854,8 @@ struct PrefillScratch {
   storage h;       // input-norm out [cap, NE]
   storage h2;      // post-attn norm out [cap, NE]
   storage qkv;     // fused projection out [cap, attn_proj | ssm_proj]
-  // q|k|v head-major in ONE buffer [NH+2*NKV, cap, HD]: one split_heads pass
-  // over every head, and k / v are views into it.
+  // q|k|v head-major in ONE buffer [qkv_heads(l), cap, hd(l)], the widest layer's:
+  // one split_heads pass over every head, and k / v are views into it.
   storage qkvh;
   storage ah;  // attn out head-major [NH, cap, HD]
   storage at;  // attn (or DeltaNet gated-norm) out token-major [cap, NH*HD | V]
@@ -854,7 +889,7 @@ struct PrefillScratch {
     h = scratch_f32(cap * c.NE);
     h2 = scratch_f32(cap * c.NE);
     qkv = scratch_f32(cap * std::max(c.attn_proj(), c.ssm_proj()));
-    qkvh = scratch_f32((c.NH + 2 * c.NKV) * cap * c.HD);
+    qkvh = scratch_f32(cap * c.qkv_proj());
     ah = scratch_f32(c.NH * cap * c.HD);
     at = scratch_f32(cap * std::max(c.NH * c.HD, c.ssm_v()));
     if (c.attn_gate) {
@@ -1110,7 +1145,7 @@ inline void init_kv_caches(Model& M, bool f16) {
   M.kv_f16 = f16;
   for (int64_t l = 0; l < c.NL; l++)
     if (!c.is_delta(l) && c.has_kv(l))
-      M.layers[l].cache.init(c.NKV, c.MAXC, c.hd(l), f16, c.is_local(l) ? c.SWA : 0);
+      M.layers[l].cache.init(c.nkv(l), c.MAXC, c.hd(l), f16, c.is_local(l) ? c.SWA : 0);
 }
 
 // Reset the sequence to position 0 (replay from a fresh prefill): every KV
@@ -1284,7 +1319,7 @@ inline int64_t prefill_chunk_(Model& M, int64_t T, bool exact = false, bool last
     } else {
       // A layer that reads another's KV (Config::kv_src) projects q alone and
       // attends over that layer's cache, which has this chunk already.
-      const int64_t hd = c.hd(l), Q = c.NH * hd, AP = c.attn_proj(l);
+      const int64_t hd = c.hd(l), Q = c.NH * hd, AP = c.attn_proj(l), nkv = c.nkv(l);
       const bool own = c.has_kv(l);
       tl::kv_cache& kv = M.layers[c.kv_src(l)].cache;
       gemm(sp(P.h), sp(P.h16), L.wqkv_row, sp(P.qkv), AP, c.NE);
@@ -1292,23 +1327,22 @@ inline int64_t prefill_chunk_(Model& M, int64_t T, bool exact = false, bool last
       // adds the bias — rope's own fused-bias form only indexes correctly at
       // T == 1, so the bias rides along here instead. One pass over every head;
       // k and v are views into its output.
-      gpu::split_heads(sp(P.qkv), sp(L.bqkv), sp(P.qkvh), T, AP, 0,
-                       c.NH + (own ? 2 * c.NKV : 0), hd);
+      gpu::split_heads(sp(P.qkv), sp(L.bqkv), sp(P.qkvh), T, AP, 0, c.qkv_heads(l), hd);
       const gpu::span qh = sp(P.qkvh);
       const gpu::span kh = at_f32(qh, c.NH * T * hd);
-      const gpu::span vh = at_f32(qh, (c.NH + c.NKV) * T * hd);
+      const gpu::span vh = at_f32(qh, (c.NH + nkv) * T * hd);
       // Qwen3: every q / k head row (hd wide, one per h*T + t) is RMS-normalized
       // in place, before rope. v is untouched, but for Gemma 4's weightless norm.
       // [H,T,D] flattened: row r = h*T + t, so rope's `pos + r % T` is pos0 + t.
       const gpu::rope_freq rf = rope_of(M, l);
       if (c.qk_norm) {
         gpu::rmsnorm_rope(qh, sp(L.qn), c.NH * T, T, hd, pos0, rf, c.EPS);
-        if (own) gpu::rmsnorm_rope(kh, sp(L.kn), c.NKV * T, T, hd, pos0, rf, c.EPS);
+        if (own) gpu::rmsnorm_rope(kh, sp(L.kn), nkv * T, T, hd, pos0, rf, c.EPS);
       } else {
         gpu::rope(qh, qh, c.NH * T, T, hd, pos0, rf);
-        if (own) gpu::rope(kh, kh, c.NKV * T, T, hd, pos0, rf);
+        if (own) gpu::rope(kh, kh, nkv * T, T, hd, pos0, rf);
       }
-      if (own && c.v_norm) gpu::rmsnorm(vh, sp(M.ones), vh, hd, c.EPS, c.NKV * T);
+      if (own && c.v_norm) gpu::rmsnorm(vh, sp(M.ones), vh, hd, c.EPS, nkv * T);
       cache_ok_(own ? kv.prefill(qh, kh, vh, sp(P.ah), T, c.NH, c.scale(l), exact)
                     : kv.attend(qh, sp(P.ah), T, c.NH, c.scale(l), exact));
       // Qwen3.5: times sigmoid of the gate, the tail of each projection row —
@@ -1316,7 +1350,7 @@ inline int64_t prefill_chunk_(Model& M, int64_t T, bool exact = false, bool last
       gpu::span ao = sp(P.at);
       if (c.attn_gate) {
         gpu::merge_heads(sp(P.ah), sp(P.at), T, c.NH, hd);
-        rows_out(at_f32(sp(P.qkv), (c.NH + 2 * c.NKV) * hd), AP, sp(P.gt), Q, T);
+        rows_out(at_f32(sp(P.qkv), c.qkv_heads(l) * hd), AP, sp(P.gt), Q, T);
         gpu::unary(gpu::kop::sigmoid, sp(P.gt), sp(P.gs), T * Q, 1, 0);
         gpu::binary(gpu::kop::mul, ao, sp(P.gs), sp(P.gt), T * Q, 1, 0);
         ao = sp(P.gt);
@@ -1652,7 +1686,7 @@ inline Model build(const gg::model& m, tl::dtype wdt = tl::dtype::f32,
       // head; the fused load takes q's rows first and the gate's last, so the
       // output is q | k | v | gate and every slice downstream is contiguous.
       // A layer that reads another's KV (Config::kv_src) has q's weights only.
-      const int64_t hd = c.hd(l), Q = c.NH * hd, KV = c.NKV * hd;
+      const int64_t hd = c.hd(l), Q = c.NH * hd, KV = c.nkv(l) * hd;
       const bool own = c.has_kv(l);
       const std::vector<wpart> qkv_parts = layer_qkv_parts(c, l);
       auto bias = [&](const char* n, int64_t len) {
@@ -1897,6 +1931,15 @@ inline logits_vs compare_logits(const std::vector<float>& want, const std::vecto
   return {mx / (1.0 + ref), ta == tb, ta != tb && want[ta] - want[tb] < bound * (1.0 + ref)};
 }
 
+// How far a form that rounds the activations may move a model's distribution from
+// the f32 forward's, as KL in nats (int8 activations move Gemma 3 4B by 1.4e-2; its
+// GLU epilogue run as SiLU, 3.7), and the rule the checks hold such a form to with
+// it: the same top token, or a near tie turned over (compare_logits), and KL within.
+constexpr double KL_BOUND = 0.3;
+inline bool close_by_kl(const logits_vs& c, double kl) {
+  return (c.same_top || c.near_tie) && kl < KL_BOUND;
+}
+
 // q4 decode GEMV: y(N) = a(1,K) @ dequant(Wq). Wq is a q4 array (logical [K,N],
 // storage [packed [N][K/2] | scales [N][K/32]]); the scales are a view into the
 // same buffer (they ride along the base upload — the array path's split too).
@@ -1974,42 +2017,42 @@ inline void run_layers_(Model& M, gpu::span x0, int64_t pos,
       }
       gv(L.wsout_row, L.wsout, sp(S.ab), ro, c.NE, V);  // ro = mixer @ ssm_out
     } else {
-      // Fused QKV: one GEMV -> [q(NH*hd) | k(NKV*hd) | v(NKV*hd)] in S.qkvb (then
+      // Fused QKV: one GEMV -> [q(NH*hd) | k(nkv*hd) | v(nkv*hd)] in S.qkvb (then
       // Qwen3.5's gate), and q, k and v are views of it: rope q & k in place,
       // bias-add v. Same per-column split-K as the separate wq/wk/wv GEMVs (bx=1,
       // chunk=32), so bit-identical per column. A layer that reads another's KV
       // (Config::kv_src) projects q alone and attends over that layer's cache,
       // which has this position already.
-      const int64_t hd = c.hd(l), Q = c.NH * hd;
+      const int64_t hd = c.hd(l), Q = c.NH * hd, nkv = c.nkv(l);
       const bool own = c.has_kv(l);
       tl::kv_cache& kv = M.layers[c.kv_src(l)].cache;
       gv(L.wqkv_row, L.wqkv, sp(S.hb), sp(S.qkvb), c.attn_proj(l), c.NE);
       const gpu::span qp = sp(S.qkvb);
       const gpu::span kp = at_f32(qp, Q);
-      const gpu::span vp = at_f32(qp, (c.NH + c.NKV) * hd);
+      const gpu::span vp = at_f32(qp, (c.NH + nkv) * hd);
       // Qwen3: RMSNorm every q / k head (one row of hd each) in place, before rope;
       // Gemma 4's v too, without a weight.
       if (c.qk_norm) {
         gpu::rmsnorm(qp, sp(L.qn), qp, hd, c.EPS, c.NH);
-        if (own) gpu::rmsnorm(kp, sp(L.kn), kp, hd, c.EPS, c.NKV);
+        if (own) gpu::rmsnorm(kp, sp(L.kn), kp, hd, c.EPS, nkv);
       }
-      if (own && c.v_norm) gpu::rmsnorm(vp, sp(M.ones), vp, hd, c.EPS, c.NKV);
+      if (own && c.v_norm) gpu::rmsnorm(vp, sp(M.ones), vp, hd, c.EPS, nkv);
       const gpu::rope_freq rf = rope_of(M, l);
       if (cap) {
         gpu::rope_dpos(qp, qp, c.NH, 1, hd, d_pos, rf, sp(L.bq));
-        if (own) gpu::rope_dpos(kp, kp, c.NKV, 1, hd, d_pos, rf, sp(L.bk));
+        if (own) gpu::rope_dpos(kp, kp, nkv, 1, hd, d_pos, rf, sp(L.bk));
       } else {
         gpu::rope(qp, qp, c.NH, 1, hd, pos, rf, sp(L.bq));
-        if (own) gpu::rope(kp, kp, c.NKV, 1, hd, pos, rf, sp(L.bk));
+        if (own) gpu::rope(kp, kp, nkv, 1, hd, pos, rf, sp(L.bk));
       }
-      if (c.qkv_bias) gpu::binary(gpu::kop::add, vp, sp(L.bv), vp, c.NKV * hd, 1, 0);
+      if (c.qkv_bias) gpu::binary(gpu::kop::add, vp, sp(L.bv), vp, nkv * hd, 1, 0);
       cache_ok_(cap ? (!own || kv.append_dpos(kp, vp, d_pos)) &&
                           kv.attn_dpos(qp, sp(S.ab), c.NH, d_pos, c.scale(l))
                     : (!own || kv.append(kp, vp)) && kv.attn(qp, sp(S.ab), c.NH, c.scale(l)));
       // Qwen3.5: the attention output times sigmoid of its gate (q|k|v's tail).
       gpu::span ao = sp(S.ab);
       if (c.attn_gate) {
-        const gpu::span gate = at_f32(qp, (c.NH + 2 * c.NKV) * hd);
+        const gpu::span gate = at_f32(qp, c.qkv_heads(l) * hd);
         gpu::unary(gpu::kop::sigmoid, gate, sp(S.gateb), Q, 1, 0);
         gpu::binary(gpu::kop::mul, ao, sp(S.gateb), sp(S.gateb), Q, 1, 0);
         ao = sp(S.gateb);
