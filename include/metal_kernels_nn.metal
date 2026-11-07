@@ -1087,14 +1087,15 @@ kernel void gemv_q4_(device const float* a       [[buffer(0)]],
 // columns of a wider output.
 // ---------------------------------------------------------------------------
 
-// A reader gives one weight, f(n, k), and eight, f.vec(n, k, v): the eight
-// from k, a multiple of 8, which never cross a format's scale group (16 or
-// 32 weights), so one scale serves them and their bytes come in a few wide
+// A reader gives one weight, f(n, k), and a run of RUN, f.vec(n, k, v): the
+// run from k, a multiple of RUN, which never crosses a format's scale group
+// (16 or 32 weights), so one scale serves it and its bytes come in a few wide
 // loads. STEEL's functor loader takes a tile's whole rows by vec and its
 // clipped edges by element.
 
 // B[n,k] of a bf16 [N,K] weight (the reader only where K is not whole vectors).
 struct read_bf16_ {
+  static constexpr constant short RUN = 8;
   device const ushort* B;
   uint K;
   float operator()(uint n, uint k) const { return widen_(B[(ulong)n * K + k]); }
@@ -1136,6 +1137,7 @@ static inline uint ld32_h_(device const uchar* b) {
 // GEMVs below read too.
 struct read_q4k_ {
   static constexpr constant uint ELEMS = 256, BYTES = 144;
+  static constexpr constant short RUN = 16;
   device const uchar* W;
   uint row_bytes;
   float operator()(uint n, uint k) const {
@@ -1147,7 +1149,7 @@ struct read_q4k_ {
     const float d1 = half_at_(b) * sc, m1 = half_at_(b + 2) * mn;
     return d1 * float((g & 1u) ? q >> 4 : q & 0xFu) - m1;
   }
-  // Two 32-bit loads (the block and its quants 4-byte aligned: quant_ok_).
+  // Four 32-bit loads (the block and its quants 4-byte aligned: quant_ok_).
   void vec(uint n, uint k, thread float* v) const {
     device const uchar* b = W + (ulong)n * row_bytes + (k >> 8) * BYTES;
     const uint o = k & 255u, g = o >> 5;
@@ -1155,11 +1157,11 @@ struct read_q4k_ {
     q4k_scale_min_(q4k_scale_words_(b), g, sc, mn);
     device const uint* q =
         reinterpret_cast<device const uint*>(b + 16 + 32 * (g >> 1) + (o & 31u));
-    const uint sh = (g & 1u) ? 4u : 0u, w0 = q[0] >> sh, w1 = q[1] >> sh;
+    const uint sh = (g & 1u) ? 4u : 0u;
     const float d1 = half_at_(b) * sc, m1 = half_at_(b + 2) * mn;
-    for (uint j = 0; j < 4; j++) {
-      v[j] = d1 * float((w0 >> (8 * j)) & 0xFu) - m1;
-      v[4 + j] = d1 * float((w1 >> (8 * j)) & 0xFu) - m1;
+    for (uint i = 0; i < RUN / 4; i++) {  // four weights a word
+      const uint w = q[i] >> sh;
+      for (uint j = 0; j < 4; j++) v[4 * i + j] = d1 * float((w >> (8 * j)) & 0xFu) - m1;
     }
   }
 };
@@ -1167,6 +1169,7 @@ struct read_q4k_ {
 // byte l the fifth bit of weight l of group g), then Q4_K's quants at byte 48.
 struct read_q5k_ {
   static constexpr constant uint ELEMS = 256, BYTES = 176;
+  static constexpr constant short RUN = 16;
   device const uchar* W;
   uint row_bytes;
   float operator()(uint n, uint k) const {
@@ -1178,7 +1181,7 @@ struct read_q5k_ {
     const float d1 = half_at_(b) * sc, m1 = half_at_(b + 2) * mn;
     return d1 * float(((g & 1u) ? q >> 4 : q & 0xFu) | (h << 4)) - m1;
   }
-  // Four 32-bit loads (the block 4-byte aligned: quant_ok_).
+  // Eight 32-bit loads (the block 4-byte aligned: quant_ok_).
   void vec(uint n, uint k, thread float* v) const {
     device const uchar* b = W + (ulong)n * row_bytes + (k >> 8) * BYTES;
     const uint o = k & 255u, g = o >> 5, l = o & 31u;
@@ -1187,16 +1190,17 @@ struct read_q5k_ {
     device const uint* q = reinterpret_cast<device const uint*>(b + 48 + 32 * (g >> 1) + l);
     device const uint* qh = reinterpret_cast<device const uint*>(b + 16 + l);
     const uint sh = (g & 1u) ? 4u : 0u;
-    const uint w0 = q[0] >> sh, w1 = q[1] >> sh, h0 = qh[0] >> g, h1 = qh[1] >> g;
     const float d1 = half_at_(b) * sc, m1 = half_at_(b + 2) * mn;
-    for (uint j = 0; j < 4; j++) {
-      v[j] = d1 * float(((w0 >> (8 * j)) & 0xFu) | (((h0 >> (8 * j)) & 1u) << 4)) - m1;
-      v[4 + j] = d1 * float(((w1 >> (8 * j)) & 0xFu) | (((h1 >> (8 * j)) & 1u) << 4)) - m1;
+    for (uint i = 0; i < RUN / 4; i++) {  // four weights a word
+      const uint w = q[i] >> sh, h = qh[i] >> g;
+      for (uint j = 0; j < 4; j++)
+        v[4 * i + j] = d1 * float(((w >> (8 * j)) & 0xFu) | (((h >> (8 * j)) & 1u) << 4)) - m1;
     }
   }
 };
 struct read_q6k_ {
   static constexpr constant uint ELEMS = 256, BYTES = 210;
+  static constexpr constant short RUN = 16;
   device const uchar* W;
   uint row_bytes;
   float operator()(uint n, uint k) const {
@@ -1222,7 +1226,7 @@ struct read_q6k_ {
     device const char* scales = reinterpret_cast<device const char*>(b + 192);
     const float d = half_at_(b + 208) * float(scales[8 * h + l / 16 + 2 * quarter]);
     const uint ls = quarter >= 2 ? 4u : 0u, hs = 2 * quarter;
-    for (uint i = 0; i < 4; i++) {
+    for (uint i = 0; i < RUN / 2; i++) {  // two weights a load
       const uint lo = ql[i], hi = qh[i];
       for (uint e = 0; e < 2; e++) {
         const int q = int((((lo >> (8 * e)) >> ls) & 0xFu) |
@@ -1234,6 +1238,7 @@ struct read_q6k_ {
 };
 struct read_q80_ {
   static constexpr constant uint ELEMS = 32, BYTES = 34;
+  static constexpr constant short RUN = 8;
   device const uchar* W;
   uint row_bytes;
   float operator()(uint n, uint k) const {
@@ -1292,6 +1297,7 @@ template <class Vals>
 struct read_d32_ {
   using V = Vals;
   static constexpr constant uint ELEMS = 32, BYTES = V::BYTES;
+  static constexpr constant short RUN = 8;
   device const uchar* W;
   uint row_bytes;
   float operator()(uint n, uint k) const {
@@ -1312,6 +1318,7 @@ using read_q40_ = read_d32_<q40_>;
 // Q4_1, 20 bytes a block of 32: d, a half min m, then the nibbles; weight d * q + m.
 struct read_q41_ {
   static constexpr constant uint ELEMS = 32, BYTES = 20;
+  static constexpr constant short RUN = 8;
   device const uchar* W;
   uint row_bytes;
   float operator()(uint n, uint k) const {
@@ -1343,20 +1350,24 @@ TL_STEEL_KERNEL_ST(gemm_bf16_f16acc32_, 32, false, true, ushort, B, half)
 // a short chunk (steel_grid_).
 TL_STEEL_KERNEL_SRC(gemm_bf16_nt_, 64, false, true, ushort, TL_READ_BF16)
 TL_STEEL_KERNEL_SRC(gemm_bf16_nt32_, 32, false, true, ushort, TL_READ_BF16)
-TL_STEEL_KERNEL_SRC(gemm_q4k_nt_, 64, false, true, uchar, TL_READ_Q(read_q4k_))
-TL_STEEL_KERNEL_SRC(gemm_q4k_nt32_, 32, false, true, uchar, TL_READ_Q(read_q4k_))
-TL_STEEL_KERNEL_SRC(gemm_q5k_nt_, 64, false, true, uchar, TL_READ_Q(read_q5k_))
-TL_STEEL_KERNEL_SRC(gemm_q5k_nt32_, 32, false, true, uchar, TL_READ_Q(read_q5k_))
-TL_STEEL_KERNEL_SRC(gemm_q6k_nt_, 64, false, true, uchar, TL_READ_Q(read_q6k_))
-TL_STEEL_KERNEL_SRC(gemm_q6k_nt32_, 32, false, true, uchar, TL_READ_Q(read_q6k_))
-TL_STEEL_KERNEL_SRC(gemm_q80_nt_, 64, false, true, uchar, TL_READ_Q(read_q80_))
-TL_STEEL_KERNEL_SRC(gemm_q80_nt32_, 32, false, true, uchar, TL_READ_Q(read_q80_))
-TL_STEEL_KERNEL_SRC(gemm_q50_nt_, 64, false, true, uchar, TL_READ_Q(read_q50_))
-TL_STEEL_KERNEL_SRC(gemm_q50_nt32_, 32, false, true, uchar, TL_READ_Q(read_q50_))
-TL_STEEL_KERNEL_SRC(gemm_q40_nt_, 64, false, true, uchar, TL_READ_Q(read_q40_))
-TL_STEEL_KERNEL_SRC(gemm_q40_nt32_, 32, false, true, uchar, TL_READ_Q(read_q40_))
-TL_STEEL_KERNEL_SRC(gemm_q41_nt_, 64, false, true, uchar, TL_READ_Q(read_q41_))
-TL_STEEL_KERNEL_SRC(gemm_q41_nt32_, 32, false, true, uchar, TL_READ_Q(read_q41_))
+// The block formats step K by 32: a thread's 16 weights a step are one run of
+// the K-quants' readers (one scale decoded for them) or two of the others',
+// and a step's barriers serve twice the weights. Against a step of 16, at
+// Gemma 4 E2B's and E4B's MLP shapes (512 rows): Q4_K 2 to 3% faster, Q5_K 7
+// to 8%, Q6_K 15%.
+#define TL_GEMM_Q(F)                                                         \
+  TL_STEEL_KERNEL_BK(gemm_##F##_nt_, 64, false, true, uchar,                 \
+                     TL_READ_Q(read_##F##_), float, 32)                      \
+  TL_STEEL_KERNEL_BK(gemm_##F##_nt32_, 32, false, true, uchar,               \
+                     TL_READ_Q(read_##F##_), float, 32)
+TL_GEMM_Q(q4k)
+TL_GEMM_Q(q5k)
+TL_GEMM_Q(q6k)
+TL_GEMM_Q(q80)
+TL_GEMM_Q(q50)
+TL_GEMM_Q(q40)
+TL_GEMM_Q(q41)
+#undef TL_GEMM_Q
 
 // ---- one row of a table into f32, the row the f32 index idx[0] names (a
 // decode step's input, from the token the last step's argmax_to left; an

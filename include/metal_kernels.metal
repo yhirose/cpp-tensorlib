@@ -585,9 +585,10 @@ struct SteelLoaderF {
   STEEL_CONST short vec_size = (BCOLS * BROWS) / tgp_size;
   static_assert(BCOLS == vec_size * (tgp_size / BROWS),
                 "SteelLoaderF: tile must be covered in one pass");
-  // A thread's run is a reader's f.vec: eight weights from a k that stays a
-  // multiple of 8 (bj is 0 or 8, and k steps by BCOLS).
-  static_assert(vec_size == 8 && BCOLS % 8 == 0, "SteelLoaderF: runs of eight");
+  // A thread's vec_size weights are whole runs of the reader's f.vec (F::RUN
+  // weights from a k that stays a multiple of RUN: bj is a multiple of
+  // vec_size, and k steps by BCOLS).
+  static_assert(vec_size % F::RUN == 0, "SteelLoaderF: whole runs of the reader's");
 
   const F f;
   const short bi;
@@ -607,7 +608,8 @@ struct SteelLoaderF {
 
   METAL_FUNC void load_unsafe() const {
     float v[vec_size];
-    f.vec(n, k, v);
+    STEEL_PRAGMA_UNROLL
+    for (short r = 0; r < vec_size; r += F::RUN) f.vec(n, k + r, v + r);
     STEEL_PRAGMA_UNROLL
     for (short j = 0; j < vec_size; j++) dst[j * dst_ld] = v[j];
   }
@@ -798,19 +800,21 @@ struct SteelMMA {
   }
 };
 
-// Unified STEEL body — BN = 64, WM = WN = 2; BM ∈ {64, 32}. gemm_params
+// Unified STEEL body — BN = 64, WM = WN = 2; BM ∈ {64, 32}; a K step of BK
+// (16, or the nn layer's 32 for its block formats). gemm_params
 // reuse: `a_fast` carries swizzle_log for STEEL dispatches (32-family
 // ignores swizzle; STEEL ignores the fast flags). TA/TB select the
 // transposing loader for an operand whose device storage is a transposed
 // view (backward-pass matmuls, attention's Q·Kᵀ); the MMA stays NN. B is
 // whatever steel_b_ takes: a pointer, or a functor over W's rows. C's rows
 // are p.ldc apart.
-template <short BM, bool TA = false, bool TB = false, typename BSrc, typename ST>
+template <short BM, bool TA = false, bool TB = false, short BK = 16, typename BSrc,
+          typename ST>
 void steel_body_(device const float* A, BSrc B,
                  device float* C, constant gemm_params& p,
                  threadgroup ST* As, threadgroup ST* Bs,
                  uint3 tgid, uint sid, uint lane) {
-  constexpr short BN = 64, BK = 16, WM = 2, WN = 2, pad = steel_pad_<ST>();
+  constexpr short BN = 64, WM = 2, WN = 2, pad = steel_pad_<ST>();
   constexpr short tgp_size = WM * WN * 32;
 
   // The tile's origin and the operands' starts in 32 and 64 bits, so a
@@ -919,8 +923,8 @@ void steel_body_(device const float* A, BSrc B,
 // BT: B's element type (float here; a bf16 weight's ushort in the nn layer);
 // BSRC what steel_body_ reads B through: B itself, or a reader f(n, k) over
 // it (the nn layer's GGUF formats), built after the slice moved B; ST the
-// tiles' type, which the product is summed in.
-#define TL_STEEL_KERNEL_ST(name, BM, TA, TB, BT, BSRC, ST)                   \
+// tiles' type, which the product is summed in; BK the K step.
+#define TL_STEEL_KERNEL_BK(name, BM, TA, TB, BT, BSRC, ST, BK)               \
   kernel void name(device const float* A [[buffer(0)]],                      \
                    device const BT* B [[buffer(1)]],                         \
                    device float* C [[buffer(2)]],                            \
@@ -928,11 +932,13 @@ void steel_body_(device const float* A, BSrc B,
                    uint3 tgid [[threadgroup_position_in_grid]],              \
                    uint sid [[simdgroup_index_in_threadgroup]],              \
                    uint lane [[thread_index_in_simdgroup]]) {                \
-    threadgroup ST As[BM * (16 + steel_pad_<ST>())];                         \
-    threadgroup ST Bs[16 * (64 + steel_pad_<ST>())];                         \
+    threadgroup ST As[BM * (BK + steel_pad_<ST>())];                         \
+    threadgroup ST Bs[BK * (64 + steel_pad_<ST>())];                         \
     gemm_slice_(A, B, C, p, tgid.z);                                         \
-    steel_body_<BM, TA, TB>(A, BSRC, C, p, As, Bs, tgid, sid, lane);         \
+    steel_body_<BM, TA, TB, BK>(A, BSRC, C, p, As, Bs, tgid, sid, lane);     \
   }
+#define TL_STEEL_KERNEL_ST(name, BM, TA, TB, BT, BSRC, ST)                   \
+  TL_STEEL_KERNEL_BK(name, BM, TA, TB, BT, BSRC, ST, 16)
 #define TL_STEEL_KERNEL_SRC(name, BM, TA, TB, BT, BSRC)                      \
   TL_STEEL_KERNEL_ST(name, BM, TA, TB, BT, BSRC, float)
 #define TL_STEEL_KERNEL(name, BM, TA, TB, BT)                                \
