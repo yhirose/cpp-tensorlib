@@ -1,9 +1,9 @@
 // M9 "actually chat" — numeric proof. Load a real Qwen2.5-0.5B-Instruct, Qwen3
 // or Qwen3.5 GGUF (F16 or BF16 weights, or Qwen3.5 0.8B's Q4_K_M, a fifth of it
-// Q5_K), Gemma 3 4B or 1B (Q4_K_M), Gemma 4 E2B or 12B (Q4_K_M), or Llama 3.2 1B
+// Q5_K), Gemma 3 4B or 1B (Q4_K_M), Gemma 4 E2B, E4B or 12B (Q4_K_M), or Llama 3.2 1B
 // (F16, Q4_K_M, or Q4_0 with Q4_1) or 3B (Q4_K_M), and run the decoder end to end, verified
 // against a tight numpy reference that reads the SAME weights (tools/qwen_oracle.py
-// wrote the *_oracle_data.h headers: Gemma 3 1B's and Gemma 4 E2B's and 12B's over a prompt
+// wrote the *_oracle_data.h headers: Gemma 3 1B's and Gemma 4 E2B's, E4B's and 12B's over a prompt
 // past their 512-position window, Llama 3.2 1B's over one long enough that its RoPE factors
 // turn the low-frequency pairs well apart; the model's arch and shape pick one,
 // and of several, the one that read the file's weights). Identical
@@ -22,6 +22,7 @@
 #include "gemma3_oracle_data.h"
 #include "gemma4_12b_oracle_data.h"
 #include "gemma4_e2b_oracle_data.h"
+#include "gemma4_e4b_oracle_data.h"
 #include "llama32_1b_oracle_data.h"
 #include "llama32_1b_q40_oracle_data.h"
 #include "llama32_1b_q4_oracle_data.h"
@@ -585,8 +586,9 @@ int main(int argc, char** argv) {
       // unsloth/gemma-3-{4b,1b}-it-GGUF's gemma-3-*-it-Q4_K_M.gguf
       {"gemma3", 34, 2560, TL_ORACLE(gemma3oracle, 0x0b1451ea793e00e9ull)},     // Gemma 3 4B
       {"gemma3", 26, 1152, TL_ORACLE(gemma3_1boracle, 0x1f0d93832cf2bb46ull)},  // Gemma 3 1B
-      // unsloth/gemma-4-E2B-it-GGUF's gemma-4-E2B-it-Q4_K_M.gguf, past its 512 window
-      {"gemma4", 35, 1536, TL_ORACLE(gemma4_e2b_oracle, 0xfd1769fcfb2b2478ull)},
+      // unsloth/gemma-4-{E2B,E4B}-it-GGUF's gemma-4-*-it-Q4_K_M.gguf, past their 512 window
+      {"gemma4", 35, 1536, TL_ORACLE(gemma4_e2b_oracle, 0xfd1769fcfb2b2478ull)},  // E2B
+      {"gemma4", 42, 2560, TL_ORACLE(gemma4_e4b_oracle, 0x7d1f4da887ddfe03ull)},  // E4B
       // and gemma-4-12b-it-GGUF's Q4_K_M: kv heads a layer's own, a global layer's v its k,
       // its prompt twice LONG_USER, past its 1024 window
       {"gemma4", 48, 3840, sensitive(TL_ORACLE(gemma4_12b_oracle, 0x6d183d8cd40a4e55ull))},

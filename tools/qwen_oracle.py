@@ -28,12 +28,12 @@ sliding window on 7 layers of 8, and YaRN on the global ones, unrounded
 times 0.1 ln(factor) + 1. Its prompt is a translation (PFML3) of LONG_USER, four
 times over: 2,542 tokens, past the 2048-position window.
 
-Gemma 4 (E2B, 12B) as HF's modeling_gemma4.py, which llama.cpp's gemma4.cpp follows: heads of
+Gemma 4 (E2B, E4B, 12B) as HF's modeling_gemma4.py, which llama.cpp's gemma4.cpp follows: heads of
 256 on the local layers and 512 on the global ones, which turn only their first 64 pairs
 (rope_freqs.weight: 1 for those, 1e30 for the rest), v RMS-normalized without a weight,
 an attention scale of 1, the per-layer embeddings (a token's own row of
 per_layer_token_embd, gathered, never the whole table, plus a projection of its
-embedding), the last 20 layers reading the KV of the last layer of their kind before
+embedding), the last 20 layers (E4B's 18) reading the KV of the last layer of their kind before
 them, each layer's output times its layer_output_scale, and the logits capped at 30
 by tanh. The 12B's and 31B's kv heads are a layer's own (fewer on the global layers),
 and a global layer has no attn_v: its v is its k projection, before k's norm and RoPE.
