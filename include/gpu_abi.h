@@ -366,6 +366,15 @@ inline constexpr int64_t max_group_threads = 1024;
 // a decoder hands the next step on the device (gpu_ops_llm.h).
 inline constexpr int64_t max_f32_index = int64_t(1) << 24;
 
+// A GQA decode attention's slices, a group each: a kv head and `per` of the q
+// heads that share it (each backend's kernel says how many, and cuts its slices
+// by the same count), the last of a kv head's slices holding fewer where `per`
+// does not divide them. A split launches this many groups a part
+// (split_parts' `groups`).
+inline int64_t kv_head_slices(int64_t n_q_heads, int64_t n_kv_heads, int64_t per) {
+  return n_kv_heads * ((n_q_heads / n_kv_heads + per - 1) / per);
+}
+
 // One group per (head, row), a thread per head-dim element: the attention
 // and KV-cache kernels' shape.
 inline grid per_head(int64_t heads, int64_t rows, int64_t D) {

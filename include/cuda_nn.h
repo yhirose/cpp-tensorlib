@@ -718,8 +718,8 @@ inline bool own_nn::cvt_h16(gpu::span src, gpu::span dst16, int64_t n) {
 inline constexpr int64_t attn_dec_heads(int64_t D) { return D == 256 ? 1 : 2; }
 inline constexpr unsigned attn_dec_threads(int64_t D) { return 32 * (D == 512 ? 4 : 8); }
 inline unsigned attn_dec_rows(int64_t n_q_heads, int64_t n_kv_heads, int64_t D) {
-  const int64_t group = n_q_heads / n_kv_heads;
-  return static_cast<unsigned>(n_kv_heads * ((group + attn_dec_heads(D) - 1) / attn_dec_heads(D)));
+  return static_cast<unsigned>(
+      gpu::policy::kv_head_slices(n_q_heads, n_kv_heads, attn_dec_heads(D)));
 }
 
 // Split-KV split-count heuristic: how many ctx-splits make grid = rows×S fill

@@ -452,8 +452,8 @@ static_assert(attn_decode_tg_bytes_(64) <= 32768 && attn_decode_tg_bytes_(128) <
               "the decode merge must fit a threadgroup's 32 KB");
 // grid.x: a kv head's q heads, attn_dec_heads_ at a time, over every kv head.
 inline unsigned long attn_decode_rows_(int64_t n_q_heads, int64_t n_kv_heads, int64_t D) {
-  const int64_t group = n_q_heads / n_kv_heads, g = attn_dec_heads_(D);
-  return static_cast<unsigned long>(n_kv_heads * ((group + g - 1) / g));
+  return static_cast<unsigned long>(
+      gpu::policy::kv_head_slices(n_q_heads, n_kv_heads, attn_dec_heads_(D)));
 }
 
 // Keys per split, or 0 for the single-pass kernel: one threadgroup a row
