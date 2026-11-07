@@ -723,6 +723,21 @@ inline bool gemm_quant(int type, bool a16, span A, span W, span C, int64_t m, in
   }
 }
 
+// The same product of an f32 A over f16 operands: A and the dequantized weight
+// rounded to f16 as they are staged, the sums f32 (Metal's, where the prefill
+// has no f16 activations; llama.cpp's Metal GEMM). f16's range, as
+// gemm_bf16_nt_f16acc's: an activation past 65504 turns to inf, which the
+// caller must check for. A backend without the form runs gemm_quant's exact one.
+TL_GPU_DETECT_OWN(gemm_quant_f16)
+template <class Own = own>
+inline bool gemm_quant_f16(int type, span A, span W, span C, int64_t m, int64_t n,
+                           int64_t k, int64_t ldc) {
+  if constexpr (detail::owns_gemm_quant_f16<Own>::value) {
+    if (detail::ran(Own::gemm_quant_f16(type, A, W, C, m, n, k, ldc))) return true;
+  }
+  return gemm_quant<Own>(type, false, A, W, C, m, n, k, ldc);
+}
+
 // act(gate) * up of a fused gate|up block-quantized projection in one MMQ GEMM (see
 // own::gemm_quant_glu in cuda.h). False where the backend has none or it does not apply.
 TL_GPU_DETECT_OWN(gemm_quant_glu)

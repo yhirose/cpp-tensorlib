@@ -173,28 +173,29 @@ static void fixed_sums(bool on) {
 #endif
 }
 
-// The batched prefill's f16 sums (the default where the backend has them),
-// against `ref`, an f32 forward's logits for the same prompt: the top-5 logits to
-// 2e-2 and the same greedy token (a sensitive model's as Oracle::agree holds
-// it). Then the safety net: with the first layer's FFN norm scaled by 1e5 the
-// f16 sums overflow (the MLP's input
-// passes f16's range), and the prompt must be redone once, exactly, from the
-// state it started at: an exact prefill of the same model, both with their
-// sums in a fixed order (fixed_sums). Split-K's atomics would move them apart
+// The batched prefill's f16 GEMMs (the default where the backend has them:
+// sums f16, or a block-quantized weight's operands f16 over f32 sums), against
+// `ref`, an f32 forward's logits for the same prompt: the top-5 logits to 2e-2
+// and the same greedy token (a sensitive model's as Oracle::agree holds it).
+// Then the safety net: with the first layer's FFN norm scaled by 1e5 the f16
+// GEMMs overflow (the MLP's input passes f16's range), and the prompt must be
+// redone once, exactly, from the state it started at: an exact prefill of the
+// same model, both with their sums in a fixed order (fixed_sums). Split-K's
+// atomics would move them apart
 // by their own rounding, which Gemma 4 E2B grows to 2e-3 to 6e-3; a missed
 // restore is off by far more.
-static bool check_f16_sums(qm::Model& B, const std::vector<int>& ids,
-                           const std::vector<float>& ref, const Oracle& O) {
+static bool check_f16_gemms(qm::Model& B, const std::vector<int>& ids,
+                            const std::vector<float>& ref, const Oracle& O) {
   const bool was = B.f16_acc;
   B.f16_acc = true;
-  if (!qm::prefill_sums_f16(B, false)) {  // nothing to hold: its prefill sums in f32 still
-    std::printf("\nf16 sums: none on this build (block-quantized weights, f32 activations) — skipped\n");
+  if (!qm::prefill_gemm_f16(B, false)) {  // nothing to hold: its prefill GEMMs are exact still
+    std::printf("\nf16 GEMMs: none on this build for block-quantized weights, skipped\n");
     B.f16_acc = was;
     return true;
   }
   qm::reset_cache(B);
   const int64_t tok = qm::prefill_batched(B, ids);
-  std::printf("\nf16 sums vs f32: ");
+  std::printf("\nf16 GEMMs vs f32: ");
   const bool close =
       O.agree(ref, logits_of(B), 2e-2) && (O.sensitive || tok == qm::argmax(ref));
   std::printf(", token %lld %s\n", (long long)tok, close ? "OK" : "FAIL");
@@ -370,8 +371,8 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   // that is the model's (Gemma 3 ~70x Qwen's: docs/llama-cpp-comparison.md,
   // "Accuracy"), so the structural checks below read the blocks with float
   // activations, where their bounds hold for every model, and the default forms
-  // are held to the f32 reference after them. The checks run the f32 sums, so
-  // their bounds stay tight; check_f16_sums holds the default f16 ones to the
+  // are held to the f32 reference after them. The checks run the exact GEMMs, so
+  // their bounds stay tight; check_f16_gemms holds the default f16 ones to the
   // same prompts after.
   const int64_t NB = 8;
   qm::Model B = qm::build(m, tl::dtype::bf16, false, false, 4096, /*oracle=*/false,
@@ -529,9 +530,9 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
     std::printf(" %s\n", one_ok ? "OK" : "FAIL");
   }
   const bool f16_ok = !qm::can_prefill_batched(B, (int64_t)longp.size()) ||
-                      check_f16_sums(B, longp, imp_long, O);
+                      check_f16_gemms(B, longp, imp_long, O);
 
-  // The chat's own defaults, its activation forms and f16 sums: the decoder's logits
+  // The chat's own defaults, its activation forms and f16 GEMMs: the decoder's logits
   // after a spread-out prompt, held to the f32 forward's by the KL of their
   // distributions (a chat prompt's next token is too certain for one position to
   // show anything: Gemma 3 4B's KL there is ~1e-13 though its logits move by up to
@@ -545,7 +546,7 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   B.f16_acc = true;
   // A quantized file's (ref_spread is its f32 forward's), where its forms are not
   // the f32 ones the checks above ran.
-  const bool mmq = qm::prefill_mmq(B, false), f16 = qm::prefill_sums_f16(B, false);
+  const bool mmq = qm::prefill_mmq(B, false), f16 = qm::prefill_gemm_f16(B, false);
   if (B.quant && (chat_form != tl::gpu::act_form::f32 || mmq || f16)) {
     B.gemv_form = chat_form;
     qm::reset_cache(B);
@@ -553,7 +554,7 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
     d.begin(B, spread);
     const std::vector<float> got = logits_of(B);
     d.destroy();
-    std::printf("\nthe chat's defaults (decode GEMV activations %s, prefill MMQ %s, sums in %s), a "
+    std::printf("\nthe chat's defaults (decode GEMV activations %s, prefill MMQ %s, GEMMs %s), a "
                 "spread-out prompt, from the f32 forward: ",
                 qm::act_form_name(chat_form), mmq ? "on" : "off", f16 ? "f16" : "f32");
     defaults_ok = kl_agree(ref_spread, got);
@@ -757,7 +758,7 @@ int main(int argc, char** argv) {
       for (auto t : got) std::printf(" %lld", (long long)t);
       bf16_ok = got == want;
       std::printf("\n  greedy %s\n", bf16_ok ? "MATCH" : "DIVERGE");
-      bf16_ok &= check_f16_sums(B, ids, array_prompt, O);
+      bf16_ok &= check_f16_gemms(B, ids, array_prompt, O);
       bf16_ok &= check_sampled(B, ids);
     }
   }

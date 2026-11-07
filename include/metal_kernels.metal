@@ -391,8 +391,8 @@ static inline uint frag_col_(uint lane) {
 // 16-byte boundaries and stagger across the threadgroup banks.
 template <typename ST> constexpr short steel_pad_() { return 16 / sizeof(ST); }
 
-// The tiles hold ST: float, or half for a GEMM summed in f16 (the MMA
-// multiplies and sums in the tiles' type).
+// The tiles hold ST: float, or half for a GEMM over f16 operands (the MMA
+// multiplies in the tiles' type, and sums in SteelMMA's AT).
 template <short BROWS, short BCOLS, short dst_ld, short reduction_dim, short tgp_size,
           typename ST = float>
 struct SteelLoader {
@@ -662,10 +662,12 @@ METAL_FUNC SteelLoaderF<BN, BK, ld, tgp, F, ST> steel_b_(
   return {f, col0, Bs, sid, lane};
 }
 
+// ST the tiles' type, AT the sums' (ST, or float over half tiles).
 template <short BM, short BN, short BK, short WM, short WN,
-          short lda_tgp, short ldb_tgp, typename ST = float>
+          short lda_tgp, short ldb_tgp, typename ST = float, typename AT = ST>
 struct SteelMMA {
   typedef vec<ST, 2> frag_type;
+  typedef vec<AT, 2> acc_type;
   STEEL_CONST short kFrag = 8;
   STEEL_CONST short TM = BM / (kFrag * WM);
   STEEL_CONST short TN = BN / (kFrag * WN);
@@ -680,7 +682,7 @@ struct SteelMMA {
 
   frag_type Atile[TM];
   frag_type Btile[TN];
-  frag_type Ctile[TM * TN];
+  acc_type Ctile[TM * TN];
 
   short sm, sn;
   short As_off, Bs_off;
@@ -698,7 +700,7 @@ struct SteelMMA {
     sm += tm; sn += tn;
 
     STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < TM * TN; i++) Ctile[i] = frag_type(0);
+    for (short i = 0; i < TM * TN; i++) Ctile[i] = acc_type(0);
   }
 
   METAL_FUNC static constexpr void load_frag_contig(
@@ -712,14 +714,15 @@ struct SteelMMA {
   }
 
   METAL_FUNC static constexpr void frag_mma(
-      thread frag_type& D, thread frag_type& A,
-      thread frag_type& B, thread frag_type& C) {
-    simdgroup_matrix<ST, 8, 8> A_mat, B_mat, C_mat;
+      thread acc_type& D, thread frag_type& A,
+      thread frag_type& B, thread acc_type& C) {
+    simdgroup_matrix<ST, 8, 8> A_mat, B_mat;
+    simdgroup_matrix<AT, 8, 8> C_mat;
     reinterpret_cast<thread frag_type&>(A_mat.thread_elements()) = A;
     reinterpret_cast<thread frag_type&>(B_mat.thread_elements()) = B;
-    reinterpret_cast<thread frag_type&>(C_mat.thread_elements()) = C;
+    reinterpret_cast<thread acc_type&>(C_mat.thread_elements()) = C;
     simdgroup_multiply_accumulate(C_mat, A_mat, B_mat, C_mat);
-    D = reinterpret_cast<thread frag_type&>(C_mat.thread_elements());
+    D = reinterpret_cast<thread acc_type&>(C_mat.thread_elements());
   }
 
   // Per kk step: load one K-slice of fragments, immediately MMA, serpentine
@@ -808,8 +811,8 @@ struct SteelMMA {
 // view (backward-pass matmuls, attention's Q·Kᵀ); the MMA stays NN. B is
 // whatever steel_b_ takes: a pointer, or a functor over W's rows. C's rows
 // are p.ldc apart.
-template <short BM, bool TA = false, bool TB = false, short BK = 16, typename BSrc,
-          typename ST>
+template <short BM, bool TA = false, bool TB = false, short BK = 16, typename AT = float,
+          typename BSrc, typename ST>
 void steel_body_(device const float* A, BSrc B,
                  device float* C, constant gemm_params& p,
                  threadgroup ST* As, threadgroup ST* Bs,
@@ -836,7 +839,7 @@ void steel_body_(device const float* A, BSrc B,
       loader_a(A, int(p.lda), As, sid, ushort(lane));
   auto loader_b = steel_b_<TB, BN, BK, ldb_nn, tgp_size>(
       B, p, col0, Bs, ushort(sid), ushort(lane));
-  SteelMMA<BM, BN, BK, WM, WN, lda_nn, ldb_nn, ST> mma_op(sid, lane);
+  SteelMMA<BM, BN, BK, WM, WN, lda_nn, ldb_nn, ST, AT> mma_op(sid, lane);
 
   int k_iters = int(p.K / BK);
   short lbk = short(p.K) - short(k_iters * BK);
@@ -923,8 +926,8 @@ void steel_body_(device const float* A, BSrc B,
 // BT: B's element type (float here; a bf16 weight's ushort in the nn layer);
 // BSRC what steel_body_ reads B through: B itself, or a reader f(n, k) over
 // it (the nn layer's GGUF formats), built after the slice moved B; ST the
-// tiles' type, which the product is summed in; BK the K step.
-#define TL_STEEL_KERNEL_BK(name, BM, TA, TB, BT, BSRC, ST, BK)               \
+// tiles' type, AT the sums' (TL_STEEL_KERNEL_ST sums in ST); BK the K step.
+#define TL_STEEL_KERNEL_BK(name, BM, TA, TB, BT, BSRC, ST, AT, BK)           \
   kernel void name(device const float* A [[buffer(0)]],                      \
                    device const BT* B [[buffer(1)]],                         \
                    device float* C [[buffer(2)]],                            \
@@ -935,10 +938,10 @@ void steel_body_(device const float* A, BSrc B,
     threadgroup ST As[BM * (BK + steel_pad_<ST>())];                         \
     threadgroup ST Bs[BK * (64 + steel_pad_<ST>())];                         \
     gemm_slice_(A, B, C, p, tgid.z);                                         \
-    steel_body_<BM, TA, TB, BK>(A, BSRC, C, p, As, Bs, tgid, sid, lane);     \
+    steel_body_<BM, TA, TB, BK, AT>(A, BSRC, C, p, As, Bs, tgid, sid, lane); \
   }
 #define TL_STEEL_KERNEL_ST(name, BM, TA, TB, BT, BSRC, ST)                   \
-  TL_STEEL_KERNEL_BK(name, BM, TA, TB, BT, BSRC, ST, 16)
+  TL_STEEL_KERNEL_BK(name, BM, TA, TB, BT, BSRC, ST, ST, 16)
 #define TL_STEEL_KERNEL_SRC(name, BM, TA, TB, BT, BSRC)                      \
   TL_STEEL_KERNEL_ST(name, BM, TA, TB, BT, BSRC, float)
 #define TL_STEEL_KERNEL(name, BM, TA, TB, BT)                                \

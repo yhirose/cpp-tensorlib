@@ -19,6 +19,9 @@ enum class nn_kernel {
   gemv_q4k, gemv_q6k, gemv_q80, gemv_q50, gemv_q5k, gemv_q40, gemv_q41,
   gemm_q4k, gemm_q4k_32, gemm_q6k, gemm_q6k_32, gemm_q80, gemm_q80_32, gemm_q50, gemm_q50_32,
   gemm_q5k, gemm_q5k_32, gemm_q40, gemm_q40_32, gemm_q41, gemm_q41_32,
+  gemm_q4k_f16, gemm_q4k_f16_32, gemm_q6k_f16, gemm_q6k_f16_32, gemm_q80_f16,
+  gemm_q80_f16_32, gemm_q50_f16, gemm_q50_f16_32, gemm_q5k_f16, gemm_q5k_f16_32,
+  gemm_q40_f16, gemm_q40_f16_32, gemm_q41_f16, gemm_q41_f16_32,
   rmsnorm_rope_64, rmsnorm_rope_128, rmsnorm_rope_256, gated_rmsnorm,
   gemm_bf16_steel, gemm_bf16_steel_32, gemm_bf16_f16acc, gemm_bf16_f16acc_32,
   embed_row_f32, embed_row_bf16, embed_row_q4k, embed_row_q6k, embed_row_q80, embed_row_q50,
@@ -48,6 +51,20 @@ inline const char* nn_kernel_name_(nn_kernel t) {
     case nn_kernel::gemm_q40_32: return "gemm_q40_nt32_";
     case nn_kernel::gemm_q41: return "gemm_q41_nt_";
     case nn_kernel::gemm_q41_32: return "gemm_q41_nt32_";
+    case nn_kernel::gemm_q4k_f16: return "gemm_q4k_f16_";
+    case nn_kernel::gemm_q4k_f16_32: return "gemm_q4k_f16_32_";
+    case nn_kernel::gemm_q6k_f16: return "gemm_q6k_f16_";
+    case nn_kernel::gemm_q6k_f16_32: return "gemm_q6k_f16_32_";
+    case nn_kernel::gemm_q80_f16: return "gemm_q80_f16_";
+    case nn_kernel::gemm_q80_f16_32: return "gemm_q80_f16_32_";
+    case nn_kernel::gemm_q50_f16: return "gemm_q50_f16_";
+    case nn_kernel::gemm_q50_f16_32: return "gemm_q50_f16_32_";
+    case nn_kernel::gemm_q5k_f16: return "gemm_q5k_f16_";
+    case nn_kernel::gemm_q5k_f16_32: return "gemm_q5k_f16_32_";
+    case nn_kernel::gemm_q40_f16: return "gemm_q40_f16_";
+    case nn_kernel::gemm_q40_f16_32: return "gemm_q40_f16_32_";
+    case nn_kernel::gemm_q41_f16: return "gemm_q41_f16_";
+    case nn_kernel::gemm_q41_f16_32: return "gemm_q41_f16_32_";
     case nn_kernel::rmsnorm_rope_64: return "rmsnorm_rope_64_";
     case nn_kernel::rmsnorm_rope_128: return "rmsnorm_rope_128_";
     case nn_kernel::rmsnorm_rope_256: return "rmsnorm_rope_256_";
@@ -113,6 +130,8 @@ struct own_nn {
   static bool gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
                          gpu::span C, int64_t m, int64_t n, int64_t k,
                          int64_t ldc, bool mmq);
+  static bool gemm_quant_f16(int type, gpu::span A, gpu::span W, gpu::span C,
+                             int64_t m, int64_t n, int64_t k, int64_t ldc);
   // Every gpu::rope_freq: a part of the row, a scaled position, per-pair factors.
   static bool rope(gpu::span x, gpu::span out, int64_t rows, int64_t T, int64_t D,
                    int64_t pos, const gpu::rope_freq& f, gpu::span bias);
@@ -328,22 +347,44 @@ inline constexpr unsigned long gemv_quant_qrows_ = 2, gemv_quant_sg_ = 2,
                                gemv_quant_rows_ = gemv_quant_sg_ * gemv_quant_qrows_;
 
 // The GGUF block formats the kernels read, a row each (cuda_nn.h's quant_fmts_):
-// the ggml type, its GEMV, GEMM (64- and 32-row bands) and row-lookup kernels, and
-// whether its reader takes 32-bit loads into a block (W word_aligned_) or 16-bit
-// ones (W 2-byte aligned). A block's geometry is ggml's (gguf::ggml_block).
+// the ggml type, its GEMV, GEMMs (gemm[f16][band32]: over f32 tiles or half
+// ones, in the 64- or the 32-row band) and row-lookup kernels, and whether its
+// reader takes 32-bit loads into a block (W word_aligned_) or 16-bit ones (W
+// 2-byte aligned). A block's geometry is ggml's (gguf::ggml_block).
 struct quant_fmt {
   int type;
-  nn_kernel gemv, gemm, gemm32, embed;
+  nn_kernel gemv, gemm[2][2], embed;
   bool word;
 };
 inline constexpr quant_fmt quant_fmts_[] = {
-    {12, nn_kernel::gemv_q4k, nn_kernel::gemm_q4k, nn_kernel::gemm_q4k_32, nn_kernel::embed_row_q4k, true},
-    {14, nn_kernel::gemv_q6k, nn_kernel::gemm_q6k, nn_kernel::gemm_q6k_32, nn_kernel::embed_row_q6k, false},
-    {8, nn_kernel::gemv_q80, nn_kernel::gemm_q80, nn_kernel::gemm_q80_32, nn_kernel::embed_row_q80, false},
-    {6, nn_kernel::gemv_q50, nn_kernel::gemm_q50, nn_kernel::gemm_q50_32, nn_kernel::embed_row_q50, false},
-    {13, nn_kernel::gemv_q5k, nn_kernel::gemm_q5k, nn_kernel::gemm_q5k_32, nn_kernel::embed_row_q5k, true},
-    {2, nn_kernel::gemv_q40, nn_kernel::gemm_q40, nn_kernel::gemm_q40_32, nn_kernel::embed_row_q40, false},
-    {3, nn_kernel::gemv_q41, nn_kernel::gemm_q41, nn_kernel::gemm_q41_32, nn_kernel::embed_row_q41, false},
+    {12, nn_kernel::gemv_q4k,
+     {{nn_kernel::gemm_q4k, nn_kernel::gemm_q4k_32},
+      {nn_kernel::gemm_q4k_f16, nn_kernel::gemm_q4k_f16_32}},
+     nn_kernel::embed_row_q4k, true},
+    {14, nn_kernel::gemv_q6k,
+     {{nn_kernel::gemm_q6k, nn_kernel::gemm_q6k_32},
+      {nn_kernel::gemm_q6k_f16, nn_kernel::gemm_q6k_f16_32}},
+     nn_kernel::embed_row_q6k, false},
+    {8, nn_kernel::gemv_q80,
+     {{nn_kernel::gemm_q80, nn_kernel::gemm_q80_32},
+      {nn_kernel::gemm_q80_f16, nn_kernel::gemm_q80_f16_32}},
+     nn_kernel::embed_row_q80, false},
+    {6, nn_kernel::gemv_q50,
+     {{nn_kernel::gemm_q50, nn_kernel::gemm_q50_32},
+      {nn_kernel::gemm_q50_f16, nn_kernel::gemm_q50_f16_32}},
+     nn_kernel::embed_row_q50, false},
+    {13, nn_kernel::gemv_q5k,
+     {{nn_kernel::gemm_q5k, nn_kernel::gemm_q5k_32},
+      {nn_kernel::gemm_q5k_f16, nn_kernel::gemm_q5k_f16_32}},
+     nn_kernel::embed_row_q5k, true},
+    {2, nn_kernel::gemv_q40,
+     {{nn_kernel::gemm_q40, nn_kernel::gemm_q40_32},
+      {nn_kernel::gemm_q40_f16, nn_kernel::gemm_q40_f16_32}},
+     nn_kernel::embed_row_q40, false},
+    {3, nn_kernel::gemv_q41,
+     {{nn_kernel::gemm_q41, nn_kernel::gemm_q41_32},
+      {nn_kernel::gemm_q41_f16, nn_kernel::gemm_q41_f16_32}},
+     nn_kernel::embed_row_q41, false},
 };
 // The row of `type` where rows of k weights are a whole number of its blocks, else null.
 inline const quant_fmt* quant_fmt_(int type, int64_t k) {
@@ -369,6 +410,20 @@ inline void gemm_nt_launch_(context& c, const steel_grid& g, gpu::span A, gpu::s
   const gemm_params p{u(M), u(N), u(K), u(K), u(K), 0u, 1u, g.swizzle_log, 0u,
                       1.0f, 0.0f, 0u, 0u, u(ldc)};
   gemm_launch_(c, A, W, C, p, g.gx, g.gy, 1);
+}
+
+// A GEMM over block-quantized rows on STEEL's body, over half tiles (f16) or
+// f32 ones (the format's kernels for the band steel_grid_ picks); false where
+// the kernels do not read W.
+inline bool gemm_quant_run_(bool f16, int type, gpu::span A, gpu::span W, gpu::span C,
+                            int64_t m, int64_t n, int64_t k, int64_t ldc) {
+  auto& c = context::get();
+  const quant_fmt* f = quant_ok_(type, k, W);
+  if (!c.device || m <= 0 || n <= 0 || ldc < n || !f) return false;
+  const steel_grid g = steel_grid_(m, n);
+  bind_(c, f->gemm[f16][g.band32]);
+  gemm_nt_launch_(c, g, A, W, C, m, n, k, ldc);
+  return true;
 }
 
 struct attn_decode_params {
@@ -595,13 +650,16 @@ inline bool own_nn::gemm_quant(int type, bool a16, gpu::span A, gpu::span W,
                                gpu::span C, int64_t m, int64_t n, int64_t k,
                                int64_t ldc, bool mmq) {
   (void)mmq;
-  auto& c = context::get();
-  const detail_::quant_fmt* f = detail_::quant_ok_(type, k, W);
-  if (!c.device || a16 || m <= 0 || n <= 0 || ldc < n || !f) return false;
-  const detail_::steel_grid g = detail_::steel_grid_(m, n);
-  detail_::bind_(c, g.band32 ? f->gemm32 : f->gemm);
-  detail_::gemm_nt_launch_(c, g, A, W, C, m, n, k, ldc);
-  return true;
+  return !a16 && detail_::gemm_quant_run_(false, type, A, W, C, m, n, k, ldc);
+}
+
+// The same over f16 operands (gpu_ops_nn.h's contract): STEEL's body over half
+// tiles, A and the dequantized weight rounded to half as they are staged, the
+// sums f32.
+inline bool own_nn::gemm_quant_f16(int type, gpu::span A, gpu::span W,
+                                   gpu::span C, int64_t m, int64_t n,
+                                   int64_t k, int64_t ldc) {
+  return detail_::gemm_quant_run_(true, type, A, W, C, m, n, k, ldc);
 }
 
 // One decode step: q [n_q_heads,D] against a [n_kv_heads,kv_max,D] cache read

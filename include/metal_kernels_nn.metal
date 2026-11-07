@@ -1354,12 +1354,19 @@ TL_STEEL_KERNEL_SRC(gemm_bf16_nt32_, 32, false, true, ushort, TL_READ_BF16)
 // the K-quants' readers (one scale decoded for them) or two of the others',
 // and a step's barriers serve twice the weights. Against a step of 16, at
 // Gemma 4 E2B's and E4B's MLP shapes (512 rows): Q4_K 2 to 3% faster, Q5_K 7
-// to 8%, Q6_K 15%.
+// to 8%, Q6_K 15%. Each also over half tiles (gpu_ops_nn.h's gemm_quant_f16):
+// A and the dequantized weight rounded to half as they are staged, the sums
+// f32 (llama.cpp's kernel_mul_mm). Summed in half too, pp512 was 5 to 9%
+// faster still, and the logits 40 to 120 times as far off the f32 forward's.
 #define TL_GEMM_Q(F)                                                         \
   TL_STEEL_KERNEL_BK(gemm_##F##_nt_, 64, false, true, uchar,                 \
-                     TL_READ_Q(read_##F##_), float, 32)                      \
+                     TL_READ_Q(read_##F##_), float, float, 32)               \
   TL_STEEL_KERNEL_BK(gemm_##F##_nt32_, 32, false, true, uchar,               \
-                     TL_READ_Q(read_##F##_), float, 32)
+                     TL_READ_Q(read_##F##_), float, float, 32)               \
+  TL_STEEL_KERNEL_BK(gemm_##F##_f16_, 64, false, true, uchar,                \
+                     TL_READ_Q(read_##F##_), half, float, 32)                \
+  TL_STEEL_KERNEL_BK(gemm_##F##_f16_32_, 32, false, true, uchar,             \
+                     TL_READ_Q(read_##F##_), half, float, 32)
 TL_GEMM_Q(q4k)
 TL_GEMM_Q(q5k)
 TL_GEMM_Q(q6k)

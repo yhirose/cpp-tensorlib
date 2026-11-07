@@ -958,10 +958,11 @@ struct Model {
   bool row = false;  // imperative gemvs use warp-per-row [N,K] (bf16 only)
   bool q4_mlp = false;     // imperative MLP gemvs (wgu, wd) use q4
   bool q4_lmhead = false;  // imperative lm_head gemv uses q4
-  // The batched prefill's GEMMs sum in f16 where the backend can (twice the
-  // tensor-core rate here, at a small cost in precision). A prompt whose
-  // logits come out non-finite — an f16 overflow, in these sums or in the
-  // attention's f16 operands — is redone exactly (prefill_batched), and
+  // The batched prefill's GEMMs take f16 where the backend can
+  // (prefill_gemm_f16: f16 sums, twice the tensor-core rate here, or f16
+  // operands over f32 sums), at a small cost in precision. A prompt whose
+  // logits come out non-finite (an f16 overflow, in these GEMMs or in the
+  // attention's f16 operands) is redone exactly (prefill_batched), and
   // counted in f16_retries.
   bool f16_acc = false;
   int64_t f16_retries = 0;
@@ -1167,14 +1168,16 @@ inline void set_cache_pos(Model& M, int64_t p) {
 
 // The batched prefill's f16 forms, in one place (prefill_chunk_ takes them, the
 // checks ask): its activations are f16 (a16) where f16_acc asks for f16 and the
-// backend has the producers that write them; its GEMMs sum in f16 under f16_acc,
-// a bf16 weight's on either activation (gemm_bf16_nt_f16acc reads f32 too), a
-// block-quantized one's only on f16 ones. The exact form takes neither.
+// backend has the producers that write them; its GEMMs take f16's precision and
+// range under f16_acc (prefill_gemm_f16): a bf16 weight's sums f16 on either
+// activation (gemm_bf16_nt_f16acc reads f32 too), a block-quantized one's sums
+// f16 on f16 activations, or its operands f16 where the backend has that form
+// over f32 ones (gemm_quant_f16). The exact form takes none.
 inline bool prefill_a16(const Model& M, bool exact) {
   return M.f16_acc && !exact && gpu::f16_activations;
 }
-inline bool prefill_sums_f16(const Model& M, bool exact) {
-  return M.f16_acc && !exact && (!M.quant || gpu::f16_activations);
+inline bool prefill_gemm_f16(const Model& M, bool exact) {
+  return M.f16_acc && !exact && (!M.quant || gpu::f16_activations || gpu::has_gemm_quant_f16);
 }
 // MMQ (block-quantized weights' int8 GEMM) quantizes the f16 activation a16
 // makes, so it runs only where that is made.
@@ -1199,8 +1202,8 @@ inline bool prefill_mmq(const Model& M, bool exact) { return M.mmq && prefill_a1
 //
 // bf16 row-major weights only (the layout gemm_bf16_nt shares with the decode
 // GEMV); callers check Model.row and fall back to token-by-token otherwise.
-// `exact` runs the chunk at full precision — the GEMMs' sums in f32 and the
-// attention's operands f32 — as the retry after an f16 overflow does.
+// `exact` runs the chunk at full precision (the GEMMs' operands and sums f32,
+// and the attention's operands f32), as the retry after an f16 overflow does.
 //
 // The layers past the KV-sharing line (Config::KV_SHARED) write no cache, so a
 // prompt needs them for its last row alone (llama.cpp's prune_shared): a chunk
@@ -1225,6 +1228,7 @@ inline int64_t prefill_chunk_(Model& M, int64_t T, bool exact = false, bool last
     mmq = T > 1 && prefill_mmq(M, exact);
   };
   set_forms();
+  const bool gemm_f16 = prefill_gemm_f16(M, exact);
   // A GEMM a run of one format, each into its columns of y. The bf16 GEMMs
   // write y densely, so a bf16 run is the whole projection, as every bf16 build
   // loads it (load_wmat).
@@ -1233,10 +1237,13 @@ inline int64_t prefill_chunk_(Model& M, int64_t T, bool exact = false, bool last
     if (T == 1)
       return gemv_m(W, a, y, exact ? gpu::act_form::f32 : M.gemv_form, sp(M.scratch.act));
     for (const auto& p : W.parts) {
-      const gpu::span w = W.at(p);
+      const gpu::span w = W.at(p), yp = y.at(p.row_off * 4);
       if (p.type != bf16_type) {
-        if (!gpu::gemm_quant(p.type, a16, a16 ? a16s : a, w, y.at(p.row_off * 4), T, p.rows,
-                             k, n, mmq))
+        const bool ran =
+            a16        ? gpu::gemm_quant(p.type, true, a16s, w, yp, T, p.rows, k, n, mmq)
+            : gemm_f16 ? gpu::gemm_quant_f16(p.type, a, w, yp, T, p.rows, k, n)
+                       : gpu::gemm_quant(p.type, false, a, w, yp, T, p.rows, k, n);
+        if (!ran)
           throw std::logic_error("qwen: the block-quantized prefill GEMM refused its operands");
         continue;
       }
@@ -1246,7 +1253,7 @@ inline int64_t prefill_chunk_(Model& M, int64_t T, bool exact = false, bool last
       if (a16) {
         if (!gpu::gemm_bf16_nt_f16acc_a16(a16s, w, y, T, n, k))
           throw std::logic_error("qwen: the f16 prefill GEMM refused its operands");
-      } else if (prefill_sums_f16(M, exact)) gpu::gemm_bf16_nt_f16acc(a, w, y, T, n, k);
+      } else if (gemm_f16) gpu::gemm_bf16_nt_f16acc(a, w, y, T, n, k);
       else gpu::gemm_bf16_nt(a, w, y, T, n, k);
     }
   };
@@ -1469,8 +1476,8 @@ inline int64_t prefill_batched(Model& M, const std::vector<int>& ids,
     run(true);
     return argmax_logits(M);
   }
-  // f16 operands can overflow — the attention's always, the GEMMs' sums under
-  // f16_acc — and an inf anywhere reaches every logit as NaN through the next
+  // f16 can overflow (the attention's operands always, the GEMMs' sums or
+  // operands under f16_acc), and an inf anywhere reaches every logit as NaN through the next
   // RMSNorm, so a non-finite logit sum is the test. The retry is exact, so it
   // cannot overflow the same way; first the sequence goes back to where it
   // started: the caches' position, and a DeltaNet layer's state, which the

@@ -1708,17 +1708,8 @@ TEST_CASE("generic compositions agree with the fused kernels") {
           array a = random_array({M, K}, 1060 + type);
           a.eval();
           array W = dev(q.W), ad = dev(a);
-          array C = dev(array::from(std::vector<float>((size_t)(M * ldc), 7.0f), {M, ldc}));
-          REQUIRE(gpu::gemm_quant(type, false, ad.device_span(), W.device_span(),
-                                  C.device_span().at(off * 4), M, N, K, ldc));
-          tl::gpu::flush();
           // The product and its terms' magnitude, and the worst error of an
-          // output's N columns from col0 (rows ldc apart) relative to it. f32
-          // sums over f32 operands (CUDA's tensor cores hold each as a bf16
-          // pair, to ~2^-16; Metal's keep f32): ~1e-6 of the terms' magnitude,
-          // where operands rounded to bf16 were 3e-4..7e-4 off, enough to move
-          // the batched prefill's logits off the token-by-token ones'. A misread
-          // weight is off by whole terms.
+          // output's N columns from col0 (rows ldc apart) relative to it.
           std::vector<double> ref((size_t)(M * N)), mag((size_t)(M * N));
           for (int64_t i = 0; i < M; i++)
             for (int64_t j = 0; j < N; j++)
@@ -1737,28 +1728,46 @@ TEST_CASE("generic compositions agree with the fused kernels") {
               }
             return worst;
           };
-          constexpr double bound = 2e-5;
-          const std::vector<float> got = host_values(C);
-          bool kept = true;
-          for (int64_t i = 0; i < M; i++)
-            for (int64_t j = 0; j < ldc; j++)
-              if (j < off || j >= off + N) kept = kept && got[(size_t)(i * ldc + j)] == 7.0f;
-          CHECK(worst_rel(got, off) < bound);
-          CHECK(kept);
-          // C one column off its float2 stores, and the weight 4 bytes off its
-          // base (a format read by halves still fits; Q4_K's and Q5_K's vectors
-          // do not): each refused or computed as above, never misplaced.
           array Wl = dev(with_lead(q.W, 1));
-          for (const bool shift_w : {false, true}) {
-            array C1 = dev(array::zeros({M * ldc + 1}));
-            check_misaligned(
-                shift_w ? "quantized GEMM, W off its base" : "quantized GEMM, C off 8 bytes",
-                [&] {
-                  return gpu::gemm_quant(type, false, ad.device_span(),
-                                         shift_w ? Wl.device_span().at(4) : W.device_span(),
-                                         C1.device_span().at(shift_w ? 0 : 4), M, N, K, ldc);
-                },
-                [&] { return worst_rel(after_lead(C1, shift_w ? 0 : 1, M * ldc), 0) < bound; });
+          for (const bool f16 : {false, true}) {
+            if (f16 && !gpu::has_gemm_quant_f16) continue;  // it would run the exact form again
+            CAPTURE(f16);
+            auto run = [&](gpu::span w, gpu::span c) {
+              return f16 ? gpu::gemm_quant_f16(type, ad.device_span(), w, c, M, N, K, ldc)
+                         : gpu::gemm_quant(type, false, ad.device_span(), w, c, M, N, K, ldc);
+            };
+            array C = dev(array::from(std::vector<float>((size_t)(M * ldc), 7.0f), {M, ldc}));
+            REQUIRE(run(W.device_span(), C.device_span().at(off * 4)));
+            tl::gpu::flush();
+            // The exact form: f32 sums over f32 operands (CUDA's tensor cores
+            // hold each as a bf16 pair, to ~2^-16; Metal's keep f32), ~1e-6
+            // of the terms' magnitude, where operands rounded to bf16 were
+            // 3e-4..7e-4 off, enough to move the batched prefill's logits off
+            // the token-by-token ones'. The f16 operands round each to
+            // 2^-11, up to 9.6e-5 of the magnitude here (Metal's). A misread
+            // weight is off by whole terms, ~1/K of it.
+            const double bound = f16 ? 3e-4 : 2e-5;
+            const std::vector<float> got = host_values(C);
+            bool kept = true;
+            for (int64_t i = 0; i < M; i++)
+              for (int64_t j = 0; j < ldc; j++)
+                if (j < off || j >= off + N) kept = kept && got[(size_t)(i * ldc + j)] == 7.0f;
+            CHECK(worst_rel(got, off) < bound);
+            CHECK(kept);
+            // C one column off its float2 stores, and the weight 4 bytes off
+            // its base (a format read by halves still fits; Q4_K's and Q5_K's
+            // vectors do not): each refused or computed as above, never
+            // misplaced.
+            for (const bool shift_w : {false, true}) {
+              array C1 = dev(array::zeros({M * ldc + 1}));
+              check_misaligned(
+                  shift_w ? "quantized GEMM, W off its base" : "quantized GEMM, C off 8 bytes",
+                  [&] {
+                    return run(shift_w ? Wl.device_span().at(4) : W.device_span(),
+                               C1.device_span().at(shift_w ? 0 : 4));
+                  },
+                  [&] { return worst_rel(after_lead(C1, shift_w ? 0 : 1, M * ldc), 0) < bound; });
+            }
           }
         }
       }
