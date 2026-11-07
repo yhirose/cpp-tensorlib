@@ -3,7 +3,7 @@
 // exercises the D=64 instantiations (Qwen2 = 896/14 = 64) against the same
 // from-scratch CPU references that validate D=128 in bench_attn_decode. Covers
 // every head-dim-specific kernel at D=64: kv_append, decode attention (both the
-// single-block and the split-KV path, straddling the ctx>=256 boundary), kv_fill,
+// single-block and the split-KV path, straddling the ctx>=64 boundary), kv_fill,
 // causal prefill, and the prefill->decode handoff. Also the model-free lockstep
 // guard for the CUDA-graph attention: attn_dpos (capacity-static split grid,
 // in-kernel chunk twin) is memcmp'd bit-equal against attn at every checkpoint.
@@ -45,7 +45,7 @@ int main() {
   };
 
   // ---- KV cache + GQA: grow one token at a time, verify prefix reads + GQA
-  // mapping at checkpoints straddling the split-KV boundary (ctx>=256), at
+  // mapping at checkpoints straddling the split-KV boundary (ctx>=64), at
   // each head width the decode kernels serve a model at, in an f32 cache and an
   // f16 one (the reference then reads the values the cache rounded to). ----
   auto decode_check = [&](int64_t D, int64_t HQ, int64_t HKV, bool f16) -> bool {
@@ -67,7 +67,7 @@ int main() {
     bool dpos_eq = true;
     std::vector<float> Khist((size_t)HKV * MAXC * D), Vhist((size_t)HKV * MAXC * D);
 
-    // Checkpoints straddle the split-KV boundary (256) and reach max capacity
+    // Checkpoints straddle the split-KV boundary (64) and reach max capacity
     // so the dpos sweep exercises several live-split depths of the chunk twin.
     const int64_t checks[] = {1,   2,   63,  64,   127, 128, 255,
                               256, 257, 512, 1024, 2047};
@@ -141,7 +141,7 @@ int main() {
       }
     }
     ok &= maxrel < 1e-4 && maxrel_w < 1e-4;
-    std::printf("  D=%lld %s kv cache grow to %lld tokens (%zu checkpoints, split-KV @>=256) "
+    std::printf("  D=%lld %s kv cache grow to %lld tokens (%zu checkpoints, split-KV @>=64) "
                 "— maxrel %.1e, windows 100 / 300 %.1e %s\n", (long long)D, f16 ? "f16" : "f32",
                 (long long)cache.pos, sizeof(checks) / sizeof(checks[0]), maxrel, maxrel_w,
                 maxrel < 1e-4 && maxrel_w < 1e-4 ? "OK" : "FAIL");

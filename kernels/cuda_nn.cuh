@@ -3078,7 +3078,7 @@ __device__ __forceinline__ unsigned attn_window_lo_(unsigned n, unsigned w) {
 }
 
 // The decode attention's shape, a twin of the host's (cuda_nn.h): a block of
-// attn_dec_warps<AD> warps takes attn_dec_heads<AD> q heads of one kv head.
+// attn_dec_threads<AD> threads takes attn_dec_heads<AD> q heads of one kv head.
 // Measured as GPU time a layer at Qwen2.5 0.5B, Llama 3.2 1B and 3B, Qwen3
 // 0.6B, PLaMo 3 2B, Qwen3.5, Gemma 3 and Gemma 4 E2B's shapes, 32 to 4096
 // cached tokens, against 1, 2, 4 and 8 heads by 4 and 8 warps: two heads by 8
@@ -3090,6 +3090,8 @@ template <int AD>
 constexpr int attn_dec_heads = AD == 256 ? 1 : 2;
 template <int AD>
 constexpr int attn_dec_warps = AD == 512 ? 4 : 8;
+template <int AD>
+constexpr int attn_dec_threads = 32 * attn_dec_warps<AD>;
 
 // The decode attention's core. Block blockIdx.x is one kv head and a slice of
 // GB of the q heads that share it (GQA): it reads each of its keys [k0, k1)
@@ -3113,7 +3115,7 @@ __device__ __forceinline__ void attn_dec_core(const float* __restrict__ q, const
                                               float* __restrict__ pm, float* __restrict__ pl,
                                               float* __restrict__ pacc, unsigned k0, unsigned k1,
                                               unsigned kv_stride, unsigned group, float scale) {
-  constexpr int NR = AD / 32, GB = attn_dec_heads<AD>, NWB = attn_dec_warps<AD>, NT = 32 * NWB;
+  constexpr int NR = AD / 32, GB = attn_dec_heads<AD>, NWB = attn_dec_warps<AD>;
   constexpr int U = 2;
   const unsigned slices = (group + GB - 1) / GB;  // a kv head's q heads, GB at a time
   const unsigned kv_h = blockIdx.x / slices;
@@ -3123,10 +3125,9 @@ __device__ __forceinline__ void attn_dec_core(const float* __restrict__ q, const
   const KT* Vh = V + (size_t)kv_h * kv_stride;
   const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
 
-  __shared__ float q_sh[GB][AD];
-  for (unsigned e = tid; e < GB * AD; e += NT)
-    q_sh[e / AD][e % AD] = e / AD < gn ? q[(size_t)h0 * AD + e] : 0.0f;
-  __syncthreads();
+  // The queries straight from global (each warp reads the same few KB, from
+  // L1), so their loads go out with the first keys' rather than behind a
+  // barrier.
   float qr[GB][NR], acc[GB][NR], m[GB], l[GB];
 #pragma unroll
   for (int g = 0; g < GB; g++) {
@@ -3134,7 +3135,7 @@ __device__ __forceinline__ void attn_dec_core(const float* __restrict__ q, const
     l[g] = 0.0f;
 #pragma unroll
     for (int r = 0; r < NR; r++) {
-      qr[g][r] = q_sh[g][lane + r * 32];
+      qr[g][r] = g < (int)gn ? q[(size_t)(h0 + g) * AD + lane + r * 32] : 0.0f;
       acc[g][r] = 0.0f;
     }
   }
@@ -3200,7 +3201,7 @@ __device__ __forceinline__ void attn_dec_core(const float* __restrict__ q, const
     for (int r = 0; r < NR; r++) sacc[warp][g][lane + r * 32] = acc[g][r];
   }
   __syncthreads();
-  for (unsigned e = tid; e < gn * AD; e += NT) {
+  for (unsigned e = tid; e < gn * AD; e += attn_dec_threads<AD>) {
     const unsigned g = e / AD, d = e % AD;
     float gm = -1e30f;
 #pragma unroll
@@ -3229,7 +3230,7 @@ __device__ __forceinline__ void attn_dec_core(const float* __restrict__ q, const
 // K, V are [H_kv, max_ctx, D] read over [0, ctx); kv_stride = max_ctx * D.
 // tl_attn_decode_{f32,f16}_{64,128,256,512}
 #define TL_ATTN_DECODE(AD, KT, TN)                                                             \
-  extern "C" __global__ void __launch_bounds__(32 * attn_dec_warps<AD>)                        \
+  extern "C" __global__ void __launch_bounds__(attn_dec_threads<AD>)                           \
       tl_attn_decode_##TN##_##AD(const float* q, const KT* K, const KT* V, float* out,          \
                                  unsigned ctx, unsigned kv_stride, unsigned group, float scale) { \
     attn_dec_core<AD, KT, true>(q, K, V, out, nullptr, nullptr, nullptr, 0, ctx, kv_stride,      \
@@ -3258,7 +3259,7 @@ __device__ __forceinline__ void attn_dec_split(const float* q, const KT* K, cons
 }
 // tl_attn_decode_split_{f32,f16}_{64,128,256,512}
 #define TL_ATTN_SPLIT(AD, KT, TN)                                                                    \
-  extern "C" __global__ void __launch_bounds__(32 * attn_dec_warps<AD>) tl_attn_decode_split_##TN##_##AD( \
+  extern "C" __global__ void __launch_bounds__(attn_dec_threads<AD>) tl_attn_decode_split_##TN##_##AD(  \
       const float* q, const KT* K, const KT* V, float* pm, float* pl, float* pacc, unsigned ctx,     \
       unsigned kv_stride, unsigned group, unsigned chunk, float scale) {                             \
     attn_dec_split<AD, KT>(q, K, V, pm, pl, pacc, ctx, kv_stride, group, chunk, scale);           \

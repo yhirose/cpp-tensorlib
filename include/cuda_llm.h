@@ -169,16 +169,24 @@ inline bool own_llm::kv_append_dpos(gpu::span Kc, gpu::span Vc, gpu::span k_new,
                    0, pKc, pVc, pk, pv, pp, kv_stride);
 }
 
+// The splits the graph-capture decode attention launches over a cache of
+// `keys` keys (its capacity, or a window's length): sizes the partials
+// (attn_dpos_partials_bytes) and the grid (attn_decode_dpos) alike, so the
+// partials always hold what is launched. 0 for a head count GQA cannot split.
+inline unsigned attn_dpos_splits(int64_t n_q_heads, int64_t n_kv_heads, int64_t D, int64_t keys) {
+  if (n_kv_heads <= 0 || n_q_heads % n_kv_heads) return 0;
+  return attn_split_count(attn_dec_rows(n_q_heads, n_kv_heads, D), keys);
+}
+
 // Decode attention with ctx = *d_pos + 1, split-KV on a capacity-static grid:
-// gridDim.y = S_max = attn_split_count(rows, max_ctx), a constant for the cache's
+// gridDim.y = S_max = attn_dpos_splits at max_ctx, a constant for the cache's
 // lifetime — so the launch is capturable — while each block derives its live
-// split bounds from *d_pos (attn_dpos_chunk, the device twin of
-// attn_split_count + attn_split_chunk). Splits past the live count write
-// neutral partials that combine as exact zeros, so the output is bit-identical
-// to the host attn_decode at every pos, and the captured path stays
-// split-KV-flat at long ctx (the S=1 pin it replaces was linear in ctx).
-// `partials` is a caller-OWNED device buffer of attn_partials::bytes(H*S_max, D)
-// — like d_pos, it is graph-lifetime state (a captured graph bakes its address
+// split bounds from *d_pos (attn_dpos_chunk, under attn_split_rule passed as
+// arguments). Splits past the live count write neutral partials that combine
+// as exact zeros, so the output is bit-identical to the host attn_decode at
+// every pos, and the captured path stays split-KV-flat at long ctx.
+// `partials` is a caller-OWNED device buffer of attn_dpos_partials_bytes —
+// like d_pos, it is graph-lifetime state (a captured graph bakes its address
 // in), so it must not be a shared growable scratch; kv_cache owns one per
 // cache. The cache f32, or f16 with kv_f16.
 inline bool own_llm::attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
@@ -200,19 +208,21 @@ inline bool own_llm::attn_decode_dpos(gpu::span q, gpu::span K, gpu::span V,
   float* pv = context::off_(V.buf, V.off);
   float* po = context::off_(out.buf, out.off);
   float* pp = context::off_(d_pos.buf, d_pos.off);
-  unsigned uh = (unsigned)n_q_heads, uD = (unsigned)D;
+  unsigned uh = (unsigned)n_q_heads;
   unsigned kv_stride = (unsigned)(kv_max * D);
   unsigned group = (unsigned)(n_q_heads / n_kv_heads);
   // A window (< kv_max) bounds the live keys, and so the splits, at its length; the
-  // partials, sized from kv_max, hold at least as many.
-  const unsigned rows = attn_dec_rows(n_q_heads, n_kv_heads, D);
-  unsigned S = attn_split_count(rows, window > 0 ? window : kv_max);
+  // partials, sized from kv_max, hold at least as many (split_parts is monotone).
+  const unsigned S = attn_dpos_splits(n_q_heads, n_kv_heads, D, window > 0 ? window : kv_max);
+  const gpu::policy::split_rule& r = attn_split_rule;
   attn_partials p(context::off_(partials.buf, partials.off), (size_t)uh * S);
-  if (!c.launch_(c.attn_(context::attn_k::split_dpos, D, kv_f16), {rows, S}, {attn_dec_threads(D)}, 0, pq, pk, pv, p.pm,
-                 p.pl, p.pacc, pp, kv_stride, group, scale, (unsigned)window)) {
+  if (!c.launch_(c.attn_(context::attn_k::split_dpos, D, kv_f16),
+                 {attn_dec_rows(n_q_heads, n_kv_heads, D), S}, {attn_dec_threads(D)}, 0, pq, pk, pv,
+                 p.pm, p.pl, p.pacc, pp, kv_stride, group, scale, (unsigned)window,
+                 (unsigned)r.target, (unsigned)r.min_k, (unsigned)r.min_part, (unsigned)r.granule)) {
     return false;
   }
-  return p.combine(c, po, uh, uD, S);
+  return p.combine(c, po, uh, static_cast<unsigned>(D), S);
 }
 
 // Row idx[0] of a table into f32 (gpu_ops_llm.h's contract): a thread an
@@ -322,8 +332,8 @@ inline bool own_llm::sample_to(gpu::span a, int64_t n, const gpu::sampling& s,
 // above and size their partials here.
 inline int64_t attn_dpos_partials_bytes(int64_t n_q_heads, int64_t n_kv_heads, int64_t max_ctx,
                                         int64_t D) {
-  if (n_kv_heads <= 0 || n_q_heads % n_kv_heads) return 0;
-  const unsigned S = attn_split_count(attn_dec_rows(n_q_heads, n_kv_heads, D), max_ctx);
+  const unsigned S = attn_dpos_splits(n_q_heads, n_kv_heads, D, max_ctx);
+  if (S == 0) return 0;
   return static_cast<int64_t>(
       attn_partials::bytes(static_cast<size_t>(n_q_heads) * S, D));
 }

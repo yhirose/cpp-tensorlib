@@ -241,9 +241,10 @@ of the decision: the target (the fill, or a multiple of it for a kernel with
 small groups), the shortest k worth splitting, the shortest part, and what a
 part must be a multiple of. A backend states its rule next to its kernel and
 launches the count the rule gives; it does not do the arithmetic itself. The
-CUDA decode attention's device twin (`attn_dpos_chunk` in
-`tensorlib_cuda.cu`) reproduces its rule for the captured-graph path, which is
-why CUDA's fill is a constant rather than a device query.
+one exception is CUDA's captured-graph decode attention, whose live split
+count depends on a position only the device has: its kernel does the same
+arithmetic (`attn_dpos_chunk` in `cuda_llm.cuh`) under the rule the launcher
+passes it.
 
 Which of its kernels a backend launches — CUDA's f32 tile and its wave plan,
 Metal's STEEL bands — stays with the backend: a tile is that kernel family's

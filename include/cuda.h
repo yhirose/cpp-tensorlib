@@ -1141,9 +1141,7 @@ struct traits {
   // Each launch's tl::profile row carries a device time.
   static constexpr bool times_launches = true;
   // Blocks that keep the GPU busy: ~2 per SM on the 82-SM RTX 3090. The
-  // target every tile and split choice below measures its grid against. A
-  // constant rather than a device query because the decode attention's
-  // device twin (attn_dpos_chunk in tensorlib_cuda.cu) bakes it in.
+  // target every tile and split choice below measures its grid against.
   static constexpr int64_t fill_groups = 164;
 };
 

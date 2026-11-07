@@ -711,9 +711,9 @@ inline bool own_nn::cvt_h16(gpu::span src, gpu::span dst16, int64_t n) {
 // head-major attention.
 
 // The decode attention's blocks (attn_dec_core): a kv head and attn_dec_heads(D)
-// of the q heads that share it, attn_dec_threads(D) threads. These are the
-// kernel's attn_dec_heads<AD> and attn_dec_warps<AD> (where the measurements
-// behind them are), its ABI: a block derives its heads from the same numbers.
+// of the q heads that share it, attn_dec_threads(D) threads. The kernel's
+// attn_dec_heads<AD> and attn_dec_threads<AD> (where the measurements behind
+// them are) are the same table, its ABI: a block derives its heads from it.
 // rows is grid.x, the blocks one split has.
 inline constexpr int64_t attn_dec_heads(int64_t D) { return D == 256 ? 1 : 2; }
 inline constexpr unsigned attn_dec_threads(int64_t D) { return 32 * (D == 512 ? 4 : 8); }
@@ -815,7 +815,6 @@ inline bool own_nn::attn_decode(gpu::span q, gpu::span K, gpu::span V,
   // Split ctx over gridDim.y so grid = rows×S fills the SMs (see
   // attn_split_count; chunk below is rounded to a multiple of 4).
   unsigned S = attn_split_count(rows, ctx);
-  unsigned uD = static_cast<unsigned>(D);
   if (S == 1) {
     return c.launch_(c.attn_(context::attn_k::decode, D, kv_f16), {rows}, {attn_dec_threads(D)}, 0,
                      pq, pk, pv, po, uctx, kv_stride, group, scale);
@@ -831,7 +830,7 @@ inline bool own_nn::attn_decode(gpu::span q, gpu::span K, gpu::span V,
                  pk, pv, p.pm, p.pl, p.pacc, uctx, kv_stride, group, chunk, scale)) {
     return false;
   }
-  return p.combine(c, po, uh, uD, S);
+  return p.combine(c, po, uh, static_cast<unsigned>(D), S);
 }
 
 // M9 causal prefill attention: q,out [n_q_heads,T,D]; K/V a [n_kv_heads,kv_max,D]
