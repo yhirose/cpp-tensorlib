@@ -1342,10 +1342,13 @@ struct read_q41_ {
 // A bf16 W whose K is whole 8-element vectors: the vectorized loader.
 TL_STEEL_KERNEL(gemm_bf16_steel_, 64, false, true, ushort)
 TL_STEEL_KERNEL(gemm_bf16_steel32_, 32, false, true, ushort)
-// The same summed in f16 (cuda's gemm_bf16_nt_f16acc): A and W rounded to
-// half as they are staged, and the MMA's sums half.
-TL_STEEL_KERNEL_ST(gemm_bf16_f16acc_, 64, false, true, ushort, B, half)
-TL_STEEL_KERNEL_ST(gemm_bf16_f16acc32_, 32, false, true, ushort, B, half)
+// The same over f16 operands (gpu_ops_nn.h's gemm_bf16_nt_f16acc): A and W
+// rounded to half as they are staged, the sums f32 as the quantized formats'
+// (below). Half sums were 3 to 6% faster at pp512 on F16 files (Qwen3 0.6B,
+// Qwen2.5 0.5B, Qwen3.5 0.8B, Llama 3.2 1B), at the precision SteelMMA's note
+// gives.
+TL_STEEL_KERNEL_BK(gemm_bf16_f16_, 64, false, true, ushort, B, half, 16)
+TL_STEEL_KERNEL_BK(gemm_bf16_f16_32_, 32, false, true, ushort, B, half, 16)
 // The rest through a reader (steel_b_'s functor loader); the 32-row band for
 // a short chunk (steel_grid_).
 TL_STEEL_KERNEL_SRC(gemm_bf16_nt_, 64, false, true, ushort, TL_READ_BF16)
@@ -1357,16 +1360,16 @@ TL_STEEL_KERNEL_SRC(gemm_bf16_nt32_, 32, false, true, ushort, TL_READ_BF16)
 // to 8%, Q6_K 15%. Each also over half tiles (gpu_ops_nn.h's gemm_quant_f16):
 // A and the dequantized weight rounded to half as they are staged, the sums
 // f32 (llama.cpp's kernel_mul_mm). Summed in half too, pp512 was 5 to 9%
-// faster still, and the logits 40 to 120 times as far off the f32 forward's.
+// faster still, at the precision SteelMMA's note gives.
 #define TL_GEMM_Q(F)                                                         \
   TL_STEEL_KERNEL_BK(gemm_##F##_nt_, 64, false, true, uchar,                 \
-                     TL_READ_Q(read_##F##_), float, float, 32)               \
+                     TL_READ_Q(read_##F##_), float, 32)                      \
   TL_STEEL_KERNEL_BK(gemm_##F##_nt32_, 32, false, true, uchar,               \
-                     TL_READ_Q(read_##F##_), float, float, 32)               \
+                     TL_READ_Q(read_##F##_), float, 32)                      \
   TL_STEEL_KERNEL_BK(gemm_##F##_f16_, 64, false, true, uchar,                \
-                     TL_READ_Q(read_##F##_), half, float, 32)                \
+                     TL_READ_Q(read_##F##_), half, 32)                       \
   TL_STEEL_KERNEL_BK(gemm_##F##_f16_32_, 32, false, true, uchar,             \
-                     TL_READ_Q(read_##F##_), half, float, 32)
+                     TL_READ_Q(read_##F##_), half, 32)
 TL_GEMM_Q(q4k)
 TL_GEMM_Q(q5k)
 TL_GEMM_Q(q6k)

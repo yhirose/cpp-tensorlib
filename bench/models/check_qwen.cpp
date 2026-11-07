@@ -174,7 +174,7 @@ static void fixed_sums(bool on) {
 }
 
 // The batched prefill's f16 GEMMs (the default where the backend has them:
-// sums f16, or a block-quantized weight's operands f16 over f32 sums), against
+// CUDA's sums f16, Metal's operands f16 over f32 sums), against
 // `ref`, an f32 forward's logits for the same prompt: the top-5 logits to 2e-2
 // and the same greedy token (a sensitive model's as Oracle::agree holds it).
 // Then the safety net: with the first layer's FFN norm scaled by 1e5 the f16

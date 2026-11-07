@@ -825,30 +825,30 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
                                   k2));
         tl::gpu::flush();
         CHECK(same(C2, A2.dot(W2t), 1e-4f));
-        // The f16-sum form (below) past one band too (K = 76 isn't whole
+        // The f16 form (below) past one band too (K = 76 isn't whole
         // vectors: Metal declines it, and this is the f32 fallback). Its
-        // 136-term sums, up to 16 in size, round by up to about 0.06 in f16;
-        // a misplaced tile would be off by the products themselves.
+        // 136-term sums, up to 16 in size, round by up to about 0.06 in f16
+        // (CUDA's); a misplaced tile would be off by the products themselves.
         array C2h = array::empty({M2, N2});
         REQUIRE(gpu::gemm_bf16_nt_f16acc(A2.device_span(), W2b.device_span(), C2h.device_span(),
                                          M2, N2, k2));
         tl::gpu::flush();
         CHECK(same(C2h, A2.dot(W2t), 0.25f));
       }
-      // The f16-sum form: the activations rounded to f16 (2^-11) and the sums
-      // f16, the second by far the larger. A backend without the form sums in
-      // f32 and passes trivially.
+      // The f16 form: the activations rounded to f16 (2^-11), and on CUDA the
+      // sums f16 too, by far the larger error (Metal sums in f32). A backend
+      // without the form sums in f32 and passes trivially.
       array C16 = array::empty({M, N});
       REQUIRE(gpu::gemm_bf16_nt_f16acc(A.device_span(), Wb.device_span(), C16.device_span(), M,
                                        N, K));
       tl::gpu::flush();
       CHECK(same(C16, A.dot(Wt), 1e-2f));
-      // W off as above: the backend's f16 sums, or (where it declines) the
+      // W off as above: the backend's f16 form, or (where it declines) the
       // f32 GEMM the op falls back to, so never refused; within the f16
       // rounding of the f32 product either way.
       for (const auto& c : {cases[2], cases[3]}) {
         array C16s = array::empty({M, N});
-        const std::string what = std::string("f16-sum ") + c.what;
+        const std::string what = std::string("f16 ") + c.what;
         check_misaligned(
             what.c_str(),
             [&] {

@@ -959,8 +959,8 @@ struct Model {
   bool q4_mlp = false;     // imperative MLP gemvs (wgu, wd) use q4
   bool q4_lmhead = false;  // imperative lm_head gemv uses q4
   // The batched prefill's GEMMs take f16 where the backend can
-  // (prefill_gemm_f16: f16 sums, twice the tensor-core rate here, or f16
-  // operands over f32 sums), at a small cost in precision. A prompt whose
+  // (prefill_gemm_f16: CUDA's f16 sums, twice the tensor-core rate, or Metal's
+  // f16 operands over f32 sums), at a small cost in precision. A prompt whose
   // logits come out non-finite (an f16 overflow, in these GEMMs or in the
   // attention's f16 operands) is redone exactly (prefill_batched), and
   // counted in f16_retries.
@@ -1169,10 +1169,10 @@ inline void set_cache_pos(Model& M, int64_t p) {
 // The batched prefill's f16 forms, in one place (prefill_chunk_ takes them, the
 // checks ask): its activations are f16 (a16) where f16_acc asks for f16 and the
 // backend has the producers that write them; its GEMMs take f16's precision and
-// range under f16_acc (prefill_gemm_f16): a bf16 weight's sums f16 on either
-// activation (gemm_bf16_nt_f16acc reads f32 too), a block-quantized one's sums
-// f16 on f16 activations, or its operands f16 where the backend has that form
-// over f32 ones (gemm_quant_f16). The exact form takes none.
+// range under f16_acc (prefill_gemm_f16): a bf16 weight's on either activation
+// (gemm_bf16_nt_f16acc reads f32 too), a block-quantized one's on f16
+// activations, or on f32 ones where the backend has that form
+// (gemm_quant_f16). The exact form takes none.
 inline bool prefill_a16(const Model& M, bool exact) {
   return M.f16_acc && !exact && gpu::f16_activations;
 }
@@ -1217,7 +1217,7 @@ inline int64_t prefill_chunk_(Model& M, int64_t T, bool exact = false, bool last
   // same place, and kv_cache::prefill appends there, so rope reads it from the
   // same source rather than taking it as a parameter that could disagree.
   int64_t pos0 = seq_cache(M).pos;
-  // The f16-sum GEMMs read their activation as f16 where prefill_a16 says; `a16s`
+  // The f16 GEMMs read their activation as f16 where prefill_a16 says; `a16s`
   // is that copy of `a`. One row (a one-token chunk, or the last row past the
   // KV-sharing line) is a decode step's product: the decode's GEMVs, which read the
   // weights once at their bandwidth where a tile GEMM wastes all its rows but one

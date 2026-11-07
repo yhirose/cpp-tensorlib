@@ -23,7 +23,7 @@ enum class nn_kernel {
   gemm_q80_f16_32, gemm_q50_f16, gemm_q50_f16_32, gemm_q5k_f16, gemm_q5k_f16_32,
   gemm_q40_f16, gemm_q40_f16_32, gemm_q41_f16, gemm_q41_f16_32,
   rmsnorm_rope_64, rmsnorm_rope_128, rmsnorm_rope_256, gated_rmsnorm,
-  gemm_bf16_steel, gemm_bf16_steel_32, gemm_bf16_f16acc, gemm_bf16_f16acc_32,
+  gemm_bf16_steel, gemm_bf16_steel_32, gemm_bf16_f16, gemm_bf16_f16_32,
   embed_row_f32, embed_row_bf16, embed_row_q4k, embed_row_q6k, embed_row_q80, embed_row_q50,
   embed_row_q5k, embed_row_q40, embed_row_q41,
 };
@@ -71,8 +71,8 @@ inline const char* nn_kernel_name_(nn_kernel t) {
     case nn_kernel::gated_rmsnorm: return "gated_rmsnorm_";
     case nn_kernel::gemm_bf16_steel: return "gemm_bf16_steel_";
     case nn_kernel::gemm_bf16_steel_32: return "gemm_bf16_steel32_";
-    case nn_kernel::gemm_bf16_f16acc: return "gemm_bf16_f16acc_";
-    case nn_kernel::gemm_bf16_f16acc_32: return "gemm_bf16_f16acc32_";
+    case nn_kernel::gemm_bf16_f16: return "gemm_bf16_f16_";
+    case nn_kernel::gemm_bf16_f16_32: return "gemm_bf16_f16_32_";
     case nn_kernel::embed_row_f32: return "embed_row_f32_";
     case nn_kernel::embed_row_bf16: return "embed_row_bf16_";
     case nn_kernel::embed_row_q4k: return "embed_row_q4k_";
@@ -583,8 +583,8 @@ inline bool own_nn::gemm_bf16_nt(gpu::span A, gpu::span B, gpu::span C, int64_t 
   return true;
 }
 
-// The same summed in f16, cuda.h's contract: STEEL's body over half tiles,
-// for a W the vectorized loader reads (bf16_rows_vec_); otherwise
+// The same in f16 (gpu_ops_nn.h's contract): STEEL's body over half tiles, its
+// sums f32, for a W the vectorized loader reads (bf16_rows_vec_); otherwise
 // false, and the caller's f32 GEMM.
 inline bool own_nn::gemm_bf16_nt_f16acc(gpu::span A, gpu::span B, gpu::span C,
                                         int64_t M, int64_t N, int64_t K) {
@@ -592,7 +592,7 @@ inline bool own_nn::gemm_bf16_nt_f16acc(gpu::span A, gpu::span B, gpu::span C,
   if (!c.device || M <= 0 || N <= 0 || K <= 0 || !detail_::bf16_rows_vec_(K, B))
     return false;
   const detail_::steel_grid g = detail_::steel_grid_(M, N);
-  detail_::bind_(c, g.band32 ? nn_kernel::gemm_bf16_f16acc_32 : nn_kernel::gemm_bf16_f16acc);
+  detail_::bind_(c, g.band32 ? nn_kernel::gemm_bf16_f16_32 : nn_kernel::gemm_bf16_f16);
   detail_::gemm_nt_launch_(c, g, A, B, C, M, N, K, N);
   return true;
 }

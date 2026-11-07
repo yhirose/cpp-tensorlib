@@ -693,12 +693,12 @@ inline bool gemm_bf16_nt(span A, span B, span C, int64_t M, int64_t N,
   }
 }
 
-// The same product summed in f16, for an inference prefill that takes the
-// trade: f16 sums run at twice the f32 rate on tensor cores that have them
-// (CUDA's gemm_bf16_nt_f16acc), and somewhat faster where the two rates
-// match (Metal's), at a small cost in precision and with f16's range — an
-// activation or partial sum past 65504 turns to inf, which the caller must
-// check for. A backend without the form sums in f32.
+// The same product in f16, for an inference prefill that takes the trade:
+// summed in f16 where tensor cores run that at twice the f32 rate (CUDA's),
+// or over f16 operands with f32 sums (Metal's, as gemm_quant_f16), at a small
+// cost in precision and with f16's range: an activation (on CUDA a partial
+// sum too) past 65504 turns to inf, which the caller must check for. A
+// backend without the form runs the f32 GEMM.
 TL_GPU_DETECT_OWN(gemm_bf16_nt_f16acc)
 template <class Own = own>
 inline bool gemm_bf16_nt_f16acc(span A, span B, span C, int64_t M, int64_t N,
@@ -725,9 +725,9 @@ inline bool gemm_quant(int type, bool a16, span A, span W, span C, int64_t m, in
 
 // The same product of an f32 A over f16 operands: A and the dequantized weight
 // rounded to f16 as they are staged, the sums f32 (Metal's, where the prefill
-// has no f16 activations; llama.cpp's Metal GEMM). f16's range, as
-// gemm_bf16_nt_f16acc's: an activation past 65504 turns to inf, which the
-// caller must check for. A backend without the form runs gemm_quant's exact one.
+// has no f16 activations; llama.cpp's Metal GEMM). f16's range: an activation
+// past 65504 turns to inf, which the caller must check for. A backend without
+// the form runs gemm_quant's exact one.
 TL_GPU_DETECT_OWN(gemm_quant_f16)
 template <class Own = own>
 inline bool gemm_quant_f16(int type, span A, span W, span C, int64_t m, int64_t n,
