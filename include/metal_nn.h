@@ -374,25 +374,42 @@ inline void gemm_nt_launch_(context& c, const steel_grid& g, gpu::span A, gpu::s
 struct attn_decode_params {
   uint32_t ctx, kv_stride, group, chunk;
   float scale;
+  uint32_t heads;
 };
 
 struct attn_combine_params {
   uint32_t splits;
 };
 
-// The decode kernels' threadgroup: a lane per dim, up to 8 simdgroups (wider
-// heads give each thread more dims), the kernels' attn_decode_sg_ * 32.
-inline unsigned long attn_decode_threads_(int64_t D) {
-  return static_cast<unsigned long>(D < 256 ? D : 256);
+// The decode kernels' shape (attn_dec_core_): a threadgroup takes a kv head and
+// attn_dec_heads_ of the q heads that share it, as attn_decode_sg_
+// simdgroups. The kernel's attn_dec_heads_ is the same table (it sizes the
+// kernel's registers, and the host counts the threadgroups by it); the kernel
+// takes its simdgroups from the launch. Where the measurements are: the kernel.
+inline constexpr int64_t attn_dec_heads_(int64_t D) { return D == 256 ? 1 : 2; }
+inline constexpr unsigned long attn_decode_sg_(int64_t D) { return D == 256 ? 8 : 4; }
+// The merge's threadgroup memory: sacc [sg][G][D], sm and sl [sg][G].
+inline constexpr unsigned long attn_decode_tg_bytes_(int64_t D) {
+  return attn_decode_sg_(D) * static_cast<unsigned long>(attn_dec_heads_(D) * (2 + D)) * 4;
+}
+static_assert(attn_decode_tg_bytes_(64) <= 32768 && attn_decode_tg_bytes_(128) <= 32768 &&
+                  attn_decode_tg_bytes_(256) <= 32768 && attn_decode_tg_bytes_(512) <= 32768,
+              "the decode merge must fit a threadgroup's 32 KB");
+// grid.x: a kv head's q heads, attn_dec_heads_ at a time, over every kv head.
+inline unsigned long attn_decode_rows_(int64_t n_q_heads, int64_t n_kv_heads, int64_t D) {
+  const int64_t group = n_q_heads / n_kv_heads, g = attn_dec_heads_(D);
+  return static_cast<unsigned long>(n_kv_heads * ((group + g - 1) / g));
 }
 
-// Keys per split, or 0 for the single-pass kernel: one threadgroup a head
+// Keys per split, or 0 for the single-pass kernel: one threadgroup a row
 // leaves most of the GPU idle when a model has few heads, so cut the keys
-// until there are enough threadgroups. The kernel's rule: no split under 256
-// keys, a split at least 128 keys and a multiple of 4.
-inline unsigned long attn_split_chunk_(int64_t heads, int64_t ctx) {
+// until there are enough threadgroups. No split under 256 keys, a split at
+// least 128 keys and a multiple of 4. Splitting from 128, 64 or 32 keys (at
+// least half that a split), or to twice or four times the fill, was no faster
+// at the kernel's shapes.
+inline unsigned long attn_split_chunk_(int64_t rows, int64_t ctx) {
   constexpr gpu::policy::split_rule rule{traits::fill_groups, 256, 128, 4};
-  const int64_t parts = gpu::policy::split_parts(heads, ctx, rule);
+  const int64_t parts = gpu::policy::split_parts(rows, ctx, rule);
   if (parts <= 1) return 0;
   return static_cast<unsigned long>(gpu::policy::split_chunk(ctx, parts, rule));
 }
@@ -598,7 +615,10 @@ inline bool own_nn::attn_decode(gpu::span q, gpu::span K, gpu::span V,
   const attn_kernel whole = attn_kernel_(attn_op::decode, D, kv_f16);
   if (!c.device || !whole) return false;
   if (n_kv_heads <= 0 || n_q_heads % n_kv_heads != 0 || ctx <= 0) return false;
-  unsigned long chunk = detail_::attn_split_chunk_(n_q_heads, ctx);
+  // The kernel reads the cache 4 elements at a time.
+  if (kv_f16 && !(detail_::word_aligned_(K) && detail_::word_aligned_(V))) return false;
+  const unsigned long rows = detail_::attn_decode_rows_(n_q_heads, n_kv_heads, D);
+  unsigned long chunk = detail_::attn_split_chunk_(static_cast<int64_t>(rows), ctx);
   const unsigned long splits =
       chunk ? (static_cast<unsigned long>(ctx) + chunk - 1) / chunk : 1;
   gpu::span dst = out;
@@ -617,12 +637,12 @@ inline bool own_nn::attn_decode(gpu::span q, gpu::span K, gpu::span V,
   detail_::attn_decode_params p{static_cast<uint32_t>(ctx),
                                 static_cast<uint32_t>(kv_max * D),
                                 static_cast<uint32_t>(n_q_heads / n_kv_heads),
-                                static_cast<uint32_t>(chunk), scale};
+                                static_cast<uint32_t>(chunk), scale,
+                                static_cast<uint32_t>(n_q_heads)};
   detail_::set_bytes_(c.enc, p, 4ul);
-  detail_::dispatch_grid_(c.enc,
-                          {static_cast<unsigned long>(n_q_heads),
-                           split ? splits : 1ul, 1},
-                          {detail_::attn_decode_threads_(D), 1, 1});
+  detail_::set_tg_mem_(c.enc, detail_::attn_decode_tg_bytes_(D), 0ul);
+  detail_::dispatch_grid_(c.enc, {rows, split ? splits : 1ul, 1},
+                          {detail_::attn_decode_sg_(D) * 32, 1, 1});
   if (!split) return true;
   c.bind_(attn_kernel_(attn_op::combine, D, false));  // partials are f32
   detail_::set_buf_(c.enc, dst, 0ul);

@@ -1711,87 +1711,183 @@ TL_GEMV_Q("gemv_q41_", gemv_q41_dot_)
 #undef TL_GEMV_Q
 
 // ---------------------------------------------------------------------------
-// Fused decode attention: one query row against the whole cache. cuda's
-// attn_decode_core, the same online softmax and merge. A threadgroup owns one
-// query head as NW simdgroups (attn_decode_sg_: AD / 32, at most 8, so that
-// their merge fits threadgroup memory at AD = 512); a lane holds the dims
-// lane, lane + 32, … of the score and the running output, each simdgroup walks
-// every NW-th key and reduces the score with simd_sum, and the simdgroups'
-// softmax states are merged through threadgroup memory, a thread giving out
-// the dims tid, tid + NW * 32, ….
+// Fused decode attention: one query row a head against the cache, the online
+// softmax of cuda's attn_dec_core in llama.cpp's Metal form
+// (kernel_flash_attn_ext_vec). A threadgroup takes a kv head and G of the q
+// heads that share it (GQA), and reads each of its keys once for all of them.
+// Its simdgroups take the keys C at a time in turn. In a simdgroup NL lanes
+// share a key, lane tx holding its float4s j * NL + tx, so NE = 32 / NL keys
+// go at once, P passes a chunk; K and V rows are read together. A chunk's
+// scores take one max and an exp each, and a lane keeps its weighted sums of
+// V in registers across chunks: the lanes holding the same dims of different
+// keys are summed once at the end, and the simdgroups merge through
+// threadgroup memory. A slice's heads past the group's last run on zero
+// queries and store nothing.
 //
 // Split-KV: a model with few heads leaves most of the GPU idle at one
-// threadgroup a head, so the keys are cut into chunks over the grid's y, each
-// chunk writing its own (m, l, acc) partial for attn_combine_ to merge.
+// threadgroup a slice, so the keys are cut into chunks over the grid's y, each
+// writing its own (m, l, acc) partial for attn_combine_ to merge.
+//
+// The shape, by head width (attn_dec_heads_, attn_dec_pass_ and the host's
+// attn_decode_sg_), measured as the kernel's time a call at Llama 3.2 1B's,
+// Qwen2.5 0.5B's, PLaMo 3 2B's, Gemma 3 1B's and Gemma 4 E2B's heads, 64 to
+// 4096 cached keys of f16, against 1, 2, 4 and 8 heads, 2, 4 and 8 passes and
+// 1 to 8 simdgroups: two heads, two passes and 4 simdgroups at 64, 128 and
+// 512; one head, four passes and 8 simdgroups at 256, where a short window's
+// few keys (Gemma's 512) want the threadgroups more than the reads. The form
+// that took one q head a threadgroup and a key a step took Llama 3.2 1B's
+// layer 160 us at 2048 keys; this one takes 28.
 // ---------------------------------------------------------------------------
 
 struct attn_decode_params {
   uint ctx, kv_stride, group, chunk;
   float scale;
+  uint heads;  // q heads: the partials' layout
 };
 
-// metal_nn.h's attn_decode_threads_ / 32.
-constexpr int attn_decode_sg_(int AD) { return AD / 32 < 8 ? AD / 32 : 8; }
+// q heads a threadgroup (the host's attn_dec_heads_, the same table), lanes a
+// key, passes a chunk.
+constexpr int attn_dec_heads_(int AD) { return AD == 256 ? 1 : 2; }
+constexpr int attn_dec_nl_(int AD) { return AD >= 256 ? 32 : AD / 8; }
+constexpr int attn_dec_pass_(int AD) { return AD == 256 ? 4 : 2; }
 
-// The softmax state of keys [k0, k1) for this threadgroup's head: `gm`, `gl`
-// and this thread's output dims `o` (tid + u * NW * 32). The threadgroup
-// arrays are the caller's (threadgroup memory can only be declared in a
-// kernel): qs [AD], sm/sl [NW] and sacc [NW][AD].
-template <int AD, typename KT, int NW = attn_decode_sg_(AD), int R = AD / 32,
-          int NO = R / NW>
-static inline void attn_span_(device const float* qh, device const KT* Kh,
-                             device const KT* Vh, uint k0, uint k1,
-                             float scale, threadgroup float* qs,
-                             threadgroup float* sm, threadgroup float* sl,
-                             threadgroup float* sacc, uint tid, uint sgid,
-                             uint lane, thread float& gm, thread float& gl,
-                             thread float (&o)[NO]) {
-  _Pragma("clang loop unroll(full)")
-  for (int u = 0; u < NO; u++) qs[tid + u * NW * 32] = qh[tid + u * NW * 32];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+// Threadgroup `row` over keys [0, ctx) (FINAL: stores the output) or over
+// split s's chunk (stores its partials). sh is sacc [nsg][G][AD] | sm, sl
+// [nsg][G], sacc first so its float4s are 16-byte aligned at any shape.
+template <int AD, typename KT, bool FINAL>
+static inline void attn_dec_core_(device const float* q, device const KT* K,
+                                  device const KT* V, device float* out,
+                                  constant attn_decode_params& p,
+                                  threadgroup float* sh, uint row, uint s,
+                                  uint S, uint sgid, uint nsg, uint lane) {
+  constexpr int G = attn_dec_heads_(AD), NL = attn_dec_nl_(AD), NE = 32 / NL;
+  constexpr int NV = AD / (4 * NL), P = attn_dec_pass_(AD), C = NE * P;
+  using KT4 = vec<KT, 4>;
+  const uint slices = (p.group + G - 1) / G;
+  const uint kv_h = row / slices, g0 = (row % slices) * G;  // g0: in the group
+  const uint h0 = kv_h * p.group + g0, gn = min((uint)G, p.group - g0);  // gn: real heads
+  const uint k0 = s * p.chunk, k1 = FINAL ? p.ctx : min(p.ctx, k0 + p.chunk);
+  device const KT4* Kh = (device const KT4*)(K + (ulong)kv_h * p.kv_stride);
+  device const KT4* Vh = (device const KT4*)(V + (ulong)kv_h * p.kv_stride);
+  const uint tx = lane % NL, ty = lane / NL;
 
-  float m = -1e30f, l = 0.0f, acc[R];
+  float4 qr[G][NV], acc[G][NV];
+  float m[G], l[G];
   _Pragma("clang loop unroll(full)")
-  for (int r = 0; r < R; r++) acc[r] = 0.0f;
-  for (uint i = k0 + sgid; i < k1; i += NW) {
-    device const KT* Ki = Kh + i * AD;
-    float dot = 0.0f;
+  for (int g = 0; g < G; g++) {
+    m[g] = -1e30f;
+    l[g] = 0.0f;
+    device const float4* qh = (device const float4*)(q + (ulong)(h0 + min((uint)g, gn - 1)) * AD);
     _Pragma("clang loop unroll(full)")
-    for (int r = 0; r < R; r++)
-      dot += qs[lane + r * 32] * widen_(Ki[lane + r * 32]);
-    const float sc = simd_sum(dot) * scale;
-    const float m_new = max(m, sc);
-    const float corr = exp(m - m_new), pr = exp(sc - m_new);
-    l = l * corr + pr;
-    device const KT* Vi = Vh + i * AD;
-    _Pragma("clang loop unroll(full)")
-    for (int r = 0; r < R; r++)
-      acc[r] = acc[r] * corr + pr * widen_(Vi[lane + r * 32]);
-    m = m_new;
+    for (int j = 0; j < NV; j++) {
+      qr[g][j] = g < (int)gn ? qh[j * NL + tx] : 0.0f;
+      acc[g][j] = 0.0f;
+    }
   }
 
-  // Merge the simdgroups' states (one whose key range was empty carries
-  // m = -1e30 and l = 0, so it contributes nothing).
+  for (uint c0 = k0 + sgid * C; c0 < k1; c0 += nsg * C) {
+    // Key c0 + u * NE + ty, a key past the range reading the last one's row.
+    float sc[P][G];
+    KT4 vr[P][NV];
+    _Pragma("clang loop unroll(full)")
+    for (int u = 0; u < P; u++) {
+      // A row within one head: its index fits 32 bits (a ulong one cost 10-17%).
+      const uint i = min(c0 + (uint)(u * NE) + ty, k1 - 1) * (AD / 4);
+      KT4 kr[NV];
+      _Pragma("clang loop unroll(full)")
+      for (int j = 0; j < NV; j++) {
+        kr[j] = Kh[i + j * NL + tx];
+        vr[u][j] = Vh[i + j * NL + tx];
+      }
+      _Pragma("clang loop unroll(full)")
+      for (int g = 0; g < G; g++) {
+        float d = 0.0f;
+        _Pragma("clang loop unroll(full)")
+        for (int j = 0; j < NV; j++) d += dot(qr[g][j], float4(kr[j]));
+        sc[u][g] = d;
+      }
+    }
+    _Pragma("clang loop unroll(full)")
+    for (int off = NL / 2; off > 0; off >>= 1)
+      _Pragma("clang loop unroll(full)")
+      for (int u = 0; u < P; u++)
+        _Pragma("clang loop unroll(full)")
+        for (int g = 0; g < G; g++) sc[u][g] += simd_shuffle_xor(sc[u][g], (ushort)off);
+    _Pragma("clang loop unroll(full)")
+    for (int g = 0; g < G; g++) {
+      float mx = -INFINITY;
+      _Pragma("clang loop unroll(full)")
+      for (int u = 0; u < P; u++) {
+        sc[u][g] = c0 + (uint)(u * NE) + ty < k1 ? sc[u][g] * p.scale : -INFINITY;
+        mx = max(mx, sc[u][g]);
+      }
+      const float m_new = max(m[g], simd_max(mx)), corr = exp(m[g] - m_new);
+      float ls = 0.0f;
+      _Pragma("clang loop unroll(full)")
+      for (int j = 0; j < NV; j++) acc[g][j] *= corr;
+      _Pragma("clang loop unroll(full)")
+      for (int u = 0; u < P; u++) {
+        const float pr = exp(sc[u][g] - m_new);
+        ls += pr;
+        _Pragma("clang loop unroll(full)")
+        for (int j = 0; j < NV; j++) acc[g][j] += pr * float4(vr[u][j]);
+      }
+      l[g] = l[g] * corr + ls;
+      m[g] = m_new;
+    }
+  }
+
+  // The lanes holding the same dims (one tx) hold different keys' sums.
+  _Pragma("clang loop unroll(full)")
+  for (int off = NL; off < 32; off <<= 1)
+    _Pragma("clang loop unroll(full)")
+    for (int g = 0; g < G; g++) {
+      l[g] += simd_shuffle_xor(l[g], (ushort)off);
+      _Pragma("clang loop unroll(full)")
+      for (int j = 0; j < NV; j++) acc[g][j] += simd_shuffle_xor(acc[g][j], (ushort)off);
+    }
+  // Merge the simdgroups' states (one whose keys were none carries m = -1e30
+  // and l = 0, so it adds nothing).
+  threadgroup float4* sacc = (threadgroup float4*)sh;
+  threadgroup float* sm = sh + nsg * G * AD;
+  threadgroup float* sl = sm + nsg * G;
   if (lane == 0) {
-    sm[sgid] = m;
-    sl[sgid] = l;
+    _Pragma("clang loop unroll(full)")
+    for (int g = 0; g < G; g++) {
+      sm[sgid * G + g] = m[g];
+      sl[sgid * G + g] = l[g];
+    }
   }
-  _Pragma("clang loop unroll(full)")
-  for (int r = 0; r < R; r++) sacc[sgid * AD + lane + r * 32] = acc[r];
+  if (ty == 0) {
+    _Pragma("clang loop unroll(full)")
+    for (int g = 0; g < G; g++)
+      _Pragma("clang loop unroll(full)")
+      for (int j = 0; j < NV; j++) sacc[(sgid * G + g) * (AD / 4) + j * NL + tx] = acc[g][j];
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  gm = -1e30f;
-  _Pragma("clang loop unroll(full)")
-  for (int w = 0; w < NW; w++) gm = max(gm, sm[w]);
-  gl = 0.0f;
-  _Pragma("clang loop unroll(full)")
-  for (int u = 0; u < NO; u++) o[u] = 0.0f;
-  _Pragma("clang loop unroll(full)")
-  for (int w = 0; w < NW; w++) {
-    const float e = exp(sm[w] - gm);
-    gl += sl[w] * e;
-    _Pragma("clang loop unroll(full)")
-    for (int u = 0; u < NO; u++) o[u] += sacc[w * AD + tid + u * NW * 32] * e;
+  threadgroup const float* sa = (threadgroup const float*)sacc;
+  const uint hs = p.heads * S;
+  for (uint e = sgid * 32 + lane; e < gn * AD; e += nsg * 32) {
+    const uint g = e / AD, d = e % AD, h = h0 + g;
+    float gm = -1e30f;
+    for (uint w = 0; w < nsg; w++) gm = max(gm, sm[w * G + g]);
+    float gl = 0.0f, o = 0.0f;
+    for (uint w = 0; w < nsg; w++) {
+      const float x = exp(sm[w * G + g] - gm);
+      gl += sl[w * G + g] * x;
+      o += sa[(w * G + g) * AD + d] * x;
+    }
+    if (FINAL) {
+      out[(ulong)h * AD + d] = o / gl;
+    } else {
+      const uint at = h * S + s;
+      if (d == 0) {
+        out[at] = gm;
+        out[hs + at] = gl;
+      }
+      out[2 * hs + (ulong)at * AD + d] = o;
+    }
   }
 }
 
@@ -1801,24 +1897,18 @@ kernel void attn_decode_(device const float* q          [[buffer(0)]],
                          device const KT* V             [[buffer(2)]],
                          device float* out              [[buffer(3)]],
                          constant attn_decode_params& p [[buffer(4)]],
-                         uint h    [[threadgroup_position_in_grid]],
-                         uint tid  [[thread_index_in_threadgroup]],
+                         threadgroup float* sh          [[threadgroup(0)]],
+                         uint row  [[threadgroup_position_in_grid]],
                          uint sgid [[simdgroup_index_in_threadgroup]],
+                         uint nsg  [[simdgroups_per_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
-  constexpr int NW = attn_decode_sg_(AD), NO = AD / (NW * 32);
-  threadgroup float qs[AD], sm[NW], sl[NW], sacc[NW * AD];
-  const uint kv_h = p.group ? h / p.group : h;
-  float gm, gl, o[NO];
-  attn_span_<AD>(q + h * AD, K + kv_h * p.kv_stride, V + kv_h * p.kv_stride, 0,
-                 p.ctx, p.scale, qs, sm, sl, sacc, tid, sgid, lane, gm, gl, o);
-  _Pragma("clang loop unroll(full)")
-  for (int u = 0; u < NO; u++) out[h * AD + tid + u * NW * 32] = o[u] / gl;
+  attn_dec_core_<AD, KT, true>(q, K, V, out, p, sh, row, 0, 1, sgid, nsg, lane);
 }
 // Every head width (64, 128, 256, 512) over either cache.
-#define TL_ATTN_DECODE(name, AD, KT)                                         \
-  template [[host_name(name)]] kernel void attn_decode_<AD, KT>(             \
+#define TL_ATTN_DECODE(name, AD, KT)                                          \
+  template [[host_name(name)]] kernel void attn_decode_<AD, KT>(              \
       device const float*, device const KT*, device const KT*, device float*, \
-      constant attn_decode_params&, uint, uint, uint, uint);
+      constant attn_decode_params&, threadgroup float*, uint, uint, uint, uint);
 TL_ATTN_DECODE("attn_decode_64_", 64, float)
 TL_ATTN_DECODE("attn_decode_128_", 128, float)
 TL_ATTN_DECODE("attn_decode_256_", 256, float)
@@ -1829,44 +1919,28 @@ TL_ATTN_DECODE("attn_decode_256_f16_", 256, half)
 TL_ATTN_DECODE("attn_decode_512_f16_", 512, half)
 #undef TL_ATTN_DECODE
 
-// One key chunk of one head: partials pm[H*S] | pl[H*S] | pacc[H*S*AD], the
-// layout attn_combine_ reads (cuda's attn_partials).
+// One key chunk (grid y) of one row: partials pm[H*S] | pl[H*S] | pacc[H*S*AD]
+// over the q heads, the layout attn_combine_ reads (cuda's attn_partials). The
+// host cuts no chunk past the live count, so every chunk has keys.
 template <int AD, typename KT>
 kernel void attn_decode_split_(device const float* q          [[buffer(0)]],
                                device const KT* K             [[buffer(1)]],
                                device const KT* V             [[buffer(2)]],
                                device float* parts            [[buffer(3)]],
                                constant attn_decode_params& p [[buffer(4)]],
+                               threadgroup float* sh          [[threadgroup(0)]],
                                uint2 tgp [[threadgroup_position_in_grid]],
                                uint2 ntg [[threadgroups_per_grid]],
-                               uint tid  [[thread_index_in_threadgroup]],
                                uint sgid [[simdgroup_index_in_threadgroup]],
+                               uint nsg  [[simdgroups_per_threadgroup]],
                                uint lane [[thread_index_in_simdgroup]]) {
-  constexpr int NW = attn_decode_sg_(AD), NO = AD / (NW * 32);
-  threadgroup float qs[AD], sm[NW], sl[NW], sacc[NW * AD];
-  const uint h = tgp.x, s = tgp.y;
-  const uint kv_h = p.group ? h / p.group : h;
-  const uint k0 = s * p.chunk, k1 = min(p.ctx, k0 + p.chunk);
-  float gm = -1e30f, gl = 0.0f, o[NO];
-  _Pragma("clang loop unroll(full)")
-  for (int u = 0; u < NO; u++) o[u] = 0.0f;
-  if (k0 < k1) {
-    attn_span_<AD>(q + h * AD, K + kv_h * p.kv_stride, V + kv_h * p.kv_stride,
-                   k0, k1, p.scale, qs, sm, sl, sacc, tid, sgid, lane, gm, gl,
-                   o);
-  }
-  const uint hs = ntg.x * ntg.y, at = h * ntg.y + s;
-  if (tid == 0) {
-    parts[at] = gm;
-    parts[hs + at] = gl;
-  }
-  _Pragma("clang loop unroll(full)")
-  for (int u = 0; u < NO; u++) parts[2 * hs + at * AD + tid + u * NW * 32] = o[u];
+  attn_dec_core_<AD, KT, false>(q, K, V, parts, p, sh, tgp.x, tgp.y, ntg.y, sgid, nsg, lane);
 }
-#define TL_ATTN_SPLIT(name, AD, KT)                                          \
-  template [[host_name(name)]] kernel void attn_decode_split_<AD, KT>(       \
+#define TL_ATTN_SPLIT(name, AD, KT)                                           \
+  template [[host_name(name)]] kernel void attn_decode_split_<AD, KT>(        \
       device const float*, device const KT*, device const KT*, device float*, \
-      constant attn_decode_params&, uint2, uint2, uint, uint, uint);
+      constant attn_decode_params&, threadgroup float*, uint2, uint2, uint,   \
+      uint, uint);
 TL_ATTN_SPLIT("attn_decode_split_64_", 64, float)
 TL_ATTN_SPLIT("attn_decode_split_128_", 128, float)
 TL_ATTN_SPLIT("attn_decode_split_256_", 256, float)

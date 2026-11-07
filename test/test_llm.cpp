@@ -288,6 +288,11 @@ TEST_CASE("the KV cache and the decode step's kernels match their array forms") 
         const float scale = 1.0f / std::sqrt((float)D);
         tl::kv_cache cache;
         REQUIRE(cache.init(HKV, MAXC, D, f16));
+        // Every row NaN first (a reused cache's stale rows): a row past the live
+        // count must not reach the output, not even as 0 × NaN.
+        array nan_kv = dev(array::full({HKV, MAXC, D}, NAN));
+        REQUIRE(gpu::kv_fill(cache.K.device_span(), cache.V.device_span(), nan_kv.device_span(),
+                             nan_kv.device_span(), MAXC, MAXC, HKV, D, f16));
         // T steps appended one at a time, then a query over all of them. K and V
         // go up once in step order ([T,HKV,D]), so step t's rows are one span.
         auto K = random_array({HKV, T, D}, 900), V = random_array({HKV, T, D}, 901);

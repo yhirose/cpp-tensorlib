@@ -649,6 +649,11 @@ inline void set_buf_(objc::id enc, gpu::span s, unsigned long idx) {
 // (bf16, quantized blocks) read wider than its element needs this check.
 inline bool word_aligned_(gpu::span s) { return s.off % 4 == 0; }
 
+// The size of a kernel's [[threadgroup(idx)]] memory, a multiple of 16 bytes.
+inline void set_tg_mem_(objc::id enc, unsigned long bytes, unsigned long idx) {
+  objc::send(enc, "setThreadgroupMemoryLength:atIndex:", (bytes + 15) / 16 * 16, idx);
+}
+
 template <class P>
 inline void set_bytes_(objc::id enc, const P& p, unsigned long idx) {
   objc::send(enc, "setBytes:length:atIndex:", static_cast<const void*>(&p),
