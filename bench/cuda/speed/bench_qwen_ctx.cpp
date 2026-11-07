@@ -119,9 +119,9 @@ int main(int argc, char** argv) {
   void* d_pos = cu::alloc(4, nullptr);
   // Value guard alongside the timing: at each ctx, layer 0's host-path output
   // vs the dpos-path output must be BIT-IDENTICAL (the dpos kernel replicates
-  // the host chunk heuristic; empty splits combine as exact zeros). This is the
-  // long-ctx complement to bench_qwen_decode's dpos-vs-hostpos check (pos 32,
-  // which never leaves the S=1 regime).
+  // the host chunk heuristic, and the combine's sums stop at the empty
+  // splits). This is the long-ctx complement to bench_qwen_decode's
+  // dpos-vs-hostpos check (pos 32, which never leaves the S=1 regime).
   float *ref_host = nullptr, *got_host = nullptr;
   void* refb = cu::alloc(C.NH * C.HD * 4, &ref_host);
   void* gotb = cu::alloc(C.NH * C.HD * 4, &got_host);

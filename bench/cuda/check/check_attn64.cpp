@@ -103,7 +103,9 @@ int main() {
           // Lockstep guard: attn_dpos (split-KV on the capacity-static grid,
           // *d_pos = pos so ctx matches) must be BIT-identical to attn — the
           // device attn_dpos_chunk twins the host attn_split_count/attn_split_chunk
-          // heuristic, and the capacity grid's empty splits combine as exact zeros.
+          // heuristic, and an empty split's m alone is written, which the
+          // combine's max must see (the windowed passes after the unwindowed
+          // one leave its later splits' partials behind).
           upload_u32(dp, (unsigned)pos);
           cache.attn_dpos({q, 0}, {o2, 0}, HQ, {dp, 0}, scale);
           flush();

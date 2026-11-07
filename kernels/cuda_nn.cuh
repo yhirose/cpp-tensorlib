@@ -3092,6 +3092,11 @@ template <int AD>
 constexpr int attn_dec_warps = AD == 512 ? 4 : 8;
 template <int AD>
 constexpr int attn_dec_threads = 32 * attn_dec_warps<AD>;
+// A softmax state's m before any key. A split's partial left at it (a dpos
+// split past the live count writes nothing else) weighs exp(-1e30 - max) = 0
+// in the merge, so tl_attn_combine reads no l or acc past the last split that
+// is not.
+constexpr float attn_m_empty = -1e30f;
 
 // The decode attention's core. Block blockIdx.x is one kv head and a slice of
 // GB of the q heads that share it (GQA): it reads each of its keys [k0, k1)
@@ -3107,8 +3112,8 @@ constexpr int attn_dec_threads = 32 * attn_dec_warps<AD>;
 // memory, one barrier for all heads. FINAL normalizes and stores the output;
 // else each head writes its partial (m, l, acc at the local max) for
 // tl_attn_combine, at split blockIdx.y of gridDim.y. An empty range (k0 >=
-// k1, a dpos split past the live count) writes the neutral partial (m = -1e30,
-// l = 0, acc = 0), which combines as exact zeros.
+// k1, a dpos split past the live count) writes its heads' m alone, at
+// attn_m_empty, and returns before any barrier (the whole block alike).
 template <int AD, typename KT, bool FINAL>
 __device__ __forceinline__ void attn_dec_core(const float* __restrict__ q, const KT* __restrict__ K,
                                               const KT* __restrict__ V, float* __restrict__ out,
@@ -3124,6 +3129,10 @@ __device__ __forceinline__ void attn_dec_core(const float* __restrict__ q, const
   const KT* Kh = K + (size_t)kv_h * kv_stride;
   const KT* Vh = V + (size_t)kv_h * kv_stride;
   const unsigned tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
+  if (!FINAL && k0 >= k1) {
+    if (tid < gn) pm[(size_t)(h0 + tid) * gridDim.y + blockIdx.y] = attn_m_empty;
+    return;
+  }
 
   // The queries straight from global (each warp reads the same few KB, from
   // L1), so their loads go out with the first keys' rather than behind a
@@ -3131,7 +3140,7 @@ __device__ __forceinline__ void attn_dec_core(const float* __restrict__ q, const
   float qr[GB][NR], acc[GB][NR], m[GB], l[GB];
 #pragma unroll
   for (int g = 0; g < GB; g++) {
-    m[g] = -1e30f;
+    m[g] = attn_m_empty;
     l[g] = 0.0f;
 #pragma unroll
     for (int r = 0; r < NR; r++) {
@@ -3274,18 +3283,27 @@ TL_ATTN_SPLIT(256, __half, f16)
 TL_ATTN_SPLIT(512, __half, f16)
 #undef TL_ATTN_SPLIT
 
-// Merge the S per-head partials (each already at its local max) into out. Not
-// templated: the per-dim thread stride D == blockDim.x, so head_dim is implicit.
+// Merge the S per-head partials (each already at its local max) into out, the
+// sums stopping after the last split whose m is not attn_m_empty (the
+// splits after it are empty: a dpos step's past its live count). Not
+// templated: the per-dim thread stride D == blockDim.x, so head_dim is
+// implicit.
 extern "C" __global__ void tl_attn_combine(const float* __restrict__ pm,
                                            const float* __restrict__ pl,
                                            const float* __restrict__ pacc,
                                            float* __restrict__ out, unsigned S) {
   const unsigned h = blockIdx.x, tid = threadIdx.x, D = blockDim.x;
   const size_t base = (size_t)h * S;
-  float gm = -1e30f;
-  for (unsigned s = 0; s < S; s++) gm = fmaxf(gm, pm[base + s]);
-  float gl = 0.0f, o = 0.0f;
+  float gm = attn_m_empty;
+  unsigned n = 0;
+#pragma unroll 16  // as many m loads in flight as the max alone gets
   for (unsigned s = 0; s < S; s++) {
+    const float m = pm[base + s];
+    gm = fmaxf(gm, m);
+    n = m != attn_m_empty ? s + 1 : n;
+  }
+  float gl = 0.0f, o = 0.0f;
+  for (unsigned s = 0; s < n; s++) {
     float e = __expf(pm[base + s] - gm);
     gl += pl[base + s] * e;
     o += pacc[(base + s) * D + tid] * e;
