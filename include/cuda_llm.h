@@ -182,10 +182,10 @@ inline unsigned attn_dpos_splits(int64_t n_q_heads, int64_t n_kv_heads, int64_t 
 // gridDim.y = S_max = attn_dpos_splits at max_ctx, a constant for the cache's
 // lifetime — so the launch is capturable — while each block derives its live
 // split bounds from *d_pos (attn_dpos_chunk, under attn_split_rule passed as
-// arguments). Splits past the live count write an empty m alone, and the
-// combine's sums stop before them, so the output is bit-identical to the
-// host attn_decode at every pos, a short cache costs its own splits rather
-// than the capacity's, and the captured path stays split-KV-flat at long ctx.
+// arguments). Splits past the live count are empty (attn_partials), which the
+// combine's sums stop before, so the output is bit-identical to the host
+// attn_decode at every pos, and the captured path stays split-KV-flat at long
+// ctx.
 // `partials` is a caller-OWNED device buffer of attn_dpos_partials_bytes —
 // like d_pos, it is graph-lifetime state (a captured graph bakes its address
 // in), so it must not be a shared growable scratch; kv_cache owns one per

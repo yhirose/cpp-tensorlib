@@ -768,7 +768,11 @@ inline unsigned attn_split_chunk(unsigned rows, int64_t ctx) {
 // Split-KV partials scratch: ONE buffer laid out pm[H*S] | pl[H*S] | pacc[H*S*D]
 // (hs = H*S). bytes/the carve constructor/combine() keep that layout contract in
 // a single place — attn_decode's split branch and attn_decode_dpos both bake
-// these pointers into launches (the dpos ones into a captured graph).
+// these pointers into launches (the dpos ones into a captured graph). An empty
+// split (a graph step's past its live count) writes its m alone, at
+// attn_m_empty, and empty splits come after the rest (a split's first key
+// grows with its index), so the combine's sums stop after the last split that
+// is not: a short cache reads its own splits' partials, not the capacity's.
 struct attn_partials {
   float *pm, *pl, *pacc;
   attn_partials(float* base, size_t hs) : pm(base), pl(pm + hs), pacc(pl + hs) {}

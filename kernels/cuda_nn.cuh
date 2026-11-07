@@ -3092,10 +3092,8 @@ template <int AD>
 constexpr int attn_dec_warps = AD == 512 ? 4 : 8;
 template <int AD>
 constexpr int attn_dec_threads = 32 * attn_dec_warps<AD>;
-// A softmax state's m before any key. A split's partial left at it (a dpos
-// split past the live count writes nothing else) weighs exp(-1e30 - max) = 0
-// in the merge, so tl_attn_combine reads no l or acc past the last split that
-// is not.
+// A softmax state's m before any key, and all an empty split writes of its
+// partial (attn_partials, cuda_nn.h): it weighs exp(-1e30 - max) = 0 in a merge.
 constexpr float attn_m_empty = -1e30f;
 
 // The decode attention's core. Block blockIdx.x is one kv head and a slice of
@@ -3197,8 +3195,8 @@ __device__ __forceinline__ void attn_dec_core(const float* __restrict__ q, const
     }
   }
 
-  // Merge the warps' states (a warp whose keys were none carries m = -1e30,
-  // l = 0 and adds exp(-inf) = 0), every head at once.
+  // Merge the warps' states (a warp whose keys were none carries m =
+  // attn_m_empty, l = 0 and adds exp(-inf) = 0), every head at once.
   __shared__ float sm[NWB][GB], sl[NWB][GB], sacc[NWB][GB][AD];
 #pragma unroll
   for (int g = 0; g < GB; g++) {
@@ -3212,7 +3210,7 @@ __device__ __forceinline__ void attn_dec_core(const float* __restrict__ q, const
   __syncthreads();
   for (unsigned e = tid; e < gn * AD; e += attn_dec_threads<AD>) {
     const unsigned g = e / AD, d = e % AD;
-    float gm = -1e30f;
+    float gm = attn_m_empty;
 #pragma unroll
     for (int w = 0; w < NWB; w++) gm = fmaxf(gm, sm[w][g]);
     float gl = 0.0f, o = 0.0f;
@@ -3284,8 +3282,7 @@ TL_ATTN_SPLIT(512, __half, f16)
 #undef TL_ATTN_SPLIT
 
 // Merge the S per-head partials (each already at its local max) into out, the
-// sums stopping after the last split whose m is not attn_m_empty (the
-// splits after it are empty: a dpos step's past its live count). Not
+// sums stopping after the last split that is not empty (attn_partials). Not
 // templated: the per-dim thread stride D == blockDim.x, so head_dim is
 // implicit.
 extern "C" __global__ void tl_attn_combine(const float* __restrict__ pm,

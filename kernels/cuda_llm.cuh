@@ -11,11 +11,9 @@
 // DYNAMIC position: each block recomputes the host launcher's split heuristic
 // from *d_pos, so one instantiated graph replays correctly at every pos AND
 // stays split-KV-flat at long ctx. Splits past ceil(ctx/chunk) see k0 >= ctx
-// and write their m alone, empty (attn_m_empty), and tl_attn_combine sums
-// up to the last split that is not, so the output is bit-identical to the
-// host path (single pass or split) at the same pos, and a short cache reads
-// its own splits' partials rather than the capacity's. Body is
-// attn_dec_core, as the by-value kernels'.
+// and are empty (attn_partials, cuda_nn.h), which tl_attn_combine sums past,
+// so the output is bit-identical to the host path (single pass or split) at
+// the same pos. Body is attn_dec_core, as the by-value kernels'.
 //
 // attn_dpos_chunk is gpu::policy::split_parts + split_chunk on the device, under
 // the rule the launcher passes (cuda_nn.h's attn_split_rule), so the host and
