@@ -30,14 +30,14 @@ namespace qm = qwenmodel;
 // What a Gemma 4 file's chat template puts after the model's turn when it is not
 // thinking: an empty thought channel (12B's and 31B's), or nothing (E2B's). There is
 // no jinja here, so the template is read by what it contains, as llama.cpp's
-// llm_chat_detect_template tells templates apart: the channel as a string literal
-// in it, its newline escaped.
+// llm_chat_detect_template tells templates apart by substrings: the channel as the
+// template's source spells it, its newline escaped (whatever quotes it is in; E2B's
+// other channel strings never run thought and its close together).
 static std::string gemma4_reply_prefix(const qm::gg::model& m) {
   const std::string channel = "<|channel>thought\n<channel|>", key = "tokenizer.chat_template";
-  std::string literal = "'";
-  for (char ch : channel) literal += ch == '\n' ? std::string("\\n") : std::string(1, ch);
-  literal += "'";
-  return m.has(key) && m.kv(key).as_str().find(literal) != std::string::npos ? channel : "";
+  std::string spelled;
+  for (char ch : channel) spelled += ch == '\n' ? std::string("\\n") : std::string(1, ch);
+  return m.has(key) && m.kv(key).as_str().find(spelled) != std::string::npos ? channel : "";
 }
 
 int main(int argc, char** argv) {
