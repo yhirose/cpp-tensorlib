@@ -209,12 +209,12 @@ int main(int argc, char** argv) {
   std::printf("=== 2a. projection GEMV(M=1) vs batched GEMM (per prompt token) ===\n");
   const int64_t MB = qm::PREFILL_CHUNK;  // the chunk production runs
   struct Shape { const char* name; int64_t K, N; const qm::wmat* w; };  // one bf16 run
-  qm::Layer& L0 = M.layers[0];
+  qm::Layer& L0 = M.layers[0];  // layer 0's own widths (a family's may vary by layer)
   const Shape shapes[] = {
-      {"QKV.fused", C.NE, (C.NH + 2 * C.NKV) * C.HD, &L0.wqkv_row},
-      {"wo", C.NH * C.HD, C.NE, &L0.wo_row},
-      {"gateup.fused", C.NE, 2 * C.FF, &L0.wgu_row},
-      {"wd", C.FF, C.NE, &L0.wd_row},
+      {"QKV.fused", C.NE, C.attn_proj(0), &L0.wqkv_row},
+      {"wo", C.NH * C.hd(0), C.NE, &L0.wo_row},
+      {"gateup.fused", C.NE, 2 * C.ff(0), &L0.wgu_row},
+      {"wd", C.ff(0), C.NE, &L0.wd_row},
   };
   int64_t maxK = 0, maxN = 0;
   for (const Shape& s : shapes) {
@@ -284,12 +284,13 @@ int main(int argc, char** argv) {
               "speedup");
   for (int64_t T : {(int64_t)128, (int64_t)512, (int64_t)2048}) {
     if (T > max_T) break;
-    tl::kv_cache c;
-    if (!c.init(C.NKV, C.MAXC, C.HD)) { std::printf("  cache init failed\n"); return 1; }
-    void* ks = zeros(C.NKV * T * C.HD);
-    void* vs = zeros(C.NKV * T * C.HD);
-    void* qs = zeros(C.NH * T * C.HD);
-    void* os = zeros(C.NH * T * C.HD);
+    tl::kv_cache c;  // layer 0's heads
+    const int64_t nkv = C.nkv(0), hd = C.hd(0);
+    if (!c.init(nkv, C.MAXC, hd)) { std::printf("  cache init failed\n"); return 1; }
+    void* ks = zeros(nkv * T * hd);
+    void* vs = zeros(nkv * T * hd);
+    void* qs = zeros(C.NH * T * hd);
+    void* os = zeros(C.NH * T * hd);
     if (!ks || !vs || !qs || !os) { std::printf("  alloc failed\n"); return 1; }
 
     // Per-token: append + attend at every position 0..T-1 (ctx grows).

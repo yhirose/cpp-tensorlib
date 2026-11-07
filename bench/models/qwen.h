@@ -145,17 +145,17 @@ struct Config {
   bool array_path() const {
     return !hybrid() && !post_norms && act == gpu::glu_act::silu && local.empty() &&
            ROPE_SCALE == 1.0f && !rope_factors && !PLE && !KV_SHARED && !v_norm &&
-           SOFTCAP == 0.0f && FF_L.empty() && !HD_LOCAL && NKV_L.empty() &&
-           std::find(k_eq_v.begin(), k_eq_v.end(), true) == k_eq_v.end();
+           SOFTCAP == 0.0f && FF_L.empty() && !HD_LOCAL && NKV_L.empty() && k_eq_v.empty();
   }
   bool is_delta(int64_t l) const { return hybrid() && (l + 1) % INTERVAL != 0; }
   // Layer l's heads in its q|k|v projection: q's, and k's and v's where it keeps
   // its own KV (not where it reads another layer's: Config::kv_src).
   int64_t qkv_heads(int64_t l) const { return NH + (has_kv(l) ? 2 * nkv(l) : 0); }
   // Output widths of the fused projections (and so of the scratch they land in):
-  // layer l's q|k|v(|gate), and the widest layer's, its q|k|v alone and with the gate.
-  int64_t attn_proj(int64_t l) const { return (qkv_heads(l) + (attn_gate ? NH : 0)) * hd(l); }
-  int64_t qkv_proj() const { return widest_([&](int64_t l) { return qkv_heads(l) * hd(l); }); }
+  // layer l's q|k|v, and with Qwen3.5's gate after it; and the widest layer's of each.
+  int64_t qkv_proj(int64_t l) const { return qkv_heads(l) * hd(l); }
+  int64_t attn_proj(int64_t l) const { return qkv_proj(l) + (attn_gate ? NH * hd(l) : 0); }
+  int64_t qkv_proj() const { return widest_([&](int64_t l) { return qkv_proj(l); }); }
   int64_t attn_proj() const { return widest_([&](int64_t l) { return attn_proj(l); }); }
   template <class F>
   int64_t widest_(F f) const {
@@ -247,7 +247,7 @@ inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
   };
   c.fused_qkv = rows(a0 + "attn_q.weight") < 0 && rows(a0 + "attn_qkv.weight") >= 0;
   if (c.fused_qkv) {
-    if (rows(a0 + "attn_qkv.weight") != c.qkv_heads(c.first_attn()) * c.HD)
+    if (rows(a0 + "attn_qkv.weight") != c.qkv_proj(c.first_attn()))
       throw std::runtime_error("qwen: " + a0 + "attn_qkv.weight is not q|k|v");
   } else {
     const int64_t wq = rows(a0 + "attn_q.weight");
@@ -372,8 +372,8 @@ inline Config config_from_gguf(const gg::model& m, int64_t maxc = 4096) {
     c.k_eq_v.assign(c.NL, false);
     for (int64_t l = 0; l < c.NL; l++)
       c.k_eq_v[l] = c.has_kv(l) && !m.tensor("blk." + std::to_string(l) + ".attn_v.weight");
-    if (std::count(c.k_eq_v.begin(), c.k_eq_v.end(), true) && (c.qkv_bias || c.fused_qkv))
-      throw std::runtime_error("qwen: a v that is k, with a qkv bias or a fused qkv");
+    if (std::find(c.k_eq_v.begin(), c.k_eq_v.end(), true) == c.k_eq_v.end()) c.k_eq_v.clear();
+    else if (c.qkv_bias || c.fused_qkv) throw std::runtime_error("qwen: a v that is k, with a qkv bias or a fused qkv");
   }
   return c;
 }

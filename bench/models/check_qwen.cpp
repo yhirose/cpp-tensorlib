@@ -173,10 +173,10 @@ static void fixed_sums(bool on) {
 }
 
 // The batched prefill's f16 sums (the default where the backend has them),
-// against `ref`, an f32 forward's logits for the same prompt: the top-5
-// logits to 2e-2 and the same greedy token (a sensitive model's as Oracle::agree
-// holds it). Then the safety net: with the
-// first layer's FFN norm scaled by 1e5 the f16 sums overflow (the MLP's input
+// against `ref`, an f32 forward's logits for the same prompt: the top-5 logits to
+// 2e-2 and the same greedy token (a sensitive model's as Oracle::agree holds
+// it). Then the safety net: with the first layer's FFN norm scaled by 1e5 the
+// f16 sums overflow (the MLP's input
 // passes f16's range), and the prompt must be redone once, exactly, from the
 // state it started at: an exact prefill of the same model, both with their
 // sums in a fixed order (fixed_sums). Split-K's atomics would move them apart
@@ -395,9 +395,17 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   }
   // The prompt again, token by token: the logits, cache and first step the
   // decoder is held to below, and the greedy opening, the reference's (a
-  // quantized file's own, run again from a reset cache).
+  // quantized file's own, run again from a reset cache). The long prompt's
+  // logits (below) are taken on the way where it is the prompt's head.
+  std::vector<int> longp;
+  const int64_t n_long = std::max<int64_t>(96, B.c.SWA > 0 ? B.c.SWA + 64 : 0);
+  for (int64_t i = 0; i < n_long; i++) longp.push_back(O.prompt_ids[i % NP]);
+  std::vector<float> imp_long;
   int64_t tok = 0, p = 0;
-  for (int64_t i = 0; i < NP; i++) tok = qm::step_imperative(B, O.prompt_ids[i], p++);
+  for (int64_t i = 0; i < NP; i++) {
+    tok = qm::step_imperative(B, O.prompt_ids[i], p++);
+    if (i + 1 == n_long) imp_long = logits_of(B);
+  }
   const std::vector<float> imp_prompt = logits_of(B);  // the last prompt token's
   const auto imp_cache = cache_rows(B, NP);           // and the k / v the prompt left
   std::vector<float> imp_step;                         // and the first decode step's
@@ -501,11 +509,9 @@ static bool check_imperative(const qm::gg::model& m, const Oracle& O, bool held)
   // A prompt past one chunk of the delta rule (32 tokens), so the batched
   // prefill takes the backend's chunked form where it has one, and past a
   // sliding window (Gemma 3's local layers), so both paths read one: its last
-  // token's logits against the imperative path's (Oracle::agree).
-  std::vector<int> longp;
-  const int64_t n_long = std::max<int64_t>(96, B.c.SWA > 0 ? B.c.SWA + 64 : 0);
-  for (int64_t i = 0; i < n_long; i++) longp.push_back(O.prompt_ids[i % NP]);
-  const std::vector<float> imp_long = imperative_prompt(B, longp);
+  // token's logits against the imperative path's (Oracle::agree), run here where
+  // the prompt is shorter than it (the prompt repeated).
+  if (imp_long.empty()) imp_long = imperative_prompt(B, longp);
   qm::reset_cache(B);
   bool long_ok = true;
   if (qm::prefill_batched(B, longp) >= 0) {
